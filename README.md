@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> Â·
-  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> Â·
-  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> Â·
-  <a href="NETPLAY.md"><strong>Netplay</strong></a> Â·
+  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> ·
+  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> ·
+  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
+  <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a>
 </p>
 
@@ -48,7 +48,7 @@ There is no Nintendo online-service integration, general Switch compatibility cl
 
 ## Download and run
 
-**[Get the Windows x64 runtime â†’](https://github.com/SNO2207/WindowSmash/releases)**
+**[Get the Windows x64 runtime →](https://github.com/SNO2207/WindowSmash/releases)**
 
 Extract the runtime ZIP, run **Configure Game Data.bat** to select your own compatible RomFS and firmware fonts, then use **Play SSBU.bat**. The runtime ZIP has the compiled files needed to execute the game; it excludes source, debug maps, object files, caches, saves, keys, and game-data archives. A compiler and Python are not required to play.
 
@@ -82,7 +82,7 @@ Choose a job count appropriate to your CPU and available memory. The output is `
 3. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
 4. Both open **Local Wireless** in-game. The host creates a room; the friend selects it and the host accepts.
 
-**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting â†’](NETPLAY.md)**
+**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting →](NETPLAY.md)**
 
 | Launcher | Use |
 | :--- | :--- |
