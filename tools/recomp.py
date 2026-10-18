@@ -534,11 +534,12 @@ def compile_dir(outdir, jobs):
     return not failures
 
 
-def link(dirs, exe):
-    """Compile the host runtime and link it with the given module build directories."""
+def link(dirs, exe, rt_dir=None):
+    """Compile the host runtime and link it with the given module build directories. The
+    runtime's objects go to rt_dir (default: rt beside the exe)."""
     import cc
     t0 = time.time()
-    rt_dir = os.path.join(os.path.dirname(exe), "rt")
+    rt_dir = rt_dir or os.path.join(os.path.dirname(exe), "rt")
     os.makedirs(rt_dir, exist_ok=True)
     headers = max(os.path.getmtime(os.path.join(cc.RUNTIME, n)) for n in os.listdir(cc.RUNTIME) if n.endswith(".h"))
     sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*)\.c", n)]
@@ -656,7 +657,7 @@ if __name__ == "__main__":
     elif cmd == "compile":
         sys.exit(0 if compile_dir(nso, int(arg("--jobs", "16"))) else 1)
     elif cmd == "link":
-        sys.exit(0 if link(arg("--dirs").split(","), arg("--out")) else 1)
+        sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
         sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20"))) else 1)
     elif cmd == "check":
