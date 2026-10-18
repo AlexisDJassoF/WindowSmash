@@ -2,10 +2,11 @@
  * packs them) into the renderer's disk cache, translated and compiled exactly as the renderer
  * would, so that a program's first use loads its DXBC instead of compiling it.
  *
- * Usage: shaderaot <pack> <cache dir> <part> <parts> [--dry]
+ * Usage: shaderaot <pack> <cache dir> <part> <parts> [--dry] [--keys <file>]
  *   Every process translates all vertex programs (their outputs are the paired pixel programs'
  *   inputs) and compiles the records whose index is <part> modulo <parts>. --dry translates only
- *   and prints the cache key of each program ("vs <hash>", "ps <hash> <vs outputs>").
+ *   and prints the cache key of each program ("vs <hash>", "ps <hash> <vs outputs>"); --keys
+ *   compiles only the keys listed in a file of such lines.
  *
  * Pack: "SAOT", u32 count; then per program u32 stage (0 vertex, 1 pixel), u32 length, u32 pairs,
  * u32 pair[pairs] (the vertex programs found before it in its containers), then its bytes
@@ -77,22 +78,49 @@ static void compile_to(const char *hlsl, const char *name, int stage, const char
     if (errors) errors->lpVtbl->Release(errors);
 }
 
-/* Keys this process has seen: the same program is often packed more than once. */
-static u64 *seen;
-static u32 seen_cap = 1u << 17;
-static int first_time(u64 key) {
+/* Sets of keys: the ones this process has seen (the same program is often packed more than
+ * once), and --keys' list. */
+typedef struct KeySet { u64 *slot; u32 cap; } KeySet;
+static KeySet seen = {0, 1u << 17}, only = {0, 1u << 16};
+static int add_key(KeySet *ks, u64 key) {   /* 1 if it was not there */
+    if (!ks->slot) ks->slot = calloc(ks->cap, sizeof *ks->slot);
     u64 k = key | 1;
-    for (u32 i = (u32)(k * 0x9E3779B97F4A7C15ull >> 47) & (seen_cap - 1);; i = (i + 1) & (seen_cap - 1)) {
-        if (seen[i] == k) return 0;
-        if (!seen[i]) { seen[i] = k; return 1; }
+    for (u32 i = (u32)(k * 0x9E3779B97F4A7C15ull >> 47) & (ks->cap - 1);; i = (i + 1) & (ks->cap - 1)) {
+        if (ks->slot[i] == k) return 0;
+        if (!ks->slot[i]) { ks->slot[i] = k; return 1; }
     }
 }
+static int has_key(const KeySet *ks, u64 key) {
+    u64 k = key | 1;
+    for (u32 i = (u32)(k * 0x9E3779B97F4A7C15ull >> 47) & (ks->cap - 1);; i = (i + 1) & (ks->cap - 1)) {
+        if (ks->slot[i] == k) return 1;
+        if (!ks->slot[i]) return 0;
+    }
+}
+static int first_time(u64 key) { return add_key(&seen, key) && (!only.slot || has_key(&only, key)); }
 
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: shaderaot <pack> <cache dir> <part> <parts> [--dry]\n"); return 2; }
     const char *dir = argv[2];
     u32 part = (u32)atoi(argv[3]), parts = (u32)atoi(argv[4]);
-    int dry = argc > 5 && !strcmp(argv[5], "--dry");
+    int dry = 0;
+    for (int a = 5; a < argc; a++) {
+        if (!strcmp(argv[a], "--dry")) dry = 1;
+        else if (!strcmp(argv[a], "--keys") && a + 1 < argc) {
+            FILE *k = fopen(argv[++a], "r");
+            char kind[4];
+            unsigned long long hash;
+            unsigned mask = 0;
+            char line[128];
+            while (k && fgets(line, sizeof line, k)) {
+                int n = sscanf(line, "%3s %llx %x", kind, &hash, &mask);
+                if (n >= 2 && !strcmp(kind, "vs")) add_key(&only, hash * 3);
+                else if (n == 3 && !strcmp(kind, "ps")) add_key(&only, hash * 5 ^ mask);
+            }
+            if (k) fclose(k);
+            if (!only.slot) add_key(&only, 0);   /* (an empty list: nothing) */
+        }
+    }
     FILE *f = fopen(argv[1], "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
     _fseeki64(f, 0, SEEK_END);
@@ -115,7 +143,6 @@ int main(int argc, char **argv) {
         prog[i].bytes = q + 12 + 4ull * w[2];
         q = prog[i].bytes + w[1];
     }
-    seen = calloc(seen_cap, sizeof *seen);
     ShaderInfo info;
     char path[1200], name[64];
     /* every vertex program: its key and outputs; compiled by its part */
