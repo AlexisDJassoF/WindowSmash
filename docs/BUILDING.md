@@ -148,7 +148,7 @@ Alternatively, leave it elsewhere and set `SSBU_SDL3_DIR` to the extracted `SDL3
 $env:SSBU_SDL3_DIR = 'D:\Libraries\SDL3-3.x.y'
 ```
 
-The runtime is compiled against SDL3's headers only and loads `SDL3.dll` at run time; the link step copies `SDL3.dll` beside `build/ssbu.exe`. Without SDL3, the build still succeeds and XInput (Xbox) pads 1-4 are players 1-4. If you add SDL3 after a build, delete `build/rt/hle_pad.obj` so the next build compiles the runtime's controller code with it. SDL3 is under the zlib license ([third-party notices](../NOTICE.md)); a local bundle ships it as `build/SDL3-LICENSE.txt`.
+The runtime is compiled against SDL3's headers only and loads `SDL3.dll` at run time; the link step copies `SDL3.dll` beside `build/ssbu.exe`. Without SDL3, the build still succeeds and XInput (Xbox) pads 1-4 are players 1-4. SDL3 is under the zlib license ([third-party notices](../NOTICE.md)); a local bundle ships it as `build/SDL3-LICENSE.txt`.
 
 ## 7. Optional installed DLC list
 

@@ -542,11 +542,18 @@ def link(dirs, exe, rt_dir=None):
     rt_dir = rt_dir or os.path.join(os.path.dirname(exe), "rt")
     os.makedirs(rt_dir, exist_ok=True)
     headers = max(os.path.getmtime(os.path.join(cc.RUNTIME, n)) for n in os.listdir(cc.RUNTIME) if n.endswith(".h"))
+    # the compile command the objects were built with: cc.CFLAGS change as SDL3, libopus or libvpx come and go
+    stamp, flags = os.path.join(rt_dir, "cflags.txt"), " ".join([cc.CLANG, *cc.CFLAGS]) + "\n"
+    old = ""
+    if os.path.exists(stamp):
+        with open(stamp, encoding="utf-8") as f:
+            old = f.read()
+    every = old != flags
     sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*)\.c", n)]
     jobs = []
     for n in sources:
         src, obj = os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj")
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), headers):
+        if every or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), headers):
             jobs.append((src, obj, "/O2"))
     # Native implementations by name, for symbols no module defines.
     names = sorted(hle_names())
@@ -554,7 +561,7 @@ def link(dirs, exe, rt_dir=None):
     changed = write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
                                + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
                                + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
-    if changed or not os.path.exists(table[:-2] + ".obj"):
+    if changed or every or not os.path.exists(table[:-2] + ".obj"):
         jobs.append((table, table[:-2] + ".obj", "/O1"))
     # The run-time loadable modules (NROs) linked in, for nn::ro to find by build id.
     nros = [os.path.basename(os.path.normpath(d)) for d in dirs
@@ -565,13 +572,14 @@ def link(dirs, exe, rt_dir=None):
                                + "const RtModule *const rt_nro_modules[] = {"
                                + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
                                + f"const u32 rt_nro_count = {len(nros)};\n")
-    if changed or not os.path.exists(nro_table[:-2] + ".obj"):
+    if changed or every or not os.path.exists(nro_table[:-2] + ".obj"):
         jobs.append((nro_table, nro_table[:-2] + ".obj", "/O1"))
     failures = cc.compile_each(jobs, 4)
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
         return False
+    write_if_changed(stamp, flags)   # (only now: a failed compile is tried again)
     objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [table[:-2] + ".obj", nro_table[:-2] + ".obj"]
     for d in dirs:
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
