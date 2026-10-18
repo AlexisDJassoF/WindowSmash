@@ -17,11 +17,17 @@ build/, save/, cache/ next to it: tools/recomp.py --tree, the runtime's data dir
 
 An update's RomFS is a patch (BKTR) over the RomFS of the original release: a map of the new
 image whose pieces are either the update's own data or bytes of the original base at given
-offsets. The base given here need not be the original release: when it is an image with an
-earlier update merged in (for example 11.0.0 rebuilt into one plain NCA), the patch's base
-offsets point nowhere useful. What remains true is that every base piece the patch asks for is
-data of the original release, and the merged base still holds that data - moved, file by file,
-folder by folder. So the pieces are found again:
+offsets (in the base NCA's RomFS section). When the base is that original release, unpacked
+(its RomFS section stored plain, which is what the runtime reads in place), the patch applies
+exactly: every base piece is those bytes of the base's file. That is tried first - blocks
+sampled across the image are checked against the update's hashes - and the whole result is
+verified at the end like any other.
+
+Otherwise the base need not be the original release: when it is an image with an earlier
+update merged in (for example 11.0.0 rebuilt into one plain NCA), the patch's base offsets point
+nowhere useful. What remains true is that every base piece the patch asks for is data of the
+original release, and the merged base still holds that data - moved, file by file, folder by
+folder. So the pieces are found again:
 
   1. data.arc's file tables (both versions) give every file's place in the new image and in the
      base; a new file inside a base piece takes its bytes from the same file in the base
@@ -49,7 +55,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arc import Arc, data_arc_offset  # noqa: E402
-from nca import LAYER_ZERO, RomfsImage, copy_out, nsp_ncas, pfs0_entries, write_layers  # noqa: E402
+from nca import LAYER_ZERO, Nca, RomfsImage, copy_out, nsp_ncas, pfs0_entries, write_layers  # noqa: E402
 
 ZERO = "zero"        # a piece of zeros
 NODE = 0x4000        # bucket tree node size
@@ -161,21 +167,63 @@ class Seg:
 
 
 class Builder:
-    def __init__(self, patch, base_cfg):
+    def __init__(self, patch, base_cfg, keydir=None):
         self.p = patch
         img = RomfsImage(base_cfg)
         if img.entries is not None:
             raise SystemExit("the base's romfs.cfg is layered: give the base release's own romfs.cfg")
         self.base_path = os.path.abspath(img.f.name)
         self.bf = open(self.base_path, "rb")
+        self.base_l6 = img.base                              # the base's RomFS image in its file
         self.base_arc = img.base + data_arc_offset(img)      # data.arc in the base's file
         self.l6 = patch.l6
+        self.keydir = keydir
 
     def base_read(self, off, n):
         if off < 0:
             return b"\xfe" * n
         self.bf.seek(off)
         return self.bf.read(n)
+
+    # 0. the original release itself
+    def base_section(self):
+        """Where the base's RomFS section starts in its file - what the patch's base offsets
+        count from - or None if the base's file is not an NCA with its RomFS where romfs.cfg says."""
+        if not self.keydir:
+            return None
+        try:
+            nca = Nca(self.base_path, self.keydir)
+        except (SystemExit, OSError, ValueError):
+            return None
+        sec = nca.section(0)
+        if sec is None or sec.hash_type != 3 or nca.base + sec.start + sec.data_off != self.base_l6:
+            return None
+        return nca.base + sec.start
+
+    def exact_segments(self, start):
+        """The pieces as the patch says: base pieces are the base's bytes at their offsets."""
+        p, segs = self.p, []
+        for i, (v, ph, st) in enumerate(p.ind):
+            end = p.iv[i + 1] if i + 1 < len(p.iv) else p.vend
+            v0, v1 = max(v, p.l6), min(end, p.l6 + p.l6size)
+            if v0 >= v1:
+                continue
+            if st == 1:
+                segs.append(Seg(v0, v1, 1, off=ph + (v0 - v)))
+                continue
+            orig = ph + (v0 - v)
+            s = Seg(v0, v1, 0, orig=orig, cands=[start + orig - v0])
+            s.pick = s.cands[0]
+            segs.append(s)
+        self.segs, self.sv = segs, [s.v for s in segs]
+
+    def is_original(self, start, samples=256):
+        """Whether the base is the release the patch was made for: blocks with base pieces,
+        sampled across the image, match the update's hashes when taken as the patch says."""
+        self.exact_segments(start)
+        blocks = sorted({(s.v - self.l6) // self.p.block for s in self.segs if s.kind == 0})
+        sample = blocks[::max(1, len(blocks) // samples)]
+        return all(self.ok(b, {}) for b in sample)
 
     # 1. the two data.arc's
     def tables(self):
@@ -539,28 +587,42 @@ def write_patch_data(patch, path, end):
     os.replace(path + ".partial", path)
 
 
-def apply(a):
-    t0 = time.time()
-    patch = Patch(a.nsp, a.keys)
+def open_patch(nsp, keydir):
+    patch = Patch(nsp, keydir)
     log(f"update: patch data {patch.data_end / 2**30:.2f} GiB, {len(patch.ind):,} patch pieces, "
         f"new RomFS {patch.l6size / 2**30:.2f} GiB in {patch.blocks:,} blocks")
-    dump = os.path.join(a.tree, "dump")
-    modules = os.path.join(dump, "modules")
-    os.makedirs(modules, exist_ok=True)
+    return patch
+
+
+def apply_exefs(patch, tree):
+    """The update's ExeFS into <tree>/dump/exefs."""
     log("ExeFS:")
     for name, off, size in pfs0_entries(patch.exefs):
         log(f"  {name:<12} {size:>10}")
-        copy_out(patch.exefs, off, size, os.path.join(dump, "exefs", name))
+        copy_out(patch.exefs, off, size, os.path.join(tree, "dump", "exefs", name))
 
-    b = Builder(patch, a.base)
-    new, old = b.tables()
-    b.extents(new, old)
-    b.segments()
-    log("checking each block against the update's hash tree:")
-    bad = b.first_pass()
-    log(f"first pass: {patch.blocks - len(bad):,} of {patch.blocks:,} blocks confirmed ({time.time() - t0:.0f}s)")
-    if bad:
-        bad = b.solve(bad)
+
+def apply_romfs(patch, base_cfg, keydir, tree):
+    """The updated RomFS over the base's: <tree>/dump/modules/romfs.cfg and its files.
+    Returns the blocks left unconfirmed."""
+    t0 = time.time()
+    modules = os.path.join(tree, "dump", "modules")
+    os.makedirs(modules, exist_ok=True)
+    b = Builder(patch, base_cfg, keydir)
+    start = b.base_section()
+    if start is not None and b.is_original(start):
+        log("the base is the release this update was made for: applying the patch as it is")
+    else:
+        log("the base is not the release this update was made for (an earlier update merged in?): "
+            "finding the original release's pieces in it")
+        new, old = b.tables()
+        b.extents(new, old)
+        b.segments()
+        log("checking each block against the update's hash tree:")
+        bad = b.first_pass()
+        log(f"first pass: {patch.blocks - len(bad):,} of {patch.blocks:,} blocks confirmed ({time.time() - t0:.0f}s)")
+        if bad:
+            b.solve(bad)
 
     layers = b.layers()
     patch_end = max([s.off + (s.e - s.v) for s in b.segs if s.kind == 1] +
@@ -576,6 +638,13 @@ def apply(a):
     log(f"wrote {cfg}; verifying the result as the runtime will read it:")
     bad = verify(patch, cfg, os.path.join(modules, "romfs.unverified.txt"))
     log(f"done in {time.time() - t0:.0f}s" + (f"; unconfirmed blocks listed in {modules}/romfs.unverified.txt" if bad else ""))
+    return bad
+
+
+def apply(a):
+    patch = open_patch(a.nsp, a.keys)
+    apply_exefs(patch, a.tree)
+    apply_romfs(patch, a.base, a.keys, a.tree)
 
 
 def main():

@@ -1,6 +1,6 @@
 # Later game versions
 
-[README](../README.md) · [Build guide](BUILDING.md) · [Multiplayer](../NETPLAY.md) · [Technical guide](TECHNICAL.md)
+[README](../README.md) · [Build guide](BUILDING.md) · [Several versions](VERSIONS.md) · [Multiplayer](../NETPLAY.md) · [Technical guide](TECHNICAL.md)
 
 The port's own tree is game version **11.0.0**. `tools/update.py` applies an update package (a
 Patch NSP) from your own dump to it. The result goes into a separate folder laid out like the
@@ -27,7 +27,8 @@ An update's RomFS is a patch over the RomFS of the game's **original release**. 
 the new image whose pieces are either the update's own data or bytes of the original release
 at given places.
 
-If your base RomFS is the original release, those places are right. If it's an image that
+If your base RomFS is the original release, unpacked, those places are right: `update.py`
+checks that first, and then applies the patch exactly. If it's an image that
 already has an earlier update merged in, for example 11.0.0 rebuilt into one plain file, they
 aren't, and applying the patch the usual way would give a corrupt game. `update.py` finds the
 pieces again:
@@ -53,7 +54,15 @@ extracted, and the plain `romfs.cfg` format still works.
 
 ## Steps
 
-From the checkout, with your own update package, DLC and keys (example paths):
+`tools/install_version.py` does all of the steps below, and the build, in one command
+([several game versions](VERSIONS.md)):
+
+```powershell
+python tools/install_version.py install --tree v13.0.5 --update "D:\MyDump\update.nsp" --dlc "D:\MyDump\dlc" --keys "D:\MyKeys"
+```
+
+Step by step instead, from the checkout, with your own update package, DLC and keys (example
+paths):
 
 ```powershell
 python tools/update.py apply "D:\MyDump\update.nsp" --base dump/modules/romfs.cfg --keys "D:\MyKeys" --tree v13.0.5
@@ -89,14 +98,16 @@ Start that version from the checkout:
 v13.0.5\build\ssbu.exe v13.0.5\dump\modules --status 30 > v13.0.5\build\play.log 2>&1
 ```
 
-The launchers start the port's own tree. `SSBU_TREE=v13.0.5 tools/menurun.sh <out dir>` runs the
+The launchers list every version that's built and ask which one to start
+([several game versions](VERSIONS.md)). `SSBU_TREE=v13.0.5 tools/menurun.sh <out dir>` runs the
 scripted menu test on that version.
 
 ## Good to know
 
 - **Netplay needs the same version on every PC.** A 13.0.5 player can't join an 11.0.0 one.
-- **The unlock tool** (`Unlock All Fighters.bat`) was worked out on 11.0.0's save layout. It
-  hasn't been checked against 13.0.5's save.
+- **The unlock tool** (`Unlock All Fighters.bat`) knows 11.0.0's and 13.0.5's save layouts,
+  which are the same, and refuses other versions. The game unlocks Kazuya and Sora itself when
+  their DLC is installed ([DLC/unlock guide](DLC-AND-UNLOCKS.md)).
 - **The local bundler** (`tools/bundle_ssbu.py`) only knows the plain `romfs.cfg`. It refuses a
   layered one rather than make a broken bundle.
 - **Checked on 13.0.5:** the RomFS (every block, as above), a build of `main` and all 98 fighter

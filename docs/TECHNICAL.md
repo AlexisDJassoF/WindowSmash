@@ -52,6 +52,8 @@ The primary modules have explicit guest bases in `recomp.py`: `main`, `subsdk0`,
 
 That address manifest is a build input. Preserve it when incrementally rebuilding an existing installation; generated code and relocation images must agree on placement.
 
+With several game versions in one checkout ([several versions](VERSIONS.md)), `module_bases.txt` at the checkout root keeps one address per build ID across all version folders. A module that is byte-identical between versions then gets the same address everywhere, and [`modcache.py`](../tools/modcache.py) reuses its generated C and objects from another version's build instead of building it again.
+
 ## 2. Loading, symbols, and guest execution
 
 [`host.c`](../runtime/host.c) maps `*.reloc.bin` images at their expected guest addresses, registers module ranges, publishes exports, resolves imports, and applies symbol relocations. Function metadata associates guest addresses with compiled host functions.
@@ -138,7 +140,7 @@ Room names are routing identifiers, not passwords. The protocol is not encrypted
 
 The target game's content archive already contains assets and code for the DLC available in that version. `aoc.cfg` reports locally installed add-on indices to `nn::aoc`; it does not add newer game data. DLC fighter NROs must also be extracted and compiled.
 
-The unlock tools edit the known 11.0.0 save layout, validate the fighter tables, and create a backup. Base-game selection flags and associated milestones are separate from installed DLC reporting. Mii Fighters may still need to be created in-game. See the [DLC/save guide](DLC-AND-UNLOCKS.md) for usage and limitations.
+The unlock tools edit the known save layout of 11.0.0, which 13.0.5 shares; they identify a version folder by its program's build ID, validate the fighter tables, and create a backup. Base-game selection flags and associated milestones are separate from installed DLC reporting. Mii Fighters may still need to be created in-game. See the [DLC/save guide](DLC-AND-UNLOCKS.md) for usage and limitations.
 
 ## 7. Tool reference
 
@@ -150,9 +152,12 @@ Paths below are relative to the repository root. Diagnostic tools may require `r
 | :--- | :--- |
 | [`nca.py`](../tools/nca.py) | Inspect packages; extract ExeFS/RomFS files; generate `romfs.cfg` and installed-content `aoc.cfg`. |
 | [`arc.py`](../tools/arc.py) | Inspect `data.arc`, extract named paths, and collect known embedded NRO modules. Requires Python 3.14. |
+| [`update.py`](../tools/update.py) | Apply an update package as a layered RomFS in a version folder, checking every block against the update's hashes ([later versions](UPDATES.md)). |
+| [`install_version.py`](../tools/install_version.py) | Install and build a game version in a folder of its own with one command ([several versions](VERSIONS.md)). |
+| [`modcache.py`](../tools/modcache.py) | Share module addresses and reuse module builds across version folders by build ID. |
 | [`nso.py`](../tools/nso.py) | Read NSO/NRO images and dynamic metadata; inspect modules and export ELF representations. |
 | [`funcs.py`](../tools/funcs.py) | Discover functions and optionally write a function inventory. |
-| [`recomp.py`](../tools/recomp.py) | Run `coverage`, `emit`, `image`, `build`, `compile`, `link`, or the end-to-end `all` driver. |
+| [`recomp.py`](../tools/recomp.py) | Run `coverage`, `emit`, `image`, `build`, `compile`, `link`, the end-to-end `all` driver, the `check` of unresolved imports, or `wrap-sig` for a hook's code signature. |
 | [`lift.py`](../tools/lift.py) | AArch64 integer/control-flow lifting implementation. |
 | [`lift_simd.py`](../tools/lift_simd.py) | NEON/AdvSIMD lifting implementation. |
 | [`a64.py`](../tools/a64.py) | Shared instruction-emission helpers, register expressions, types, and unsupported-operation handling. |
@@ -193,6 +198,7 @@ Paths below are relative to the repository root. Diagnostic tools may require `r
 | [`unlock_all.py`](../tools/unlock_all.py) | Validate, back up, and unlock the compatible local save using Python. |
 | [`Unlock-All-Fighters.ps1`](../tools/Unlock-All-Fighters.ps1) | Equivalent Windows save-unlock helper, with a running-game guard and atomic backup/replacement. |
 | [`Configure-Game-Data.ps1`](../tools/Configure-Game-Data.ps1) | Configure a runtime release using a separately supplied RomFS, fonts, and optional installed-content config. |
+| [`pick_version.bat`](../tools/pick_version.bat) | Let the launchers list the built game versions and ask which to start. |
 | [`smoke.ps1`](../smoke.ps1) | Compile and execute a small known game-function smoke harness against prepared local inputs. |
 
 The `.sh` helpers expect a Unix-like shell/tool environment that can run the Windows executable. They recreate their named output/test directories; use disposable capture paths. They are developer scripts, not required player launchers.

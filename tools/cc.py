@@ -70,12 +70,13 @@ def compile_each(jobs_list, jobs=16):
         return [f for f in pool.map(one, jobs_list) if f]
 
 
-def link(objs, exe):
+def link(objs, exe, options=()):
+    """Link objects into an executable; `options` go to the linker."""
     rsp = exe + ".rsp"
     with open(rsp, "w") as f:
         f.write("\n".join(f'"{o}"' for o in objs))
     lld = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(CLANG), "lld-link.exe")) else []
-    r = subprocess.run([CLANG, "/nologo", *lld, "@" + rsp, "/Fe" + exe, "/link", "/HIGHENTROPYVA:NO", "/MAP:" + exe[:-4] + ".map", "winmm.lib", "user32.lib", "gdi32.lib", "d3d11.lib", "dxgi.lib", "d3dcompiler.lib", "dxguid.lib", "ws2_32.lib", "ole32.lib", "oleaut32.lib", *EXTRA_LIBS],
+    r = subprocess.run([CLANG, "/nologo", *lld, "@" + rsp, "/Fe" + exe, "/link", "/HIGHENTROPYVA:NO", "/MAP:" + exe[:-4] + ".map", *options, "winmm.lib", "user32.lib", "gdi32.lib", "d3d11.lib", "dxgi.lib", "d3dcompiler.lib", "dxguid.lib", "ws2_32.lib", "ole32.lib", "oleaut32.lib", *EXTRA_LIBS],
                        capture_output=True, text=True)
     if r.returncode:
         lines = (r.stdout + r.stderr).splitlines()
