@@ -28,9 +28,14 @@ static void load_xinput(void) {
     static int tried;
     if (tried) return;
     tried = 1;
+#ifdef _WIN32
     HMODULE m = LoadLibraryA("xinput1_4.dll");
     if (!m) m = LoadLibraryA("xinput9_1_0.dll");
     if (m) xinput_get_state = (XInputGetStateFn)(void *)GetProcAddress(m, "XInputGetState");
+#else
+    DWORD rt_xinput_get_state(DWORD index, void *state);   /* (linux/window.c: the first SDL game controller) */
+    xinput_get_state = (XInputGetStateFn)(void *)rt_xinput_get_state;
+#endif
 }
 
 static int pad_connected(u32 id) { return id == NPAD_NO1; }

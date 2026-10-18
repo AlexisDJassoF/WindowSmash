@@ -109,7 +109,8 @@ scripted menu test on that version.
   which are the same, and refuses other versions. The game unlocks Kazuya and Sora itself when
   their DLC is installed ([DLC/unlock guide](DLC-AND-UNLOCKS.md)).
 - **The local bundler** (`tools/bundle_ssbu.py`) only knows the plain `romfs.cfg`. It refuses a
-  layered one rather than make a broken bundle.
+  layered one rather than make a broken bundle. The Linux packager handles both
+  ([Linux](../README-LINUX.md)).
 - **Checked on 13.0.5:** the RomFS (every block, as above), a build of `main` and all 98 fighter
   modules, and menu-only scripted runs: the title screen reads Ver. 13.0.5, the unlock sequence
   for the new content plays, and character select shows the full roster, Kazuya and Sora

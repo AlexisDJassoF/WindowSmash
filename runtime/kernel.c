@@ -150,7 +150,7 @@ static void query_memory(u64 info, u64 addr) {
 
 static void *commit(u64 at, u64 size, const char *what) {
     void *p = VirtualAlloc((void *)at, size, MEM_COMMIT, PAGE_READWRITE);
-    if (!p) rt_fatal("kernel: cannot commit %llu KiB at %#llx for %s (error %lu)", size >> 10, at, what, GetLastError());
+    if (!p) rt_fatal("kernel: cannot commit %llu KiB at %#llx for %s (error %lu)", size >> 10, at, what, (unsigned long)GetLastError());
     return p;
 }
 
@@ -173,12 +173,21 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 
     return t;
 }
 
+#ifndef _WIN32
+/* Linux: a thread leaves from wherever it is by jumping back to its start (ExitThread would be
+ * pthread_exit, which unwinds every guest frame on the way out). */
+static __thread jmp_buf *exit_point;
+#endif
+
 static _Noreturn void exit_thread(KThread *t) {
     EnterCriticalSection(&klock);
     t->exited = 1;
     objects[t->handle - 0xA000].signaled = 1;
     WakeAllConditionVariable(&kchanged);
     LeaveCriticalSection(&klock);
+#ifndef _WIN32
+    if (exit_point) longjmp(*exit_point, 1);
+#endif
     ExitThread(0);
 }
 
@@ -186,9 +195,18 @@ static DWORD WINAPI thread_main(LPVOID param) {
     KThread *t = param;
     char where[96];
     WCHAR desc[128];   /* for the profiler and debuggers */
+#ifdef _WIN32
     _snwprintf(desc, 127, L"guest thread %llu (%hs, priority %d)", t->id, rt_describe(t->entry, where, sizeof where), t->priority);
+#else
+    swprintf(desc, 127, L"guest thread %llu (%s, priority %d)", (unsigned long long)t->id, rt_describe(t->entry, where, sizeof where), t->priority);
+#endif
     desc[127] = 0;
     SetThreadDescription(GetCurrentThread(), desc);
+#ifndef _WIN32
+    jmp_buf out;
+    exit_point = &out;
+    if (setjmp(out)) return 0;
+#endif
     rt_call(t->cpu, t->entry);
     exit_thread(t);
 }
@@ -447,7 +465,7 @@ void rt_svc(Cpu *c, u32 n) {
         if (!(o = object_of(c, (u32)x[0], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
         o->thread->started = 1;
         o->thread->host = CreateThread(NULL, HOST_STACK, thread_main, o->thread, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-        if (!o->thread->host) rt_fatal("kernel: cannot start a host thread (error %lu)", GetLastError());
+        if (!o->thread->host) rt_fatal("kernel: cannot start a host thread (error %lu)", (unsigned long)GetLastError());
         x[0] = R_OK;
         break;
     case 0x0C:     /* GetThreadPriority(handle) -> priority */

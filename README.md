@@ -8,7 +8,8 @@
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
   <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
-  <a href="docs/UPDATES.md"><strong>Later versions</strong></a>
+  <a href="docs/UPDATES.md"><strong>Later versions</strong></a> ·
+  <a href="README-LINUX.md"><strong>Linux</strong></a>
 </p>
 
 ---
@@ -34,7 +35,7 @@ The result is a locally built Windows executable backed by your own extracted ga
 
 ## Status
 
-The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). `tools/install_version.py` installs and builds a version in a folder of its own with one command, and the launchers ask which built version to start ([several game versions](docs/VERSIONS.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
+The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). `tools/install_version.py` installs and builds a version in a folder of its own with one command, and the launchers ask which built version to start ([several game versions](docs/VERSIONS.md)). An experimental **Linux x64** build is cross-compiled from the same source ([Linux](README-LINUX.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
 
 | Area | Current position |
 | :--- | :--- |
@@ -74,25 +75,30 @@ python tools/recomp.py all dump/exefs --out build --jobs 16
 
 Choose a job count appropriate to your CPU and available memory. The output is `build/ssbu.exe`; generated files and game inputs remain ignored by Git.
 
+### Linux (experimental)
+
+The same game can also be built as a native x86-64 Linux program, cross-compiled on Windows from the Windows build's generated C. The renderer stays Direct3D 11, running on Vulkan through DXVK, with shaders compiled by vkd3d-shader; SDL2 handles the window, controllers and sound. `tools/linux/package_linux.py` turns the build into a folder to copy to the Linux machine, with launchers that find your game data there. See **[Linux](README-LINUX.md)** for the toolchain, the build commands, and running it, including in a virtual machine.
+
 ## Play and connect
 
 ### Multiplayer setup
 
 1. Put the same WindowSmash release/build and game version on both PCs. Configure each PC's own data and keep separate player IDs.
-2. The host runs **Host SSBU Netplay.bat**, chooses a room name, permits incoming UDP, and shares the displayed address.
-3. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
+2. **Online lobby:** put the lobby's address in `online_server.txt` and run **Play SSBU.bat**. Every Local Wireless room created in that lobby appears in the Rooms List of players with the same game version; nobody forwards a port.
+3. **Private room:** the host runs **Host SSBU Netplay.bat**, chooses a room name, permits incoming UDP, and shares the displayed address. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
 4. Both open **Local Wireless** in-game. The host creates a room; the friend selects it and the host accepts.
 
 **[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting →](NETPLAY.md)**
 
 | Launcher | Use |
 | :--- | :--- |
-| [`Play SSBU.bat`](Play%20SSBU.bat) | Start an offline session. |
+| [`Play SSBU.bat`](Play%20SSBU.bat) | Start the game and join the online lobby in `online_server.txt`; it plays offline if the lobby does not answer or the file says `off`. |
+| [`Play SSBU Offline.bat`](Play%20SSBU%20Offline.bat) | Start an offline session. |
 | [`Host SSBU Netplay.bat`](Host%20SSBU%20Netplay.bat) | Run the relay and host a Local Wireless room. |
 | [`Join SSBU Netplay.bat`](Join%20SSBU%20Netplay.bat) | Connect to a host or a standalone relay. |
 | [`Unlock All Fighters.bat`](Unlock%20All%20Fighters.bat) | Back up and edit your own compatible save while the game is closed. |
 
-For multiplayer, use matching game versions and build revisions, enter the same relay room name, and open **Local Wireless** in the game. See the [networking guide](NETPLAY.md) for firewall, UPnP, VPN, and standalone-relay details.
+For multiplayer, use matching game versions and build revisions, use the same lobby (and lobby code) or relay room name, and open **Local Wireless** in the game. See the [networking guide](NETPLAY.md) for the online lobby, firewall, UPnP, VPN, and standalone-relay details.
 
 <details>
 <summary><strong>Keyboard and controller controls</strong></summary>
