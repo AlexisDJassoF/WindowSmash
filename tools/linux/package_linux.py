@@ -138,6 +138,8 @@ def main():
         copied += copy(os.path.join(DXVK_LIBS, so), os.path.join(BUNDLE, "lib", so))
 
     copied += copy_tree(modules, os.path.join(BUNDLE, "dump", "modules"), lambda f: f.endswith(".reloc.bin") or f == "aoc.cfg")
+    # (the unlock tool reads which game version the save belongs to from main's build id)
+    copied += copy(os.path.join(dump, "exefs", "main"), os.path.join(BUNDLE, "dump", "exefs", "main"))
     copied += copy_tree(os.path.join(dump, "fonts"), os.path.join(BUNDLE, "dump", "fonts"))
     version = shader_cache_version()   # (only the current translator's compiles: older ones are never read)
     copied += copy_tree(os.path.join(dump, "shadercache"), os.path.join(BUNDLE, "dump", "shadercache"), lambda f: f.startswith(f"v{version}_"))

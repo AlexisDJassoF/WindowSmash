@@ -105,8 +105,8 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
   (see `NETPLAY.md`). Every player needs the same game version: 13.0.5 can't play with
   11.0.0.
 - `unlock-all-fighters.sh`: the unlock tool, on this folder's save. Run it with the game
-  closed. It was worked out on an 11.0.0 save and hasn't been checked against later versions'
-  saves, as with `Unlock All Fighters.bat` on Windows.
+  closed. Like `Unlock All Fighters.bat` on Windows, it knows the save layouts of 11.0.0 and
+  13.0.5 (it reads which one this folder's game is) and changes nothing for another version.
 
 ## Saves
 

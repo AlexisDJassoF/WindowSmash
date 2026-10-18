@@ -120,6 +120,16 @@ def hle_names():
     return sorted(names)
 
 
+def hle_wraps():
+    """The guest functions the runtime wraps (HLE_WRAP(<address>), as tools/recomp.py finds them)."""
+    found = set()
+    for n in os.listdir(RUNTIME):
+        if n.endswith(".c"):
+            with open(os.path.join(RUNTIME, n), encoding="utf-8") as f:
+                found |= {int(a, 16) for a in re.findall(r"^HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M)}
+    return sorted(found)
+
+
 def write_if_changed(path, text):
     if os.path.exists(path) and open(path, encoding="utf-8").read() == text:
         return False
@@ -164,7 +174,16 @@ def runtime_jobs():
                                + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
     if changed or needs(os.path.join(rt_out, "hle_table.o"), table, *headers):
         jobs.append((table, os.path.join(rt_out, "hle_table.o"), "-O1", RUNTIME_INCLUDES + RUNTIME_DEFINES))
-    nros = [n for n, src, _o in modules() if os.path.basename(os.path.dirname(src)) == "nro"]
+    # A wrapped function this game version has no module for: the original its wrapper names
+    # (f_<address>_orig, which nothing reaches) is rt_wrap_missing. The Windows link says so
+    # with /alternatename (tools/recomp.py); here it is a weak stub a module's own replaces.
+    missing = os.path.join(GEN, "wrap_missing.c")
+    changed = write_if_changed(missing, '#include "host.h"\n\nvoid rt_wrap_missing(Cpu *c);\n'
+                               + "".join(f"__attribute__((weak)) void f_{a:x}_orig(Cpu *c) {{ rt_wrap_missing(c); }}\n"
+                                         for a in hle_wraps()))
+    if changed or needs(os.path.join(rt_out, "wrap_missing.o"), missing, *headers):
+        jobs.append((missing, os.path.join(rt_out, "wrap_missing.o"), "-O1", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+    nros =[n for n, src, _o in modules() if os.path.basename(os.path.dirname(src)) == "nro"]
     nro_table = os.path.join(GEN, "nro_table.c")
     changed = write_if_changed(nro_table, '#include "module.h"\n\n' + "".join(f"extern const RtModule rt_module_{n};\n" for n in nros)
                                + "const RtModule *const rt_nro_modules[] = {" + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
