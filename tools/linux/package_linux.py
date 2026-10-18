@@ -6,7 +6,8 @@ Usage: package_linux.py [--port <dir>] [--build <build-linux dir>] [--out <dir>]
 
 <out>/ssbu-linux/ (default <out>: dist-linux in this checkout) gets the program and its DXVK
 libraries, the module images, fonts, the add-on content list and shader cache from the game
-tree's dump/, a copy of its save (unless --no-save), the launchers and the unlock tool. <port>
+tree's dump/, a copy of its save (unless --no-save), the launchers (run.sh goes online: the
+lobby is in online_server.txt), the guides and the unlock tool. <port>
 is the tree the build was made from (its port.txt; see build_linux.py), and a package holds one
 tree's game: package another tree's into another <out> (e.g. dist-linux-11.0.0), or give
 --replace to start this one over - never one the game was played from. The game's RomFS stays
@@ -34,7 +35,7 @@ BUILD = os.path.abspath(arg("--build", os.path.join(REPO, "build-linux")))
 PORT = os.path.abspath(arg("--port") or read_port_stamp(BUILD) or default_port())
 OUT = os.path.abspath(arg("--out", os.path.join(REPO, "dist-linux")))
 BUNDLE = os.path.join(OUT, "ssbu-linux")
-EXECUTABLE = {"ssbu", "run.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
+EXECUTABLE = {"ssbu", "run.sh", "run-offline.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
 
 
 def copy(src, dst):
@@ -163,7 +164,8 @@ def main():
             text = text.replace("@ROMFS_KIND@", kind).replace("@ROMFS_OFFSET@", nca_offset).replace("@ROMFS_FILES@", files_text)
             with open(dst, "w", encoding="utf-8", newline="\n") as out:
                 out.write(text)
-    for doc in ("README-LINUX.md", "NETPLAY.md", "DLC_AND_UNLOCKS.md", "UPDATE_13.0.5.md"):
+    # (online_server.txt: the online lobby run.sh joins)
+    for doc in ("README-LINUX.md", "NETPLAY.md", "DLC_AND_UNLOCKS.md", "UPDATE_13.0.5.md", "online_server.txt"):
         if os.path.exists(os.path.join(REPO, doc)):
             copy(os.path.join(REPO, doc), os.path.join(BUNDLE, doc))
     for tool in ("unlock_all.py", "ssbu_relay.py"):

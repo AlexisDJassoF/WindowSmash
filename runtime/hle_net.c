@@ -46,8 +46,9 @@ HLE(_ZN2nn4nifm18IsNetworkAvailableEv) {
 HLE(_ZN2nn4nifm22IsNetworkRequestOnHoldEv) { c->x[0] = 0; }
 HLE(_ZN2nn4nifm20SubmitNetworkRequestEv) { (void)c; }
 HLE(_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv) {
-    /* (a request waits a little for the relay, as one waits for a connection) */
-    for (int i = 0; i < 50 && net_configured() && !net_local_ip(); i++) Sleep(100);
+    /* (a request waits a little for the relay, as one waits for a connection - unless it has not
+     * answered for a while: then the game is offline at once, not after a wait each time) */
+    for (int i = 0; i < 50 && net_configured() && !net_local_ip() && !net_unreachable(); i++) Sleep(100);
     (void)c;
 }
 HLE(_ZN2nn4nifm20CancelNetworkRequestEv) { (void)c; }
@@ -129,7 +130,8 @@ enum { DR_NONE, DR_USER, DR_SYSTEM, DR_DESTROYED_BY_USER, DR_DESTROYED_BY_SYSTEM
 #define NI_ADV_SIZE  0x26A
 #define NI_ADV       0x26C
 #define NODE(i)      (NI_NODES + 0x40 * (i))
-#define SEEN_NETWORKS 16
+#define SEEN_NETWORKS 24   /* (as many as a lobby lists) */
+#define LIST_WAIT_MS 500   /* a scan waits this long at most for the lobby's list */
 
 typedef struct SeenNetwork { u8 info[NI_SIZE]; u32 from; u64 at; } SeenNetwork;
 static struct {
@@ -139,7 +141,11 @@ static struct {
     u32 event;                        /* the kernel event behind the game's state change event */
     u8 net[NI_SIZE];                  /* the network: this player's (host) or the one joined (station) */
     u64 node_heard[8], host_heard;    /* (host) when each station last spoke; (station) the host */
-    SeenNetwork seen[SEEN_NETWORKS];  /* networks other players advertise */
+    u32 join_host;                    /* (station, joining) the host asked, which alone may answer */
+    u8 join_session[16];
+    SeenNetwork seen[SEEN_NETWORKS];  /* networks other players advertise, or the lobby lists */
+    u32 list_asked, list_filling, list_done;   /* (lobby) the newest list asked for, being filled, complete */
+    int list_next;
 } L = {SRWLOCK_INIT, CONDITION_VARIABLE_INIT};
 
 static u64 now_ms_(void) { return rt_now_ns() / 1000000; }
@@ -215,7 +221,7 @@ static void ldn_receive(u32 from, const u8 *p, u32 n) {
     AcquireSRWLockExclusive(&L.lock);
     switch (p[1]) {
     case LM_ADVERTISE: {
-        if (len < NI_SIZE) break;
+        if (len < NI_SIZE || get_u32(m + NODE(0)) != from) break;   /* (only a network's host advertises it) */
         int slot = 0;   /* the same network seen before, else the oldest entry */
         for (int i = 0; i < SEEN_NETWORKS; i++) {
             if (!memcmp(L.seen[i].info + NI_SESSION, m + NI_SESSION, 16)) { slot = i; break; }
@@ -224,7 +230,7 @@ static void ldn_receive(u32 from, const u8 *p, u32 n) {
         memcpy(L.seen[slot].info, m, NI_SIZE);
         L.seen[slot].from = from;
         L.seen[slot].at = t;
-        if (L.state == LS_CONNECTED && !memcmp(L.net + NI_SESSION, m + NI_SESSION, 16)) {
+        if (L.state == LS_CONNECTED && !memcmp(L.net + NI_SESSION, m + NI_SESSION, 16) && from == get_u32(L.net + NODE(0))) {
             L.host_heard = t;
             if (memcmp(L.net, m, NI_SIZE)) {   /* players came or went */
                 memcpy(L.net, m, NI_SIZE);
@@ -259,14 +265,14 @@ static void ldn_receive(u32 from, const u8 *p, u32 n) {
         ldn_signal();
         break;
     }
-    case LM_ACCEPT:
-        if (len < NI_SIZE || L.state != LS_STATION || L.join_answer) break;
+    case LM_ACCEPT:   /* (only from the host asked, for the network asked for) */
+        if (len < NI_SIZE || L.state != LS_STATION || L.join_answer || from != L.join_host || memcmp(m + NI_SESSION, L.join_session, 16)) break;
         memcpy(L.net, m, NI_SIZE);
         L.join_answer = 1;
         WakeAllConditionVariable(&L.changed);
         break;
     case LM_REJECT:
-        if (L.state == LS_STATION && !L.join_answer) { L.join_answer = -1; WakeAllConditionVariable(&L.changed); }
+        if (L.state == LS_STATION && !L.join_answer && from == L.join_host) { L.join_answer = -1; WakeAllConditionVariable(&L.changed); }
         break;
     case LM_KEEP: {
         int node = L.state == LS_AP_CREATED && len >= 16 && !memcmp(m, L.net + NI_SESSION, 16) ? node_of(from) : -1;
@@ -279,16 +285,47 @@ static void ldn_receive(u32 from, const u8 *p, u32 n) {
         break;
     }
     case LM_GONE:
-    case LM_KICK:
-        if (L.state == LS_CONNECTED && len >= 16 && !memcmp(m, L.net + NI_SESSION, 16))
+    case LM_KICK:   /* (only from the host) */
+        if (L.state == LS_CONNECTED && len >= 16 && !memcmp(m, L.net + NI_SESSION, 16) && from == get_u32(L.net + NODE(0)))
             lost_network(p[1] == LM_GONE ? DR_DESTROYED_BY_USER : DR_REJECTED);
         break;
     }
     ReleaseSRWLockExclusive(&L.lock);
 }
 
+/* (net_relay.c) A room in the online lobby's list asked for as seq: the list replaces the
+ * networks seen, in its order (the best rooms first), and its end wakes the scan waiting for it. */
+static void start_list(u32 seq) {   /* (lock held) */
+    if (L.list_filling == seq) return;
+    memset(L.seen, 0, sizeof L.seen);
+    L.list_filling = seq;
+    L.list_next = 0;
+}
+void ldn_listing(u32 seq, u32 owner, const u8 *info) {
+    AcquireSRWLockExclusive(&L.lock);
+    if (seq == L.list_asked && seq != L.list_done && get_u32(info + NODE(0)) == owner) {
+        start_list(seq);
+        if (L.list_next < SEEN_NETWORKS) {
+            SeenNetwork *s = &L.seen[L.list_next++];
+            memcpy(s->info, info, NI_SIZE);
+            s->from = owner;
+            s->at = now_ms_();
+        }
+    }
+    ReleaseSRWLockExclusive(&L.lock);
+}
+void ldn_list_end(u32 seq) {
+    AcquireSRWLockExclusive(&L.lock);
+    if (seq == L.list_asked) {
+        start_list(seq);   /* (an empty list: no rooms) */
+        L.list_done = seq;
+        WakeAllConditionVariable(&L.changed);
+    }
+    ReleaseSRWLockExclusive(&L.lock);
+}
+
 HLE(_ZN2nn3ldn10InitializeEv) { LDN_TRACE;
-    if (!net_configured()) { c->x[0] = R_UNAVAILABLE; return; }
+    if (!net_configured() || net_unreachable()) { c->x[0] = R_UNAVAILABLE; return; }   /* (offline, as without netplay) */
     AcquireSRWLockExclusive(&L.lock);
     if (!L.agent) { L.agent = 1; CloseHandle(CreateThread(NULL, 0, ldn_agent, NULL, 0, NULL)); }
     if (L.state == LS_NONE) L.state = LS_INITIALIZED;
@@ -388,6 +425,17 @@ HLE(_ZN2nn3ldn14DestroyNetworkEv) { LDN_TRACE;
  * 2 session id, 4 network type, 0x10 SSID, 0x20 scene id). */
 static void scan(Cpu *c, u64 out, u64 count_p, i32 room, u64 filter) {
     u32 flags = ld32(filter + 0x5C);
+    if (net_lobby()) {   /* online: the lobby lists the rooms - wait a moment for its list, as a real scan listens a while */
+        AcquireSRWLockExclusive(&L.lock);
+        u32 seq = ++L.list_asked;
+        ReleaseSRWLockExclusive(&L.lock);
+        net_lobby_list(seq);
+        u64 until = now_ms_() + LIST_WAIT_MS, now;
+        AcquireSRWLockExclusive(&L.lock);
+        while (L.list_done != seq && (now = now_ms_()) < until) SleepConditionVariableSRW(&L.changed, &L.lock, (DWORD)(until - now), 0);
+        if (L.list_done != seq && net_log()) fprintf(stderr, "[net] ldn: no room list from the lobby in time\n");
+        ReleaseSRWLockExclusive(&L.lock);
+    }
     u64 t = now_ms_();
     i32 found = 0;
     AcquireSRWLockShared(&L.lock);
@@ -428,6 +476,8 @@ static void join(Cpu *c, const u8 *session, u64 user, u16 version) {
     memcpy(ask + 16, P(void, user), 32);
     memcpy(ask + 48, &version, 2);
     L.join_answer = 0;
+    L.join_host = host;
+    memcpy(L.join_session, session, 16);
     for (int tries = 0; tries < 5 && !L.join_answer; tries++) {
         ldn_send(host, LM_JOIN, ask, sizeof ask);
         u64 until = now_ms_() + 1000;
@@ -442,6 +492,7 @@ static void join(Cpu *c, const u8 *session, u64 user, u16 version) {
     if (net_log()) fprintf(stderr, "[net] ldn: joining %.32s's network: %s\n", (const char *)L.net + NODE(0) + 0xC,
                            accepted ? "joined" : L.join_answer ? "refused" : "no answer");
     L.join_answer = 0;
+    L.join_host = 0;
     ReleaseSRWLockExclusive(&L.lock);
     c->x[0] = accepted ? 0 : R_LDN_CONNECT;
 }
@@ -606,7 +657,10 @@ static void drop_queue(VSock *s) {
 }
 
 void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
-    if (dst_port == LDN_PORT) { ldn_receive(src_ip, data, len); return; }   /* (local wireless's own messages) */
+    if (dst_port == LDN_PORT) {   /* (local wireless's own messages: from local wireless alone) */
+        if (src_port == LDN_PORT) ldn_receive(src_ip, data, len);
+        return;
+    }
     int broadcast = dst_ip == ANY_BROADCAST || dst_ip == NET_BROADCAST, delivered = 0;
     AcquireSRWLockExclusive(&lock);
     for (u32 i = 0; i < VSOCKS; i++) {

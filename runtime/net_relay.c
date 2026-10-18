@@ -1,19 +1,26 @@
-/* Netplay's relay (see net.h): the client every player's game runs, and the relay itself,
- * which the host player's game runs (tools/ssbu_relay.py is the same relay, standalone).
+/* Netplay's relay (see net.h): the client every player's game runs, and the relay of a private
+ * room, which the host player's game runs. tools/ssbu_relay.py is the online lobby: the same
+ * protocol, plus room lists.
  *
- * Protocol, UDP, every field big-endian; each packet starts 'S' 'N' version type:
- *   1 JOIN     client: nonce u64, room[32], name[32]        (repeated until answered)
- *   2 WELCOME  relay:  nonce u64, address u32, then the member list as in MEMBERS
- *   3 REJECT   relay:  nonce u64, reason u8, text[64]
- *   4 PING     client: nonce u64, time u64                   (every second; keeps NAT open)
- *   5 PONG     relay:  time u64, members u8
+ * Protocol 2, UDP, every field big-endian; each packet starts 'S' 'N' version type:
+ *   1 JOIN     client: nonce u64, room[32], name[32], build[40]  (repeated until answered; build:
+ *                      the game's main module build id - players of different versions never meet)
+ *   2 WELCOME  relay:  nonce u64, address u32, cookie u64, flags u8 (1: a lobby), then the member
+ *                      list as in MEMBERS (empty from a lobby)
+ *   3 REJECT   relay:  nonce u64, reason u8, text[64]       (sent with the JOIN's version)
+ *   4 PING     client: nonce u64, time u64, cookie u64, ping u16   (every second; keeps NAT open)
+ *   5 PONG     relay:  time u64, players u16, rooms u16, flags u8
  *   6 DATA     both:   source u32, destination u32, source port u16, destination port u16, payload
  *   7 MEMBERS  relay:  count u8, count x (address u32, name[32])
  *   8 LEAVE    client: nonce u64
- * The relay gives each member of a room an address in 10.13.0.0/16 and forwards DATA by
- * destination (the room's broadcast address: every other member), checking the source. A
- * member that is silent for 10 s is gone; a JOIN with its nonce from a new place takes it
- * back. Up to 8 members a room. */
+ *   9 LIST     client: cookie u64, seq u32                 (a lobby's rooms, for nn::ldn's Scan)
+ *  10 LISTING  lobby:  seq u32, host address u32, NetworkInfo[0x480]   (up to 24, best first)
+ *  11 LIST_END lobby:  seq u32, count u8
+ * A relay gives each member of a room an address in 10.13.0.0/16 and forwards DATA by
+ * destination (the room's broadcast address: every other member), checking the source; a
+ * lobby gives every player an address of its own and carries a Local Wireless network's
+ * traffic between that network's players only. A member that is silent for 10 s is gone; a
+ * JOIN with its nonce from a new place takes it back. Up to 8 members a relay's room. */
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_RAND_S
 #define COBJMACROS
@@ -43,10 +50,16 @@ typedef int SOCKET;
 
 #define MAGIC0 'S'
 #define MAGIC1 'N'
-enum { T_JOIN = 1, T_WELCOME, T_REJECT, T_PING, T_PONG, T_DATA, T_MEMBERS, T_LEAVE };
+enum { T_JOIN = 1, T_WELCOME, T_REJECT, T_PING, T_PONG, T_DATA, T_MEMBERS, T_LEAVE, T_LIST, T_LISTING, T_LIST_END };
 #define NAME_LEN 32
+#define BUILD_LEN 40
+#define JOIN_SIZE (4 + 8 + 2 * NAME_LEN + BUILD_LEN)
 #define ROOM_MEMBERS 8
 #define TIMEOUT_MS 10000
+#define UNREACHABLE_MS 5000   /* unanswered this long: the game plays offline (and keeps asking) */
+#define NETWORK_INFO 0x480
+
+extern const RtModule rt_module_main;   /* (its build id tells game versions apart) */
 
 static u16 get16(const u8 *p) { return (u16)(p[0] << 8 | p[1]); }
 static u32 get32(const u8 *p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
@@ -82,7 +95,7 @@ const char *net_player_name(void) { configure(); return name; }
 
 /* ---- the relay (host mode) ------------------------------------------------------------ */
 typedef struct Member { struct sockaddr_in at; u64 nonce, seen; u32 ip; char name[NAME_LEN + 1]; } Member;
-typedef struct Room { char name[NAME_LEN + 1]; Member members[ROOM_MEMBERS]; int count; } Room;
+typedef struct Room { char name[NAME_LEN + 1]; u8 build[BUILD_LEN]; Member members[ROOM_MEMBERS]; int count; } Room;
 #define ROOMS 64
 static Room rooms[ROOMS];
 static SOCKET relay_sock = INVALID_SOCKET;
@@ -115,9 +128,9 @@ static void drop_member(Room *r, int i) {
 
 static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
     if (n < 4 || p[0] != MAGIC0 || p[1] != MAGIC1) return;
-    u8 out[4 + 8 + 4 + 1 + ROOM_MEMBERS * (4 + NAME_LEN)];
+    u8 out[4 + 8 + 4 + 8 + 1 + 1 + ROOM_MEMBERS * (4 + NAME_LEN)];
     if (p[2] != NET_PROTOCOL) {   /* another version of the game's netplay: say so */
-        if (n >= 12 && p[3] == T_JOIN) {
+        if (n >= 4 + 8 + 2 * NAME_LEN && p[3] == T_JOIN) {   /* (only to a whole JOIN: no small packet gets a bigger answer) */
             memset(out, 0, 4 + 8 + 1 + 64);
             header(out, T_REJECT);
             memcpy(out + 4, p + 4, 8);
@@ -135,8 +148,9 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             if (same_addr(&rooms[i].members[j].at, from)) { r = &rooms[i]; m = j; break; }
     switch (p[3]) {
     case T_JOIN: {
-        if (n < 4 + 8 + 2 * NAME_LEN) return;
+        if (n < JOIN_SIZE) return;
         u64 nonce = get64(p + 4);
+        const u8 *build = p + 12 + 2 * NAME_LEN;
         char want[NAME_LEN + 1] = {0}, who[NAME_LEN + 1] = {0};
         memcpy(want, p + 12, NAME_LEN);
         memcpy(who, p + 12 + NAME_LEN, NAME_LEN);
@@ -150,16 +164,18 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             r = NULL;
             for (int i = 0; i < ROOMS && !r; i++) if (rooms[i].count && !strcmp(rooms[i].name, want)) r = &rooms[i];
             for (int i = 0; i < ROOMS && !r; i++) if (!rooms[i].count) { r = &rooms[i]; snprintf(r->name, sizeof r->name, "%s", want); }
-            const char *why = !r ? "the relay is full" : r->count == ROOM_MEMBERS ? "the room is full (8 players)" : NULL;
+            const char *why = !r ? "the relay is full" : r->count == ROOM_MEMBERS ? "the room is full (8 players)"
+                            : r->count && memcmp(r->build, build, BUILD_LEN) ? "the host has another game version" : NULL;
             if (why) {
                 memset(out, 0, 4 + 8 + 1 + 64);
                 header(out, T_REJECT);
                 put64(out + 4, nonce);
-                out[12] = 1;
+                out[12] = r && r->count < ROOM_MEMBERS ? 3 : 1;
                 snprintf((char *)out + 13, 64, "%s", why);
                 sendto(relay_sock, (const char *)out, 4 + 8 + 1 + 64, 0, (const struct sockaddr *)from, sizeof *from);
                 return;
             }
+            if (!r->count) memcpy(r->build, build, BUILD_LEN);
             u32 ip = 0;   /* the lowest free address from 10.13.0.2 */
             for (u32 cand = NET_GATEWAY + 1; !ip; cand++) {
                 int used = 0;
@@ -179,7 +195,9 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
         header(out, T_WELCOME);
         put64(out + 4, nonce);
         put32(out + 12, r->members[m].ip);
-        int len = 16 + member_list(r, out + 16);
+        put64(out + 16, 0);   /* (cookie: a private room's relay checks none) */
+        out[24] = 0;          /* (flags: not a lobby) */
+        int len = 25 + member_list(r, out + 25);
         sendto(relay_sock, (const char *)out, len, 0, (const struct sockaddr *)from, sizeof *from);
         return;
     }
@@ -188,8 +206,10 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
         r->members[m].seen = now_ms();
         header(out, T_PONG);
         memcpy(out + 4, p + 12, 8);
-        out[12] = (u8)r->count;
-        sendto(relay_sock, (const char *)out, 13, 0, (const struct sockaddr *)from, sizeof *from);
+        put16(out + 12, (u16)r->count);
+        put16(out + 14, 0);
+        out[16] = 0;
+        sendto(relay_sock, (const char *)out, 17, 0, (const struct sockaddr *)from, sizeof *from);
         return;
     case T_LEAVE:
         if (m >= 0) drop_member(r, m);
@@ -339,12 +359,15 @@ static DWORD WINAPI upnp_thread(LPVOID unused) {
 static SOCKET client_sock = INVALID_SOCKET;
 static struct sockaddr_in relay_at;
 static volatile LONG joined;           /* WELCOME seen and not timed out */
+static volatile LONG lobby;            /* ...from a lobby */
 static volatile u32 my_ip;
-static u64 nonce, last_pong;
-static volatile LONG members, ping_ms = -1;
+static u64 nonce, cookie, last_pong, unjoined_since;
+static volatile LONG members, rooms_open, ping_ms = -1;
 static char reject_text[80], member_names[ROOM_MEMBERS][NAME_LEN + 1];
 
 u32 net_local_ip(void) { start(); return joined ? my_ip : 0; }
+int net_unreachable(void) { start(); return configured && !joined && now_ms() - unjoined_since > UNREACHABLE_MS; }
+int net_lobby(void) { start(); return joined && lobby; }
 
 void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
     if (!joined || client_sock == INVALID_SOCKET || len > 65000) return;
@@ -398,11 +421,23 @@ static int resolve_relay(void) {
 }
 
 static void send_join(void) {
-    u8 p[4 + 8 + 2 * NAME_LEN] = {0};
+    u8 p[JOIN_SIZE] = {0};
     header(p, T_JOIN);
     put64(p + 4, nonce);
     memcpy(p + 12, room, strlen(room));
     memcpy(p + 12 + NAME_LEN, name, strlen(name));
+    const char *build = rt_module_main.build_id ? rt_module_main.build_id : "";
+    size_t build_len = strlen(build);
+    memcpy(p + 12 + 2 * NAME_LEN, build, build_len < BUILD_LEN ? build_len : BUILD_LEN);
+    sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+}
+
+void net_lobby_list(u32 seq) {
+    if (!net_lobby()) return;
+    u8 p[4 + 8 + 4];
+    header(p, T_LIST);
+    put64(p + 4, cookie);
+    put32(p + 12, seq);
     sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
 }
 
@@ -430,14 +465,17 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         u64 t = now_ms();
         if (!joined && t - last_join >= 500) { send_join(); last_join = t; }
         if (joined && t - last_ping >= 1000) {
-            u8 p[20];
+            u8 p[4 + 8 + 8 + 8 + 2];
             header(p, T_PING);
             put64(p + 4, nonce);
             put64(p + 12, t);
+            put64(p + 20, cookie);
+            put16(p + 28, ping_ms < 0 || ping_ms > 0xFFFF ? 0xFFFF : (u16)ping_ms);
             sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
             last_ping = t;
         }
         if (joined && t - last_pong > TIMEOUT_MS) {
+            unjoined_since = t;
             InterlockedExchange(&joined, 0);   /* the relay is gone: keep asking to join again */
             InterlockedExchange(&ping_ms, -1);
             fprintf(stderr, "[net] lost the relay %s; reconnecting\n", relay_text);
@@ -446,17 +484,22 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         socklen_t flen = sizeof from;
         int n = recvfrom(client_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
         if (n < 4 || buf[0] != MAGIC0 || buf[1] != MAGIC1 || !same_addr(&from, &relay_at)) continue;
+        if (buf[2] != NET_PROTOCOL && buf[3] != T_REJECT) continue;   /* (a REJECT comes in our own version) */
         switch (buf[3]) {
         case T_DATA:
             if (n >= 16 && joined) vsock_deliver(get32(buf + 4), get16(buf + 12), get32(buf + 8), get16(buf + 14), buf + 16, (u32)(n - 16));
             break;
         case T_WELCOME:
-            if (n < 17 || get64(buf + 4) != nonce) break;
+            if (n < 26 || get64(buf + 4) != nonce) break;
             my_ip = get32(buf + 12);
-            read_members(buf + 16, n - 16);
+            cookie = get64(buf + 16);
+            InterlockedExchange(&lobby, buf[24] & 1);
+            read_members(buf + 25, n - 25);
             last_pong = now_ms();
+            last_ping = 0;   /* (a ping at once: a lobby answers nothing else until it has seen the cookie) */
             reject_text[0] = 0;
-            if (!joined) fprintf(stderr, "[net] joined room %s on %s as 10.13.%u.%u (%ld players)\n", room, relay_text, my_ip >> 8 & 255, my_ip & 255, (long)members);
+            if (!joined && lobby) fprintf(stderr, "[net] joined the lobby on %s as 10.13.%u.%u (lobby code %s)\n", relay_text, my_ip >> 8 & 255, my_ip & 255, room);
+            else if (!joined) fprintf(stderr, "[net] joined room %s on %s as 10.13.%u.%u (%ld players)\n", room, relay_text, my_ip >> 8 & 255, my_ip & 255, (long)members);
             InterlockedExchange(&joined, 1);
             break;
         case T_REJECT:
@@ -467,13 +510,20 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             }
             break;
         case T_PONG:
-            if (n >= 13) {
+            if (n >= 17) {
                 last_pong = now_ms();
                 InterlockedExchange(&ping_ms, (LONG)(last_pong - get64(buf + 4)));
+                if (lobby) { InterlockedExchange(&members, get16(buf + 12)); InterlockedExchange(&rooms_open, get16(buf + 14)); }
             }
             break;
         case T_MEMBERS:
             read_members(buf + 4, n - 4);
+            break;
+        case T_LISTING:
+            if (n >= 12 + NETWORK_INFO && lobby) ldn_listing(get32(buf + 4), get32(buf + 8), buf + 12);
+            break;
+        case T_LIST_END:
+            if (n >= 9 && lobby) ldn_list_end(get32(buf + 4));
             break;
         }
     }
@@ -505,6 +555,7 @@ static void start(void) {
         unsigned int r1, r2;
         rand_s(&r1); rand_s(&r2);
         nonce = (u64)r1 << 32 | r2;
+        unjoined_since = now_ms();
         if (hosting) {
             relay_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             struct sockaddr_in a = {0};
@@ -542,7 +593,15 @@ void net_status(char *out, size_t n) {
     start();
     if (!configured) { if (n) out[0] = 0; return; }
     if (reject_text[0] && !joined) { snprintf(out, n, "Netplay: %s", reject_text); return; }
-    if (!joined) { snprintf(out, n, "Netplay: connecting to %s (room %s)...", relay_text, room); return; }
+    if (!joined && net_unreachable()) { snprintf(out, n, "Netplay: no answer from %s - playing offline (still trying)", relay_text); return; }
+    if (!joined) { snprintf(out, n, "Netplay: connecting to %s...", relay_text); return; }
+    if (lobby) {   /* (smash, the default code, is the public lobby) */
+        char code[NAME_LEN + 16] = "";
+        if (strcmp(room, "smash")) snprintf(code, sizeof code, " (lobby %s)", room);
+        snprintf(out, n, "Online%s: %ld player%s, %ld room%s - you are %s, ping %ld ms", code, (long)members, members == 1 ? "" : "s",
+                 (long)rooms_open, rooms_open == 1 ? "" : "s", name, (long)ping_ms);
+        return;
+    }
     char share[128] = "";
     if (hosting) {
         LONG u = upnp_state;

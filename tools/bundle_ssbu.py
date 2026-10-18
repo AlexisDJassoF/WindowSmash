@@ -24,18 +24,29 @@ FONTS = (
     'nintendo_udsg-r_ext_zh-cn_003.bfttf', 'nintendo_udjxh-db_zh-tw_003.bfttf',
     'nintendo_udsg-r_ko_003.bfttf', 'nintendo_ext_003.bfttf',
 )
-LAUNCHERS = ('Play SSBU.bat', 'Host SSBU Netplay.bat', 'Join SSBU Netplay.bat')
+LAUNCHERS = ('Play SSBU.bat', 'Play SSBU Offline.bat', 'Host SSBU Netplay.bat', 'Join SSBU Netplay.bat')
 START_HERE = r'''SSBU PORTABLE - WINDOWS
 
 Extract the ENTIRE ZIP to a writable local folder. Do not play inside the ZIP.
 Use NTFS or exFAT, not FAT32. Allow at least 22 GB for extraction plus space for
 saves and caches. Keeping both the ZIP and game takes roughly 40 GB.
 
-Run Play SSBU.bat for offline play. No compiler, Python, or separate emulator
-installation is needed to play this build. Windows 10/11 x64, an AVX2/FMA/F16C
-CPU, and a Direct3D 11-capable GPU are required.
+Run Play SSBU.bat to play. It goes online (below) and plays offline by itself
+if the online lobby does not answer; Play SSBU Offline.bat never goes online.
+No compiler, Python, or separate emulator installation is needed to play this
+build. Windows 10/11 x64, an AVX2/FMA/F16C CPU, and a Direct3D 11-capable GPU
+are required.
 
-PLAY TOGETHER - ONE PLAYER PER PC
+PLAY ONLINE - ONE PLAYER PER PC
+Run Play SSBU.bat and choose the name other players see (kept in
+online_name.txt). Open Local Wireless in the main-menu sidebar: Create a Room
+to host, or pick anyone's room from the Rooms List. Rooms are public to players
+of the same game version. For friends only, add the same lobby code after the
+address in online_server.txt (for example: lobby.example.net:39420 ourcode).
+Allow the game through Windows Firewall if asked. The overlay (F1) shows
+"Online: N players, M rooms" when connected.
+
+PRIVATE ROOM - ONE PLAYER PER PC
 Host: run Host SSBU Netplay.bat. Choose your player name and a room name.
 Allow the game through Windows Firewall if asked. Give your friend the address
 shown by the launcher, netplay_address.txt, or the game's overlay (F2).
@@ -47,7 +58,7 @@ The host accepts the challenger. Both PCs must use the same build.
 
 If unreachable, forward UDP port 39420 on the host's router or use a shared
 virtual LAN and join the host's VPN IP. Joining players need no port forwarding.
-The optional tools\ssbu_relay.py is a standalone relay; it requires Python.
+The optional tools\ssbu_relay.py is the online lobby server; it requires Python.
 Nintendo's official online service is not used.
 
 CONTROLS
@@ -128,7 +139,11 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
     relay = source / 'tools/ssbu_relay.py'
     if relay.is_file():
         payload.append(file_payload('tools/ssbu_relay.py', relay))
-    for name in ('tools/unlock_all.py', 'tools/Unlock-All-Fighters.ps1', 'Unlock All Fighters.bat'):
+    server = source / 'online_server.txt'
+    if server.is_file():
+        payload.append(text_payload('online_server.txt', server.read_text(encoding='utf-8-sig')))
+    # (every launcher picks the game version through tools/pick_version.bat)
+    for name in ('tools/pick_version.bat', 'tools/unlock_all.py', 'tools/Unlock-All-Fighters.ps1', 'Unlock All Fighters.bat'):
         path = source / name
         if path.is_file():
             payload.append(file_payload(name, path))
@@ -155,7 +170,7 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
         path = source / name
         # Retain current launch behavior, while isolating saves, modes and scripted input.
         reset = '@echo off\nsetlocal\n'
-        for key in ('SSBU_DATA_ROOT', 'SSBU_INPUT', 'SSBU_NET_HOST', 'SSBU_NET_RELAY', 'SSBU_NET_BIND'):
+        for key in ('SSBU_DATA_ROOT', 'SSBU_INPUT', 'SSBU_NET_HOST', 'SSBU_NET_RELAY', 'SSBU_NET_BIND', 'SSBU_NET_ROOM', 'SSBU_NET_NAME'):
             reset += f'set "{key}="\n'
         script = path.read_text(encoding='utf-8-sig')
         script = script.replace('Online ^> Local Wireless', 'Local Wireless')

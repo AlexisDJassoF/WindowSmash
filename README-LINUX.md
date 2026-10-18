@@ -58,6 +58,13 @@ This folder holds the game's code and data. It's for your own machines, not for 
 
    The log goes to `build/play.log` and to the terminal.
 
+   `run.sh` plays online, as `Play SSBU.bat` does on Windows. The game joins the online lobby
+   named in `online_server.txt`, and Local Wireless lists every room that players of the same
+   game version create, on Windows or Linux (see `NETPLAY.md`). The first time, it asks for the
+   name other players see, and keeps it in `online_name.txt`. To play offline, use
+   `bash run-offline.sh`, or write `off` in `online_server.txt`. If the lobby doesn't answer, the
+   game plays offline by itself after a few seconds.
+
 ## In a VMware virtual machine
 
 - Turn on **Accelerate 3D graphics** (*VM > Settings > Display*).
@@ -76,10 +83,11 @@ This folder holds the game's code and data. It's for your own machines, not for 
 - Give the VM enough memory. 8 GB is tight with a desktop, and 12 to 16 GB is better.
 - Saving the VM's settings while *Shared Folders* is set to *Disabled* turns sharing off. Set it
   to *Always enabled*.
-- **Netplay hosting from the VM**: with VMware's default NAT networking, other PCs can't reach a
-  relay running inside the VM. Either switch the VM's network adapter to *Bridged*, or forward
-  UDP port 39420 in *Edit > Virtual Network Editor > VMnet8 > NAT Settings*. Joining someone
-  else's room works either way.
+- **Netplay from the VM**: playing online (`run.sh`) and joining someone else's private room
+  work with VMware's default NAT networking, because the game only sends to the server. Hosting
+  a private room (`host-netplay.sh`) is different: other PCs can't reach a relay running inside
+  the VM. Either switch the VM's network adapter to *Bridged*, or forward UDP port 39420 in
+  *Edit > Virtual Network Editor > VMnet8 > NAT Settings*.
 
 ## Controls
 
@@ -101,8 +109,9 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 
 ## Other launchers
 
-- `host-netplay.sh` and `join-netplay.sh`: netplay, as `Host/Join SSBU Netplay.bat` on Windows
-  (see `NETPLAY.md`). Every player needs the same game version: 13.0.5 can't play with
+- `run-offline.sh`: the game without going online, as `Play SSBU Offline.bat` on Windows.
+- `host-netplay.sh` and `join-netplay.sh`: a private room, as `Host/Join SSBU Netplay.bat` on
+  Windows (see `NETPLAY.md`). Every player needs the same game version: 13.0.5 can't play with
   11.0.0.
 - `unlock-all-fighters.sh`: the unlock tool, on this folder's save. Run it with the game
   closed. Like `Unlock All Fighters.bat` on Windows, it knows the save layouts of 11.0.0 and
@@ -113,7 +122,8 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 `save/` is a copy of the Windows save of the same game tree (its `save\` folder), taken when this
 folder was made. The two don't sync with each other: copy `save/` back to that folder on Windows
 to carry progress back. Unpacking a newer `ssbu-linux.tar` over this folder replaces `save/`
-too, so keep a copy of it first.
+too, so keep a copy of it first. It also replaces `online_server.txt`, while `online_name.txt`
+stays.
 
 ## If something goes wrong
 

@@ -115,3 +115,40 @@ vulkan_installed() {
     done
     return 1
 }
+
+# Online play (see NETPLAY.md): the lobby is the first line of online_server.txt that is not a
+# comment - host:port, then an optional lobby code (only players with the same code see each
+# other's rooms) - or "off". SSBU_NET_RELAY (and SSBU_NET_ROOM) set beforehand name a lobby
+# outright. The name the other players see is kept in online_name.txt, asked for the first time.
+go_online() {
+    local relay code rest name pick
+    unset SSBU_NET_HOST
+    if [ -z "$SSBU_NET_RELAY" ] && [ -f online_server.txt ]; then
+        while read -r relay code rest || [ -n "$relay" ]; do
+            relay=${relay%$'\r'} code=${code%$'\r'}
+            case "$relay" in '' | '#'*) relay= code= ; continue ;; esac
+            break
+        done < online_server.txt
+        [ "${relay,,}" = off ] && relay=
+        SSBU_NET_RELAY=$relay
+        [ -n "$code" ] && SSBU_NET_ROOM=$code
+    fi
+    if [ -z "$SSBU_NET_RELAY" ]; then
+        unset SSBU_NET_RELAY
+        echo "Playing offline (no lobby in online_server.txt)."
+        return 0
+    fi
+    if [ -z "$SSBU_NET_NAME" ]; then
+        if [ ! -s online_name.txt ]; then
+            pick="Player$((RANDOM % 9000 + 1000))"
+            echo "Online, other players see your name (it is kept in online_name.txt)."
+            read -r -p "Your online name [$pick]: " name || echo
+            printf '%s\n' "${name:-$pick}" > online_name.txt
+        fi
+        IFS= read -r SSBU_NET_NAME < online_name.txt
+        SSBU_NET_NAME=${SSBU_NET_NAME%$'\r'}
+    fi
+    export SSBU_NET_RELAY SSBU_NET_NAME
+    [ -n "$SSBU_NET_ROOM" ] && export SSBU_NET_ROOM
+    echo "Online: lobby $SSBU_NET_RELAY${SSBU_NET_ROOM:+ (lobby code $SSBU_NET_ROOM)}, as $SSBU_NET_NAME. To play offline: bash run-offline.sh"
+}
