@@ -4,9 +4,11 @@
 Players' games join it at start (Play SSBU.bat). A room anyone creates in Local Wireless is listed
 to every player of the same game version and lobby code, who join it from the game's Rooms List;
 the lobby then carries the room's traffic between its players only. Players only send to the
-lobby, so nobody needs port forwarding; the lobby's machine needs its UDP port open. The protocol
-is runtime/net_relay.c's (version 2); the host player's game can run a smaller relay of its own
-for a private room (Host SSBU Netplay.bat).
+lobby, so nobody needs port forwarding; the lobby's machine needs its UDP port open. Players in
+the same room whose games can do it are also introduced to each other, so their games can send the
+room's traffic straight to each other (UDP hole punching) and use the lobby only when that fails.
+The protocol is runtime/net_relay.c's (version 2); the host player's game can run a smaller relay
+of its own for a private room (Host SSBU Netplay.bat).
 
     python3 ssbu_relay.py [--port 39420] [--bind 0.0.0.0] [--verbose] [--banlist FILE]
     python3 ssbu_relay.py --probe HOST[:PORT] [--room CODE] [--build ID]   (is a lobby there?)
@@ -26,11 +28,17 @@ import time
 
 PROTOCOL = 2
 JOIN, WELCOME, REJECT, PING, PONG, DATA, MEMBERS, LEAVE, LIST, LISTING, LIST_END = range(1, 12)
+PEERS, BCAST, PUNCH, DIRECT = range(12, 16)   # (direct connections; PUNCH and DIRECT go between players)
 NAME_LEN = 32
 BUILD_LEN = 40
 JOIN_SIZE = 4 + 8 + 2 * NAME_LEN + BUILD_LEN
 V1_JOIN_SIZE = 4 + 8 + 2 * NAME_LEN
 PING_SIZE = 4 + 8 + 8 + 8 + 2
+PING_EXT_SIZE = PING_SIZE + 4 + 4 + 2 + 1 + 1   # (a game that can connect directly says so in its PINGs)
+PEER = struct.Struct(">I32sBIHIHQ")   # a PEERS entry
+ROOM_MAX = 8
+INTRO_ROOMS = 20      # rooms a player is introduced in an hour, at most
+PEERS_GAP = 0.25      # seconds between two PEERS to a player, at least
 SUBNET = 0x0A0D0000
 BROADCASTS = (0x0A0DFFFF, 0xFFFFFFFF)
 DEFAULT_PORT = 39420
@@ -65,6 +73,10 @@ def printable(s):
 
 def ip_text(ip):
     return f"10.13.{ip >> 8 & 255}.{ip & 255}"
+
+
+def address_number(host):
+    return struct.unpack(">I", socket.inet_aton(host))[0]
 
 
 def ldn_packet(src, dst, kind, payload):
@@ -123,6 +135,16 @@ class Client:
         self.ping = 0xFFFF
         self.claim = None      # the session this player asked to join (its LM_JOIN)
         self.listing = None    # the network this player hosts
+        # direct connections (from its extended PINGs)
+        self.ext = False           # its game can connect directly
+        self.direct_ok = False     # ...and its player allows it (it shows the player's address)
+        self.lan = None            # (address, port) on its own network
+        self.direct_count = 0      # the players it reaches directly now
+        self.peers_version = 0     # of the last PEERS it was sent
+        self.peers_sent = b""      # ...and its entries
+        self.peers_at = -1e9
+        self.introduced_count = 0
+        self.intro_rooms = {}      # session -> when it was first introduced in that room (the last hour's)
         self.packets = Bucket(o.packet_rate, o.packet_rate * 2, now)
         self.bytes = Bucket(o.byte_rate, o.byte_rate * 2, now)
         self.joins = Bucket(2, 8, now)
@@ -135,6 +157,9 @@ class Listing:
         self.owner, self.session, self.created = owner, session, now
         self.info, self.nodes, self.updated = b"", frozenset(), 0.0
         self.distance = None   # the host's ping to the lobby in 100 ms steps, when the room opened
+        self.pair_secrets = {}   # frozenset of two Clients -> their secret for direct packets
+        self.talked = set()      # (sender, receiver): players that sent each other game packets here
+        self.introduced = set()  # the players last told about each other
 
     @property
     def count(self):
@@ -169,6 +194,8 @@ class Lobby(asyncio.DatagramProtocol):
         self.pending = 0        # players not verified yet
         self.gates = {}         # host -> Bucket: answers to strangers' JOINs
         self.next_ip = SUBNET + 2
+        self.dirty = set()           # rooms whose players may need a new PEERS
+        self.dirty_clients = set()   # ...and players
         self.banned, self.ban_stamp, self.ban_checked = [], None, 0.0
         self.counts = collections.Counter()
         self.drops = collections.Counter()
@@ -271,6 +298,8 @@ class Lobby(asyncio.DatagramProtocol):
         """A network is gone: tell its players (with the host's own LM_GONE if there is one)."""
         if packet is None:
             packet = ldn_packet(listing.owner.ip, BROADCASTS[0], LM_GONE, listing.session)
+        self.dirty_clients.update(self.members(listing), listing.introduced)
+        self.dirty.discard(listing)
         for m in self.members(listing):
             if m is not listing.owner:
                 self.send(packet, m.at)
@@ -292,6 +321,8 @@ class Lobby(asyncio.DatagramProtocol):
             listing = self.listings.get(c.claim)
             if listing is not None and c.ip in listing.nodes:
                 self.send(ldn_packet(c.ip, listing.owner.ip, LM_LEAVE, c.claim), listing.owner.at)
+                self.dirty.add(listing)
+        self.dirty_clients.discard(c)
         self.by_addr.pop(c.at, None)
         self.by_ip.pop(c.ip, None)
         players = self.parts.get(c.part)
@@ -320,7 +351,10 @@ class Lobby(asyncio.DatagramProtocol):
         if len(p) < 4 or p[:2] != b"SN":
             return
         try:
-            self.packet(p, at, time.monotonic())
+            now = time.monotonic()
+            self.packet(p, at, now)
+            if self.dirty or self.dirty_clients:
+                self.flush(now)
         except Exception as e:   # (one bad packet never stops the lobby)
             self.drops["error"] += 1
             self.say(f"error on a packet from {at[0]}: {e!r}")
@@ -342,6 +376,8 @@ class Lobby(asyncio.DatagramProtocol):
             self.verify(c)
             c.seen = now
             c.ping = struct.unpack_from(">H", p, 28)[0]
+            if len(p) >= PING_EXT_SIZE:
+                self.on_ping_ext(c, p, now)
             self.send(header(PONG) + p[12:20] + struct.pack(">HHB", min(len(self.parts.get(c.part, ())), 0xFFFF),
                                                             min(len(self.part_rooms.get(c.part, ())), 0xFFFF), 1), at)
         elif kind == LEAVE:
@@ -357,15 +393,7 @@ class Lobby(asyncio.DatagramProtocol):
                 return
             self.on_list(c, p[12:16], now)
         elif kind == DATA:
-            if len(p) < 16 or not c.verified:
-                return
-            c.seen = now
-            if len(p) - 16 > self.o.max_data:
-                self.drops["too big"] += 1
-                return
-            self.max_data = max(self.max_data, len(p) - 16)
-            if not c.packets.take(now) or not c.bytes.take(now, len(p)):
-                self.drops["rate"] += 1
+            if len(p) < 16 or not self.admit(c, p, 4, now):
                 return
             src, dst, sport, dport = struct.unpack_from(">IIHH", p, 4)
             if src != c.ip:
@@ -374,6 +402,23 @@ class Lobby(asyncio.DatagramProtocol):
                 self.on_ldn(c, p, dst, sport, dport, now)
             else:
                 self.on_game(c, p, dst)
+        elif kind == BCAST:
+            self.on_bcast(c, p, now)
+
+    def admit(self, c, p, at, now):
+        """Whether a verified player's datagram (its DATA body at offset at) may be carried."""
+        if not c.verified:
+            return False
+        c.seen = now
+        size = len(p) - at - 12
+        if size > self.o.max_data:
+            self.drops["too big"] += 1
+            return False
+        self.max_data = max(self.max_data, size)
+        if not c.packets.take(now) or not c.bytes.take(now, len(p)):
+            self.drops["rate"] += 1
+            return False
+        return True
 
     def on_join(self, p, at, c, now):
         if len(p) < JOIN_SIZE:
@@ -398,6 +443,7 @@ class Lobby(asyncio.DatagramProtocol):
                     self.per_ip[at[0]] += 1
                     other.at = at
                     self.by_addr[at] = c = other
+                    self.mark(c)   # (the players it was introduced to need its new port)
                     break
         if c is None:   # a new player
             if not self.gate(at, now):
@@ -417,7 +463,7 @@ class Lobby(asyncio.DatagramProtocol):
             self.log(f"{printable(name)} joined lobby {printable(room)!r} (build {build[:8].decode('ascii', 'replace')}) "
                      f"as {ip_text(ip)} from {at[0]}:{at[1]}")
         c.seen = now
-        self.send(header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, 1) + b"\0", at)
+        self.send(header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, 1 | 2) + b"\0", at)   # (2: introduces peers)
 
     def on_list(self, c, seq, now):
         """The rooms this player's Rooms List shows: open ones first, fuller ones first, then the
@@ -458,7 +504,9 @@ class Lobby(asyncio.DatagramProtocol):
                 return
             if c.listing is not None:   # (a host cannot be joining: its network is gone)
                 self.close(c.listing)
+            self.mark(c)
             c.claim = listing.session
+            self.dirty.add(listing)
         elif kind in (LM_ACCEPT, LM_REJECT, LM_KICK):   # the host answering one who asked
             if c.listing is None or b.claim != c.listing.session:
                 self.drops["ldn"] += 1
@@ -470,6 +518,8 @@ class Lobby(asyncio.DatagramProtocol):
             if kind == LM_LEAVE:
                 self.send(p, b.at)
                 c.claim = None
+                self.dirty.add(b.listing)
+                self.dirty_clients.add(c)
                 return
         else:
             self.drops["ldn"] += 1
@@ -493,6 +543,7 @@ class Lobby(asyncio.DatagramProtocol):
         if listing is None:   # a new network (one at a time: it replaces the host's last)
             if c.listing is not None:
                 self.close(c.listing)
+            self.mark(c)   # (it was perhaps a station of another)
             c.claim = None
             listing = c.listing = self.listings[session] = Listing(c, session, now)
             self.part_rooms.setdefault(c.part, set()).add(listing)
@@ -500,6 +551,8 @@ class Lobby(asyncio.DatagramProtocol):
         if listing.distance is None and c.ping != 0xFFFF:
             listing.distance = min(c.ping, 1000) // 100
         before = self.members(listing)
+        if nodes != listing.nodes:
+            self.dirty.add(listing)
         listing.info, listing.nodes, listing.updated = info, nodes, now
         # (to whoever is in it, and whoever just left it, so they learn it at once)
         for m in {*before, *self.members(listing)}:
@@ -517,12 +570,139 @@ class Lobby(asyncio.DatagramProtocol):
             for m in members:
                 if m is not c:
                     self.send(p, m.at)
+                    self.counts["game relayed"] += 1
             return
         m = self.by_ip.get(dst)
         if m is None or m is c or m not in members:
             self.drops["not in the room"] += 1
             return
         self.send(p, m.at)
+        self.counts["game relayed"] += 1
+        if (c, m) not in listing.talked:   # (both ways: their games really play together - introduce them)
+            listing.talked.add((c, m))
+            if (m, c) in listing.talked:
+                self.dirty.add(listing)
+
+    def on_bcast(self, c, p, now):
+        """A broadcast to the room's players other than the ones listed (the sender reaches those
+        directly): count u8, count x address u32, then a DATA body."""
+        if len(p) < 5:
+            return
+        n = p[4]
+        at = 5 + 4 * n
+        if n >= ROOM_MAX or len(p) < at + 12:
+            self.drops["bad broadcast"] += 1
+            return
+        if not self.admit(c, p, at, now):
+            return
+        skip = set(struct.unpack_from(f">{n}I", p, 5))
+        src, dst, sport, dport = struct.unpack_from(">IIHH", p, at)
+        if src != c.ip:
+            self.drops["not its address"] += 1
+            return
+        if dst not in BROADCASTS or sport == LDN_PORT or dport == LDN_PORT:
+            self.drops["bad broadcast"] += 1
+            return
+        listing = self.network_of(c)
+        if listing is None:
+            self.drops["not in a room"] += 1
+            return
+        out = header(DATA) + p[at:]
+        for m in self.members(listing):
+            if m is not c and m.ip not in skip:
+                self.send(out, m.at)
+                self.counts["game relayed"] += 1
+
+    # ---- direct connections -------------------------------------------------------------
+    # The players of a room whose games can connect directly are introduced to each other: each
+    # learns the other's address as the lobby sees it, and a secret for the two of them, which
+    # every direct packet carries. Their games then punch through their routers and send the
+    # room's traffic straight to each other, falling back to the lobby when that fails. A pair
+    # is introduced only once both allow it and their games have sent each other game packets
+    # through the lobby (they really play together: one that only joins rooms learns nobody's
+    # address), and a player in INTRO_ROOMS rooms an hour at most.
+    def on_ping_ext(self, c, p, now):
+        have, lan_ip, lan_port, flags, ndirect = struct.unpack_from(">IIHBB", p, PING_SIZE)
+        direct_ok, lan = bool(flags & 1), ((lan_ip, lan_port) if lan_ip and lan_port else None)
+        if not c.ext or direct_ok != c.direct_ok or lan != c.lan:
+            c.ext, c.direct_ok, c.lan = True, direct_ok, lan
+            self.mark(c)
+        c.direct_count = min(ndirect, ROOM_MAX - 1)
+        if have != c.peers_version:   # (a PEERS lost on the way: again)
+            self.sync(c, now, again=True)
+
+    def mark(self, c):
+        """c's room (if any) needs its players' PEERS looked at."""
+        listing = self.network_of(c)
+        if listing is not None:
+            self.dirty.add(listing)
+        self.dirty_clients.add(c)
+
+    def flush(self, now):
+        while self.dirty:
+            listing = self.dirty.pop()
+            if self.listings.get(listing.session) is not listing:
+                continue   # (closed: close() queued its players)
+            members = set(self.members(listing))
+            gone = listing.introduced - members
+            listing.introduced = members
+            if gone:   # (one that comes back is introduced anew, with a new secret)
+                listing.pair_secrets = {k: v for k, v in listing.pair_secrets.items() if not k & gone}
+                listing.talked = {t for t in listing.talked if t[0] not in gone and t[1] not in gone}
+            self.dirty_clients |= members | gone
+        todo, self.dirty_clients = self.dirty_clients, set()
+        for c in todo:
+            self.sync(c, now)
+
+    def room_ok(self, c, session, now):
+        if c.intro_rooms and now - min(c.intro_rooms.values()) > 3600:
+            c.intro_rooms = {k: t for k, t in c.intro_rooms.items() if now - t <= 3600}
+        return session in c.intro_rooms or len(c.intro_rooms) < INTRO_ROOMS
+
+    def pair_secret(self, listing, a, b, now):
+        """The secret of two players of a room, or 0 when they are not to be introduced."""
+        if not (a.direct_ok and b.direct_ok):
+            return 0
+        key = frozenset((a, b))
+        s = listing.pair_secrets.get(key)
+        if s is None:
+            if not (a.ext and b.ext and (a, b) in listing.talked and (b, a) in listing.talked and
+                    self.room_ok(a, listing.session, now) and self.room_ok(b, listing.session, now)):
+                return 0
+            s = listing.pair_secrets[key] = secrets.randbits(64) | 1
+            for x in (a, b):
+                x.intro_rooms.setdefault(listing.session, now)
+        return s
+
+    def sync(self, c, now, again=False):
+        """Send c the players of its room (none: an empty list), when they changed (or again)."""
+        if not c.ext or self.by_addr.get(c.at) is not c:
+            return
+        listing = self.network_of(c)
+        peers = sorted((m for m in self.members(listing) if m is not c), key=lambda m: m.ip) if listing else []
+        entries, introduced = [], 0
+        for m in peers:
+            secret = self.pair_secret(listing, c, m, now)
+            pub = lan = (0, 0)
+            if secret:
+                introduced += 1
+                pub = (address_number(m.at[0]), m.at[1])
+                if m.at[0] == c.at[0] and m.lan and m.lan != pub:   # (behind the same router: its address there too)
+                    lan = m.lan
+            flags = (1 if secret else 0) | (0 if m.direct_ok else 2 if m.ext else 4)   # (2: it turned them off, 4: an older game)
+            entries.append(PEER.pack(m.ip, m.name.encode()[:NAME_LEN], flags, *pub, *lan, secret))
+        entries = b"".join(entries)
+        if entries == c.peers_sent and not again:
+            return
+        if now - c.peers_at < PEERS_GAP:
+            self.dirty_clients.add(c)   # (later: a room changing fast sends no flood)
+            return
+        if entries != c.peers_sent:
+            c.peers_version = (c.peers_version + 1) & 0xFFFFFFFF or 1
+            c.peers_sent = entries
+        c.peers_at = now
+        c.introduced_count = introduced
+        self.send(header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries, c.at)
 
     # ---- housekeeping -------------------------------------------------------------------
     def sweep(self, now):
@@ -537,14 +717,18 @@ class Lobby(asyncio.DatagramProtocol):
                 del self.gates[host]
         if now - self.ban_checked >= 5:
             self.load_banlist(now)
+        self.flush(now)
 
     def report(self, secs):
         c, n = self.counts, len(self.by_addr)
         drops = ", ".join(f"{k} {v}" for k, v in sorted(self.drops.items())) or "none"
+        paths = sum(p.introduced_count for p in self.by_addr.values())
+        direct = sum(min(p.direct_count, p.introduced_count) for p in self.by_addr.values())
         self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting) in {len(self.parts)} "
                  f"lobb{'y' if len(self.parts) == 1 else 'ies'}, {len(self.listings)} room{'' if len(self.listings) == 1 else 's'}; "
                  f"in {c['in packets'] / secs:.0f}/s {c['in bytes'] / secs / 1024:.1f} KB/s, "
                  f"out {c['out packets'] / secs:.0f}/s {c['out bytes'] / secs / 1024:.1f} KB/s; "
+                 f"game relayed {c['game relayed'] / secs:.0f}/s; direct paths {direct} of {paths}; "
                  f"largest {self.max_data} B; dropped: {drops}")
         self.counts.clear()
         self.drops.clear()
@@ -643,7 +827,8 @@ def probe(target, room, name, build, wait=3.0):
         print(f"{target}: joined as {ip_text(ip)}, but no answer to a ping")
         return 1
     online, nrooms, flags = struct.unpack_from(">HHB", pong, 12)
-    print(f"{target} ({addr[0]}:{addr[1]}): {'lobby' if flags & 1 else 'relay'} protocol {PROTOCOL}, "
+    print(f"{target} ({addr[0]}:{addr[1]}): {'lobby' if flags & 1 else 'relay'} protocol {PROTOCOL}"
+          f"{', direct connections' if welcome[24] & 2 else ''}, "
           f"ping {rtt:.0f} ms; lobby {room!r}, build {build or '(none)'}: {online} player{'' if online == 1 else 's'} "
           f"(this probe included), {nrooms} room{'' if nrooms == 1 else 's'}")
     for info in rooms:

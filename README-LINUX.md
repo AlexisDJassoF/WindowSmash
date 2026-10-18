@@ -63,7 +63,9 @@ This folder holds the game's code and data. It's for your own machines, not for 
    game version create, on Windows or Linux (see `NETPLAY.md`). The first time, it asks for the
    name other players see, and keeps it in `online_name.txt`. To play offline, use
    `bash run-offline.sh`, or write `off` in `online_server.txt`. If the lobby doesn't answer, the
-   game plays offline by itself after a few seconds.
+   game plays offline by itself after a few seconds. The word `off` in `online_direct.txt`
+   keeps all of a room's traffic going through the lobby, as on Windows (no direct connections,
+   so the other players don't learn your internet address).
 
 ## In a VMware virtual machine
 

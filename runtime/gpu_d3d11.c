@@ -3311,7 +3311,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     if (profile_at == -1) profile_at = getenv("SSBU_PROFILE_AT") ? atof(getenv("SSBU_PROFILE_AT")) : -2;
     if (profile_at >= 0 && rt_now_ns() > (u64)(profile_at * 1e9)) { profile_at = -2; keys |= 32; }
     if (keys & 32) profile_start(10.0);   /* F6 */
-    static char detail[1400], hint[352];
+    static char detail[1800], hint[640];
     static u64 last_ns, last_presented, last_drawn, last_dispatched, last_skipped, last_watch, last_busy, last_upload, last_waits, last_composed, last_kind[4];
     u64 now = rt_now_ns();
     if (now - last_ns >= 500000000ull) {   /* the details, twice a second */
@@ -3341,7 +3341,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  (gfx_stat_skipped - last_skipped) / secs, gfx_stat_shaders, (long)compiles_pending, (long)prewarm_ready, (long)prewarm_total, ntextures, nsurfaces, nresidents,
                  (gfx_stat_watch_us - last_watch) / 1000.0 / secs, depth_sampling != 0 ? "on" : "off",
                  profile_running() ? "  (profiling...)" : "");
-        char net[256];
+        char net[512];
         net_status(net, sizeof net);
         snprintf(hint, sizeof hint, "F2 details%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
                  profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);

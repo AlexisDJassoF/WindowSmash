@@ -148,6 +148,17 @@ go_online() {
         IFS= read -r SSBU_NET_NAME < online_name.txt
         SSBU_NET_NAME=${SSBU_NET_NAME%$'\r'}
     fi
+    # "off" in online_direct.txt: all of a room's traffic through the lobby (no direct connections,
+    # so the players in your rooms don't learn your internet address)
+    if [ -z "$SSBU_NET_DIRECT" ] && [ -f online_direct.txt ]; then
+        local direct
+        while read -r direct rest || [ -n "$direct" ]; do
+            direct=${direct%$'\r'}
+            case "$direct" in '' | '#'*) continue ;; esac
+            [ "${direct,,}" = off ] && export SSBU_NET_DIRECT=0
+            break
+        done < online_direct.txt
+    fi
     export SSBU_NET_RELAY SSBU_NET_NAME
     [ -n "$SSBU_NET_ROOM" ] && export SSBU_NET_ROOM
     echo "Online: lobby $SSBU_NET_RELAY${SSBU_NET_ROOM:+ (lobby code $SSBU_NET_ROOM)}, as $SSBU_NET_NAME. To play offline: bash run-offline.sh"
