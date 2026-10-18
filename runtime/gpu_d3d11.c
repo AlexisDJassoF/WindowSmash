@@ -405,10 +405,15 @@ static LARGE_INTEGER enter_t0;
 u64 gfx_stat_busy_ticks, gfx_stat_upload_bytes, gfx_stat_gpu_waits, gfx_stat_composed, gfx_stat_upload_kind[4];
 static struct { u32 size, bank, extent; char shader[24]; } gfx_stat_biggest_cb;
 
+static volatile DWORD last_enter_thread;
+DWORD gfx_lock_owner(void) { return ready ? (DWORD)(uintptr_t)lock.OwningThread : 0; }
+DWORD gfx_last_enter_thread(void) { return last_enter_thread; }
+
 static int enter(void) {
     InitOnceExecuteOnce(&once, init, NULL, NULL);
     if (!ready) return 0;
     EnterCriticalSection(&lock);
+    last_enter_thread = GetCurrentThreadId();
     if (!enter_depth++) QueryPerformanceCounter(&enter_t0);
     return 1;
 }
@@ -855,9 +860,11 @@ static void enqueue_shader(Shader *s) {
     WakeConditionVariable(&jobs_cv);
 }
 
-/* For a crash report: what each compiler thread is doing, its program kept next to the disk
- * cache (shadercrash/) so it can be compiled again outside the game. */
-void gfx_report_compiles(void) {
+/* For a crash or freeze report: what each compiler thread is doing (to line, a line at a time),
+ * its program kept next to the disk cache (shadercrash/) so it can be compiled again outside the
+ * game. */
+void gfx_report_compiles(void (*line)(const char *text)) {
+    char text[600];
     static const char *const what[] = {"idle", "reading its DXBC from the disk cache", "fxc compiling its HLSL", "the driver compiling its DXBC"};
     DWORD self = GetCurrentThreadId();
     u64 now = GetTickCount64();
@@ -866,7 +873,7 @@ void gfx_report_compiles(void) {
         Shader *s = compilers[i].job;
         LONG step = compilers[i].step;
         if (!s || step == STEP_IDLE) continue;
-        if (!busy++) fprintf(stderr, "shader compiler threads at the time:\n");
+        if (!busy++) line("shader compiler threads at the time:\n");
         char dir[1100], path[1200];
         snprintf(dir, sizeof dir, "%s/../shadercrash", rt_data_dir);
         CreateDirectoryA(dir, NULL);
@@ -883,10 +890,11 @@ void gfx_report_compiles(void) {
             FILE *f = fopen(path, "wb");
             if (f) { fwrite(dxbc, 1, size, f); fclose(f); saved = s->hlsl ? "; HLSL and DXBC saved" : "; DXBC saved"; }
         }
-        fprintf(stderr, "  thread %lu%s: %s - %s, for %.1f s%s\n", compilers[i].thread, compilers[i].thread == self ? " (the faulting thread)" : "",
-                s->name, what[step], (now - compilers[i].since_ms) / 1000.0, saved);
+        snprintf(text, sizeof text, "  thread %lu%s: %s - %s, for %.1f s%s\n", compilers[i].thread, compilers[i].thread == self ? " (this thread)" : "",
+                 s->name, what[step], (now - compilers[i].since_ms) / 1000.0, saved);
+        line(text);
     }
-    if (busy) fprintf(stderr, "  (programs in %s/../shadercrash)\n", rt_data_dir);
+    if (busy) { snprintf(text, sizeof text, "  (programs in %s/../shadercrash)\n", rt_data_dir); line(text); }
 }
 
 typedef struct CbufSource { const CbBinding *cb; } CbufSource;   /* one stage's bindings */
@@ -3103,9 +3111,14 @@ static void gpu_timer_frame(void) {
     frame_event_cur = (frame_event_cur + 1) % FRAME_EVENTS;
 }
 
+void watchdog_present(void);   /* debug_watchdog.c */
+void hitch_present(void);      /* debug_profile.c */
+
 void gfx_present(u64 guest, u32 width, u32 height) {
     (void)width; (void)height;
     if (!enter()) return;
+    watchdog_present();
+    hitch_present();
     if (draw_logging) save_sampled();
     forget_draw_state();
     gfx_stat_presented++;

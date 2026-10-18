@@ -555,6 +555,28 @@ void rt_svc(Cpu *c, u32 n) {
 }
 
 /* For diagnosis: where is every guest thread right now? */
+DWORD kernel_lock_owner(void) { return (DWORD)(uintptr_t)klock.OwningThread; }
+
+/* For a freeze report: every guest thread's state and host thread id (its stack is in the host
+ * threads' part of the report). Without waiting for the kernel's lock: says so when it is held. */
+void kernel_thread_states(void (*line)(const char *text)) {
+    char text[200];
+    if (!TryEnterCriticalSection(&klock)) {
+        snprintf(text, sizeof text, "  (the kernel's lock is held by thread %lu: guest thread states not read)\n", kernel_lock_owner());
+        line(text);
+        return;
+    }
+    for (u32 i = 1; i < 4096; i++) {
+        KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
+        if (!t || !t->started || t->exited || !t->host) continue;
+        const char *state = t->mutex_addr ? "waiting for a mutex" : t->cv_key ? "waiting on a condition" :
+                            t->arb_addr ? "waiting on an address" : "running or in a system call";
+        snprintf(text, sizeof text, "  guest thread %llu (host thread %lu, priority %d): %s\n", t->id, GetThreadId(t->host), t->priority, state);
+        line(text);
+    }
+    LeaveCriticalSection(&klock);
+}
+
 void kernel_dump_threads(void) {
     EnterCriticalSection(&klock);
     for (u32 i = 1; i < 4096; i++) {

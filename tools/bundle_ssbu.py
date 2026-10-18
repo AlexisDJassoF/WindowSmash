@@ -69,6 +69,8 @@ needed. DLC is enabled by the included aoc.cfg when present. This 11.0.0 build
 has DLC through Pyra/Mythra; Kazuya and Sora require a newer game version.
 Do not copy netplay_id.txt between PCs. Saves are under save\.
 Check build\play.log if launch fails. Initial shader compilation can stutter.
+A crash or a freeze (no picture for 5 s) writes a report and a minidump
+into the reports folder: send those when you report a problem.
 This is a snapshot of an existing port; packaging verification does not test
 gameplay or a complete network match on another PC.
 '''

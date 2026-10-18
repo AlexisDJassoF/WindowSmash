@@ -37,6 +37,8 @@ static const struct { const char *path; int kind; u32 cls; } NODES[] = {
 static struct { int kind; u32 syncpoint, cls; } files[256];
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+static volatile LONG lock_made;
+DWORD nv_lock_owner(void) { return lock_made ? (DWORD)(uintptr_t)lock.OwningThread : 0; }   /* (freeze reports) */
 
 /* ---- shared GPU state ------------------------------------------------------------ */
 NvMap gpu_maps[NVMAP_MAX];
@@ -55,6 +57,7 @@ static u64 next_va = 0x100000000ull;   /* bump allocator for VA requests without
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     (void)o; (void)p; (void)ctx;
     InitializeCriticalSection(&lock);
+    lock_made = 1;
     return TRUE;
 }
 

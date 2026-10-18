@@ -14,6 +14,7 @@
 
 #include "host.h"
 #include "display.h"
+#include <dbghelp.h>
 
 extern const RtModule rt_module_main, rt_module_subsdk0, rt_module_sdk;
 #define BOOT_MODULES 3
@@ -38,8 +39,11 @@ static int status_every;   /* seconds between thread dumps, 0 for none */
 extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_stat_dispatched, gfx_stat_residents, gfx_stat_clears, gfx_stat_drawn, gfx_stat_skipped,
     gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology, gfx_skip_target;
 u64 present_frames(void);
-void gfx_report_compiles(void);
+void gfx_report_compiles(void (*line)(const char *text));
 const char *rt_data_dir;
+/* This thread is reading another thread's stack (debug_profile.c): a fault there is expected and
+ * handled where it happens, not a crash. */
+__declspec(thread) int rt_probing;
 
 /* ---- diagnostics ----------------------------------------------------------------- */
 static struct HostFn { u64 host, guest; } *by_host;   /* guest == 0 marks runtime code */
@@ -71,18 +75,130 @@ static u64 guest_of(u64 pc) {
     return lo && pc - by_host[lo - 1].host <= (4u << 20) ? by_host[lo - 1].guest : 0;
 }
 
+/* A host code address in recompiled code, as the guest function's place ("main+0x1234"); NULL
+ * for any other code (debug_profile.c's thread dumps). */
+const char *rt_describe_host(u64 pc, char *buf, size_t n) {
+    u64 guest = by_host ? guest_of(pc) : 0;
+    return guest ? rt_describe(guest, buf, n) : NULL;
+}
+
+/* ---- reports: to the log, and for a crash or a stop also to reports\<kind>_<time>.txt ------ */
+static HANDLE report_file = INVALID_HANDLE_VALUE;
+
+/* (no heap: a crash may have happened inside the allocator) */
+static void out(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int)sizeof buf) n = sizeof buf - 1;
+    fputs(buf, stderr);
+    DWORD written;
+    if (report_file != INVALID_HANDLE_VALUE) WriteFile(report_file, buf, (DWORD)n, &written, NULL);
+}
+static void out_line(const char *text) { out("%s", text); }
+
+/* reports\<kind>_<date>_<time>.<ext>, in the current directory (the port root, where every
+ * launcher starts the game) */
+void rt_report_path(char *path, size_t n, const char *kind, const char *ext) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    CreateDirectoryA("reports", NULL);
+    snprintf(path, n, "reports\\%s_%04u%02u%02u_%02u%02u%02u.%s", kind, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, ext);
+}
+
+static void report_open(const char *kind, char *path, size_t n) {
+    rt_report_path(path, n, kind, "txt");
+    report_file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+}
+
+/* ---- minidumps, written by a second process (this exe with --write-dump): a process dumping
+ * itself can deadlock on a lock one of its suspended threads holds. The request goes through a
+ * helper thread started with the process, so a faulting thread with no stack left needs none.
+ * SSBU_MINIDUMP=0: none; =full: all memory (the guest's too: several GB). */
+static struct { HANDLE request, done; char path[MAX_PATH]; DWORD tid; EXCEPTION_POINTERS *e; volatile LONG ok, busy; } dumper;
+
+static DWORD WINAPI dump_helper(void *unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"minidump helper");
+    for (;;) {
+        WaitForSingleObject(dumper.request, INFINITE);
+        wchar_t exe[MAX_PATH], cmd[2 * MAX_PATH + 160];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        _snwprintf(cmd, sizeof cmd / sizeof *cmd, L"\"%ls\" --write-dump %lu %lu %llx \"%hs\"", exe, GetCurrentProcessId(), dumper.tid,
+                   (unsigned long long)(uintptr_t)dumper.e, dumper.path);
+        STARTUPINFOW si = {sizeof si};
+        PROCESS_INFORMATION pi;
+        DWORD code = 1;
+        if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        InterlockedExchange(&dumper.ok, code == 0);
+        SetEvent(dumper.done);
+    }
+}
+
+/* A minidump of this process at path (with thread tid's exception, if e); 1 when written. */
+int rt_write_dump(const char *path, DWORD tid, EXCEPTION_POINTERS *e, DWORD wait_ms) {
+    if (!dumper.request || InterlockedExchange(&dumper.busy, 1)) return 0;
+    snprintf(dumper.path, sizeof dumper.path, "%s", path);
+    dumper.tid = tid;
+    dumper.e = e;
+    ResetEvent(dumper.done);
+    SetEvent(dumper.request);
+    int ok = WaitForSingleObject(dumper.done, wait_ms) == WAIT_OBJECT_0 && dumper.ok;
+    InterlockedExchange(&dumper.busy, 0);
+    return ok;
+}
+
+static void dump_helper_start(void) {
+    const char *m = getenv("SSBU_MINIDUMP");
+    if (m && !strcmp(m, "0")) return;
+    dumper.request = CreateEventW(NULL, FALSE, FALSE, NULL);
+    dumper.done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CloseHandle(CreateThread(NULL, 0, dump_helper, NULL, 0, NULL));
+}
+
+/* The second process: ssbu --write-dump <pid> <thread id> <exception pointers, hex> <file> */
+static int write_dump_main(char **argv) {
+    DWORD pid = strtoul(argv[2], NULL, 10), tid = strtoul(argv[3], NULL, 10);
+    unsigned long long ptrs = strtoull(argv[4], NULL, 16);
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, pid);
+    HMODULE dbghelp = LoadLibraryExW(L"dbghelp.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    BOOL (WINAPI *write)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
+                         PMINIDUMP_CALLBACK_INFORMATION) =
+        dbghelp ? (BOOL (WINAPI *)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
+                                   PMINIDUMP_CALLBACK_INFORMATION))(void *)GetProcAddress(dbghelp, "MiniDumpWriteDump") : NULL;
+    if (!proc || !write) return 2;
+    HANDLE f = CreateFileA(argv[5], GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 3;
+    const char *m = getenv("SSBU_MINIDUMP");
+    MINIDUMP_TYPE type = m && !_stricmp(m, "full")
+                             ? (MINIDUMP_TYPE)(MiniDumpWithFullMemory | MiniDumpWithHandleData | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules)
+                             : (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory);
+    MINIDUMP_EXCEPTION_INFORMATION mei = {tid, (PEXCEPTION_POINTERS)(uintptr_t)ptrs, TRUE};
+    BOOL ok = write(proc, pid, f, type, ptrs ? &mei : NULL, NULL, NULL);
+    CloseHandle(f);
+    if (!ok) DeleteFileA(argv[5]);
+    return ok ? 0 : 4;
+}
+
 static void print_frames(void **frames, int n) {
     char name[96];
-    fprintf(stderr, "guest backtrace (innermost first):\n");
+    out("guest backtrace (innermost first):\n");
     for (int i = 0, shown = 0; i < n && shown < 28; i++) {
         u64 guest = guest_of((u64)frames[i]);
         if (!guest) {   /* runtime code: its offset in the executable (see the linker map) */
             static u64 image;
             if (!image) image = (u64)GetModuleHandleW(NULL);
-            if (rt_trace || getenv("SSBU_HOST_FRAMES")) fprintf(stderr, "  [host +%#llx]\n", (u64)frames[i] - image);
+            if (rt_trace || getenv("SSBU_HOST_FRAMES")) out("  [host +%#llx]\n", (u64)frames[i] - image);
             continue;
         }
-        fprintf(stderr, "  %s\n", rt_describe(guest, name, sizeof name));
+        out("  %s\n", rt_describe(guest, name, sizeof name));
         shown++;
     }
 }
@@ -146,24 +262,31 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
 /* A host fault inside recompiled code is a guest fault: report where, and what it touched. */
 static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (rt_probing) return EXCEPTION_CONTINUE_SEARCH;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_IN_PAGE_ERROR)
         return EXCEPTION_CONTINUE_SEARCH;
-    char name[96];
+    static volatile LONG faulting;
+    if (InterlockedExchange(&faulting, 1)) {   /* another thread is reporting its fault: let it finish */
+        Sleep(90000);
+        TerminateProcess(GetCurrentProcess(), 6);
+    }
+    char name[96], report[MAX_PATH];
     fflush(stdout);
-    fprintf(stderr, "\n*** host exception %#lx during %s", code, phase);
+    report_open("crash", report, sizeof report);
+    out("\n*** host exception %#lx during %s", code, phase);
     if (code == EXCEPTION_ACCESS_VIOLATION)
-        fprintf(stderr, ": %s address %s", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-                rt_describe(e->ExceptionRecord->ExceptionInformation[1], name, sizeof name));
-    fprintf(stderr, "\n");
+        out(": %s address %s", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+            rt_describe(e->ExceptionRecord->ExceptionInformation[1], name, sizeof name));
+    out("\n");
     /* where on the host: the faulting instruction's module and offset (symbolize with tools/hostsym.py) */
     HMODULE mod = NULL;
     char modname[MAX_PATH] = "?";
     u64 pc = (u64)e->ExceptionRecord->ExceptionAddress;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &mod))
         GetModuleFileNameA(mod, modname, sizeof modname);
-    fprintf(stderr, "host pc %#llx: %s +%#llx (thread %lu)\n", pc, strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname,
-            pc - (u64)mod, GetCurrentThreadId());
+    out("host pc %#llx: %s +%#llx (thread %lu)\n", pc, strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname,
+        pc - (u64)mod, GetCurrentThreadId());
     {   /* and the host frames above it */
         CONTEXT ctx = *e->ContextRecord;
         for (int i = 0; i < 24; i++) {
@@ -178,25 +301,32 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
             strcpy(modname, "?");
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ctx.Rip, &mod))
                 GetModuleFileNameA(mod, modname, sizeof modname);
-            fprintf(stderr, "  host frame %s +%#llx\n", strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname, ctx.Rip - (u64)mod);
+            out("  host frame %s +%#llx\n", strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname, ctx.Rip - (u64)mod);
         }
     }
-    gfx_report_compiles();   /* (a fault in the driver's shader compiler names the program) */
+    gfx_report_compiles(out_line);   /* (a fault in the driver's shader compiler names the program) */
     void *frames[62];
     print_frames(frames, unwind(*e->ContextRecord, frames, 62));   /* from the faulting frame */
+    char dump[MAX_PATH];
+    snprintf(dump, sizeof dump, "%.*s.dmp", (int)strlen(report) - 4, report);
+    int dumped = report_file != INVALID_HANDLE_VALUE && rt_write_dump(dump, GetCurrentThreadId(), e, 100000);
+    if (report_file != INVALID_HANDLE_VALUE) out("report: %s%s%s\n", report, dumped ? "; minidump: " : "", dumped ? dump : "");
+    if (report_file != INVALID_HANDLE_VALUE) CloseHandle(report_file);
     fflush(stderr);
     ExitProcess(5);
 }
 
 _Noreturn void rt_fatal(const char *fmt, ...) {
     va_list ap;
+    char text[768], report[MAX_PATH];
     fflush(stdout);
-    fprintf(stderr, "\n*** stopped during %s: ", phase);
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(text, sizeof text, fmt, ap);
     va_end(ap);
-    fprintf(stderr, "\n");
+    report_open("stopped", report, sizeof report);
+    out("\n*** stopped during %s: %s\n", phase, text);
     rt_backtrace();
+    if (report_file != INVALID_HANDLE_VALUE) { out("report: %s\n", report); CloseHandle(report_file); }
     fflush(stderr);
     ExitProcess(3);
 }
@@ -541,14 +671,37 @@ static DWORD WINAPI guest_main(LPVOID unused) {
     return 0;
 }
 
+/* SSBU_CRASH_TEST=<seconds>: a deliberate fault then (to try the crash report and minidump). */
+static DWORD WINAPI crash_test(void *seconds) {
+    Sleep((DWORD)(uintptr_t)seconds * 1000);
+    fprintf(stderr, "[test] SSBU_CRASH_TEST: writing to address 0\n");
+    *(volatile int *)0 = 0;
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 6 && !strcmp(argv[1], "--write-dump")) return write_dump_main(argv);
     if (argc < 2) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
     display_dpi_aware();
+    {   /* which build this is, for reports */
+        wchar_t exe[MAX_PATH];
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        SYSTEMTIME st = {0};
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        if (GetFileAttributesExW(exe, GetFileExInfoStandard, &fa)) {
+            FILETIME local;
+            FileTimeToLocalFileTime(&fa.ftLastWriteTime, &local);
+            FileTimeToSystemTime(&local, &st);
+        }
+        fprintf(stderr, "[boot] %ls, built %04u-%02u-%02u %02u:%02u\n", exe, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+    }
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--trace")) rt_trace = 1;
         if (!strcmp(argv[i], "--status") && i + 1 < argc) status_every = atoi(argv[++i]);
     }
     AddVectoredExceptionHandler(1, on_fault);
+    dump_helper_start();
+    if (getenv("SSBU_CRASH_TEST")) CloseHandle(CreateThread(NULL, 0, crash_test, (void *)(uintptr_t)atoi(getenv("SSBU_CRASH_TEST")), 0, NULL));
     rt_data_dir = argv[1];
     kernel_init();
     load(argv[1]);
