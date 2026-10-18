@@ -17,6 +17,7 @@
 #include "net.h"
 #include "pad.h"
 #include "gpu_shader.h"
+#include "gpu_shader_cache.h"
 #include "gpu_texture.h"
 #include <math.h>
 #include <d3d11.h>
@@ -505,9 +506,8 @@ static void dump_shaders(const u32 *regs) {
  * threading off, compiles each one first - inside Create*Shader, on our thread, with our stack;
  * the rendering device keeps its threading (without it the renderer took twice as long a
  * frame). A draw whose
- * shaders are not ready is skipped. Bump SHADER_CACHE_VERSION when the translator changes what
- * it generates. */
-#define SHADER_CACHE_VERSION 10
+ * shaders are not ready is skipped. The disk cache's names, and fxc's flags, are
+ * gpu_shader_cache.h's (shared with tools/shaderaot.c). */
 
 typedef struct Shader {
     u64 hash, table_hash;
@@ -560,7 +560,21 @@ static const char *cache_dir(void) {
 }
 
 static void cache_path(const Shader *s, char *path, size_t n) {
-    snprintf(path, n, "%s/v%u_%s_%08x_%016llx.dxbc", cache_dir(), SHADER_CACHE_VERSION, s->name, s->vs_outputs, s->table_hash);
+    shader_cache_file(path, n, cache_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
+}
+
+/* A file the ahead-of-time compiler wrote (dated 2001), now used by the game: dated now, so the
+ * next start's prewarm makes it. */
+static void cache_touch(const char *path) {
+    HANDLE h = CreateFileA(path, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    FILETIME written, now;
+    if (GetFileTime(h, NULL, NULL, &written) && ((u64)written.dwHighDateTime << 32 | written.dwLowDateTime) < SHADER_CACHE_PLAYED) {
+        GetSystemTimeAsFileTime(&now);
+        SetFileTime(h, NULL, NULL, &now);
+    }
+    CloseHandle(h);
 }
 
 static HRESULT create_on(ID3D11Device *d, int stage, const void *code, size_t size, void **obj) {
@@ -585,8 +599,9 @@ static int create_noted(struct Compiler *me, Shader *s, const void *code, size_t
 }
 
 /* ---- prewarm: the disk cache made ready while the game starts --------------------------
- * Every DXBC file of this SHADER_CACHE_VERSION, newest first, is created on both devices by the
- * compiler threads (queue 2, below the game's own shaders) into a table by the cache's key.
+ * Every DXBC file of this SHADER_CACHE_VERSION the game has used before (gpu_shader_cache.h),
+ * newest first, is created on both devices by the compiler threads (queue 2, below the game's
+ * own shaders) into a table by the cache's key.
  * When the game first uses a program, get_shader_ex still translates it (that gives its
  * interface), then takes the object from here instead of loading it, so the draw is not
  * skipped. SSBU_SHADER_PREWARM=0: no prewarm. */
@@ -685,20 +700,11 @@ static LONG make_ready(struct Compiler *me, Shader *s) {
         int ok = code && fread(code, 1, n, f) == (size_t)n && create_noted(me, s, code, n);
         fclose(f);
         free(code);
-        if (ok) return 1;
+        if (ok) { cache_touch(path); return 1; }
     }
     me->step = STEP_FXC;
-    const char *target = s->stage == SHADER_VERTEX ? "vs_5_0" : s->stage == SHADER_PIXEL ? "ps_5_0" : "cs_5_0";
-    /* dispatch-loop programs compile much faster without fxc's optimiser; the driver
-     * optimises the bytecode anyway */
-    UINT flags = strstr(s->hlsl, "npc_") ? D3DCOMPILE_SKIP_OPTIMIZATION : D3DCOMPILE_OPTIMIZATION_LEVEL1;
     ID3DBlob *code = NULL, *errors = NULL;
-    HRESULT hr = D3DCompile(s->hlsl, strlen(s->hlsl), s->name, NULL, NULL, "main", target, flags, 0, &code, &errors);
-    if (FAILED(hr) && flags != D3DCOMPILE_SKIP_OPTIMIZATION) {   /* fxc's optimiser has internal errors on some programs */
-        if (errors) ID3D10Blob_Release(errors);
-        errors = NULL;
-        hr = D3DCompile(s->hlsl, strlen(s->hlsl), s->name, NULL, NULL, "main", target, D3DCOMPILE_SKIP_OPTIMIZATION, 0, &code, &errors);
-    }
+    HRESULT hr = shader_cache_compile(s->hlsl, s->name, s->stage, &code, &errors);
     LONG state = 2;
     if (SUCCEEDED(hr) && create_noted(me, s, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code))) {
         f = fopen(path, "wb");
@@ -784,6 +790,8 @@ static DWORD WINAPI prewarm_main(void *unused) {
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     for (BOOL more = h != INVALID_HANDLE_VALUE; more; more = FindNextFileA(h, &fd)) {
+        /* only what the game has used: not the ahead-of-time compiler's files it never asked for */
+        if (((u64)fd.ftLastWriteTime.dwHighDateTime << 32 | fd.ftLastWriteTime.dwLowDateTime) < SHADER_CACHE_PLAYED) continue;
         if (n == cap) found = realloc(found, sizeof *found * (cap = cap * 2 + 1024));
         snprintf(found[n].name, sizeof found[n].name, "%s", fd.cFileName);
         found[n++].written = (u64)fd.ftLastWriteTime.dwHighDateTime << 32 | fd.ftLastWriteTime.dwLowDateTime;
@@ -927,9 +935,8 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
         CbufSource src = {stage_cb};
         if (!s->info.ntables || s->table_hash == table_hash(&s->info, &src)) return s;
     }
-    u32 size = shader_size(p, 0x40000);
-    u64 h = 1469598103934665603ull;
-    for (u32 i = stage == SHADER_COMPUTE ? 0x50 : 0; i < size; i++) h = (h ^ p[i]) * 1099511628211ull;
+    u32 size = shader_size(p, 0x40000), skip = stage == SHADER_COMPUTE ? 0x50 : 0;
+    u64 h = shader_program_hash(p + skip, size - skip);
     if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
     CbufSource src = {stage_cb};
     for (u32 i = 0; i < shader_count; i++) {

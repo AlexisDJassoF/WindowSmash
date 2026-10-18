@@ -132,13 +132,15 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
     if (source / 'build/SDL3.dll').is_file() and sdl_licence.is_file():
         payload.append(file_payload('build/SDL3-LICENSE.txt', sdl_licence))
     if shader_cache:
-        # only the runtime's current cache version (older files are never read, and the start's
-        # prewarm creates every current one)
-        renderer = source / 'runtime/gpu_d3d11.c'
-        version = re.search(r'#define SHADER_CACHE_VERSION (\d+)', renderer.read_text(encoding='utf-8')) if renderer.is_file() else None
+        # only the runtime's current cache version (older files are never read), and only what
+        # the game has used: tools/shader_aot.py's files stay dated 2001 until then
+        header = source / 'runtime/gpu_shader_cache.h'
+        version = re.search(r'#define SHADER_CACHE_VERSION (\d+)', header.read_text(encoding='utf-8')) if header.is_file() else None
         pattern = f'v{version.group(1)}_*.dxbc' if version else '*.dxbc'
+        played_after = datetime(2002, 1, 1, tzinfo=timezone.utc).timestamp()
         for path in sorted((source / 'dump/shadercache').glob(pattern)):
-            payload.append(file_payload('dump/shadercache/' + path.name, path))
+            if path.stat().st_mtime >= played_after:
+                payload.append(file_payload('dump/shadercache/' + path.name, path))
     relay = source / 'tools/ssbu_relay.py'
     if relay.is_file():
         payload.append(file_payload('tools/ssbu_relay.py', relay))

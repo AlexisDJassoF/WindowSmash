@@ -1,7 +1,9 @@
 import contextlib
+from datetime import datetime, timezone
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -133,6 +135,18 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(archive.read('SSBU-Portable/build/SDL3.dll'), b'MZ-sdl3')
             self.assertEqual(archive.read('SSBU-Portable/build/SDL3-LICENSE.txt'), b'zlib licence text')
             self.assertFalse(any('deps/' in name for name in archive.namelist()))
+
+    def test_shader_cache_ships_only_played_files_of_the_current_version(self):
+        header = self.root / 'runtime/gpu_shader_cache.h'
+        header.parent.mkdir(parents=True)
+        header.write_text('#define SHADER_CACHE_VERSION 7\n')
+        cache = self.root / 'dump/shadercache'
+        for name in ('v7_played.dxbc', 'v7_ahead_of_time.dxbc', 'v6_old.dxbc'):
+            (cache / name).write_bytes(b'shader')
+        unplayed = datetime(2001, 6, 1, tzinfo=timezone.utc).timestamp()   # tools/shader_aot.py's date
+        os.utime(cache / 'v7_ahead_of_time.dxbc', (unplayed, unplayed))
+        names = [item.name for item in bundler.build_plan(self.root) if item.name.endswith('.dxbc')]
+        self.assertEqual(names, ['dump/shadercache/v7_played.dxbc'])
 
     def test_verification_rejects_tampering(self):
         path = self.package()
