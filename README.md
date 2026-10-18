@@ -84,7 +84,7 @@ The same game can also be built as a native x86-64 Linux program, cross-compiled
 ### Multiplayer setup
 
 1. Put the same WindowSmash release/build and game version on both PCs. Configure each PC's own data and keep separate player IDs.
-2. **Online lobby:** put the lobby's address in `online_server.txt` and run **Play SSBU.bat**. Every Local Wireless room created in that lobby appears in the Rooms List of players with the same game version; nobody forwards a port.
+2. **Online lobby:** run **Play SSBU.bat**. It joins the lobby named in `online_server.txt`, the public lobby unless you change it. Every Local Wireless room created in that lobby appears in the Rooms List of players with the same game version; nobody forwards a port.
 3. **Private room:** the host runs **Host SSBU Netplay.bat**, chooses a room name, permits incoming UDP, and shares the displayed address. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
 4. Both open **Local Wireless** in-game. The host creates a room; the friend selects it and the host accepts.
 
