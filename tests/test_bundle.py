@@ -121,6 +121,19 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertFalse(self.output.exists())
 
+    def test_sdl3_licence_ships_with_the_dll(self):
+        licence = self.root / 'deps/SDL3/LICENSE.txt'
+        licence.parent.mkdir(parents=True)
+        licence.write_bytes(b'zlib licence text')
+        names = [item.name for item in bundler.build_plan(self.root)]
+        self.assertNotIn('build/SDL3-LICENSE.txt', names)   # no SDL3.dll in this build
+        (self.root / 'build/SDL3.dll').write_bytes(b'MZ-sdl3')
+        path = self.package()
+        with zipfile.ZipFile(path) as archive:
+            self.assertEqual(archive.read('SSBU-Portable/build/SDL3.dll'), b'MZ-sdl3')
+            self.assertEqual(archive.read('SSBU-Portable/build/SDL3-LICENSE.txt'), b'zlib licence text')
+            self.assertFalse(any('deps/' in name for name in archive.namelist()))
+
     def test_verification_rejects_tampering(self):
         path = self.package()
         with zipfile.ZipFile(path) as archive:

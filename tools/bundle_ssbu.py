@@ -51,10 +51,13 @@ The optional tools\ssbu_relay.py is a standalone relay; it requires Python.
 Nintendo's official online service is not used.
 
 CONTROLS
-First Xbox/XInput controller; face buttons follow Nintendo's physical positions.
+Up to 8 players on Xbox, PlayStation, Switch Pro and most other pads (SDL3);
+each pad that connects becomes the next free player. Face buttons follow
+Nintendo's physical positions. controllers.ini (written on the first start)
+sets the keyboard's player, remaps buttons, rumble strength and dead zones.
 Keyboard: arrows = move; Z/X/C/V = A/B/X/Y; A/S = L/R; Q/W = ZL/ZR;
 Enter = Plus; Backspace = Minus; I/J/K/L = right stick.
-F1 = overlay; F2 = details; F3 = screenshot.
+F1 = overlay; F2 = details (lists the pads); F3 = screenshot.
 
 Each install starts with a fresh save and generates its own netplay identity.
 If Unlock All Fighters.bat is included, first start the game, reach the main menu,
@@ -122,6 +125,9 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
     payload.extend(file_payload('dump/fonts/' + name, source / 'dump/fonts' / name) for name in FONTS)
     for path in sorted((source / 'build').glob('*.dll')):
         payload.append(file_payload('build/' + path.name, path))
+    sdl_licence = source / 'deps/SDL3/LICENSE.txt'   # (the zlib licence of build/SDL3.dll)
+    if (source / 'build/SDL3.dll').is_file() and sdl_licence.is_file():
+        payload.append(file_payload('build/SDL3-LICENSE.txt', sdl_licence))
     if shader_cache:
         for path in sorted((source / 'dump/shadercache').glob('*.dxbc')):
             payload.append(file_payload('dump/shadercache/' + path.name, path))

@@ -13,6 +13,10 @@
 /captures/
 /netplay_address.txt
 /netplay_id.txt
+# This PC's settings, written on the first start (docs/RUNTIME-SETUP.md)
+/controllers.ini
+# Third-party packages as downloaded (SDL3 for controllers: docs/BUILDING.md)
+/deps/
 # A game version's own folder (tools/install_version.py, tools/update.py --tree), laid out like
 # the above; and what the versions share or record on this PC (docs/VERSIONS.md)
 /v[0-9]*/

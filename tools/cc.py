@@ -43,6 +43,14 @@ if not all(os.path.exists(p) for p in VPX_LIBS) or not os.path.exists(os.path.jo
     VPX_LIBS = []
 if VPX_LIBS:
     CFLAGS += ["/DSSBU_HAVE_VPX", "/I", os.path.join(VPX_DIR, "include")]
+# SDL3 for controllers (zlib licence): the runtime loads SDL3.dll at run time, so the build needs only the headers,
+# and the link step copies the DLL beside the exe. SSBU_SDL3_DIR overrides where (include/, lib/x64/SDL3.dll).
+SDL3_DIR = os.environ.get("SSBU_SDL3_DIR", os.path.join(ROOT, "deps", "SDL3"))
+SDL3_DLL = os.path.join(SDL3_DIR, r"lib\x64\SDL3.dll")
+if os.path.exists(os.path.join(SDL3_DIR, "include", "SDL3", "SDL_gamepad.h")) and os.path.exists(SDL3_DLL):
+    CFLAGS += ["/DSSBU_HAVE_SDL3", "/I", os.path.join(SDL3_DIR, "include")]
+else:
+    SDL3_DLL = None
 # (they were built against the DLL C runtime; this program uses the static one)
 EXTRA_LIBS = OPUS_LIBS + VPX_LIBS + (["/NODEFAULTLIB:msvcrt.lib"] if OPUS_LIBS or VPX_LIBS else [])
 

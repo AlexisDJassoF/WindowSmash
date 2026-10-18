@@ -576,6 +576,13 @@ def link(dirs, exe):
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
     # a wrap no module has (another game version): its original is a stub nothing calls
     cc.link(objs, exe, [f"/alternatename:f_{a:x}_orig=rt_wrap_missing" for a in sorted(hle_wraps())])
+    # the controllers' SDL3.dll, which the runtime loads from the exe's own folder
+    if cc.SDL3_DLL:
+        import shutil
+        dll = os.path.join(os.path.dirname(exe), "SDL3.dll")
+        if not os.path.exists(dll) or os.path.getsize(dll) != os.path.getsize(cc.SDL3_DLL) or \
+                os.path.getmtime(dll) < os.path.getmtime(cc.SDL3_DLL):
+            shutil.copy2(cc.SDL3_DLL, dll)
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
 

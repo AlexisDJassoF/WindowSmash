@@ -14,6 +14,7 @@
 #include "gpu_backend.h"
 #include "gpu_overlay.h"
 #include "net.h"
+#include "pad.h"
 #include "gpu_shader.h"
 #include "gpu_texture.h"
 #include <math.h>
@@ -3042,6 +3043,9 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         snprintf(hint, sizeof hint, "F2 details%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
                  profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
         if (net[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", net); }
+        char pads[256];
+        pad_describe(pads, sizeof pads);
+        { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\npads: %s", pads[0] ? pads : "none (keyboard only)"); }
         static int log_stats = -1, stat_tick;   /* SSBU_LOG_STATS: the details to the log too, every 5 s */
         if (log_stats < 0) log_stats = getenv("SSBU_LOG_STATS") != NULL;
         if (log_stats && ++stat_tick % 10 == 0) {
