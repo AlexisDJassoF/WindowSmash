@@ -1,24 +1,12 @@
 <p align="center">
-  <img src="docs/assets/windowsmash-banner.svg" alt="WindowSmash — AArch64 to native Windows, through static recompilation" width="100%">
+  <img src="docs/assets/windowsmash-banner.svg" alt="WindowSmash" width="100%">
 </p>
 
 <p align="center">
-  <strong>A Windows native porting toolkit for Super Smash Bros. Ultimate.</strong><br>
-  Static CPU recompilation. A native service runtime. Direct3D 11 graphics.
-</p>
-
-<p align="center">
-  <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows_x64-2563eb?style=flat-square">
-  <img alt="Runtime: C" src="https://img.shields.io/badge/runtime-C-14b8a6?style=flat-square">
-  <img alt="Toolchain: Python and Clang" src="https://img.shields.io/badge/toolchain-Python_%2B_Clang-8b5cf6?style=flat-square">
-  <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-f59e0b?style=flat-square">
-</p>
-
-<p align="center">
-  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> ·
-  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> ·
-  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
-  <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
+  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> Â·
+  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> Â·
+  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> Â·
+  <a href="NETPLAY.md"><strong>Netplay</strong></a> Â·
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a>
 </p>
 
@@ -43,7 +31,7 @@ The result is a locally built Windows executable backed by your own extracted ga
 | **Local Wireless relay** | Carries the game's existing Local Wireless traffic over a UDP relay, with host/join launchers and a standalone relay option. |
 | **Developer tools** | Includes instruction and function differential tests, disassembly helpers, symbol lookup, archive readers, captures, and profiling tools. |
 
-## Status, without the marketing
+## Status
 
 The current implementation targets **game version 11.0.0** and **Windows x64**. The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
 
@@ -60,7 +48,7 @@ There is no Nintendo online-service integration, general Switch compatibility cl
 
 ## Download and run
 
-**[Get the Windows x64 runtime →](https://github.com/SNO2207/WindowSmash/releases)**
+**[Get the Windows x64 runtime â†’](https://github.com/SNO2207/WindowSmash/releases)**
 
 Extract the runtime ZIP, run **Configure Game Data.bat** to select your own compatible RomFS and firmware fonts, then use **Play SSBU.bat**. The runtime ZIP has the compiled files needed to execute the game; it excludes source, debug maps, object files, caches, saves, keys, and game-data archives. A compiler and Python are not required to play.
 
@@ -94,7 +82,7 @@ Choose a job count appropriate to your CPU and available memory. The output is `
 3. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
 4. Both open **Local Wireless** in-game. The host creates a room; the friend selects it and the host accepts.
 
-**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting →](NETPLAY.md)**
+**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting â†’](NETPLAY.md)**
 
 | Launcher | Use |
 | :--- | :--- |
