@@ -11,6 +11,7 @@
 #include <stdio.h>
 
 #include "debug_profile.h"
+#include "display.h"
 #include "gpu_backend.h"
 #include "gpu_overlay.h"
 #include "net.h"
@@ -20,15 +21,18 @@
 #include <math.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
-#include <dxgi1_2.h>
-
-#define WINDOW_W 1280
-#define WINDOW_H 720
+#include <dxgi1_5.h>
 
 static HWND window;
 static ID3D11Device *dev, *compile_dev;
 static ID3D11DeviceContext *ctx;
 static IDXGISwapChain1 *swapchain;
+static UINT swapchain_flags;
+/* The game's picture at its own size, before it is fitted into the window (screenshots read it). */
+static ID3D11Texture2D *final_tex;
+static ID3D11RenderTargetView *final_rtv;
+static ID3D11ShaderResourceView *final_srv;
+enum { FINAL_W = 1920, FINAL_H = 1080 };
 static ID3D11VertexShader *blit_vs;
 static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps;
 static ID3D11SamplerState *linear_sampler;
@@ -265,6 +269,8 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
 static volatile LONG hotkeys;
 
 static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    LRESULT result;
+    if (display_message(h, msg, w, l, &result)) return result;   /* size, full screen, pointer (gpu_display.c) */
     if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); ExitProcess(0); }
     if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F6 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
     return DefWindowProcW(h, msg, w, l);
@@ -275,10 +281,7 @@ static DWORD WINAPI window_thread(LPVOID done) {
     WNDCLASSW wc = {CS_HREDRAW | CS_VREDRAW, window_proc, 0, 0, GetModuleHandleW(NULL), NULL,
                     LoadCursor(NULL, IDC_ARROW), NULL, NULL, L"ssbu"};
     RegisterClassW(&wc);
-    RECT r = {0, 0, WINDOW_W, WINDOW_H};
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    window = CreateWindowExW(0, L"ssbu", L"Super Smash Bros. Ultimate (native)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
+    window = display_create_window(wc.hInstance, L"ssbu", L"Super Smash Bros. Ultimate (native)");
     SetEvent((HANDLE)done);
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
@@ -336,11 +339,28 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
         FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
                                  levels, 2, D3D11_SDK_VERSION, &compile_dev, NULL, NULL)))
         compile_dev = NULL;
-    DXGI_SWAP_CHAIN_DESC1 sd = {1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0}, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2,
-                                DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, 0};
+    /* The back buffer is the window's inside (display.ini sizes the window). Where the system
+     * allows it, the swap chain may tear, which VRR pacing asks for at each Present. */
+    IDXGIFactory5 *factory5;
+    BOOL tearing = FALSE;
+    if (SUCCEEDED(IDXGIFactory2_QueryInterface(factory, &IID_IDXGIFactory5, (void **)&factory5))) {
+        if (FAILED(IDXGIFactory5_CheckFeatureSupport(factory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof tearing))) tearing = FALSE;
+        IDXGIFactory5_Release(factory5);
+    }
+    swapchain_flags = tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    display_set_tearing(tearing != FALSE);
+    DXGI_SWAP_CHAIN_DESC1 sd = {0, 0, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, {1, 0}, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2,
+                                DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, swapchain_flags};
     if (FAILED(IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown *)dev, window, &sd, NULL, NULL, &swapchain))) {
         fprintf(stderr, "[gfx] cannot create the swap chain\n");
         return TRUE;
+    }
+    /* full screen is gpu_display.c's (a borderless window), never DXGI's own */
+    IDXGIFactory2_MakeWindowAssociation(factory, window, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+    IDXGIDevice1 *dxgi_dev1;
+    if (SUCCEEDED(IDXGIDevice_QueryInterface(dxgi_dev, &IID_IDXGIDevice1, (void **)&dxgi_dev1))) {
+        IDXGIDevice1_SetMaximumFrameLatency(dxgi_dev1, (UINT)display_latency());
+        IDXGIDevice1_Release(dxgi_dev1);
     }
     IDXGIFactory2_Release(factory); IDXGIAdapter_Release(adapter); IDXGIDevice_Release(dxgi_dev);
 
@@ -359,6 +379,14 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     D3D11_SAMPLER_DESC smp = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
                               D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, {0}, 0, D3D11_FLOAT32_MAX};
     ID3D11Device_CreateSamplerState(dev, &smp, &linear_sampler);
+    D3D11_TEXTURE2D_DESC fd = {FINAL_W, FINAL_H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &fd, NULL, &final_tex)) ||
+        FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)final_tex, NULL, &final_rtv)) ||
+        FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)final_tex, NULL, &final_srv))) {
+        fprintf(stderr, "[gfx] cannot create the picture's texture\n");
+        return TRUE;
+    }
     ready = 1;
     fprintf(stderr, "[gfx] Direct3D 11 ready%s\n", compile_dev ? " (shaders compile on a device of their own first)" : "");
     return TRUE;
@@ -2923,36 +2951,57 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         fprintf(stderr, "[draw] -- frame start (battle); %u resident regions:\n", nresidents);
         for (u32 i = 0; i < nresidents; i++) fprintf(stderr, "[draw]    resident %#llx + %#x\n", residents[i].va, residents[i].size);
     }
+    /* the window's new size (gpu_display.c), while nothing holds the back buffer */
+    unsigned bw, bh;
+    if (display_take_size(&bw, &bh)) {
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+        ID3D11DeviceContext_Flush(ctx);
+        HRESULT hr = IDXGISwapChain1_ResizeBuffers(swapchain, 0, bw, bh, DXGI_FORMAT_UNKNOWN, swapchain_flags);
+        if (FAILED(hr)) fprintf(stderr, "[gfx] cannot resize the swap chain to %ux%u (%#lx)\n", bw, bh, (unsigned long)hr);
+    }
     ID3D11Texture2D *back;
     IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&back);
+    D3D11_TEXTURE2D_DESC back_desc;
+    ID3D11Texture2D_GetDesc(back, &back_desc);
     ID3D11RenderTargetView *rtv;
     ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)back, NULL, &rtv);
     Surface *src = NULL;
     for (u32 i = 0; i < nsurfaces; i++)
         if (surfaces[i].tex && !surfaces[i].depth && surfaces[i].guest == guest) src = &surfaces[i];
-    if (src) {
-        D3D11_VIEWPORT vp = {0, 0, 1920, 1080, 0, 1};
-        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_VSSetShader(ctx, blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &linear_sampler);
+    ID3D11DeviceContext_RSSetState(ctx, NULL);
+    ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
+    ID3D11ShaderResourceView *none = NULL;
+    if (src) {   /* the game's picture at its own size */
+        D3D11_VIEWPORT vp = {0, 0, FINAL_W, FINAL_H, 0, 1};
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &final_rtv, NULL);
         ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
-        ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
-        ID3D11DeviceContext_VSSetShader(ctx, blit_vs, NULL, 0);
-        ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
         /* the bytes as they are: the display shows them as sRGB, which an sRGB framebuffer's already are */
         ID3D11ShaderResourceView *raw = surface_srv(src, 0);
         ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &raw);
-        ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &linear_sampler);
-        ID3D11DeviceContext_RSSetState(ctx, NULL);
-        ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xFFFFFFFF);
-        ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
         ID3D11DeviceContext_Draw(ctx, 3, 0);
-        ID3D11ShaderResourceView *none = NULL;
         ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
     } else {
         static const float grey[4] = {0.1f, 0.1f, 0.12f, 1};
-        ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, grey);
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, final_rtv, grey);
     }
-    capture(back);
+    capture(final_tex);
+    /* then into the window: 16:9, centred, black around it */
+    static const float black[4] = {0, 0, 0, 1};
+    unsigned fit_x, fit_y, fit_w, fit_h;
+    display_fit(back_desc.Width, back_desc.Height, &fit_x, &fit_y, &fit_w, &fit_h);
+    D3D11_VIEWPORT wvp = {(float)fit_x, (float)fit_y, (float)fit_w, (float)fit_h, 0, 1};
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
 
     /* debug keys and the overlay */
     LONG keys = InterlockedExchange(&hotkeys, 0);
@@ -2970,7 +3019,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         char path[128];
         snprintf(path, sizeof path, "screenshots/ssbu_%04u%02u%02u_%02u%02u%02u_%03u.bmp", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
                  st.wSecond, st.wMilliseconds);
-        save_bmp(back, path);
+        save_bmp(final_tex, path);
         fprintf(stderr, "[gfx] screenshot: %s\n", path);
     }
     static char f4_dir[160];   /* F4's render targets go here, once the logged frame is drawn */
@@ -2996,7 +3045,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         sampled_seq = 0;
         char screen[200];
         snprintf(screen, sizeof screen, "%s/screen.bmp", f4_dir);
-        save_bmp(back, screen);
+        save_bmp(final_tex, screen);
         fprintf(stderr, "[draw] -- frame start (F4)\n");
     }
     if (keys & 16) {   /* F5: depth buffers sampled as textures, or not */
@@ -3066,14 +3115,14 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         last_busy = gfx_stat_busy_ticks; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed;
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
-    overlay_present(dev, ctx, rtv, 1920, 1080, overlay, details ? detail : hint);
+    overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
 
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
     gpu_timer_frame();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
-    IDXGISwapChain1_Present(swapchain, 0, 0);   /* (blocks while the GPU is frames behind) */
+    IDXGISwapChain1_Present(swapchain, 0, display_present_flags());   /* (blocks while the GPU is frames behind) */
     QueryPerformanceCounter(&p1);
     gfx_stat_present_ticks += (u64)(p1.QuadPart - p0.QuadPart);
     leave();
@@ -3081,6 +3130,15 @@ void gfx_present(u64 guest, u32 width, u32 height) {
 
 int gfx_window_focused(void) { return window && GetForegroundWindow() == window; }
 void *gfx_window_handle(void) { return window; }
+
+/* The output (monitor) the swap chain is on, referenced; NULL before there is one (display pacing). */
+void *gfx_display_output(void) {
+    if (!ready || !enter()) return NULL;
+    IDXGIOutput *output = NULL;
+    if (FAILED(IDXGISwapChain1_GetContainingOutput(swapchain, &output))) output = NULL;
+    leave();
+    return output;
+}
 
 /* The plain 2D textures in the cache, drawn into RGBA8 images like the surfaces
  * (tex_<frame>_<guest address>_fmt<format>.bmp). */

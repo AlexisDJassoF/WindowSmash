@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "display.h"
 
 extern const RtModule rt_module_main, rt_module_subsdk0, rt_module_sdk;
 #define BOOT_MODULES 3
@@ -542,6 +543,7 @@ static DWORD WINAPI guest_main(LPVOID unused) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
+    display_dpi_aware();
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--trace")) rt_trace = 1;
         if (!strcmp(argv[i], "--status") && i + 1 < argc) status_every = atoi(argv[++i]);

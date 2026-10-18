@@ -58,6 +58,9 @@ sets the keyboard's player, remaps buttons, rumble strength and dead zones.
 Keyboard: arrows = move; Z/X/C/V = A/B/X/Y; A/S = L/R; Q/W = ZL/ZR;
 Enter = Plus; Backspace = Minus; I/J/K/L = right stick.
 F1 = overlay; F2 = details (lists the pads); F3 = screenshot.
+F11 or Alt+Enter = full screen. display.ini (written on the first start) sets
+the window (windowed, borderless, fullscreen), its size, and the pacing:
+pacing = vrr is best on G-Sync / FreeSync monitors.
 
 Each install starts with a fresh save and generates its own netplay identity.
 If Unlock All Fighters.bat is included, first start the game, reach the main menu,

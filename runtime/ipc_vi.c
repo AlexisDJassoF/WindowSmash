@@ -13,6 +13,7 @@
 
 #include "ipc.h"
 #include "present.h"
+#include "display.h"
 
 #define DISPLAY_ID 1
 #define LAYER_ID 1
@@ -45,17 +46,8 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
     (void)unused;
     SetThreadDescription(GetCurrentThread(), L"vsync");
     timeBeginPeriod(1);
-    LARGE_INTEGER freq, next, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&next);
     for (;;) {
-        next.QuadPart += freq.QuadPart / 60;
-        for (;;) {
-            QueryPerformanceCounter(&now);
-            if (now.QuadPart >= next.QuadPart) break;
-            LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / freq.QuadPart;
-            Sleep(ms > 1 ? (DWORD)ms - 1 : 0);
-        }
+        display_wait_tick();   /* the next refresh (display.ini's pacing) */
         AcquireSRWLockExclusive(&queue.lock);
         int oldest = -1;
         for (int i = 0; i < SLOTS; i++)
