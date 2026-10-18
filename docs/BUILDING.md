@@ -57,7 +57,7 @@ For a base game plus separate update, use the updated program code. For an alrea
 
 ## 2. Configure an unencrypted, patched RomFS
 
-The runtime reads the RomFS in place. It must already contain the installed update; this project's runtime does not merge base/update content while playing.
+The runtime reads the RomFS in place. It must already contain the installed update, or be a layered RomFS that `tools/update.py` makes from your base and an update package (see [later game versions](UPDATES.md)).
 
 For an extracted, patched RomFS image:
 
@@ -71,7 +71,7 @@ For a merged Program NCA whose readable RomFS section is supported by the tool:
 python tools/nca.py romfs-cfg "D:\MyDump\program.nca" --keys "D:\MyKeys" --out dump/modules/romfs.cfg
 ```
 
-For a separate base/update pair, first prepare the patched image using your own extraction workflow. Encrypted or unmerged images are not interchangeable with the unencrypted RomFS the runtime expects.
+For a separate base/update pair, either prepare the patched image using your own extraction workflow, or let `tools/update.py` layer the update over your base in a version folder of its own ([later game versions](UPDATES.md)). Encrypted or unmerged images are not interchangeable with the unencrypted RomFS the runtime expects.
 
 `romfs.cfg` has exactly the runtime information needed:
 

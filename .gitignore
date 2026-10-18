@@ -13,6 +13,8 @@
 /captures/
 /netplay_address.txt
 /netplay_id.txt
+# A game version's own folder (tools/update.py --tree), laid out like the above
+/v[0-9]*/
 *.keys
 *.nca
 *.nsp

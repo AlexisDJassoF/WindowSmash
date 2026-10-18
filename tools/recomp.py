@@ -11,6 +11,10 @@ Usage:
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
   recomp.py all      <exefs dir> --out <build dir> [--jobs N]
 
+Every command also takes --tree <dir>: the folder whose dump/ (module images, harvested NROs)
+and build/ (scratch images) it works with - the port's own (default), or a game version's
+folder of the same layout, e.g. v13.0.5 (tools/update.py).
+
 coverage  lift every function and report what the lifter cannot translate yet
 emit      write C for the given functions and everything they call directly
 image     write the module image with base relocations applied for its load address
@@ -39,12 +43,13 @@ from lift import Lifter
 from nso import Module
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TREE = ROOT   # --tree
 # Load addresses, in the order the console's loader places (and searches) the modules.
 MODULES = {"main": 0x7100000000, "subsdk0": 0x7108000000, "sdk": 0x7109000000}
 # Modules the game loads at run time (NROs). The runtime saves each one it is handed that is
 # not compiled in yet as dump/nro/<build id>.nro; each is then given a load address of its
 # own for good, recorded in dump/nro/bases.txt, so that rebuilding never moves a module.
-NRO_DIR = os.path.join(ROOT, "dump", "nro")
+NRO_DIR = os.path.join(TREE, "dump", "nro")
 NRO_BASE, NRO_ALIGN = 0x7200000000, 0x1000000
 _state = {}
 
@@ -246,7 +251,7 @@ def load(path):
 
 
 def image_file(mod):
-    build_dir = os.path.join(ROOT, "build")
+    build_dir = os.path.join(TREE, "build")
     os.makedirs(build_dir, exist_ok=True)
     path = os.path.join(build_dir, f"image-{mod.build_id[:16]}.img")
     if not os.path.exists(path) or os.path.getsize(path) != len(mod.image):
@@ -497,7 +502,7 @@ def build_all(exefs, out, jobs):
     for name in MODULES:
         nso = os.path.join(NRO_DIR, name + ".nro") if name in nros else os.path.join(exefs, name)
         target = os.path.join(out, "nro", name) if name in nros else os.path.join(out, name)
-        img = os.path.join(ROOT, "dump", "modules", name + ".reloc.bin")
+        img = os.path.join(TREE, "dump", "modules", name + ".reloc.bin")
         if not os.path.exists(img) or os.path.getmtime(img) < os.path.getmtime(nso):
             image(nso, img)
         build(nso, target, jobs, 40000)
@@ -514,6 +519,9 @@ def arg(name, default=None):
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.exit(__doc__)
+    if arg("--tree"):
+        TREE = os.path.abspath(arg("--tree"))
+        NRO_DIR = os.path.join(TREE, "dump", "nro")
     cmd, nso = sys.argv[1], sys.argv[2]
     if cmd == "coverage":
         coverage(nso, int(arg("--jobs", "20")))

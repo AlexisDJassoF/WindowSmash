@@ -1,7 +1,9 @@
 /* nn::fs, natively.
  *
  *   rom:     the game's RomFS, read in place from its NCA (the section is not encrypted), so
- *            the 16.9 GB data.arc is served by positional reads with no extraction
+ *            the 16.9 GB data.arc is served by positional reads with no extraction; or, with
+ *            an update applied (tools/update.py), pieced together from several files by a
+ *            layer map - the base's NCA and the update's own data
  *   save:    save data, a host folder per user (native-port/save/<user>)
  *   cache:   cache storage, a host folder (native-port/cache)
  *
@@ -28,9 +30,20 @@ enum { OPEN_READ = 1, OPEN_WRITE = 2, OPEN_APPEND = 4 };
 enum { LIST_DIRS = 1, LIST_FILES = 2 };
 
 /* ---- the RomFS -------------------------------------------------------------------- */
+/* A layer: image bytes [at, the next layer's at) are source `src` from `off` on (LAYER_ZERO:
+ * zeros). The map file (tools/nca.py write_layers): "SSBUROM1", u64 image size, u32 count,
+ * u32 0, then the layers in image order. */
+typedef struct { u64 at, off; u32 src, pad; } RomLayer;
+#define LAYER_ZERO 0xFFFFFFFFu
+#define ROM_SOURCES 8
+
 static struct {
     HANDLE file;
-    u64 base;           /* where the RomFS image starts in the NCA */
+    u64 base;           /* plain: where the RomFS image starts in the NCA */
+    HANDLE sources[ROM_SOURCES];   /* layered: the files the layers come from */
+    RomLayer *layers;
+    u32 nlayers;
+    u64 size;           /* layered: the image's size */
     u8 *dirs, *files;   /* directory and file metadata tables */
     u64 data;           /* file data offset within the image */
 } rom;
@@ -52,20 +65,72 @@ static int pread_all(HANDLE h, u64 offset, void *buf, u64 size) {
     return 1;
 }
 
+/* Read image bytes [at, at + size). */
+static int rom_read(u64 at, void *buf, u64 size) {
+    if (!rom.layers) return pread_all(rom.file, rom.base + at, buf, size);
+    if (at + size > rom.size) return 0;
+    u32 lo = 0, hi = rom.nlayers;   /* the last layer starting at or before `at` */
+    while (hi - lo > 1) {
+        u32 mid = (lo + hi) / 2;
+        if (rom.layers[mid].at <= at) lo = mid; else hi = mid;
+    }
+    u8 *p = buf;
+    for (u32 k = lo; size; k++) {
+        const RomLayer *l = &rom.layers[k];
+        u64 end = k + 1 < rom.nlayers ? rom.layers[k + 1].at : rom.size;
+        u64 n = end - at < size ? end - at : size;
+        if (l->src == LAYER_ZERO) memset(p, 0, n);
+        else if (!pread_all(rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
+        p += n; at += n; size -= n;
+    }
+    return 1;
+}
+
+static HANDLE rom_file_open(const char *path) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+    if (h == INVALID_HANDLE_VALUE) rt_fatal("cannot open the game's RomFS at %s", path);
+    return h;
+}
+
+/* romfs.cfg: "<file>\n<byte offset>\n" (the image in place in one file), or "layered\n<layer
+ * map>\n<source 0>\n<source 1>...\n" (tools/update.py). */
 static void rom_open(void) {
     char cfg[1024], path[1024];
     snprintf(cfg, sizeof cfg, "%s/romfs.cfg", rt_data_dir);
     FILE *f = fopen(cfg, "r");
-    if (!f || !fgets(path, sizeof path, f) || fscanf(f, "%llu", &rom.base) != 1) rt_fatal("cannot read %s", cfg);
-    fclose(f);
+    if (!f || !fgets(path, sizeof path, f)) rt_fatal("cannot read %s", cfg);
     path[strcspn(path, "\r\n")] = 0;
-    rom.file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
-    if (rom.file == INVALID_HANDLE_VALUE) rt_fatal("cannot open the game's RomFS at %s", path);
+    if (!strcmp(path, "layered")) {
+        char map[1024];
+        if (!fgets(map, sizeof map, f)) rt_fatal("%s: no layer map", cfg);
+        map[strcspn(map, "\r\n")] = 0;
+        u32 n = 0;
+        while (n < ROM_SOURCES && fgets(path, sizeof path, f)) {
+            path[strcspn(path, "\r\n")] = 0;
+            if (path[0]) rom.sources[n++] = rom_file_open(path);
+        }
+        HANDLE m = rom_file_open(map);
+        u8 head[24];
+        if (!pread_all(m, 0, head, sizeof head) || memcmp(head, "SSBUROM1", 8)) rt_fatal("%s: not a layer map", map);
+        memcpy(&rom.size, head + 8, 8);
+        memcpy(&rom.nlayers, head + 16, 4);
+        rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
+        if (!rom.nlayers || !pread_all(m, sizeof head, rom.layers, sizeof *rom.layers * rom.nlayers))
+            rt_fatal("%s: cannot read its %u layers", map, rom.nlayers);
+        CloseHandle(m);
+        for (u32 k = 0; k < rom.nlayers; k++)
+            if (rom.layers[k].src != LAYER_ZERO && rom.layers[k].src >= n) rt_fatal("%s: layer %u names source %u of %u", map, k, rom.layers[k].src, n);
+        fprintf(stderr, "[fs] RomFS: %llu bytes in %u layers from %u files (%s)\n", rom.size, rom.nlayers, n, cfg);
+    } else {
+        if (fscanf(f, "%llu", &rom.base) != 1) rt_fatal("cannot read %s", cfg);
+        rom.file = rom_file_open(path);
+    }
+    fclose(f);
     u64 h[10];
-    if (!pread_all(rom.file, rom.base, h, sizeof h) || h[0] != 0x50) rt_fatal("%s: no RomFS at byte %llu", path, rom.base);
+    if (!rom_read(0, h, sizeof h) || h[0] != 0x50) rt_fatal("%s: no RomFS image there", cfg);
     rom.dirs = malloc(h[4]);
     rom.files = malloc(h[8]);
-    if (!pread_all(rom.file, rom.base + h[3], rom.dirs, h[4]) || !pread_all(rom.file, rom.base + h[7], rom.files, h[8]))
+    if (!rom_read(h[3], rom.dirs, h[4]) || !rom_read(h[7], rom.files, h[8]))
         rt_fatal("cannot read the RomFS tables");
     rom.data = h[9];
 }
@@ -104,7 +169,7 @@ static struct Mount { char name[32]; MountKind kind; char root[512]; } mounts[16
 typedef struct Handle {
     int used, kind, mode;
     HANDLE host;              /* host file */
-    u64 offset, size;         /* rom file: data offset in the NCA and length */
+    u64 offset, size;         /* rom file: data offset in the RomFS image and length */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
 } Handle;
 static Handle handles[512];
@@ -251,7 +316,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         u32 d, f;
         if (!rom_lookup(rest, &d, &f) || f == NONE) { c->x[0] = R_PATH_NOT_FOUND; return; }
         if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
-        h.offset = rom.base + rom.data + rom_file(f)->offset;
+        h.offset = rom.data + rom_file(f)->offset;
         h.size = rom_file(f)->size;
     } else {
         char path[1024];
@@ -279,7 +344,8 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (offset < 0 || (u64)offset > total) return ~0ull;
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
-    return pread_all(h->host ? h->host : rom.file, (h->host ? 0 : h->offset) + (u64)offset, buf, size) ? size : ~0ull;
+    int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
+    return ok ? size : ~0ull;
 }
 
 HLE(_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm) {   /* (handle, offset, buffer, size): all or nothing */

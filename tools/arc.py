@@ -2,17 +2,19 @@
 """Minimal reader for the game's data.arc: file lookup by path, extraction.
 
 Usage:
-  arc.py info [--romfs-cfg <romfs.cfg>]
-  arc.py get  <arc path>... --out <dir> [--romfs-cfg <romfs.cfg>]
-  arc.py nro  [--out <dir>] [--romfs-cfg <romfs.cfg>]
+  arc.py info [--tree <dir>] [--romfs-cfg <romfs.cfg>]
+  arc.py get  <arc path>... --out <dir> [--tree <dir>] [--romfs-cfg <romfs.cfg>]
+  arc.py nro  [--out <dir>] [--tree <dir>] [--romfs-cfg <romfs.cfg>]
 
 data.arc is read in place inside the game's RomFS, found through romfs.cfg (default
-dump/modules/romfs.cfg, the file the runtime reads). Paths are the archive's own, e.g.
+<tree>/dump/modules/romfs.cfg, the file the runtime reads; plain or layered, see
+nca.RomfsImage). The tree is the port's folder (default), or another game version's folder of
+the same layout, e.g. v13.0.5 (tools/update.py). Paths are the archive's own, e.g.
 "prebuilt:/nro/release/lua2cpp_mario.nro"; `get` writes each file under its base name.
 `nro` extracts every module in prebuilt:/nro/release/ that is not compiled in yet (not in
-dump/nro/bases.txt) into dump/nro, where the next `recomp.py all` picks it up - the same
-place the runtime saves an NRO the game hands over (runtime/hle_ro.c). The archive stores
-only hashes of names, so `nro` knows a module by the names in NRO_NAMES.
+<tree>/dump/nro/bases.txt) into <tree>/dump/nro, where the next `recomp.py all` picks it up -
+the same place the runtime saves an NRO the game hands over (runtime/hle_ro.c). The archive
+stores only hashes of names, so `nro` knows a module by the names in NRO_NAMES.
 
 Layout (smash-arc's naming): a header, then a zstd-compressed file system table; a path's
 hash40 (crc32 of the lowercase path | length << 32) picks a bucket, a binary search in the
@@ -27,12 +29,13 @@ import zlib
 from compression import zstd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from nca import romfs_entries  # noqa: E402
+from nca import RomfsImage, romfs_entries  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NRO_DIR = "prebuilt:/nro/release/"
 # Every module in NRO_DIR as of 11.0.0 (96): the fighters, plus common, item, element (shared by
-# Pyra/Mythra), koopag (Giga Bowser), ptrainer, and the Mii enemies of Spirits/Classic.
+# Pyra/Mythra), koopag (Giga Bowser), ptrainer, and the Mii enemies of Spirits/Classic; and
+# demon (Kazuya, 12.0.0) and trail (Sora, 13.0.0).
 NRO_NAMES = ("bayonetta brave buddy captain chrom cloud common daisy dedede demon diddy dolly donkey duckhunt "
              "edge eflame element elight falco fox gamewatch ganon gaogaen gekkouga ike inkling item jack kamui "
              "ken kirby koopa koopag koopajr krool link littlemac lucario lucas lucina luigi mario mariod marth "
@@ -50,30 +53,24 @@ def hash40(path):
     return zlib.crc32(s) | (len(s) << 32)
 
 
-class _Image:
-    """The RomFS image inside the NCA, as nca.romfs_entries reads it."""
-    start = data_off = 0
-    enc_type = 1
-
-    def __init__(self, f, base):
-        self.f, self.base = f, base
-
-    def read(self, off, size):
-        self.f.seek(self.base + off)
-        return self.f.read(size)
+def data_arc_offset(image):
+    """Where data.arc starts in a RomFS image."""
+    found = [off for path, off, _ in romfs_entries(image) if path == "data.arc"]
+    if not found:
+        raise SystemExit("no data.arc in the game's RomFS")
+    return found[0]
 
 
 class Arc:
-    def __init__(self, romfs_cfg):
-        with open(romfs_cfg) as f:
-            nca_path, base = f.read().split("\n")[:2]
-        self.f = open(nca_path, "rb")
-        image = _Image(self.f, int(base))
-        found = [off for path, off, _ in romfs_entries(image) if path == "data.arc"]
-        if not found:
-            raise SystemExit(f"no data.arc in the RomFS named by {romfs_cfg}")
-        self.base = int(base) + found[0]
-        hdr = struct.unpack("<7Q", self.read(0, 0x38))
+    def __init__(self, source):
+        """`source`: a romfs.cfg, or read(offset, size) over data.arc's own bytes."""
+        if isinstance(source, str):
+            image = RomfsImage(source)
+            base = data_arc_offset(image)
+            self.read = lambda off, size: image.read(base + off, size)
+        else:
+            self.read = source
+        hdr = self.header = struct.unpack("<7Q", self.read(0, 0x38))
         if hdr[0] != MAGIC:
             raise SystemExit("data.arc: bad magic")
         self.file_section = hdr[2]
@@ -84,30 +81,83 @@ class Arc:
 
         (_size, paths, info_indices, folders, offsets_1, child_hashes, infos, info_to_datas, datas,
          offsets_2, datas_2) = struct.unpack_from("<11I", t, 0)
-        regions, _, _, self.version, extra_folders, extra, _, _, extra_2, _ = struct.unpack_from("<BBHIIIIIII", t, 56)
-        o = 0x58 + regions * 12                      # header, then one 12-byte entry per region
+        self.regions, _, _, self.version, extra_folders, extra, _, _, extra_2, _ = struct.unpack_from("<BBHIIIIIII", t, 56)
+        o = 0x58 + self.regions * 12                 # header, then one 12-byte entry per region
         quick_dirs, stream_hashes, stream_indices, stream_datas = struct.unpack_from("<4I", t, o)
-        o += 16 + quick_dirs * 12 + stream_hashes * (8 + 12) + stream_indices * 4 + stream_datas * 16
+        o += 16 + quick_dirs * 12
+        self.tab = {}   # name -> (offset, entry size, count)
+        for name, count, size in (("stream_hash_to_entry", stream_hashes, 8), ("stream_entries", stream_hashes, 12),
+                                  ("stream_indices", stream_indices, 4), ("stream_datas", stream_datas, 16)):
+            self.tab[name] = (o, size, count)
+            o += count * size
         groups, self.buckets = struct.unpack_from("<2I", t, o)
         self.bucket_table = o + 8
         o = self.bucket_table + self.buckets * 8
-        self.tab = {}   # name -> (offset, entry size)
         for name, count, size in (("hash_to_path", groups, 8), ("paths", paths, 32), ("info_indices", info_indices, 8),
                                   ("dir_hash_to_info", folders, 8), ("dirs", folders, 0x34),
                                   ("folder_offsets", offsets_1 + offsets_2 + extra_folders, 0x1C),
                                   ("child_hashes", child_hashes, 8), ("infos", infos + datas_2 + extra, 16),
                                   ("info_to_datas", info_to_datas + datas_2 + extra_2, 12),
                                   ("datas", datas + datas_2 + extra, 16)):
-            self.tab[name] = (o, size)
+            self.tab[name] = (o, size, count)
             o += count * size
 
-    def read(self, off, size):
-        self.f.seek(self.base + off)
-        return self.f.read(size)
-
     def _entry(self, table, index, fmt):
-        offset, size = self.tab[table]
+        offset, size, _count = self.tab[table]
         return struct.unpack_from(fmt, self.t, offset + index * size)
+
+    def _data(self, to_data):
+        """(offset in data.arc, stored size, size, flags) of an info-to-data entry, or None."""
+        try:
+            folder, data, _ = self._entry("info_to_datas", to_data, "<3I")
+            folder_offset = self._entry("folder_offsets", folder, "<Q")[0]
+            in_folder, stored, size, flags = self._entry("datas", data, "<4I")
+        except struct.error:   # an index past its table
+            return None
+        return self.file_section + folder_offset + in_folder * 4, stored, size, flags
+
+    def files_by_path(self):
+        """(path hash40, region) -> where its data is, for every path (each region's variant of
+        a regional file)."""
+        out = {}
+        for i in range(self.tab["paths"][2]):
+            full = self._entry("paths", i, "<Q")[0]
+            try:
+                info = self._entry("info_indices", full >> 40, "<2I")[1]
+                to_data, flags = self._entry("infos", info, "<4I")[2:]
+            except struct.error:
+                continue
+            for r in range(self.regions) if flags & 0x8000 else (0,):
+                where = self._data(to_data + r)
+                if where:
+                    out[(full & LOW40, r)] = where
+        return out
+
+    def reachable(self):
+        """Where the data of every info-to-data entry is: everything a file can lead to."""
+        out = []
+        for i in range(self.tab["info_to_datas"][2]):
+            where = self._data(i)
+            if where:
+                out.append(where)
+        return out
+
+    def streams(self):
+        """(stream hash40, variant) -> (offset in data.arc, size): the stream: files (music,
+        movies), which are stored uncompressed outside the file section."""
+        out = {}
+        nidx, ndat = self.tab["stream_indices"][2], self.tab["stream_datas"][2]
+        for i in range(self.tab["stream_entries"][2]):
+            full, flags = self._entry("stream_entries", i, "<QI")
+            index = full >> 40
+            for r in range((14 if flags & 1 else 5) if flags & 3 else 1):   # localized / regional variants
+                if index + r >= nidx:
+                    break
+                d = self._entry("stream_indices", index + r, "<I")[0]
+                if d < ndat:
+                    size, offset = self._entry("stream_datas", d, "<QQ")
+                    out[(full & LOW40, r)] = (offset, size)
+        return out
 
     def locate(self, path):
         """(offset in data.arc, stored size, size, compressed) of a file, or None if absent."""
@@ -125,10 +175,11 @@ class Arc:
         full = self._entry("paths", v >> 40, "<Q")[0]
         info = self._entry("info_indices", full >> 40, "<2I")[1]
         _, _, to_data, _flags = self._entry("infos", info, "<4I")   # regional files are not handled
-        folder, data, _ = self._entry("info_to_datas", to_data, "<3I")
-        folder_offset = self._entry("folder_offsets", folder, "<Q")[0]
-        in_folder, stored, size, flags = self._entry("datas", data, "<4I")
-        return self.file_section + folder_offset + in_folder * 4, stored, size, bool(flags & 3)
+        where = self._data(to_data)
+        if where is None:
+            return None
+        offset, stored, size, flags = where
+        return offset, stored, size, bool(flags & 3)
 
     def get(self, path):
         where = self.locate(path)
@@ -148,9 +199,10 @@ def main():
     ap.add_argument("cmd", choices=["info", "get", "nro"])
     ap.add_argument("paths", nargs="*")
     ap.add_argument("--out")
-    ap.add_argument("--romfs-cfg", default=os.path.join(ROOT, "dump", "modules", "romfs.cfg"))
+    ap.add_argument("--tree", default=ROOT, help="the port's folder or a game version's folder (e.g. v13.0.5)")
+    ap.add_argument("--romfs-cfg")
     a = ap.parse_args()
-    arc = Arc(a.romfs_cfg)
+    arc = Arc(a.romfs_cfg or os.path.join(a.tree, "dump", "modules", "romfs.cfg"))
     if a.cmd == "info":
         v = arc.version
         print(f"data.arc version {v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}, {arc.buckets} buckets")
@@ -167,7 +219,7 @@ def main():
                 f.write(data)
             print(f"  {path} ({len(data)})")
     elif a.cmd == "nro":
-        out = a.out or os.path.join(ROOT, "dump", "nro")
+        out = a.out or os.path.join(a.tree, "dump", "nro")
         manifest = os.path.join(out, "bases.txt")
         known = {l.split()[0] for l in open(manifest)} if os.path.exists(manifest) else set()
         os.makedirs(out, exist_ok=True)

@@ -7,7 +7,8 @@
   <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> ·
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
   <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
-  <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a>
+  <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
+  <a href="docs/UPDATES.md"><strong>Later versions</strong></a>
 </p>
 
 ---
@@ -33,7 +34,7 @@ The result is a locally built Windows executable backed by your own extracted ga
 
 ## Status
 
-The current implementation targets **game version 11.0.0** and **Windows x64**. The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
+The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
 
 | Area | Current position |
 | :--- | :--- |
