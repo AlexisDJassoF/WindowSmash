@@ -132,7 +132,12 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
     if (source / 'build/SDL3.dll').is_file() and sdl_licence.is_file():
         payload.append(file_payload('build/SDL3-LICENSE.txt', sdl_licence))
     if shader_cache:
-        for path in sorted((source / 'dump/shadercache').glob('*.dxbc')):
+        # only the runtime's current cache version (older files are never read, and the start's
+        # prewarm creates every current one)
+        renderer = source / 'runtime/gpu_d3d11.c'
+        version = re.search(r'#define SHADER_CACHE_VERSION (\d+)', renderer.read_text(encoding='utf-8')) if renderer.is_file() else None
+        pattern = f'v{version.group(1)}_*.dxbc' if version else '*.dxbc'
+        for path in sorted((source / 'dump/shadercache').glob(pattern)):
             payload.append(file_payload('dump/shadercache/' + path.name, path))
     relay = source / 'tools/ssbu_relay.py'
     if relay.is_file():
