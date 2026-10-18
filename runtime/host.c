@@ -206,6 +206,11 @@ _Noreturn void rt_trap(Cpu *c, u64 pc, const char *why) {
     rt_fatal("guest trap at %s: %s", rt_describe(pc, name, sizeof name), why);
 }
 
+/* The original of a wrapped guest function (HLE_WRAP) this game version does not have:
+ * tools/recomp.py links each f_<address>_orig no module defines to this one. Nothing calls
+ * it, since nothing reaches that wrapper either. */
+void rt_wrap_missing(Cpu *c) { rt_trap(c, 0, "wrapped guest function missing from this game version"); }
+
 /* ---- dispatch -------------------------------------------------------------------- */
 /* The tables are 2 bytes per byte of code (hundreds of MB), so a lookup in them mostly misses
  * the processor's caches; a small cache of recent ones goes first. Modules are never unloaded,

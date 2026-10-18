@@ -3,11 +3,12 @@
 </p>
 
 <p align="center">
-  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> Â·
-  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> Â·
-  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> Â·
-  <a href="NETPLAY.md"><strong>Netplay</strong></a> Â·
-  <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a>
+  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> ·
+  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> ·
+  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
+  <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
+  <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
+  <a href="docs/UPDATES.md"><strong>Later versions</strong></a>
 </p>
 
 ---
@@ -33,7 +34,7 @@ The result is a locally built Windows executable backed by your own extracted ga
 
 ## Status
 
-The current implementation targets **game version 11.0.0** and **Windows x64**. The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
+The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). `tools/install_version.py` installs and builds a version in a folder of its own with one command, and the launchers ask which built version to start ([several game versions](docs/VERSIONS.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
 
 | Area | Current position |
 | :--- | :--- |
@@ -48,7 +49,7 @@ There is no Nintendo online-service integration, general Switch compatibility cl
 
 ## Download and run
 
-**[Get the Windows x64 runtime â†’](https://github.com/SNO2207/WindowSmash/releases)**
+**[Get the Windows x64 runtime →](https://github.com/SNO2207/WindowSmash/releases)**
 
 Extract the runtime ZIP, run **Configure Game Data.bat** to select your own compatible RomFS and firmware fonts, then use **Play SSBU.bat**. The runtime ZIP has the compiled files needed to execute the game; it excludes source, debug maps, object files, caches, saves, keys, and game-data archives. A compiler and Python are not required to play.
 
@@ -82,7 +83,7 @@ Choose a job count appropriate to your CPU and available memory. The output is `
 3. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
 4. Both open **Local Wireless** in-game. The host creates a room; the friend selects it and the host accepts.
 
-**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting â†’](NETPLAY.md)**
+**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting →](NETPLAY.md)**
 
 | Launcher | Use |
 | :--- | :--- |

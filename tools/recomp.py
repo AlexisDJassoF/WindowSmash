@@ -10,6 +10,12 @@ Usage:
   recomp.py compile  <dir> [--jobs N]
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
   recomp.py all      <exefs dir> --out <build dir> [--jobs N]
+  recomp.py check    <exefs dir>
+  recomp.py wrap-sig <nso> <address>
+
+Every command also takes --tree <dir>: the folder whose dump/ (module images, harvested NROs)
+and build/ (scratch images) it works with - the port's own (default), or a game version's
+folder of the same layout, e.g. v13.0.5 (tools/update.py).
 
 coverage  lift every function and report what the lifter cannot translate yet
 emit      write C for the given functions and everything they call directly
@@ -17,7 +23,10 @@ image     write the module image with base relocations applied for its load addr
 build     write C for a whole module, split across many files, plus its loader tables
 compile   compile a build directory to objects (incremental; reports per-file failures)
 link      compile the host runtime and link module build directories into an executable
-all       image + build + compile every module of an ExeFS, then link
+all       image + build + compile every module of an ExeFS, then link; a module another game
+          version tree already built (same build id) is reused, not built again (modcache.py)
+check     list each module's imports that no module exports and the runtime does not implement
+wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
 
 Each module is recompiled for a fixed load address (see MODULES); a function is named after
 its guest address, so names are unique across modules. A module function whose exported
@@ -34,18 +43,21 @@ import time
 from collections import Counter
 from multiprocessing import Pool
 
+import modcache
 from funcs import discover
 from lift import Lifter
 from nso import Module
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TREE = ROOT   # --tree
 # Load addresses, in the order the console's loader places (and searches) the modules.
 MODULES = {"main": 0x7100000000, "subsdk0": 0x7108000000, "sdk": 0x7109000000}
 # Modules the game loads at run time (NROs). The runtime saves each one it is handed that is
 # not compiled in yet as dump/nro/<build id>.nro; each is then given a load address of its
-# own for good, recorded in dump/nro/bases.txt, so that rebuilding never moves a module.
-NRO_DIR = os.path.join(ROOT, "dump", "nro")
-NRO_BASE, NRO_ALIGN = 0x7200000000, 0x1000000
+# own for good, recorded in dump/nro/bases.txt, so that rebuilding never moves a module - the
+# address the same module (build id) has in every other game version tree, when it is free
+# (modcache.place), so that its build can be shared.
+NRO_DIR = os.path.join(TREE, "dump", "nro")
 _state = {}
 
 
@@ -56,9 +68,8 @@ def module_key(path):
 def nro_modules():
     """name -> base for every harvested NRO, naming and placing new arrivals."""
     manifest = os.path.join(NRO_DIR, "bases.txt")
-    rows = [l.split() for l in open(manifest)] if os.path.exists(manifest) else []
+    rows = modcache.read_bases(manifest)
     known = {r[3]: r for r in rows}
-    end = max([int(r[2], 16) for r in rows] + [NRO_BASE])
     added = False
     for f in sorted(os.listdir(NRO_DIR)) if os.path.isdir(NRO_DIR) else []:
         path = os.path.join(NRO_DIR, f)
@@ -71,15 +82,14 @@ def nro_modules():
         name = re.sub(r"\W", "_", module_key(mod.module_name().replace("\\", "/")).lower()) or "nro"
         if not name[0].isalpha():
             name = "nro_" + name
+        name, base, reused = modcache.place(mod.build_id, name, mod.mem_end, rows)
         while name in MODULES or name in {r[0] for r in rows}:
             name += "_"
-        base = (end + NRO_ALIGN - 1) // NRO_ALIGN * NRO_ALIGN
-        end = base + mod.mem_end
-        row = [name, f"{base:x}", f"{end:x}", mod.build_id]
+        row = [name, f"{base:x}", f"{base + mod.mem_end:x}", mod.build_id]
         rows.append(row)
         known[mod.build_id] = row
         os.replace(path, os.path.join(NRO_DIR, name + ".nro"))
-        print(f"new NRO {name}: {mod.mem_end:,} bytes at {base:#x}")
+        print(f"new NRO {name}: {mod.mem_end:,} bytes at {base:#x}" + (" (as in another version)" if reused else ""))
         added = True
     if added:
         with open(manifest, "w", newline="\n") as f:
@@ -109,24 +119,97 @@ def hle_names():
 
 def hle_wraps():
     """Guest functions (not exported) wrapped natively: `HLE_WRAP(<address>)` in the runtime
-    sources. The function stays, as f_<address>_orig; its callers reach the native wrapper."""
-    found = set()
+    sources, address -> code signature or None. The function stays, as f_<address>_orig; its
+    callers reach the native wrapper. The address is a given game version's; a comment
+    `/* signature: <words> */` on the line before (`recomp.py wrap-sig` prints one) lets other
+    versions find the function where it is (resolve_wraps). A wrap no module has is left out:
+    its f_<address>_orig is linked to rt_wrap_missing (link)."""
+    found = {}
     runtime = os.path.join(ROOT, "runtime")
     for name in os.listdir(runtime):
         if name.endswith(".c"):
             with open(os.path.join(runtime, name), encoding="utf-8") as f:
-                found |= {int(a, 16) for a in re.findall(r"^HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M)}
+                for sig, a in re.findall(r"^(?:/\* signature: ([0-9a-f. ]+) \*/\r?\n)?HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M):
+                    found[int(a, 16)] = sig.split() or None
     return found
 
 
+def signature(mod, off, size, n=16):
+    """The code signature of the function at module offset `off`: its first n instructions as
+    hex words, with the nibbles that depend on where code and data lie ('.') - the immediates
+    of branches, adr/adrp and literal loads, and the page offsets added to an adrp's result."""
+    out, pages = [], set()
+    for i in range(min(n, size // 4)):
+        w = mod.u32(off + 4 * i)
+        mask = 0xFFFFFFFF
+        if w & 0x7C000000 == 0x14000000:                                  # b, bl
+            mask = 0xFC000000
+        elif w & 0xFF000010 == 0x54000000 or w & 0x7E000000 == 0x34000000 or w & 0x3B000000 == 0x18000000:
+            mask = 0xFF00001F                                             # b.cond, cbz/cbnz, ldr literal
+        elif w & 0x7E000000 == 0x36000000:                                # tbz/tbnz
+            mask = 0xFFF8001F
+        elif w & 0x1F000000 == 0x10000000:                                # adr, adrp
+            mask = 0x9F00001F
+            if w >> 31:
+                pages.add(w & 31)
+        elif (w >> 5) & 31 in pages and (w & 0x7F800000 == 0x11000000 or w & 0x3B000000 == 0x39000000):
+            mask = 0xFFC003FF                                             # add / load / store at an adrp page
+        out.append("".join(f"{w >> s & 15:x}" if mask >> s & 15 == 15 else "." for s in range(28, -4, -4)))
+    return out
+
+
+def signature_pattern(sig):
+    """A regular expression over little-endian code bytes for a signature."""
+    pat = b""
+    for word in sig:
+        for k in range(4):   # low byte first
+            hi, lo = word[6 - 2 * k], word[7 - 2 * k]
+            vals = [b for b in range(256) if (hi == "." or b >> 4 == int(hi, 16)) and (lo == "." or b & 15 == int(lo, 16))]
+            if len(vals) == 256:
+                pat += b"."
+            else:
+                pat += b"[" + b"".join(b"\\x%02x" % v for v in vals) + b"]"
+    return re.compile(b"(?=" + pat + b")", re.S)
+
+
+def resolve_wraps(mod, base, sizes, name):
+    """This module's wraps: {offset: ("wrap", wrapper)}, and [(address, address in this
+    version)] for each found by its signature somewhere else than its address."""
+    forward, moved = {}, []
+    for a, sig in sorted(hle_wraps().items()):
+        if max((b for b in MODULES.values() if b <= a), default=None) != base:
+            continue   # another module's
+        off = a - base
+        if off in sizes and (sig is None or signature(mod, off, sizes[off], len(sig)) == sig):
+            forward[off] = ("wrap", f"hle_wrap_{a:x}")
+            continue
+        text = bytes(mod.image[mod.text.mem:mod.text.end])
+        hits = [mod.text.mem + m.start() for m in signature_pattern(sig).finditer(text)] if sig else []
+        hits = [h for h in hits if h in sizes and signature(mod, h, sizes[h], len(sig)) == sig]
+        if len(hits) == 1:
+            forward[hits[0]] = ("wrap", f"hle_wrap_{a:x}")
+            moved.append((a, base + hits[0]))
+            print(f"{name}: HLE_WRAP({a:x}) is at {base + hits[0]:x} in this version (found by its signature)")
+        else:
+            why = "no function at that address" if not sig else f"{len(hits)} functions match its signature"
+            print(f"{name}: HLE_WRAP({a:x}) left out ({why}): its hook does nothing in this version")
+    return forward, moved
+
+
+def tools_fingerprint():
+    """What the generated C depends on besides the module and its address (modcache)."""
+    wraps = sorted(hle_wraps().items())
+    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps))
+
+
 def write_if_changed(path, text):
-    """Leave an identical file untouched so its object stays up to date."""
+    """Leave an identical file untouched so its object stays up to date. A changed one is
+    written as a new file: it may be a link to another tree's (modcache.adopt)."""
     if os.path.exists(path):
         with open(path, encoding="utf-8", newline="") as f:
             if f.read() == text:
                 return False
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    modcache.replace_file(path, text)
     return True
 
 
@@ -246,7 +329,7 @@ def load(path):
 
 
 def image_file(mod):
-    build_dir = os.path.join(ROOT, "build")
+    build_dir = os.path.join(TREE, "build")
     os.makedirs(build_dir, exist_ok=True)
     path = os.path.join(build_dir, f"image-{mod.build_id[:16]}.img")
     if not os.path.exists(path) or os.path.getsize(path) != len(mod.image):
@@ -348,8 +431,10 @@ def image(path, out):
     print(f"wrote {out}: {len(img):,} bytes, {n:,} base relocations applied for {base:#x}")
 
 
-def module_table(mod, name, base, funcs, missing):
-    """C source for a module's loader tables: functions, exports, and symbol relocations."""
+def module_table(mod, name, base, funcs, missing, moved=()):
+    """C source for a module's loader tables: functions, exports, and symbol relocations; and
+    for each wrapped function found elsewhere (resolve_wraps), the original under the name
+    the runtime's wrapper calls."""
     imports, relocs = {}, []
     for off, typ, sym, addend in mod.relocs:
         if typ == 1027:
@@ -362,6 +447,7 @@ def module_table(mod, name, base, funcs, missing):
     out += [f"GuestFn f_{base + a:x};\n" for a in defined]
     out += [f'void f_{base + a:x}(Cpu *c) {{ rt_trap(c, 0x{base + a:X}ull, "no code at call target"); }}\n'
             for a in sorted(missing)]
+    out += [f"GuestFn f_{at:x}_orig;\nvoid f_{a:x}_orig(Cpu *c) {{ f_{at:x}_orig(c); }}\n" for a, at in moved]
     out.append("\nstatic const RtFunc funcs[] = {\n")
     out += [f"    {{0x{base + a:X}ull, f_{base + a:x}}},\n" for a in defined]
     out.append("};\nstatic const RtSym exports[] = {\n")
@@ -383,11 +469,12 @@ def build(path, outdir, jobs, per_file):
     mod, found, funcs = load(path)
     name, base = module_key(path), base_of(path)
     os.makedirs(outdir, exist_ok=True)
+    modcache.clear_stamp(outdir)   # (until generated and compiled again)
     hle = hle_names()
     forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
     forward.update(unwind_jumpto(mod, found))
-    starts = set(found)
-    forward.update({a - base: ("wrap", f"hle_wrap_{a:x}") for a in hle_wraps() if a - base in starts})
+    wraps, moved = resolve_wraps(mod, base, dict(funcs), name)
+    forward.update(wraps)
     from eh import landing_pads
     pads = landing_pads(mod)
     chunks, cur, count = [], [], 0
@@ -408,14 +495,13 @@ def build(path, outdir, jobs, per_file):
             manifest.append((fname, insns, biggest))
             bad += b
             unresolved += unres
-    table, imports, relocs = module_table(mod, name, base, funcs, missing)
+    table, imports, relocs = module_table(mod, name, base, funcs, missing, moved)
     write_if_changed(os.path.join(outdir, "g_module.c"), table)
     keep = {n for n, _i, _b in manifest} | {"g_module.c"}
     for old in os.listdir(outdir):   # drop files left over from a different partitioning
         if old.startswith("g") and old.endswith((".c", ".obj")) and os.path.splitext(old)[0] + ".c" not in keep:
             os.remove(os.path.join(outdir, old))
-    with open(os.path.join(outdir, "manifest.tsv"), "w", newline="\n") as f:
-        f.write("".join(f"{n}\t{i}\t{b}\n" for n, i, b in sorted(manifest)))
+    write_if_changed(os.path.join(outdir, "manifest.tsv"), "".join(f"{n}\t{i}\t{b}\n" for n, i, b in sorted(manifest)))
     size = sum(os.path.getsize(os.path.join(outdir, n)) for n, _i, _b in manifest)
     print(f"{name}: {len(manifest)} files, {size / 1048576:,.0f} MB of C, {len(defined):,} functions, "
           f"{sum(i for _n, i, _b in manifest):,} instructions; {bad} untranslated, {len(missing)} calls to nowhere, "
@@ -434,6 +520,9 @@ def compile_dir(outdir, jobs):
         if not os.path.exists(obj) or os.path.getmtime(obj) < os.path.getmtime(src):
             # very large functions make the optimiser superlinear; build those at a lower level
             todo.append((src, obj, "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2"))
+    for _src, obj, _opt in todo:   # a new file, not one written through (it may be a link: modcache.adopt)
+        if os.path.exists(obj):
+            os.remove(obj)
     t0 = time.time()
     failures = cc.compile_each(todo, jobs)
     objs = [n for n in os.listdir(outdir) if n.endswith(".obj")]
@@ -485,25 +574,55 @@ def link(dirs, exe):
     objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [table[:-2] + ".obj", nro_table[:-2] + ".obj"]
     for d in dirs:
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
-    cc.link(objs, exe)
+    # a wrap no module has (another game version): its original is a stub nothing calls
+    cc.link(objs, exe, [f"/alternatename:f_{a:x}_orig=rt_wrap_missing" for a in sorted(hle_wraps())])
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
 
 
-def build_all(exefs, out, jobs):
-    dirs = []
+def module_paths(exefs):
+    """name -> module file, for the ExeFS's modules and the tree's NROs (placing new NROs)."""
     nros = nro_modules()
     MODULES.update(nros)
-    for name in MODULES:
-        nso = os.path.join(NRO_DIR, name + ".nro") if name in nros else os.path.join(exefs, name)
-        target = os.path.join(out, "nro", name) if name in nros else os.path.join(out, name)
-        img = os.path.join(ROOT, "dump", "modules", name + ".reloc.bin")
+    return {name: os.path.join(NRO_DIR, name + ".nro") if name in nros else os.path.join(exefs, name) for name in MODULES}
+
+
+def check(exefs):
+    """The imports no module exports and the runtime does not implement, listed before
+    anything is compiled."""
+    mods = {name: Module(path) for name, path in module_paths(exefs).items()}
+    return modcache.report_imports(mods, hle_names(), os.path.join(TREE, "build", "imports.unresolved.txt"))
+
+
+def build_all(exefs, out, jobs):
+    dirs = []
+    paths = module_paths(exefs)
+    check(exefs)
+    fp = tools_fingerprint()
+    reused = 0
+    for name, nso in paths.items():
+        target = os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
+        img = os.path.join(TREE, "dump", "modules", name + ".reloc.bin")
         if not os.path.exists(img) or os.path.getmtime(img) < os.path.getmtime(nso):
             image(nso, img)
-        build(nso, target, jobs, 40000)
+        mod, base = Module(nso), MODULES[name]
+        info = modcache.build_info(target)
+        if not info or info[:2] != (mod.build_id, base):   # another tree may have built it
+            src = modcache.find_built(mod.build_id, base, target, fp)
+            if src:
+                linked, copied = modcache.adopt(src, target)
+                print(f"{name}: build files of {src} ({linked} linked, {copied} copied)")
+                info = modcache.build_info(target)
+        if info == (mod.build_id, base, name, fp):
+            print(f"{name}: C up to date (build id {mod.build_id[:16]}, same tools)")
+            reused += 1
+        else:
+            build(nso, target, jobs, 40000)
         if not compile_dir(target, min(jobs, 16)):
             return False
+        modcache.write_stamp(target, mod.build_id, base, name, fp)
         dirs.append(target)
+    print(f"{reused} of {len(paths)} modules reused without generating their C again")
     return link(dirs, os.path.join(out, "ssbu.exe"))
 
 
@@ -514,6 +633,9 @@ def arg(name, default=None):
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.exit(__doc__)
+    if arg("--tree"):
+        TREE = os.path.abspath(arg("--tree"))
+        NRO_DIR = os.path.join(TREE, "dump", "nro")
     cmd, nso = sys.argv[1], sys.argv[2]
     if cmd == "coverage":
         coverage(nso, int(arg("--jobs", "20")))
@@ -530,5 +652,18 @@ if __name__ == "__main__":
         sys.exit(0 if link(arg("--dirs").split(","), arg("--out")) else 1)
     elif cmd == "all":
         sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20"))) else 1)
+    elif cmd == "check":
+        check(nso)
+    elif cmd == "wrap-sig":
+        m = Module(nso)
+        a = int(sys.argv[3], 16)
+        off = a - base_of(nso)
+        sizes = dict(load(nso)[2])
+        if off not in sizes:
+            sys.exit(f"{a:x} is not a function start in {nso}")
+        sig = signature(m, off, sizes[off])
+        text = bytes(m.image[m.text.mem:m.text.end])
+        hits = sum(1 for _ in signature_pattern(sig).finditer(text))
+        print(f"/* signature: {' '.join(sig)} */\n({hits} match(es) in the module's code)")
     else:
         sys.exit(__doc__)

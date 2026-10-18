@@ -7,9 +7,13 @@ set "SSBU_NET_RELAY="
 set "SSBU_NET_BIND="
 @echo off
 rem Starts the game as a netplay player joining a host's relay (or a standalone relay,
-rem tools\ssbu_relay.py). No port forwarding needed here. See NETPLAY.md. The log goes to build\play.log.
+rem tools\ssbu_relay.py). No port forwarding needed here. See NETPLAY.md. The log goes to
+rem <version folder>\build\play.log. With several game versions built it asks which
+rem (docs\VERSIONS.md): the host needs the same version.
 cd /d "%~dp0"
 setlocal
+call tools\pick_version.bat || (pause & exit /b 1)
+echo The host needs this same game version.
 set "SSBU_NET_RELAY="
 set /p "SSBU_NET_RELAY=Host's address (IP or IP:port, from the host's netplay_address.txt): "
 if "%SSBU_NET_RELAY%"=="" (
@@ -21,7 +25,7 @@ set "SSBU_NET_NAME=%USERNAME%"
 set /p "SSBU_NET_NAME=Your player name [%SSBU_NET_NAME%]: "
 set "SSBU_NET_ROOM=smash"
 set /p "SSBU_NET_ROOM=Room name - the same as the host's [smash]: "
-start "SSBU netplay log" /min cmd /c "build\ssbu.exe dump\modules --status 30 > build\play.log 2>&1"
+start "SSBU netplay log" /min cmd /c "%SSBU_TREE%\build\ssbu.exe %SSBU_TREE%\dump\modules --status 30 > %SSBU_TREE%\build\play.log 2>&1"
 echo.
 echo Starting the game, joining room "%SSBU_NET_ROOM%" at %SSBU_NET_RELAY%...
 echo In the game: Local Wireless, then pick the host's room from the Rooms List.

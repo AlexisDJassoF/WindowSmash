@@ -1,6 +1,8 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\Unlock-All-Fighters.ps1" %*
+cd /d "%~dp0"
+call tools\pick_version.bat || (pause & exit /b 1)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\Unlock-All-Fighters.ps1" -Tree "%SSBU_TREE%" %*
 set "SSBU_UNLOCK_RESULT=%ERRORLEVEL%"
 echo.
 pause
