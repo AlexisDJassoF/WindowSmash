@@ -35,7 +35,7 @@ The result is a locally built Windows executable backed by your own extracted ga
 
 ## Status
 
-The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). An experimental **Linux x64** build is cross-compiled from the same source ([Linux](README-LINUX.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
+The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). `tools/install_version.py` installs and builds a version in a folder of its own with one command, and the launchers ask which built version to start ([several game versions](docs/VERSIONS.md)). An experimental **Linux x64** build is cross-compiled from the same source ([Linux](README-LINUX.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
 
 | Area | Current position |
 | :--- | :--- |

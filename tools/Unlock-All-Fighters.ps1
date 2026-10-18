@@ -1,5 +1,6 @@
 param(
     [string]$SavePath,
+    [string]$Tree,
     [switch]$DryRun
 )
 
@@ -8,8 +9,29 @@ Set-StrictMode -Version Latest
 
 try {
     $installRoot = Split-Path -Parent $PSScriptRoot
+    # The game version's folder (the port's own, or e.g. v13.0.5): the save layout depends on
+    # the version, known by its main module's build id (the same table as tools/unlock_all.py).
+    if (-not $Tree) { $Tree = $installRoot } elseif (-not [System.IO.Path]::IsPathRooted($Tree)) { $Tree = Join-Path $installRoot $Tree }
+    # build id = game version, save size, FLAGS, RECORDS
+    $knownLayouts = @{
+        '4A3F8ED7DCCE3AD4541A3A2F7622B5B57FC8A55C' = @('11.0.0', 0x5B4AF8, 0x53FF40, 0x54FEA8)
+        '21450C647B8C5940ED5B68218EA128FD3C5D597D' = @('13.0.5', 0x5B4AF8, 0x53FF40, 0x54FEA8)
+    }
+    $knownVersions = ($knownLayouts.Values | ForEach-Object { $_[0] } | Sort-Object) -join ', '
+    $mainPath = Join-Path $Tree 'dump\exefs\main'
+    if (-not (Test-Path -LiteralPath $mainPath -PathType Leaf)) { throw "No game in $Tree (dump\exefs\main is missing)." }
+    $stream = [System.IO.File]::OpenRead($mainPath)
+    try { $head = New-Object byte[] 0x60; [void]$stream.Read($head, 0, 0x60) } finally { $stream.Close() }
+    $buildId = (($head[0x40..0x5F] | ForEach-Object { $_.ToString('X2') }) -join '').TrimEnd('0')
+    if (-not $knownLayouts.ContainsKey($buildId)) {
+        $versionFile = Join-Path $Tree 'version.txt'
+        $version = if (Test-Path -LiteralPath $versionFile) { (Get-Content -LiteralPath $versionFile -TotalCount 1) } else { 'unknown' }
+        throw "That is game version $version; this tool knows the save layout of $knownVersions only, so it changes nothing."
+    }
+    $version, $saveSize, $flagsOffset, $recordsOffset = $knownLayouts[$buildId]
+    Write-Host ('Game version ' + $version + ': ' + $Tree)
     if (-not $SavePath) {
-        $SavePath = Join-Path $installRoot 'save\0123456789abcdeffedcba9876543210\save_data\system_data.bin'
+        $SavePath = Join-Path $Tree 'save\0123456789abcdeffedcba9876543210\save_data\system_data.bin'
     }
     if (@(Get-Process -Name ssbu,ssbu_new -ErrorAction SilentlyContinue).Count -gt 0) {
         throw 'Close every SSBU game window before unlocking fighters, then run this again.'
@@ -21,9 +43,6 @@ try {
     $originalInfo = Get-Item -LiteralPath $SavePath
     $originalWriteTime = $originalInfo.LastWriteTimeUtc
     [byte[]]$data = [System.IO.File]::ReadAllBytes($SavePath)
-    $saveSize = 0x5B4AF8
-    $flagsOffset = 0x53FF40
-    $recordsOffset = 0x54FEA8
     $starters = @(0, 1, 2, 3, 5, 6, 7, 8)
     $fighterNames = @(
         'Mario', 'Donkey Kong', 'Link', 'Samus', 'Dark Samus', 'Yoshi', 'Kirby', 'Fox', 'Pikachu', 'Luigi',
@@ -38,7 +57,7 @@ try {
     )
     [uint64]$highBit = [uint64]::Parse('8000000000000000', [Globalization.NumberStyles]::HexNumber)
     if ($data.Length -ne $saveSize -or [BitConverter]::ToUInt32($data, 0) -ne $saveSize) {
-        throw 'Unsupported save size/header. This tool only supports this port of game version 11.0.0.'
+        throw "Unsupported save size/header for game version $version. The save has not been changed."
     }
     $order = 0
     for ($n = 0; $n -lt $fighterNames.Count; $n++) {

@@ -194,6 +194,27 @@ class Arc:
         return data
 
 
+def extract_nros(arc, out):
+    """Every module of NRO_DIR not in `out` yet (by name, or in its bases.txt) into `out`;
+    returns how many were written."""
+    manifest = os.path.join(out, "bases.txt")
+    known = {l.split()[0] for l in open(manifest)} if os.path.exists(manifest) else set()
+    os.makedirs(out, exist_ok=True)
+    n = 0
+    for name in NRO_NAMES:
+        module = "lua2cpp_" + name
+        if module in known or os.path.exists(os.path.join(out, module + ".nro")):
+            continue
+        data = arc.get(NRO_DIR + module + ".nro")
+        if data is None:
+            continue                              # a fighter newer than this data.arc
+        with open(os.path.join(out, module + ".nro"), "wb") as f:
+            f.write(data)
+        print(f"  {module}.nro ({len(data)})")
+        n += 1
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["info", "get", "nro"])
@@ -219,20 +240,7 @@ def main():
                 f.write(data)
             print(f"  {path} ({len(data)})")
     elif a.cmd == "nro":
-        out = a.out or os.path.join(a.tree, "dump", "nro")
-        manifest = os.path.join(out, "bases.txt")
-        known = {l.split()[0] for l in open(manifest)} if os.path.exists(manifest) else set()
-        os.makedirs(out, exist_ok=True)
-        for name in NRO_NAMES:
-            module = "lua2cpp_" + name
-            if module in known or os.path.exists(os.path.join(out, module + ".nro")):
-                continue
-            data = arc.get(NRO_DIR + module + ".nro")
-            if data is None:
-                continue                              # a fighter newer than this data.arc
-            with open(os.path.join(out, module + ".nro"), "wb") as f:
-                f.write(data)
-            print(f"  {module}.nro ({len(data)})")
+        extract_nros(arc, a.out or os.path.join(a.tree, "dump", "nro"))
 
 
 if __name__ == "__main__":
