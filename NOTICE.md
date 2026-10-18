@@ -11,11 +11,15 @@ No project-wide license has been specified for the WindowSmash source outside th
 
 The notice files are from the upstream `webmproject/libvpx` repository at tag `v1.14.1`.
 
+## SDL3
+
+Controller input can use [SDL3](https://www.libsdl.org/) (Simple DirectMedia Layer), copyright Sam Lantinga, under the [zlib license](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt). SDL3 is an external dependency: this repository contains no SDL source or binaries. The runtime is compiled against the headers of the official SDL3 Windows development package (`deps/SDL3`, or `SSBU_SDL3_DIR`) and loads `SDL3.dll` from the executable's folder at run time. A package that includes `SDL3.dll` should include that package's `LICENSE.txt` too; the local bundler (`tools/bundle_ssbu.py`) adds it as `build/SDL3-LICENSE.txt`.
+
 ## Optional external dependencies
 
 The libopus 1.3.1 notice is preserved at [`third_party/opus/COPYING`](third_party/opus/COPYING) for builds and runtime releases that statically link that codec.
 
-libopus, libvpx, PyCryptodome, Capstone, and Unicorn are external dependencies, not bundled implementations. Their own licenses apply when you obtain, link, or distribute them. The optional native codecs are selected through build environment variables; no codec binaries are checked into this repository.
+libopus, libvpx, SDL3, PyCryptodome, Capstone, and Unicorn are external dependencies, not bundled implementations. Their own licenses apply when you obtain, link, or distribute them. The optional native codecs are selected through build environment variables; no codec binaries are checked into this repository.
 
 ## Game content and names
 

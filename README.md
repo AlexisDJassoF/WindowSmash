@@ -28,7 +28,8 @@ The result is a locally built Windows executable backed by your own extracted ga
 | **Ahead-of-time recompiler** | Discovers guest functions, lifts AArch64 and NEON instructions to C, and incrementally compiles module code with Clang. |
 | **Native Windows runtime** | Maps module images, resolves symbols, dispatches guest calls, and implements selected console services with Windows APIs. |
 | **Direct3D 11 renderer** | Processes guest GPU commands, translates Maxwell shaders to HLSL, and manages textures, render targets, and compute work. |
-| **Asynchronous shader compilation** | Uses dedicated compiler threads, a persistent DXBC cache, and a separate D3D device to warm driver compilation. |
+| **Asynchronous shader compilation** | Uses dedicated compiler threads, a persistent DXBC cache made ready while the game starts, an optional ahead-of-time pass over the game's shaders, and a separate D3D device to warm driver compilation. |
+| **Controllers and display** | Up to eight players on Xbox, PlayStation, Switch Pro and most other pads through SDL3; windowed, borderless or full-screen play with a 16:9 picture and optional variable-refresh pacing. |
 | **Local Wireless relay** | Carries the game's existing Local Wireless traffic over a UDP relay, with host/join launchers and a standalone relay option. |
 | **Developer tools** | Includes instruction and function differential tests, disassembly helpers, symbol lookup, archive readers, captures, and profiling tools. |
 
@@ -39,8 +40,9 @@ The current implementation targets **game version 11.0.0** and **Windows x64**. 
 | Area | Current position |
 | :--- | :--- |
 | CPU and loading | AArch64-to-C translation, native symbol replacements, and deferred loading of compiled fighter modules are implemented. |
-| Graphics | D3D11 rendering and shader caching are implemented. Shader translation, driver behavior, and first-use compilation remain compatibility risks. |
-| Controllers | One local player per instance, using the first XInput controller or the keyboard. |
+| Graphics | D3D11 rendering and shader caching are implemented; cached shaders are prepared while the game starts, and `Prepare Shaders.bat` can compile the rest ahead of time. Shader translation, driver behavior, and first-use compilation remain compatibility risks. |
+| Controllers | Up to eight local players per instance on any pad SDL3 supports, plus the keyboard; without `SDL3.dll`, up to four XInput (Xbox) pads. Testing with real pads has been limited so far. |
+| Display | Windowed, borderless, or full screen (F11), with the picture kept 16:9; frame pacing for fixed-refresh or G-Sync / FreeSync monitors. |
 | Audio and movies | Optional static libopus and libvpx integration; functionality depends on the build configuration. |
 | DLC | Installed-content reporting and module extraction support the content present in the supplied game version. The 11.0.0 target contains fighters through Pyra/Mythra. |
 | Multiplayer | Relay-backed Local Wireless is implemented. Complete two-PC matches and the full DLC/stage roster have not been comprehensively verified. |
@@ -97,9 +99,11 @@ For multiplayer, use matching game versions and build revisions, enter the same 
 <details>
 <summary><strong>Keyboard and controller controls</strong></summary>
 
-The first XInput controller maps face buttons by physical position. On an Xbox controller, **B** corresponds to Nintendo **A**.
+Up to eight pads can play at once: Xbox, PlayStation, Switch Pro, and most other controllers that SDL3 recognizes. Each pad that connects becomes the next free player, and a pad that reconnects gets its player back. Face buttons follow Nintendo's physical positions by default, so on an Xbox controller **B** corresponds to Nintendo **A**; `layout = labels` in `controllers.ini` uses the printed letters instead.
 
-| Input | Mapping |
+`controllers.ini` is written with its defaults and explanations on the first start. It sets which player the keyboard adds to, button remaps, rumble strength, stick dead zones, and the trigger threshold, for every pad or for one kind of pad. F2 lists the connected pads. Without `SDL3.dll` beside `ssbu.exe`, XInput pads 1-4 are players 1-4.
+
+| Input | Keyboard (player 1 by default) |
 | :--- | :--- |
 | Left stick | Arrow keys |
 | A / B / X / Y | Z / X / C / V |
@@ -108,6 +112,24 @@ The first XInput controller maps face buttons by physical position. On an Xbox c
 | Plus / Minus | Enter / Backspace |
 | Right stick | I / J / K / L |
 | Overlay / details / screenshot | F1 / F2 / F3 |
+| Full screen on/off | F11 or Alt+Enter |
+
+</details>
+
+<details>
+<summary><strong>Window and display</strong></summary>
+
+`display.ini` is written with its defaults on the first start:
+
+| Setting | Values |
+| :--- | :--- |
+| `window` | `windowed` (default; kept 16:9 while resized), `borderless` (covers its monitor), or `fullscreen` (borderless and on top; the monitor keeps its resolution). |
+| `width`, `height` | The window's inside size at 100% display scaling (default 1280 x 720). |
+| `pacing` | `clock` (default: a steady 60 frames a second), `vrr` (for G-Sync / FreeSync monitors: each frame is shown as soon as it is ready; best with `borderless`), or `display` (follow a 60, 120, or 240 Hz monitor's own refresh). |
+| `latency` | 1-3 frames the GPU may work ahead (default 3; lower is more responsive). |
+| `hide_cursor` | 1 hides the mouse pointer after two seconds without movement. |
+
+The game draws at 1920 x 1080 and scales that picture to the window with black bars where the shapes differ. Screenshots (F3) keep the game's own 1920 x 1080 picture.
 
 </details>
 
@@ -120,7 +142,7 @@ flowchart LR
     C --> D[Local executable]
     E[WindowSmash runtime] --> D
     F[Your RomFS and fonts] --> D
-    D --> G[Direct3D 11 / XInput / Windows services]
+    D --> G[Direct3D 11 / SDL3 / Windows services]
 ```
 
 The **[technical guide](docs/TECHNICAL.md)** explains the CPU state model, function discovery, relocation and symbol binding, service shims, GPU command path, shader compilation fix, relay protocol, save handling, and the role of every tool in `tools/`.
@@ -134,7 +156,7 @@ python -m unittest discover -s tests -v
 
 The source-only tests exercise packaging and save-editing behavior with synthetic fixtures. They require no game data and do not launch the game. Windows PowerShell is used for the unlock-tool tests. Game-backed instruction and function differential tests are documented separately in the [technical guide](docs/TECHNICAL.md#verification-and-debugging).
 
-When reporting a problem, include the game version, GPU/driver, build revision, reproduction steps, and a short relevant log excerpt. Review logs for local paths, player names, and network addresses before posting. Keep extracted content, generated game code, keys, and saves out of issues and pull requests.
+When reporting a problem, include the game version, GPU/driver, build revision, reproduction steps, and a short relevant log excerpt. After a crash or a freeze (no new picture for five seconds), the `reports/` folder has a text report naming what each thread was doing; attach it. Review logs and reports for local paths, player names, and network addresses before posting. The minidump beside a report contains parts of the game's memory: share it only privately, with someone who asked for it. Keep extracted content, generated game code, keys, and saves out of issues and pull requests.
 
 ## Repository boundaries
 
