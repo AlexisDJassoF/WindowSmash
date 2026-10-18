@@ -1,0 +1,2 @@
+# Core extraction dependency. arc.py also needs Python 3.14's compression.zstd.
+pycryptodomex

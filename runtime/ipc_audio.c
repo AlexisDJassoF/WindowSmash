@@ -1,0 +1,219 @@
+/* Audio output (audout:u), natively, played through the Windows waveOut API.
+ *
+ * The game mixes its own sound and streams 48 kHz stereo 16-bit PCM through the SDK's
+ * AudioOut interface. Each buffer it appends is copied to the sound card; when the card has
+ * played it, the buffer is reported back as released and the buffer event fires - so audio
+ * paces itself exactly as on the console. */
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <string.h>
+
+#include "ipc.h"
+#include <mmsystem.h>   /* after windows.h */
+
+#define RATE 48000
+#define CHANNELS 2
+#define MAX_BUFFERS 64
+
+typedef struct Pending { WAVEHDR hdr; u64 tag; int used; } Pending;
+static struct {
+    HWAVEOUT out;
+    Pending pending[MAX_BUFFERS];
+    u64 released[MAX_BUFFERS * 2];
+    u32 nreleased;
+    u32 event;
+    int started;
+    u64 played_samples;
+    f32 volume;
+    CRITICAL_SECTION lock;
+} audio = {.volume = 1.0f};
+
+/* waveOut calls back on its own thread while holding its internal lock, and waveOutWrite
+ * takes that lock - so taking audio.lock in the callback deadlocks against an append. The
+ * callback only wakes the reaper, which collects the played buffers. */
+static HANDLE played_event;
+
+static void CALLBACK wave_done(HWAVEOUT h, UINT msg, DWORD_PTR user, DWORD_PTR p1, DWORD_PTR p2) {
+    (void)h; (void)user; (void)p1; (void)p2;
+    if (msg == WOM_DONE) SetEvent(played_event);
+}
+
+static DWORD WINAPI reaper(void *arg) {
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(played_event, INFINITE);
+        int any = 0;
+        EnterCriticalSection(&audio.lock);
+        for (u32 i = 0; i < MAX_BUFFERS; i++) {
+            Pending *p = &audio.pending[i];
+            if (p->used != 1 || !(p->hdr.dwFlags & WHDR_DONE)) continue;
+            p->used = 2;   /* done; unprepared and recycled on the next append */
+            if (audio.nreleased < MAX_BUFFERS * 2) audio.released[audio.nreleased++] = p->tag;
+            audio.played_samples += p->hdr.dwBufferLength / (2 * CHANNELS);
+            any = 1;
+        }
+        LeaveCriticalSection(&audio.lock);
+        if (any) kernel_signal_event(audio.event);
+    }
+}
+
+static void open_device(void) {
+    static int opened;
+    if (opened++) return;
+    InitializeCriticalSection(&audio.lock);
+    played_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    CloseHandle(CreateThread(NULL, 0, reaper, NULL, 0, NULL));
+    WAVEFORMATEX fmt = {WAVE_FORMAT_PCM, CHANNELS, RATE, RATE * 2 * CHANNELS, 2 * CHANNELS, 16, 0};
+    if (waveOutOpen(&audio.out, WAVE_MAPPER, &fmt, (DWORD_PTR)wave_done, 0, CALLBACK_FUNCTION) != MMSYSERR_NOERROR) {
+        fprintf(stderr, "[audio] no audio device; sound is dropped\n");
+        audio.out = NULL;
+    }
+    audio.event = kernel_create_event();
+}
+
+/* Append { u64 next; u64 address; u64 capacity; u64 size; u64 offset } with a 64-bit tag. */
+static void append(u64 desc, u64 tag) {
+    u64 addr = ld64(desc + 8), size = ld64(desc + 24), offset = ld64(desc + 32);
+    EnterCriticalSection(&audio.lock);
+    Pending *p = NULL;
+    for (u32 i = 0; i < MAX_BUFFERS && !p; i++) {
+        if (audio.pending[i].used == 2) {
+            waveOutUnprepareHeader(audio.out, &audio.pending[i].hdr, sizeof(WAVEHDR));
+            free(audio.pending[i].hdr.lpData);
+            audio.pending[i].used = 0;
+        }
+        if (!audio.pending[i].used) p = &audio.pending[i];
+    }
+    if (!p || !audio.out) {   /* no device (or saturated): hand the buffer straight back */
+        if (audio.nreleased < MAX_BUFFERS * 2) audio.released[audio.nreleased++] = tag;
+        LeaveCriticalSection(&audio.lock);
+        kernel_signal_event(audio.event);
+        return;
+    }
+    memset(&p->hdr, 0, sizeof p->hdr);
+    p->hdr.lpData = malloc(size ? size : 1);
+    memcpy(p->hdr.lpData, P(void, addr + offset), size);
+    if (audio.volume != 1.0f) {
+        i16 *s = (i16 *)p->hdr.lpData;
+        for (u64 i = 0; i < size / 2; i++) s[i] = (i16)(s[i] * audio.volume);
+    }
+    p->hdr.dwBufferLength = (DWORD)size;
+    p->tag = tag;
+    p->used = 1;
+    waveOutPrepareHeader(audio.out, &p->hdr, sizeof p->hdr);
+    waveOutWrite(audio.out, &p->hdr, sizeof p->hdr);
+    LeaveCriticalSection(&audio.lock);
+}
+
+static void audio_out(IpcObject *self, Ipc *ipc) {
+    u64 size, b;
+    switch (ipc->command) {
+    case 0: IPC_PUSH(ipc, (u32)(audio.started ? 0 : 1)); return;   /* GetAudioOutState */
+    case 1: audio.started = 1; return;                             /* Start */
+    case 2: audio.started = 0; return;                             /* Stop */
+    case 3: case 7:                                                /* AppendAudioOutBuffer(Auto)(tag) */
+        b = ipc_in_buffer(ipc, 0, &size);
+        if (rt_trace) {
+            fprintf(stderr, "[audio] append: %u raw bytes:", ipc->in_size);
+            for (u32 i = 0; i < ipc->in_size && i < 32; i += 4) fprintf(stderr, " %08x", ipc_u32(ipc, i));
+            fprintf(stderr, "; buffer %#llx (%llu bytes):", b, size);
+            for (u64 i = 0; b && i < size && i < 40; i += 8) fprintf(stderr, " %llx", ld64(b + i));
+            fprintf(stderr, " (a %u, x %u)\n", ipc->na, ipc->nx);
+        }
+        if (b && size >= 40) append(b, ipc_u64(ipc, 0));
+        return;
+    case 4: ipc_copy_handle(ipc, audio.event); return;            /* RegisterBufferEvent */
+    case 5: case 8: {                                              /* GetReleasedAudioOutBuffers(Auto) */
+        b = ipc_out_buffer(ipc, 0, &size);
+        if (b) memset(P(void, b), 0, size);   /* the client reads the first entry whatever the count */
+        EnterCriticalSection(&audio.lock);
+        u32 n = 0;
+        while (n < audio.nreleased && (n + 1) * 8 <= size) { st64(b + 8ull * n, audio.released[n]); n++; }
+        memmove(audio.released, audio.released + n, (audio.nreleased - n) * 8);
+        audio.nreleased -= n;
+        LeaveCriticalSection(&audio.lock);
+        if (rt_trace)
+            fprintf(stderr, "[audio] released %u (buffer %#llx, %llu bytes; b %u (%#llx), c %u (%#llx))\n", n, b, size,
+                    ipc->nb, ipc->nb ? ipc->b[0].addr : 0, ipc->nc, ipc->nc ? ipc->c[0].addr : 0);
+        ipc_wrote(ipc, 0, size);
+        IPC_PUSH(ipc, n);
+        return;
+    }
+    case 6: IPC_PUSH(ipc, (u32)0); return;                         /* ContainsAudioOutBuffer */
+    case 9: {                                                      /* GetAudioOutBufferCount */
+        u32 n = 0;
+        for (u32 i = 0; i < MAX_BUFFERS; i++) n += audio.pending[i].used == 1;
+        IPC_PUSH(ipc, n);
+        return;
+    }
+    case 10: IPC_PUSH(ipc, audio.played_samples); return;          /* GetAudioOutPlayedSampleCount */
+    case 11: IPC_PUSH(ipc, (u8)0); return;                         /* FlushAudioOutBuffers */
+    case 12: memcpy(&audio.volume, ipc->in, 4); return;            /* SetAudioOutVolume */
+    case 13: ipc_push(ipc, &audio.volume, 4); return;              /* GetAudioOutVolume */
+    }
+    ipc_unknown(ipc, self);
+}
+
+static void manager(IpcObject *self, Ipc *ipc) {
+    u64 size, b;
+    switch (ipc->command) {
+    case 0: case 2:   /* ListAudioOuts(Auto): one device */
+        b = ipc_out_buffer(ipc, 0, &size);
+        if (b && size >= 0x100) { memset(P(void, b), 0, 0x100); memcpy(P(void, b), "DeviceOut", 10); ipc_wrote(ipc, 0, 0x100); }
+        IPC_PUSH(ipc, (u32)1);
+        return;
+    case 1: case 3: { /* OpenAudioOut(Auto)(parameter, applet) -> rate, channels, format, state; IAudioOut */
+        open_device();
+        b = ipc_out_buffer(ipc, 0, &size);
+        if (b && size >= 0x100) { memset(P(void, b), 0, 0x100); memcpy(P(void, b), "DeviceOut", 10); ipc_wrote(ipc, 0, 0x100); }
+        u32 out[4] = {RATE, CHANNELS, 2 /* PCM int16 */, 1 /* stopped */};
+        ipc_push(ipc, out, sizeof out);
+        ipc_object(ipc, ipc_new_object("audout:IAudioOut", audio_out, NULL));
+        return;
+    }
+    }
+    ipc_unknown(ipc, self);
+}
+
+/* ---- audren:u: only its audio-device interface is used (device name, volume, events) -- */
+#define DEVICE "AudioTvOutput"
+
+static void put_name(Ipc *ipc, u32 index) {
+    u64 size, b = ipc_out_buffer(ipc, index, &size);
+    if (b && size >= 0x100) {
+        memset(P(void, b), 0, 0x100);
+        memcpy(P(void, b), DEVICE, sizeof DEVICE);
+        ipc_wrote(ipc, index, 0x100);
+    }
+}
+
+static void audio_device(IpcObject *self, Ipc *ipc) {
+    static u32 event;
+    if (!event) event = kernel_create_event();
+    switch (ipc->command) {
+    case 0: case 6: put_name(ipc, 0); IPC_PUSH(ipc, (u32)1); return;   /* ListAudioDeviceName(Auto) */
+    case 1: case 7: return;                                            /* SetAudioDeviceOutputVolume(Auto) */
+    case 2: case 8: { f32 v = 1.0f; ipc_push(ipc, &v, 4); return; }   /* GetAudioDeviceOutputVolume(Auto) */
+    case 3: case 10: case 13: put_name(ipc, 0); return;                /* GetActiveAudioDeviceName(Auto) */
+    case 4: case 11: case 12: ipc_copy_handle(ipc, event); return;     /* device change / input / output events */
+    case 5: IPC_PUSH(ipc, (u32)CHANNELS); return;                      /* GetActiveChannelCount */
+    }
+    ipc_unknown(ipc, self);
+}
+
+static void renderer_manager(IpcObject *self, Ipc *ipc) {
+    switch (ipc->command) {
+    case 1: IPC_PUSH(ipc, (u64)0x10000); return;                       /* GetWorkBufferSize */
+    case 2: case 4:                                                    /* GetAudioDeviceService(WithRevisionInfo) */
+        ipc_object(ipc, ipc_new_object("audren:IAudioDevice", audio_device, NULL));
+        return;
+    }
+    if (ipc->command == 0) rt_fatal("the game opened an audio renderer, which is not implemented");
+    ipc_unknown(ipc, self);
+}
+
+IpcObject *service_audio(const char *name) {
+    if (!strcmp(name, "audout:u")) return ipc_new_object("audout:u", manager, NULL);
+    if (!strcmp(name, "audren:u")) return ipc_new_object("audren:u", renderer_manager, NULL);
+    return NULL;
+}

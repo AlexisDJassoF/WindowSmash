@@ -1,0 +1,29 @@
+WINDOWSMASH - LOCAL BUILD PACKAGING
+
+After a successful build, run Bundle Latest SSBU.bat, or:
+  python tools\bundle_ssbu.py --dry-run
+  python tools\bundle_ssbu.py
+  python tools\bundle_ssbu.py --output-dir "D:\Local Bundles"
+
+The script uses the repository's current build\ssbu.exe. It does not rebuild
+the game or choose ssbu_new.exe / ssbu_prev.exe. Keep the game and build tools
+closed while packaging.
+
+Outputs are timestamped ZIP64 archives and SHA-256 checksums in dist\portable.
+Inputs stream directly into the archive; no full-size staging copy is created.
+Every archived file is verified before the final archive filename is published.
+Interrupted output remains marked .partial. Older bundles are retained.
+
+Included: executable, runtime module images, fonts, game data with a relative
+RomFS config, launchers, available build-folder DLLs, optional shader cache,
+the optional standalone relay, and available DLC/unlock configuration and tools.
+
+Excluded: personal saves, keys, player IDs, network addresses, logs, screenshots,
+source trees and build intermediates. --no-shader-cache omits the DXBC cache.
+
+The resulting archive contains game-derived code and content. Keep generated
+archives local; they are excluded from the public source repository and are
+not release assets. This source repository does not provide playable bundles.
+
+The bundler alone requires Python 3.10+. The full archive extraction workflow
+uses Python 3.14 because tools\arc.py imports compression.zstd.
