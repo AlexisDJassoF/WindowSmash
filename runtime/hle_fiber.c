@@ -59,7 +59,7 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
     else {
         me = new_fib(c);
         me->host = ConvertThreadToFiberEx(me, FIBER_FLAG_FLOAT_SWITCH);
-        if (!me->host) rt_fatal("cannot make a fiber of a guest thread (error %lu)", GetLastError());
+        if (!me->host) rt_fatal("cannot make a fiber of a guest thread (error %lu)", (unsigned long)GetLastError());
     }
     me->cpu = c;
     st64(save, me->token);
@@ -74,7 +74,7 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
         n->sp = target + FRAME;
         next = new_fib(n);
         next->host = CreateFiberEx(64 << 10, 64 << 20, FIBER_FLAG_FLOAT_SWITCH, fiber_main, next);
-        if (!next->host) rt_fatal("cannot create a host fiber (error %lu)", GetLastError());
+        if (!next->host) rt_fatal("cannot create a host fiber (error %lu)", (unsigned long)GetLastError());
     } else {
         next->cpu->x[0] = 0;   /* what the frame of a suspended context holds in x0 */
     }

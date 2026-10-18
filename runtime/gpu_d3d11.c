@@ -269,6 +269,7 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
  * 10-second sampling profile. */
 static volatile LONG hotkeys;
 
+#ifdef _WIN32
 static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     LRESULT result;
     if (display_message(h, msg, w, l, &result)) return result;   /* size, full screen, pointer (gpu_display.c) */
@@ -288,6 +289,12 @@ static DWORD WINAPI window_thread(LPVOID done) {
     while (GetMessageW(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
     return 0;
 }
+#else
+/* Linux: the window is SDL's, made and run by the main thread (linux/window.c), which passes
+ * the debug keys on here; DXVK takes the SDL_Window as the swap chain's HWND. */
+void *rt_window(void);
+void gfx_hotkey(int n) { InterlockedOr(&hotkeys, 1 << n); }
+#endif
 
 static ID3DBlob *compile_hlsl(const char *src, const char *entry, const char *target) {
     ID3DBlob *code = NULL, *errors = NULL;
@@ -315,12 +322,29 @@ static const char BLIT_HLSL[] =
 static void start_compilers(void);                 /* (see "shaders") */
 static DWORD WINAPI prewarm_main(void *unused);
 
+/* Direct3D 11 is DXVK's: always on Linux; on Windows when d3d11.dll is not the system's (the
+ * DXVK test builds of tools/linux/wintest.py). */
+static int on_dxvk(void) {
+#ifdef _WIN32
+    wchar_t path[MAX_PATH], sys[MAX_PATH];
+    HMODULE m = GetModuleHandleW(L"d3d11.dll");
+    UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+    return m && n && n < MAX_PATH && GetModuleFileNameW(m, path, MAX_PATH) && _wcsnicmp(path, sys, n) != 0;
+#else
+    return 1;
+#endif
+}
+
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&lock);
+#ifdef _WIN32
     HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, window_thread, done, 0, NULL);
     WaitForSingleObject(done, INFINITE);
+#else
+    window = (HWND)rt_window();
+#endif
     if (!window) { fprintf(stderr, "[gfx] cannot create the window\n"); return TRUE; }
 
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -338,6 +362,18 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      * shader first on our compiler threads (see "shaders"). SSBU_COMPILE_DEVICE=0/1 overrides. */
     DXGI_ADAPTER_DESC ad;
     int nvidia = SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)) && ad.VendorId == 0x10DE;
+#ifndef _WIN32
+    {   /* (DXVK: which Vulkan device it chose) */
+        char name[128];
+        size_t i = 0;
+        for (; i < 127 && ad.Description[i]; i++) name[i] = ad.Description[i] < 128 ? (char)ad.Description[i] : '?';
+        name[i] = 0;
+        fprintf(stderr, "[gfx] Direct3D 11 through DXVK on %s (vendor %#x)\n", name, ad.VendorId);
+        if (ad.VendorId == 0x10005 || strstr(name, "llvmpipe") || strstr(name, "lavapipe"))
+            fprintf(stderr, "[gfx] note: this is a software renderer (no Vulkan GPU driver found): expect a low frame rate\n");
+    }
+    nvidia = 0;   /* (the compile device is for NVIDIA's Direct3D driver; DXVK compiles its own way) */
+#endif
     const char *cd = getenv("SSBU_COMPILE_DEVICE");
     if ((cd ? atoi(cd) : nvidia) &&
         FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
@@ -392,8 +428,14 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
         return TRUE;
     }
     start_compilers();
+    /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
+     * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
+     * instead: the whole cache at once kept them busy for minutes and the first frame waited
+     * behind them (5,948 shaders: 600 CPU-seconds, no frame for over 30 s). So under DXVK it is
+     * off unless SSBU_SHADER_PREWARM=1. */
     const char *prewarm = getenv("SSBU_SHADER_PREWARM");
-    if (!prewarm || atoi(prewarm) != 0) CloseHandle(CreateThread(NULL, 0, prewarm_main, NULL, 0, NULL));
+    if (prewarm ? atoi(prewarm) != 0 : !on_dxvk()) CloseHandle(CreateThread(NULL, 0, prewarm_main, NULL, 0, NULL));
+    else if (!prewarm) fprintf(stderr, "[gfx] prewarm: off under DXVK (SSBU_SHADER_PREWARM=1 turns it on)\n");
     ready = 1;
     fprintf(stderr, "[gfx] Direct3D 11 ready%s\n", compile_dev ? " (shaders compile on a device of their own first)" : "");
     return TRUE;
@@ -609,7 +651,7 @@ static int create_noted(struct Compiler *me, Shader *s, const void *code, size_t
  * own shaders) into a table by the cache's key.
  * When the game first uses a program, get_shader_ex still translates it (that gives its
  * interface), then takes the object from here instead of loading it, so the draw is not
- * skipped. SSBU_SHADER_PREWARM=0: no prewarm. */
+ * skipped. SSBU_SHADER_PREWARM=0: no prewarm; under DXVK it is off unless =1 (see init). */
 typedef struct Prewarm { u64 hash, table_hash; u32 vs_outputs; int stage; LONG state; void *obj; } Prewarm;
 enum { PW_EMPTY, PW_QUEUED, PW_LOADING, PW_READY, PW_TAKEN, PW_FAILED };
 #define PREWARM_SLOTS 32768
@@ -619,11 +661,21 @@ static volatile LONG prewarm_total, prewarm_done, prewarm_ready;
 static u64 prewarm_t0, prewarm_bytes0;
 
 static u64 private_bytes(void) {
+#ifdef _WIN32
     typedef struct { DWORD cb, faults; SIZE_T peak_ws, ws, a, b, c, d, pagefile, peak_pagefile, private_usage; } Counters;
     static BOOL (WINAPI *get)(HANDLE, Counters *, DWORD);
     if (!get) get = (BOOL (WINAPI *)(HANDLE, Counters *, DWORD))(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
     Counters c = {sizeof c};
     return get && get(GetCurrentProcess(), &c, sizeof c) ? c.private_usage : 0;
+#else   /* (Linux: the process's anonymous memory in RAM) */
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[128];
+    u64 kb = 0;
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "RssAnon:", 8)) { kb = strtoull(line + 8, NULL, 10); break; }
+    if (f) fclose(f);
+    return kb << 10;
+#endif
 }
 
 /* (under prewarm_lock) the entry for a key; a new one when insert */
@@ -687,7 +739,7 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
     ReleaseSRWLockExclusive(&prewarm_lock);
     if (obj) IUnknown_Release((IUnknown *)obj);   /* the game loaded its own meanwhile */
     if (InterlockedIncrement(&prewarm_done) == prewarm_total)
-        fprintf(stderr, "[gfx] prewarm: %ld of %ld shaders ready in %.1f s; private memory %.0f -> %.0f MB\n", prewarm_ready, prewarm_total,
+        fprintf(stderr, "[gfx] prewarm: %ld of %ld shaders ready in %.1f s; private memory %.0f -> %.0f MB\n", (long)prewarm_ready, (long)prewarm_total,
                 (GetTickCount64() - prewarm_t0) / 1000.0, prewarm_bytes0 / 1048576.0, private_bytes() / 1048576.0);
 }
 
@@ -774,7 +826,7 @@ static void start_compilers(void) {
         CloseHandle(t);
         ncompilers++;
     }
-    if (!ncompilers) rt_fatal("cannot start the shader compiler threads (error %lu)", GetLastError());
+    if (!ncompilers) rt_fatal("cannot start the shader compiler threads (error %lu)", (unsigned long)GetLastError());
     fprintf(stderr, "[gfx] %u shader compiler threads\n", ncompilers);
 }
 
@@ -890,7 +942,7 @@ void gfx_report_compiles(void (*line)(const char *text)) {
             FILE *f = fopen(path, "wb");
             if (f) { fwrite(dxbc, 1, size, f); fclose(f); saved = s->hlsl ? "; HLSL and DXBC saved" : "; DXBC saved"; }
         }
-        snprintf(text, sizeof text, "  thread %lu%s: %s - %s, for %.1f s%s\n", compilers[i].thread, compilers[i].thread == self ? " (this thread)" : "",
+        snprintf(text, sizeof text, "  thread %lu%s: %s - %s, for %.1f s%s\n", (unsigned long)compilers[i].thread, compilers[i].thread == self ? " (this thread)" : "",
                  s->name, what[step], (now - compilers[i].since_ms) / 1000.0, saved);
         line(text);
     }
@@ -3286,7 +3338,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  (gfx_stat_upload_kind[0] - last_kind[0]) / 1048576.0 / frames, (gfx_stat_upload_kind[1] - last_kind[1]) / 1048576.0 / frames,
                  (gfx_stat_upload_kind[2] - last_kind[2]) / 1048576.0 / frames, (gfx_stat_upload_kind[3] - last_kind[3]) / 1048576.0 / frames,
                  (gfx_stat_drawn - last_drawn) / frames, (gfx_stat_dispatched - last_dispatched) / frames, gfx_stat_gpu_waits - last_waits,
-                 (gfx_stat_skipped - last_skipped) / secs, gfx_stat_shaders, compiles_pending, prewarm_ready, prewarm_total, ntextures, nsurfaces, nresidents,
+                 (gfx_stat_skipped - last_skipped) / secs, gfx_stat_shaders, (long)compiles_pending, (long)prewarm_ready, (long)prewarm_total, ntextures, nsurfaces, nresidents,
                  (gfx_stat_watch_us - last_watch) / 1000.0 / secs, depth_sampling != 0 ? "on" : "off",
                  profile_running() ? "  (profiling...)" : "");
         char net[256];

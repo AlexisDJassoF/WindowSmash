@@ -14,7 +14,13 @@
 
 #include "host.h"
 #include "display.h"
+#ifdef _WIN32
 #include <dbghelp.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 extern const RtModule rt_module_main, rt_module_subsdk0, rt_module_sdk;
 #define BOOT_MODULES 3
@@ -83,7 +89,11 @@ const char *rt_describe_host(u64 pc, char *buf, size_t n) {
 }
 
 /* ---- reports: to the log, and for a crash or a stop also to reports\<kind>_<time>.txt ------ */
+#ifdef _WIN32
 static HANDLE report_file = INVALID_HANDLE_VALUE;
+#else
+static int report_fd = -1;   /* (Linux: a plain descriptor, so that writing a crash report allocates nothing) */
+#endif
 
 /* (no heap: a crash may have happened inside the allocator) */
 static void out(const char *fmt, ...) {
@@ -95,8 +105,12 @@ static void out(const char *fmt, ...) {
     if (n < 0) return;
     if (n >= (int)sizeof buf) n = sizeof buf - 1;
     fputs(buf, stderr);
+#ifdef _WIN32
     DWORD written;
     if (report_file != INVALID_HANDLE_VALUE) WriteFile(report_file, buf, (DWORD)n, &written, NULL);
+#else
+    if (report_fd >= 0 && write(report_fd, buf, (size_t)n) < 0) report_fd = -1;
+#endif
 }
 static void out_line(const char *text) { out("%s", text); }
 
@@ -106,14 +120,38 @@ void rt_report_path(char *path, size_t n, const char *kind, const char *ext) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     CreateDirectoryA("reports", NULL);
+#ifdef _WIN32
     snprintf(path, n, "reports\\%s_%04u%02u%02u_%02u%02u%02u.%s", kind, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, ext);
+#else
+    snprintf(path, n, "reports/%s_%04u%02u%02u_%02u%02u%02u.%s", kind, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, ext);
+#endif
 }
 
 static void report_open(const char *kind, char *path, size_t n) {
     rt_report_path(path, n, kind, "txt");
+#ifdef _WIN32
     report_file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+#else
+    report_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+#endif
 }
 
+/* The report's last line (where it is), and closed. */
+static void report_close(const char *path) {
+#ifdef _WIN32
+    if (report_file == INVALID_HANDLE_VALUE) return;
+    out("report: %s\n", path);
+    CloseHandle(report_file);
+    report_file = INVALID_HANDLE_VALUE;
+#else
+    if (report_fd < 0) return;
+    out("report: %s\n", path);
+    close(report_fd);
+    report_fd = -1;
+#endif
+}
+
+#ifdef _WIN32
 /* ---- minidumps, written by a second process (this exe with --write-dump): a process dumping
  * itself can deadlock on a lock one of its suspended threads holds. The request goes through a
  * helper thread started with the process, so a faulting thread with no stack left needs none.
@@ -186,6 +224,14 @@ static int write_dump_main(char **argv) {
     if (!ok) DeleteFileA(argv[5]);
     return ok ? 0 : 4;
 }
+#else
+/* Linux: no minidumps. A crash or freeze report is text only; the system's core dump, where it
+ * keeps them (ulimit -c, systemd-coredump), has the rest. */
+int rt_write_dump(const char *path, DWORD tid, EXCEPTION_POINTERS *e, DWORD wait_ms) {
+    (void)path; (void)tid; (void)e; (void)wait_ms;
+    return 0;
+}
+#endif
 
 static void print_frames(void **frames, int n) {
     char name[96];
@@ -208,6 +254,7 @@ void rt_backtrace(void) {
     print_frames(frames, CaptureStackBackTrace(1, 62, frames, NULL));
 }
 
+#ifdef _WIN32
 /* Unwind a host context, collecting return addresses. */
 static int unwind(CONTEXT ctx, void **frames, int max) {
     int n = 0;
@@ -315,6 +362,119 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     fflush(stderr);
     ExitProcess(5);
 }
+#else
+/* ---- Linux: faults and other threads' stacks come through signals ---------------------- */
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+
+int rt_ww_fault(void *address);        /* (linux/win32.c) a write the fallback write watch takes */
+void rt_thread_signal_stack(void);
+
+static void host_frame(const char *indent, void *pc) {   /* "[module +offset]" */
+    Dl_info di;
+    if (dladdr(pc, &di) && di.dli_fname) {
+        const char *base = strrchr(di.dli_fname, '/');
+        out("%s[%s +%#llx]%s%s\n", indent, base ? base + 1 : di.dli_fname, (u64)pc - (u64)di.dli_fbase,
+            di.dli_sname ? " " : "", di.dli_sname ? di.dli_sname : "");
+    } else out("%s[%#llx]\n", indent, (u64)pc);
+}
+
+/* Another thread's frames: it is interrupted and records its own stack. */
+#define SIG_BACKTRACE (SIGRTMIN + 2)
+static void *bt_frames[96];
+static volatile int bt_count;
+static sem_t bt_done;
+
+static void on_backtrace_signal(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si; (void)uc;
+    int saved = errno;
+    bt_count = backtrace(bt_frames, 96);
+    sem_post(&bt_done);
+    errno = saved;
+}
+
+void rt_backtrace_thread(HANDLE thread, int max_frames) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pid_t tid = rt_thread_tid(thread);
+    if (!tid) return;
+    pthread_mutex_lock(&lock);
+    while (sem_trywait(&bt_done) == 0) {}   /* (an answer that came after its wait gave up) */
+    bt_count = 0;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 250000000L;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    if (syscall(SYS_tgkill, getpid(), tid, SIG_BACKTRACE) == 0 && sem_timedwait(&bt_done, &until) == 0) {
+        static int host_frames = -1;
+        if (host_frames < 0) host_frames = getenv("SSBU_HOST_FRAMES") != NULL;
+        char name[96];
+        for (int i = 2, shown = 0; i < bt_count && shown < max_frames; i++) {   /* (past the handler and the signal frame) */
+            u64 guest = guest_of((u64)bt_frames[i]);
+            if (!guest) { if (host_frames) host_frame("      ", bt_frames[i]); continue; }
+            fprintf(stderr, "      %s\n", rt_describe(guest, name, sizeof name));
+            shown++;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+}
+
+/* A host fault inside recompiled code is a guest fault: report where, and what it touched.
+ * (Writes to pages the fallback write watch protects are not faults: they are noted and go on.) */
+static void on_fault(int sig, siginfo_t *si, void *ucv) {
+    ucontext_t *uc = ucv;
+    if (sig == SIGSEGV && (uc->uc_mcontext.gregs[REG_ERR] & 2) && rt_ww_fault(si->si_addr)) return;
+    static volatile pid_t reporter;
+    pid_t me = gettid(), none = 0;
+    if (reporter == me) _exit(6);   /* (a fault while reporting one) */
+    if (!__atomic_compare_exchange_n(&reporter, &none, me, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) for (;;) pause();   /* (one report at a time) */
+    char name[96], report[MAX_PATH];
+    fflush(stdout);
+    report_open("crash", report, sizeof report);
+    out("\n*** host exception (signal %d: %s) during %s", sig, sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error" :
+        sig == SIGILL ? "illegal instruction" : sig == SIGFPE ? "arithmetic" : "?", phase);
+    if (sig == SIGSEGV || sig == SIGBUS)
+        out(": %s address %s", uc->uc_mcontext.gregs[REG_ERR] & 2 ? "writing" : "reading", rt_describe((u64)si->si_addr, name, sizeof name));
+    out("\n");
+    u64 pc = (u64)uc->uc_mcontext.gregs[REG_RIP];
+    out("host pc %#llx (thread %d %s):\n", pc, (int)gettid(), rt_thread_description(gettid()));
+    host_frame("  ", (void *)pc);
+    void *frames[64];
+    int n = backtrace(frames, 64), from = 0;
+    for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; break; }   /* (the faulting frame onwards) */
+    for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
+    gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
+    print_frames(frames + from, n - from);
+    report_close(report);
+    fflush(stderr);
+    _exit(5);
+}
+
+static void install_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_backtrace_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIG_BACKTRACE, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+    sem_init(&bt_done, 0, 0);
+    rt_thread_signal_stack();
+    void *warm[4];
+    backtrace(warm, 4);   /* (its first call loads the unwinder: not inside a signal handler) */
+}
+#endif
 
 _Noreturn void rt_fatal(const char *fmt, ...) {
     va_list ap;
@@ -326,7 +486,7 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
     report_open("stopped", report, sizeof report);
     out("\n*** stopped during %s: %s\n", phase, text);
     rt_backtrace();
-    if (report_file != INVALID_HANDLE_VALUE) { out("report: %s\n", report); CloseHandle(report_file); }
+    report_close(report);
     fflush(stderr);
     ExitProcess(3);
 }
@@ -582,7 +742,7 @@ static void load(const char *dir) {
         const RtModule *nro = rt_nro_modules[k];
         u64 size = (nro->image_size + 0xFFFF) & ~0xFFFFull;
         if (VirtualAlloc((void *)nro->base, size, MEM_RESERVE, PAGE_NOACCESS) != (void *)nro->base)
-            fprintf(stderr, "[ro] warning: cannot reserve %s's range at %#llx (error %lu)\n", nro->name, nro->base, GetLastError());
+            fprintf(stderr, "[ro] warning: cannot reserve %s's range at %#llx (error %lu)\n", nro->name, nro->base, (unsigned long)GetLastError());
     }
     GuestFn *own[] = {(GuestFn *)rt_call, (GuestFn *)rt_lookup, (GuestFn *)rt_backtrace, (GuestFn *)rt_fatal,
                       (GuestFn *)rt_trap, (GuestFn *)rt_svc, (GuestFn *)load, (GuestFn *)main, (GuestFn *)guest_main,
@@ -671,6 +831,33 @@ static DWORD WINAPI guest_main(LPVOID unused) {
     return 0;
 }
 
+static void print_status(void) {
+    fprintf(stderr, "\n[status] %.0f s into %s; GPU: %llu submissions, %llu command lists, %llu draws, %llu clears, %llu compute launches (%llu run, %llu GPU-resident buffers made); %llu frames presented\n",
+            (double)rt_now_ns() / 1e9, phase, gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gfx_stat_clears, gpu_stat_dispatches,
+            gfx_stat_dispatched, gfx_stat_residents,
+            present_frames());
+    fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures; %llu ms watching writes\n",
+            gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us / 1000);
+    kernel_dump_threads();
+    fflush(stderr);
+}
+
+#ifndef _WIN32
+int rt_window_init(void);                                  /* (linux/window.c) */
+_Noreturn void rt_window_loop(int every, void (*status)(void));
+
+/* (the main thread runs the window's events: the status dumps, which stop every thread a
+ * moment, go on a thread of their own so that input never waits for them) */
+static DWORD WINAPI status_thread(LPVOID unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"status");
+    for (;;) {
+        Sleep((DWORD)status_every * 1000);
+        print_status();
+    }
+}
+#endif
+
 /* SSBU_CRASH_TEST=<seconds>: a deliberate fault then (to try the crash report and minidump). */
 static DWORD WINAPI crash_test(void *seconds) {
     Sleep((DWORD)(uintptr_t)seconds * 1000);
@@ -680,9 +867,12 @@ static DWORD WINAPI crash_test(void *seconds) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
     if (argc >= 6 && !strcmp(argv[1], "--write-dump")) return write_dump_main(argv);
+#endif
     if (argc < 2) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
     display_dpi_aware();
+#ifdef _WIN32
     {   /* which build this is, for reports */
         wchar_t exe[MAX_PATH];
         WIN32_FILE_ATTRIBUTE_DATA fa;
@@ -695,27 +885,45 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "[boot] %ls, built %04u-%02u-%02u %02u:%02u\n", exe, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
     }
+#else
+    {   /* which build this is, for reports (and the time zone read now, not first in a crash report) */
+        char exe[4096];
+        ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        exe[len > 0 ? len : 0] = 0;
+        struct stat st;
+        struct tm tm = {0};
+        tzset();
+        if (len > 0 && !stat(exe, &st)) localtime_r(&st.st_mtime, &tm);
+        fprintf(stderr, "[boot] %s, built %04d-%02d-%02d %02d:%02d\n", exe, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+    }
+#endif
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--trace")) rt_trace = 1;
         if (!strcmp(argv[i], "--status") && i + 1 < argc) status_every = atoi(argv[++i]);
     }
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, on_fault);
     dump_helper_start();
+#else
+    install_signals();
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    fprintf(stderr, "[mem] write watch: %s\n", rt_ww_mode());
+#endif
     if (getenv("SSBU_CRASH_TEST")) CloseHandle(CreateThread(NULL, 0, crash_test, (void *)(uintptr_t)atoi(getenv("SSBU_CRASH_TEST")), 0, NULL));
     rt_data_dir = argv[1];
     kernel_init();
     load(argv[1]);
+#ifndef _WIN32
+    rt_window_init();   /* (SDL wants its window and events on the main thread, which then runs them) */
+#endif
     /* Guest call depth becomes host call depth, so the guest runs on a thread with a large stack. */
     HANDLE t = CreateThread(NULL, 512ull << 20, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    while (WaitForSingleObject(t, status_every ? status_every * 1000 : INFINITE) == WAIT_TIMEOUT) {
-        fprintf(stderr, "\n[status] %.0f s into %s; GPU: %llu submissions, %llu command lists, %llu draws, %llu clears, %llu compute launches (%llu run, %llu GPU-resident buffers made); %llu frames presented\n",
-                (double)rt_now_ns() / 1e9, phase, gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gfx_stat_clears, gpu_stat_dispatches,
-                gfx_stat_dispatched, gfx_stat_residents,
-                present_frames());
-        fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures; %llu ms watching writes\n",
-                gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us / 1000);
-        kernel_dump_threads();
-        fflush(stderr);
-    }
+#ifdef _WIN32
+    while (WaitForSingleObject(t, status_every ? status_every * 1000 : INFINITE) == WAIT_TIMEOUT) print_status();
+#else
+    (void)t;
+    if (status_every > 0) CloseHandle(CreateThread(NULL, 0, status_thread, NULL, 0, NULL));
+    rt_window_loop(0, NULL);
+#endif
     return 0;
 }

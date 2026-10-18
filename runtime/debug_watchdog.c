@@ -41,12 +41,12 @@ static void write_report(U64 since, int first) {
     fprintf(report, "No frame presented for %.1f s (frames so far: %llu).\n\n", since / 1000.0, presented);
     U64 held_at;
     DWORD q = present_queue_holder(&held_at);
-    fprintf(report, "Locks:\n  renderer: %s%lu (last entered by thread %lu)\n", gfx_lock_owner() ? "held by thread " : "free ", gfx_lock_owner(),
-            gfx_last_enter_thread());
-    if (q) fprintf(report, "  present queue: held by thread %lu for %.1f s\n", q, (GetTickCount64() - held_at) / 1000.0);
+    fprintf(report, "Locks:\n  renderer: %s%lu (last entered by thread %lu)\n", gfx_lock_owner() ? "held by thread " : "free ", (unsigned long)gfx_lock_owner(),
+            (unsigned long)gfx_last_enter_thread());
+    if (q) fprintf(report, "  present queue: held by thread %lu for %.1f s\n", (unsigned long)q, (GetTickCount64() - held_at) / 1000.0);
     else fprintf(report, "  present queue: free\n");
-    fprintf(report, "  kernel: %s%lu\n  GPU channel: %s%lu\n\n", kernel_lock_owner() ? "held by thread " : "free ", kernel_lock_owner(),
-            nv_lock_owner() ? "held by thread " : "free ", nv_lock_owner());
+    fprintf(report, "  kernel: %s%lu\n  GPU channel: %s%lu\n\n", kernel_lock_owner() ? "held by thread " : "free ", (unsigned long)kernel_lock_owner(),
+            nv_lock_owner() ? "held by thread " : "free ", (unsigned long)nv_lock_owner());
     gfx_report_compiles(to_report);
     fprintf(report, "\nGuest threads:\n");
     kernel_thread_states(to_report);

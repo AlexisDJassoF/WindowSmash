@@ -13,6 +13,7 @@
 /captures/
 /netplay_address.txt
 /netplay_id.txt
+/online_name.txt
 # This PC's settings, written on the first start (docs/RUNTIME-SETUP.md)
 /controllers.ini
 /display.ini
@@ -26,6 +27,9 @@
 /module_bases.txt
 /version.txt
 /last_version.txt
+# Linux build outputs (tools/linux)
+/build-linux*/
+/dist-linux*/
 *.keys
 *.nca
 *.nsp

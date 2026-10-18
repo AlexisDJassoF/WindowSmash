@@ -16,7 +16,13 @@
  *   display  the monitor's own refreshes (every 1st/2nd/4th at 60/120/240 Hz): every frame is
  *            on screen equally long, but the game then runs at the monitor's real rate (59.94
  *            frames a second on a 59.94 Hz monitor). Falls back to the clock on other rates.
- * SSBU_WINDOW, SSBU_WINDOW_SIZE (WxH) and SSBU_PACING override the file (test runs). */
+ * SSBU_WINDOW, SSBU_WINDOW_SIZE (WxH) and SSBU_PACING override the file (test runs).
+ *
+ * Linux: the window is SDL's, made and run by linux/window.c with this file's settings
+ * (display_window_mode ...); borderless and fullscreen are both SDL's desktop full screen.
+ * DXVK presents at once at sync interval 0 (Vulkan's immediate mode) whatever the pacing, so
+ * clock and vrr differ only in the flag; display falls back to the clock (DXVK's WaitForVBlank
+ * only sleeps a refresh). */
 #define _WIN32_WINNT 0x0A00
 #define COBJMACROS
 #define _CRT_SECURE_NO_WARNINGS
@@ -39,21 +45,39 @@ static const char DEFAULT_INI[] =
     "; Delete this file to get it written again with the defaults. A line starting with ';' is a comment.\n"
     "\n"
     "; window = windowed | borderless | fullscreen\n"
+#ifdef _WIN32
     ";   windowed:   a normal window, kept 16:9 while you resize it.\n"
     ";   borderless: no frame, covering the monitor the window is on.\n"
     ";   fullscreen: borderless and always on top (the monitor keeps its resolution).\n"
+#else
+    ";   windowed:   a normal window; the picture stays 16:9 inside it, with black bars.\n"
+    ";   borderless, fullscreen: the desktop's full screen on the window's monitor (it keeps its resolution).\n"
+#endif
     "; F11 or Alt+Enter switches between the window and full screen while playing.\n"
     "window = windowed\n"
+#ifdef _WIN32
     "; width, height: the window's inside, at 100% display scaling (scaled with Windows' setting).\n"
+#else
+    "; width, height: the window's inside, in the desktop's units (scaled ones on a scaled Wayland desktop).\n"
+#endif
     "width = 1280\n"
     "height = 720\n"
     "\n"
     "; pacing = clock | vrr | display\n"
+#ifdef _WIN32
     ";   clock:   a steady 60 frames a second; each is shown at the monitor's next refresh.\n"
     ";   vrr:     for G-Sync / FreeSync monitors: each frame is shown the moment it is ready, so every\n"
     ";            frame stays on screen exactly 16.7 ms. Best with window = borderless. Tears without VRR.\n"
     ";   display: follow the monitor's refreshes (60, 120 or 240 Hz only; else as clock). The game then\n"
     ";            runs at the monitor's exact rate, e.g. 59.94 frames a second.\n"
+#else
+    ";   clock:   a steady 60 frames a second, each presented the moment it is ready. A compositing\n"
+    ";            desktop shows it at its next refresh; in full screen without one it may tear\n"
+    ";            (DXVK_CONFIG=\"dxgi.tearFree = True\" in the environment prevents that).\n"
+    ";   vrr:     the same clock, for FreeSync / G-Sync monitors with VRR on in the desktop or driver:\n"
+    ";            every frame stays on screen exactly 16.7 ms. Best with window = fullscreen.\n"
+    ";   display: as clock (Linux has no wait for the monitor's refresh here).\n"
+#endif
     "pacing = clock\n"
     "; latency = 1-3: how many frames the graphics card may work ahead. Lower is more responsive.\n"
     "latency = 3\n"
@@ -125,15 +149,20 @@ static void load(void) {
 int display_latency(void) { load(); return cfg.latency; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
 
+#ifdef _WIN32
 void display_dpi_aware(void) {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     BOOL (WINAPI *set)(DPI_AWARENESS_CONTEXT) =
         user32 ? (BOOL (WINAPI *)(DPI_AWARENESS_CONTEXT))(void *)GetProcAddress(user32, "SetProcessDpiAwarenessContext") : NULL;
     if (set) set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 }
+#else
+void display_dpi_aware(void) {}   /* (SDL gives the window's pixels: linux/window.c) */
+#endif
 
 /* ---- the window --------------------------------------------------------------------- */
 static volatile LONG pending_size;          /* client w << 16 | h, 0 = none */
+#ifdef _WIN32
 static volatile LONG monitor_changed = 1;
 static int current_mode, hidden_cursor;
 static WINDOWPLACEMENT windowed_place = {sizeof(WINDOWPLACEMENT)};
@@ -206,6 +235,7 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
     SetTimer(h, 1, 500, NULL);   /* the idle pointer */
     return h;
 }
+#endif
 
 int display_take_size(unsigned *w, unsigned *h) {
     LONG v = InterlockedExchange(&pending_size, 0);
@@ -224,6 +254,7 @@ void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw,
     *y = (h - *fh) / 2;
 }
 
+#ifdef _WIN32
 int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
     switch (msg) {
     case WM_KEYDOWN:
@@ -310,6 +341,18 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
     }
     return 0;
 }
+#else
+/* Linux: linux/window.c makes the window with SDL, on the main thread, and asks here. */
+static volatile LONG refresh_hz;
+
+int display_window_mode(void) { load(); return cfg.mode; }
+void display_window_size(int *width, int *height) { load(); *width = cfg.width; *height = cfg.height; }
+int display_hide_cursor(void) { load(); return cfg.hide_cursor; }
+void display_note_size(unsigned w, unsigned h) {
+    if (w && h && w < 0x8000 && h < 0x10000) InterlockedExchange(&pending_size, (LONG)(w << 16 | h));
+}
+void display_note_refresh(int hz) { InterlockedExchange(&refresh_hz, hz); }
+#endif
 
 /* ---- pacing ----------------------------------------------------------------------------- */
 static int tearing;
@@ -325,6 +368,7 @@ void *gfx_display_output(void);   /* gpu_d3d11.c: the swap chain's output (IDXGI
 void *gfx_window_handle(void);
 
 /* The refresh rate of the window's monitor, in Hz (0 unknown). */
+#ifdef _WIN32
 static int monitor_hz(void) {
     HWND h = (HWND)gfx_window_handle();
     MONITORINFOEXW mi = {.cbSize = sizeof mi};
@@ -362,6 +406,15 @@ static int vblank_tick(void) {
     if (failed) fprintf(stderr, "[display] waiting for the monitor's refresh failed: clock pacing from now on\n");
     return !failed;
 }
+#else
+static int monitor_hz(void) { return (int)refresh_hz; }
+
+static int vblank_tick(void) {
+    static int logged;
+    if (!logged++) fprintf(stderr, "[display] display pacing: no wait for the monitor's refresh on Linux, clock pacing instead\n");
+    return 0;
+}
+#endif
 
 void display_wait_tick(void) {
     static LARGE_INTEGER freq, base;

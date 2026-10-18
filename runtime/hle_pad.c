@@ -11,7 +11,10 @@
  *
  * controllers.ini (SSBU_CONTROLLERS=<file>, else in the current directory: the port root, where
  * every launcher starts the game) says how pads become players; it is written with the defaults
- * and their documentation when it does not exist. */
+ * and their documentation when it does not exist.
+ *
+ * Linux: the program links SDL2 (SSBU_HAVE_SDL2), started by the window (linux/window.c), and
+ * the input thread reads its game controllers the same way; there is no XInput. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <math.h>
 #include <stdio.h>
@@ -24,6 +27,9 @@
 #include <SDL3/SDL_guid.h>
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_version.h>
+#elif defined SSBU_HAVE_SDL2
+#include <SDL.h>
+#include <dlfcn.h>
 #endif
 
 /* The pad's own controls, numbered as SDL3 numbers its gamepad buttons (a stable ABI). */
@@ -36,6 +42,9 @@ enum { RA_LEFTX, RA_LEFTY, RA_RIGHTX, RA_RIGHTY, RA_LEFT_TRIGGER, RA_RIGHT_TRIGG
 #ifdef SSBU_HAVE_SDL3
 _Static_assert(RB_SOUTH == SDL_GAMEPAD_BUTTON_SOUTH && RB_TOUCHPAD == SDL_GAMEPAD_BUTTON_TOUCHPAD &&
                RB_COUNT == SDL_GAMEPAD_BUTTON_COUNT && RA_RIGHT_TRIGGER == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "SDL numbering");
+#elif defined SSBU_HAVE_SDL2   /* (SDL2's numbering is SDL3's up to the touchpad; A is the bottom button) */
+_Static_assert(RB_SOUTH == SDL_CONTROLLER_BUTTON_A && RB_RIGHT_PADDLE1 == SDL_CONTROLLER_BUTTON_PADDLE1 &&
+               RB_TOUCHPAD == SDL_CONTROLLER_BUTTON_TOUCHPAD && RA_RIGHT_TRIGGER == SDL_CONTROLLER_AXIS_TRIGGERRIGHT, "SDL numbering");
 #endif
 static const char *const RAW_BUTTON_NAMES[RB_COUNT] = {
     "south", "east", "west", "north", "back", "guide", "start", "leftstick", "rightstick", "leftshoulder",
@@ -221,6 +230,9 @@ typedef struct Dev {
 #ifdef SSBU_HAVE_SDL3
     SDL_JoystickID id;
     SDL_Gamepad *gp;
+#elif defined SSBU_HAVE_SDL2
+    SDL_JoystickID id;
+    SDL_GameController *gp;
 #endif
     char guid[40], name[96], type[24], serial[64], path[192];
     int deadzone, rumble, trigger;
@@ -411,12 +423,14 @@ static void xinput_raw(const XPad *p, Raw *raw) {
 }
 
 static int xinput_start(void) {
+#ifdef _WIN32
     HMODULE m = LoadLibraryA("xinput1_4.dll");
     if (!m) m = LoadLibraryA("xinput9_1_0.dll");
     if (m) {
         xinput_get_state = (DWORD (WINAPI *)(DWORD, XState *))(void *)GetProcAddress(m, "XInputGetState");
         xinput_set_state = (DWORD (WINAPI *)(DWORD, XVibration *))(void *)GetProcAddress(m, "XInputSetState");
     }
+#endif
     return xinput_get_state != NULL;
 }
 
@@ -568,6 +582,114 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         if (rumble_due(d, now, &low, &high)) p_SDL_RumbleGamepad(d->gp, low, high, low || high ? 200 : 0);
     }
 }
+#elif defined SSBU_HAVE_SDL2
+/* ---- SDL2 (Linux) ----------------------------------------------------------------------
+ * The main thread starts SDL with the window and runs its event loop (linux/window.c), with
+ * controller and joystick events off and SDL_AUTO_UPDATE_JOYSTICKS=0: that loop leaves the pads
+ * alone, and SDL_GameControllerUpdate here reads them and finds the ones that came and went.
+ * SDL2's joystick calls take its joystick lock, so this thread may make them. Face buttons are
+ * positional (SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0): A is the bottom one, as SDL3's SOUTH. */
+static const char *(*p_SDL_GameControllerPath)(SDL_GameController *);   /* (SDL 2.24 and later) */
+
+static int sdl_start(void) {
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER) && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER)) {
+        fprintf(stderr, "[input] SDL could not start its game controllers (%s): keyboard only\n", SDL_GetError());
+        return 0;
+    }
+    SDL_GameControllerEventState(SDL_IGNORE);   /* (window.c says so too; this is in case it has no window) */
+    SDL_JoystickEventState(SDL_IGNORE);
+    p_SDL_GameControllerPath = (const char *(*)(SDL_GameController *))dlsym(RTLD_DEFAULT, "SDL_GameControllerPath");
+    int mapped = SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");
+    SDL_version v;
+    SDL_GetVersion(&v);
+    fprintf(stderr, "[input] SDL %d.%d.%d%s\n", v.major, v.minor, v.patch, mapped > 0 ? ", with gamecontrollerdb.txt" : "");
+    return 1;
+}
+
+/* A pad type as SDL3 names it (controllers.ini's [device <type>]). */
+static const char *sdl2_type(int type) {
+    switch (type) {
+    case SDL_CONTROLLER_TYPE_XBOX360: return "xbox360";
+    case SDL_CONTROLLER_TYPE_XBOXONE: return "xboxone";
+    case SDL_CONTROLLER_TYPE_PS3: return "ps3";
+    case SDL_CONTROLLER_TYPE_PS4: return "ps4";
+    case SDL_CONTROLLER_TYPE_PS5: return "ps5";
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return "switchpro";
+    case 11: return "joyconleft";   /* (SDL 2.24's NINTENDO_SWITCH_JOYCON_LEFT, _RIGHT, _PAIR) */
+    case 12: return "joyconright";
+    case 13: return "joyconpair";
+    default: return "standard";
+    }
+}
+
+static void sdl_open(int index) {
+    Dev *d = NULL;
+    for (int i = 0; i < (int)(sizeof devs / sizeof *devs) && !d; i++) if (!devs[i].used) d = &devs[i];
+    if (!d) return;
+    SDL_GameController *gp = SDL_GameControllerOpen(index);
+    if (!gp) return;
+    memset(d, 0, sizeof *d);
+    d->used = 1; d->xinput = -1; d->gp = gp;
+    d->id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gp));
+    SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(index), d->guid, sizeof d->guid);
+    const char *s;
+    int type = SDL_GameControllerGetType(gp);
+    snprintf(d->name, sizeof d->name, "%s", (s = SDL_GameControllerName(gp)) ? s : "gamepad");
+    snprintf(d->type, sizeof d->type, "%s", sdl2_type(type));
+    snprintf(d->serial, sizeof d->serial, "%s", (s = SDL_GameControllerGetSerial(gp)) ? s : "");
+    snprintf(d->path, sizeof d->path, "%s", p_SDL_GameControllerPath && (s = p_SDL_GameControllerPath(gp)) ? s : "");
+    /* the letters on the face buttons (south, east, west, north), as SDL3 gives them by type */
+    static const int XBOX[4] = {N_A, N_B, N_X, N_Y}, NINTENDO[4] = {N_B, N_A, N_Y, N_X}, NONE[4] = {-1, -1, -1, -1};
+    const int *labels = type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5 ? NONE :
+                        type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO || (type >= 11 && type <= 13) ? NINTENDO : XBOX;
+    dev_configure(d, labels);
+    d->slot = dev_assign(d);
+    if (d->slot >= 0) { dev_remember(d); SDL_GameControllerSetPlayerIndex(gp, d->slot); }
+    log_connect(d);
+}
+
+/* Pads that came and went (every 100 ms), then every pad's state. */
+static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
+    static ULONGLONG scanned;
+    ULONGLONG now = GetTickCount64();
+    SDL_GameControllerUpdate();
+    if (now - scanned >= 100) {
+        scanned = now;
+        int n = SDL_NumJoysticks();
+        for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
+            Dev *d = &devs[i];
+            if (!d->used || SDL_GameControllerGetAttached(d->gp)) continue;
+            if (d->slot >= 0) fprintf(stderr, "[input] player %d: \"%s\" disconnected\n", d->slot + 1, d->name);
+            SDL_GameControllerClose(d->gp);
+            d->used = 0;
+        }
+        for (int k = 0; k < n; k++) {
+            if (!SDL_IsGameController(k)) continue;
+            SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(k);
+            int open = 0;
+            for (int i = 0; i < (int)(sizeof devs / sizeof *devs) && !open; i++) open = devs[i].used && devs[i].id == id;
+            if (!open) sdl_open(k);
+        }
+        for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++)   /* a player became free */
+            if (devs[i].used && devs[i].slot < 0 && (devs[i].slot = dev_assign(&devs[i])) >= 0) {
+                dev_remember(&devs[i]);
+                SDL_GameControllerSetPlayerIndex(devs[i].gp, devs[i].slot);
+                log_connect(&devs[i]);
+            }
+    }
+    for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
+        Dev *d = &devs[i];
+        if (!d->used || d->slot < 0) continue;
+        Raw raw = {0};
+        for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < RB_COUNT; b++)
+            if (SDL_GameControllerGetButton(d->gp, (SDL_GameControllerButton)b)) raw.buttons |= 1u << b;
+        for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = SDL_GameControllerGetAxis(d->gp, (SDL_GameControllerAxis)a);
+        dev_state(d, &raw, &fresh[d->slot]);
+        snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
+        u16 low, high;
+        if (rumble_due(d, now, &low, &high)) SDL_GameControllerRumble(d->gp, low, high, low || high ? 200 : 0);
+    }
+}
 #else
 static int sdl_start(void) { return 0; }
 static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) { (void)fresh; (void)names; }
@@ -581,7 +703,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     int sdl = sdl_start();
-    if (!sdl && !xinput_start()) { fprintf(stderr, "[input] no SDL3 and no XInput: keyboard only\n"); return 0; }
+    if (!sdl && !xinput_start()) { fprintf(stderr, "[input] no SDL and no XInput: keyboard only\n"); return 0; }
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
         char names[PAD_SLOTS][48] = {{0}};

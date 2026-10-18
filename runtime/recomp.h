@@ -4,11 +4,21 @@
  * memory accesses are plain dereferences. Guest code addresses are only ever looked up
  * (rt_lookup) - recompiled functions are ordinary C functions taking the CPU context. */
 #pragma once
+#ifdef _WIN32
 #include <excpt.h>
+#endif
 #include <math.h>
 #include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
+
+/* Linux builds compile the generated files that have exception landing sites as C++ (see
+ * rt_eh_filter below); everything here keeps C linkage either way. */
+#ifdef __cplusplus
+#define _Alignas(n) alignas(n)
+#define _Noreturn __attribute__((noreturn))
+extern "C" {
+#endif
 
 typedef uint8_t u8;   typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef int8_t i8;    typedef int16_t i16;  typedef int32_t i32;  typedef int64_t i64;
@@ -46,10 +56,23 @@ static inline GuestFn *rt_target(u64 guest_addr, RtCache *cache) {
 jmp_buf *rt_setjmp(Cpu *c);   /* a guest setjmp(X0): its host buffer, the guest registers saved */
 /* C++ exceptions: a call that may unwind into landing pad `lp` of its function catches the
  * host exception rt_unwind_jumpto raises for that pad and this frame's stack pointer. */
+#ifdef _WIN32
 struct _EXCEPTION_POINTERS;
 int rt_eh_filter(struct _EXCEPTION_POINTERS *e, u64 sp, u64 lp);
 #ifndef GetExceptionInformation
 #define GetExceptionInformation() ((struct _EXCEPTION_POINTERS *)_exception_info())
+#endif
+#else
+/* Linux has no structured exception handling in C: the landing sites' __try / __except become
+ * a C++ try and a catch of the exception rt_unwind_jumpto throws (runtime/linux/eh.cpp), which
+ * goes on unwinding unless the filter matches this frame - the same test, the same result. */
+typedef struct RtEhSignal { u64 lp, sp; } RtEhSignal;
+int rt_eh_filter(const RtEhSignal *e, u64 sp, u64 lp);
+#ifdef __cplusplus
+#define __try try
+#define __except(filter) catch (const RtEhSignal &rt_e_) { if (!(filter)) throw; lp_ = 1; } if (0)
+#define GetExceptionInformation() (&rt_e_)
+#endif
 #endif
 _Noreturn void rt_trap(Cpu *c, u64 pc, const char *why);
 void rt_svc(Cpu *c, u32 number);   /* a guest system call */
@@ -291,3 +314,7 @@ static inline void rt_ldst_single(Cpu *c, int load, int replicate, int rt, int s
         else memcpy((void *)addr, v->b + index * ebytes, ebytes);
     }
 }
+
+#ifdef __cplusplus
+}
+#endif

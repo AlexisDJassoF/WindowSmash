@@ -6,7 +6,9 @@
  * is saved to <data dir>/../nro/<build id>.nro for the next build to pick up, and reported
  * as loaded so that the game goes on to hand over the rest. */
 #define _CRT_SECURE_NO_WARNINGS
+#ifdef _WIN32
 #include <direct.h>
+#endif
 #include <stdio.h>
 
 #include "host.h"

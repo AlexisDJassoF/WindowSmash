@@ -24,6 +24,7 @@ HLE(_ZN2nn3web16ShowYouTubeVideoEPNS0_18WebPageReturnValueERKNS0_19ShowYouTubeVi
  * "answer in UTF-8" at 0x3BC/0x3BD; the initial text lies in the work buffer (pointer at
  * 0x4D0) at the offset and length (in characters) at 0x3C0/0x3C4. The answer goes to
  * out = {pointer, size in bytes}, NUL-terminated; 0 means OK, R_SWKBD_CANCELED backed out. */
+#ifdef _WIN32
 enum { ID_TEXT = 100, ID_EDIT = 101 };
 
 typedef struct Keyboard {
@@ -148,6 +149,172 @@ HLE(_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE) {
     }
     c->x[0] = ok ? 0 : R_SWKBD_CANCELED;
 }
+
+#else
+/* Linux: the text box is zenity's (GNOME's dialog tool), else kdialog's, else the terminal's. */
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+static size_t utf8_of(const u16 *w, size_t n, char *out, size_t cap) {   /* UTF-16 -> UTF-8 */
+    size_t o = 0;
+    for (size_t i = 0; i < n && w[i]; i++) {
+        u32 c = w[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < n && w[i + 1] >= 0xDC00 && w[i + 1] < 0xE000) c = 0x10000 + ((c - 0xD800) << 10) + (w[++i] - 0xDC00);
+        u8 b[4];
+        int k = c < 0x80 ? (b[0] = (u8)c, 1) : c < 0x800 ? (b[0] = (u8)(0xC0 | c >> 6), b[1] = (u8)(0x80 | (c & 63)), 2)
+              : c < 0x10000 ? (b[0] = (u8)(0xE0 | c >> 12), b[1] = (u8)(0x80 | (c >> 6 & 63)), b[2] = (u8)(0x80 | (c & 63)), 3)
+              : (b[0] = (u8)(0xF0 | c >> 18), b[1] = (u8)(0x80 | (c >> 12 & 63)), b[2] = (u8)(0x80 | (c >> 6 & 63)), b[3] = (u8)(0x80 | (c & 63)), 4);
+        if (o + (size_t)k + 1 > cap) break;
+        memcpy(out + o, b, (size_t)k);
+        o += (size_t)k;
+    }
+    out[o] = 0;
+    return o;
+}
+
+static size_t utf16_of(const char *s, u16 *out, size_t cap) {   /* UTF-8 -> UTF-16 */
+    size_t o = 0;
+    const u8 *p = (const u8 *)s;
+    while (*p && o + 1 < cap) {
+        u32 c = *p++;
+        int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+        if (more) c &= 0x3F >> more;
+        while (more-- && (*p & 0xC0) == 0x80) c = c << 6 | (*p++ & 63);
+        if (c >= 0x10000) {
+            if (o + 2 >= cap) break;
+            c -= 0x10000;
+            out[o++] = (u16)(0xD800 + (c >> 10));
+            out[o++] = (u16)(0xDC00 + (c & 0x3FF));
+        } else out[o++] = (u16)c;
+    }
+    out[o] = 0;
+    return o;
+}
+
+static size_t count16(const u16 *w) { size_t n = 0; while (w[n]) n++; return n; }
+
+/* Run a dialog program; its standard output (trailing newline dropped) into out. Returns its
+ * exit status, or -1 if it could not run. */
+static int run_dialog(char *const argv[], char *out, size_t cap) {
+    int fds[2];
+    if (pipe(fds)) return -1;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    pid_t pid;
+    int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (err) { close(fds[0]); return -1; }
+    size_t n = 0;
+    for (ssize_t r; n + 1 < cap && (r = read(fds[0], out + n, cap - 1 - n)) != 0;) {
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        n += (size_t)r;
+    }
+    out[n] = 0;
+    close(fds[0]);
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (n && out[n - 1] == '\n') out[--n] = 0;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Ask for the text: 1 OK (answer in text), 0 cancelled. */
+static int ask_text_now(const char *prompt, const char *initial, int multiline, char *text, size_t cap) {
+    char marked[4096];   /* (zenity reads its text as Pango markup) */
+    size_t m = 0;
+    for (const char *q = prompt; *q && m + 6 < sizeof marked; q++) {
+        const char *e = *q == '&' ? "&amp;" : *q == '<' ? "&lt;" : *q == '>' ? "&gt;" : NULL;
+        if (e) { memcpy(marked + m, e, strlen(e)); m += strlen(e); } else marked[m++] = *q;
+    }
+    marked[m] = 0;
+    char *zenity_line[] = {"zenity", "--entry", "--title=Super Smash Bros. Ultimate - keyboard", "--width=480", "--text", marked,
+                           "--entry-text", (char *)initial, NULL};
+    char *kdialog[] = {"kdialog", "--title", "Super Smash Bros. Ultimate - keyboard", "--inputbox", (char *)prompt, (char *)initial, NULL};
+    (void)multiline;   /* (the answer is one line: new lines are rare in what the game asks for) */
+    int r = run_dialog(zenity_line, text, cap);
+    if (r == 0) return 1;
+    if (r == 1) return 0;   /* Cancel */
+    r = run_dialog(kdialog, text, cap);
+    if (r == 0) return 1;
+    if (r == 1) return 0;
+    if (isatty(0)) {   /* no dialog program: the terminal the game runs in */
+        fprintf(stderr, "\n[keyboard] %s\n[keyboard] text (empty line keeps \"%s\"): ", prompt, initial);
+        if (!fgets(text, (int)cap, stdin)) return 0;
+        text[strcspn(text, "\r\n")] = 0;
+        if (!text[0]) snprintf(text, cap, "%s", initial);
+        return 1;
+    }
+    fprintf(stderr, "[keyboard] no zenity, kdialog or terminal: answering with the initial text\n");
+    snprintf(text, cap, "%s", initial);
+    return 1;
+}
+
+static int ask_text(const char *prompt, const char *initial, int multiline, char *text, size_t cap) {
+    watchdog_pause(1);   /* (the game waits for the dialog: no frames meanwhile) */
+    int ok = ask_text_now(prompt, initial, multiline, text, cap);
+    watchdog_pause(0);
+    return ok;
+}
+
+HLE(_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE) {
+    u64 out = c->x[0], arg = c->x[1];
+    static u16 header[66], sub[130], guide[258], initial[1024], answer[1024];
+    u16 *texts[3] = {header, sub, guide};
+    const u64 at[3] = {0x24, 0xA6, 0x1A8};
+    const size_t max[3] = {64, 128, 256};
+    for (int t = 0; t < 3; t++) {
+        size_t n = 0;
+        while (n < max[t] && ld16(arg + at[t] + 2 * n)) { texts[t][n] = ld16(arg + at[t] + 2 * n); n++; }
+        texts[t][n] = 0;
+    }
+    int max_len = (int)ld32(arg + 0x3AC), min_len = (int)ld32(arg + 0x3B0);
+    if (max_len <= 0 || max_len > 1000) max_len = 1000;
+    if (min_len < 0 || min_len > max_len) min_len = 0;
+    int multiline = ld8(arg + 0x3BC) != 0, utf8 = ld8(arg + 0x3BD) != 0;
+    u64 work = ld64(arg + 0x4D0);
+    u32 offset = ld32(arg + 0x3C0), length = ld32(arg + 0x3C4);
+    size_t ni = 0;
+    if (work && length) for (; ni < length && ni < 1000 && ld16(work + offset + 2 * ni); ni++) initial[ni] = ld16(work + offset + 2 * ni);
+    initial[ni] = 0;
+    /* header, sub text, then the guide (the box's placeholder on the console) */
+    char prompt[2048] = "", part[1024], init8[4096], text8[4096];
+    for (int t = 0; t < 3; t++) {
+        if (!texts[t][0]) continue;
+        utf8_of(texts[t], count16(texts[t]), part, sizeof part);
+        size_t l = strlen(prompt);
+        snprintf(prompt + l, sizeof prompt - l, t == 2 && l ? "\n(%s)" : l ? "\n%s" : "%s", part);
+    }
+    if (!prompt[0]) snprintf(prompt, sizeof prompt, "Enter text");
+    utf8_of(initial, ni, init8, sizeof init8);
+    int ok;
+    size_t n;
+    for (;;) {
+        ok = ask_text(prompt, init8, multiline, text8, sizeof text8);
+        n = utf16_of(ok ? text8 : init8, answer, sizeof answer / sizeof *answer);
+        if ((int)n > max_len) answer[n = (size_t)max_len] = 0;
+        if (!ok || (int)n >= min_len) break;
+        snprintf(init8, sizeof init8, "%s", text8);   /* too short: ask again */
+    }
+    u64 ptr = out ? ld64(out) : 0, size = out ? ld64(out + 8) : 0;
+    if (ptr && size >= (utf8 ? 1u : 2u)) {
+        if (utf8) {
+            char buf[4096];
+            size_t m = utf8_of(answer, n, buf, sizeof buf) + 1;
+            if (m > size) { m = (size_t)size; buf[m - 1] = 0; }
+            memcpy(P(void, ptr), buf, m);
+        } else {
+            size_t room = (size_t)(size / 2) - 1, k = n < room ? n : room;
+            for (size_t i = 0; i < k; i++) st16(ptr + 2 * i, answer[i]);
+            st16(ptr + 2 * k, 0);
+        }
+    }
+    c->x[0] = ok ? 0 : R_SWKBD_CANCELED;
+}
+#endif
 
 /* The shop: unavailable offline. */
 HLE(_ZN2nn2ec19ShowShopProductListEPKNS0_5NsUidEiPKcRKNS_7account10UserHandleE) { c->x[0] = R_CANCELED; }

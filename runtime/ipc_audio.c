@@ -1,4 +1,4 @@
-/* Audio output (audout:u), natively, played through the Windows waveOut API.
+/* Audio output (audout:u), natively, played through the Windows waveOut API (SDL on Linux).
  *
  * The game mixes its own sound and streams 48 kHz stereo 16-bit PCM through the SDK's
  * AudioOut interface. Each buffer it appends is copied to the sound card; when the card has
@@ -9,11 +9,17 @@
 #include <string.h>
 
 #include "ipc.h"
+#ifdef _WIN32
 #include <mmsystem.h>   /* after windows.h */
+#else
+#include <SDL.h>
+#endif
 
 #define RATE 48000
 #define CHANNELS 2
 #define MAX_BUFFERS 64
+
+#ifdef _WIN32
 
 typedef struct Pending { WAVEHDR hdr; u64 tag; int used; } Pending;
 static struct {
@@ -104,6 +110,117 @@ static void append(u64 desc, u64 tag) {
     waveOutWrite(audio.out, &p->hdr, sizeof p->hdr);
     LeaveCriticalSection(&audio.lock);
 }
+
+#else
+/* Linux: SDL plays the buffers - its callback takes them in order, and a reaper reports each
+ * one played (as waveOut's completion does on Windows), outside the audio thread. */
+typedef struct Pending { u8 *data; u32 size, pos; u64 tag; int used; } Pending;   /* used: 1 queued, 2 played */
+static struct {
+    SDL_AudioDeviceID out;
+    Pending pending[MAX_BUFFERS];
+    u32 order[MAX_BUFFERS], head, count;   /* queued slots, oldest first */
+    u64 released[MAX_BUFFERS * 2];
+    u32 nreleased;
+    u32 event;
+    int started;
+    u64 played_samples;
+    f32 volume;
+    CRITICAL_SECTION lock;
+} audio = {.volume = 1.0f};
+static HANDLE played_event;
+
+static void SDLCALL feed(void *user, Uint8 *out, int len) {
+    (void)user;
+    int any = 0;
+    EnterCriticalSection(&audio.lock);
+    while (len > 0) {
+        if (!audio.count) { memset(out, 0, (size_t)len); break; }   /* (nothing queued: silence) */
+        Pending *p = &audio.pending[audio.order[audio.head]];
+        u32 n = p->size - p->pos < (u32)len ? p->size - p->pos : (u32)len;
+        memcpy(out, p->data + p->pos, n);
+        out += n; len -= (int)n; p->pos += n;
+        if (p->pos >= p->size) {
+            p->used = 2;
+            audio.head = (audio.head + 1) % MAX_BUFFERS;
+            audio.count--;
+            any = 1;
+        }
+    }
+    LeaveCriticalSection(&audio.lock);
+    if (any) SetEvent(played_event);
+}
+
+static DWORD WINAPI reaper(void *arg) {
+    (void)arg;
+    SetThreadDescription(GetCurrentThread(), L"audio reaper");
+    for (;;) {
+        WaitForSingleObject(played_event, INFINITE);
+        int any = 0;
+        EnterCriticalSection(&audio.lock);
+        for (u32 i = 0; i < MAX_BUFFERS; i++) {
+            Pending *p = &audio.pending[i];
+            if (p->used != 2) continue;
+            if (audio.nreleased < MAX_BUFFERS * 2) audio.released[audio.nreleased++] = p->tag;
+            audio.played_samples += p->size / (2 * CHANNELS);
+            free(p->data);
+            memset(p, 0, sizeof *p);
+            any = 1;
+        }
+        LeaveCriticalSection(&audio.lock);
+        if (any) kernel_signal_event(audio.event);
+    }
+}
+
+static void open_device(void) {
+    static int opened;
+    if (opened++) return;
+    InitializeCriticalSection(&audio.lock);
+    played_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    CloseHandle(CreateThread(NULL, 0, reaper, NULL, 0, NULL));
+    SDL_AudioSpec want, got;
+    memset(&want, 0, sizeof want);
+    want.freq = RATE;
+    want.format = AUDIO_S16SYS;
+    want.channels = CHANNELS;
+    want.samples = 256;   /* (the game keeps a few short buffers queued: small pulls keep up with it) */
+    want.callback = feed;
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) SDL_InitSubSystem(SDL_INIT_AUDIO);
+    audio.out = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+    if (!audio.out) fprintf(stderr, "[audio] no audio device (%s); sound is dropped\n", SDL_GetError());
+    else {
+        fprintf(stderr, "[audio] SDL %s output, %d Hz, %d-sample periods\n", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", got.freq, got.samples);
+        SDL_PauseAudioDevice(audio.out, 0);
+    }
+    audio.event = kernel_create_event();
+}
+
+static void append(u64 desc, u64 tag) {
+    u64 addr = ld64(desc + 8), size = ld64(desc + 24), offset = ld64(desc + 32);
+    EnterCriticalSection(&audio.lock);
+    Pending *p = NULL;
+    u32 slot = 0;
+    for (u32 i = 0; i < MAX_BUFFERS && !p; i++) if (!audio.pending[i].used) { p = &audio.pending[i]; slot = i; }
+    if (!p || !audio.out || !size || audio.count == MAX_BUFFERS) {   /* no device (or saturated): hand the buffer straight back */
+        if (audio.nreleased < MAX_BUFFERS * 2) audio.released[audio.nreleased++] = tag;
+        LeaveCriticalSection(&audio.lock);
+        kernel_signal_event(audio.event);
+        return;
+    }
+    p->data = malloc(size);
+    memcpy(p->data, P(void, addr + offset), size);
+    if (audio.volume != 1.0f) {
+        i16 *s = (i16 *)p->data;
+        for (u64 i = 0; i < size / 2; i++) s[i] = (i16)(s[i] * audio.volume);
+    }
+    p->size = (u32)size;
+    p->pos = 0;
+    p->tag = tag;
+    p->used = 1;
+    audio.order[(audio.head + audio.count) % MAX_BUFFERS] = slot;
+    audio.count++;
+    LeaveCriticalSection(&audio.lock);
+}
+#endif
 
 static void audio_out(IpcObject *self, Ipc *ipc) {
     u64 size, b;
