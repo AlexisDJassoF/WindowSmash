@@ -1,13 +1,14 @@
 /* nn::hid, natively: controllers.
  *
- * Player 1 is a Pro Controller ("full key" style) driven by the first XInput gamepad. The
- * console layout is positional, so the Xbox A (bottom) is the console's B, and so on.
- * Other players are disconnected; motion sensors report a controller at rest; the touch
- * screen reports no touches; rumble requests are accepted. */
+ * Players 1-8 are Pro Controllers ("full key" style) driven by the pads of hle_pad.c (any pad
+ * SDL3 knows, or XInput pads without it); the console layout is positional by default, so the
+ * Xbox A (bottom) is the console's B, and so on. The keyboard adds to one player (player 1 unless
+ * controllers.ini says otherwise). Motion sensors report a controller at rest; the touch screen
+ * reports no touches; rumble goes to the player's pad. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 
-#include "host.h"
+#include "pad.h"
 
 enum { STYLE_FULLKEY = 1u << 0 };
 enum { NPAD_NO1 = 0, NPAD_HANDHELD = 0x20 };
@@ -17,28 +18,17 @@ enum {   /* nn::hid::NpadButton */
     B_LEFT, B_UP, B_RIGHT, B_DOWN, B_SL_LEFT, B_SL_UP, B_SL_RIGHT, B_SL_DOWN, B_SR_LEFT, B_SR_UP, B_SR_RIGHT, B_SR_DOWN
 };
 
-typedef struct { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XPad;
-typedef struct { DWORD packet; XPad pad; } XState;
-typedef DWORD (WINAPI *XInputGetStateFn)(DWORD, XState *);
-
-static XInputGetStateFn xinput_get_state;
 static volatile LONG64 sampling;
 
-static void load_xinput(void) {
-    static int tried;
-    if (tried) return;
-    tried = 1;
-#ifdef _WIN32
-    HMODULE m = LoadLibraryA("xinput1_4.dll");
-    if (!m) m = LoadLibraryA("xinput9_1_0.dll");
-    if (m) xinput_get_state = (XInputGetStateFn)(void *)GetProcAddress(m, "XInputGetState");
-#else
-    DWORD rt_xinput_get_state(DWORD index, void *state);   /* (linux/window.c: the first SDL game controller) */
-    xinput_get_state = (XInputGetStateFn)(void *)rt_xinput_get_state;
-#endif
+/* A player is connected while a pad drives it, while it is the keyboard's, and (player 1) during
+ * a scripted run. */
+static int pad_connected(u32 id) {
+    static int scripted = -1;
+    if (scripted < 0) scripted = getenv("SSBU_INPUT") != NULL;
+    if (id >= PAD_SLOTS) return 0;
+    PadState p;
+    return pad_get(id, &p) || (int)id == pad_keyboard_slot() || (id == NPAD_NO1 && scripted);
 }
-
-static int pad_connected(u32 id) { return id == NPAD_NO1; }
 
 static const char *const BUTTON_NAMES[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS", "MINUS",
                                            "LEFT", "UP", "RIGHT", "DOWN"};
@@ -83,7 +73,8 @@ static u64 scripted_buttons(i32 *lx, i32 *ly) {
 }
 
 /* The keyboard, while the game's window has focus: arrows move, Z/X/C/V are A/B/X/Y,
- * A/S are L/R, Q/W are ZL/ZR, Enter is +, Backspace is -, I/J/K/L are the right stick. */
+ * A/S are L/R, Q/W are ZL/ZR, Enter is + (not with Alt: Alt+Enter is the full-screen switch),
+ * Backspace is -, I/J/K/L are the right stick. */
 int gfx_window_focused(void);
 static u64 keyboard_buttons(i32 *lx, i32 *ly, i32 *rx, i32 *ry) {
     if (!gfx_window_focused()) return 0;
@@ -92,8 +83,9 @@ static u64 keyboard_buttons(i32 *lx, i32 *ly, i32 *rx, i32 *ry) {
         {VK_RETURN, B_PLUS}, {VK_BACK, B_MINUS},
     };
     u64 buttons = 0;
+    int alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
     for (u32 i = 0; i < sizeof keys / sizeof *keys; i++)
-        if (GetAsyncKeyState(keys[i].vk) & 0x8000) buttons |= 1ull << keys[i].n;
+        if (GetAsyncKeyState(keys[i].vk) & 0x8000 && !(alt && keys[i].vk == VK_RETURN)) buttons |= 1ull << keys[i].n;
     if (GetAsyncKeyState(VK_LEFT) & 0x8000) *lx = -32767;
     if (GetAsyncKeyState(VK_RIGHT) & 0x8000) *lx = 32767;
     if (GetAsyncKeyState(VK_UP) & 0x8000) *ly = 32767;
@@ -112,23 +104,13 @@ static void npad_state(u64 out, u32 id) {
     u32 attributes = 0;
     if (pad_connected(id)) {
         attributes = ATTR_CONNECTED | ATTR_WIRED;
-        load_xinput();
-        XState s;
-        if (xinput_get_state && xinput_get_state(0, &s) == 0) {
-            WORD b = s.pad.buttons;
-            static const struct { WORD x; int n; } map[] = {
-                {0x1000, B_B}, {0x2000, B_A}, {0x4000, B_Y}, {0x8000, B_X},          /* positional A/B/X/Y */
-                {0x0100, B_L}, {0x0200, B_R}, {0x0010, B_PLUS}, {0x0020, B_MINUS},
-                {0x0040, B_STICK_L}, {0x0080, B_STICK_R},
-                {0x0001, B_UP}, {0x0002, B_DOWN}, {0x0004, B_LEFT}, {0x0008, B_RIGHT},
-            };
-            for (u32 i = 0; i < sizeof map / sizeof *map; i++)
-                if (b & map[i].x) buttons |= 1ull << map[i].n;
-            if (s.pad.lt > 64) buttons |= 1ull << B_ZL;
-            if (s.pad.rt > 64) buttons |= 1ull << B_ZR;
-            lx = s.pad.lx; ly = s.pad.ly; rx = s.pad.rx; ry = s.pad.ry;
+        PadState p;
+        if (pad_get(id, &p) && (pad_background() || gfx_window_focused())) {
+            buttons = p.buttons;
+            lx = p.lx; ly = p.ly; rx = p.rx; ry = p.ry;
         }
-        buttons |= scripted_buttons(&lx, &ly) | keyboard_buttons(&lx, &ly, &rx, &ry);
+        if (id == NPAD_NO1) buttons |= scripted_buttons(&lx, &ly);
+        if ((int)id == pad_keyboard_slot()) buttons |= keyboard_buttons(&lx, &ly, &rx, &ry);
         {
             /* the stick directions also exist as buttons */
             if (lx < -16384) buttons |= 1ull << B_SL_LEFT;
@@ -157,7 +139,11 @@ HLE(_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj) { npad_state(c->x[0],
 HLE(_ZN2nn3hid12GetNpadStateEPNS0_11NpadGcStateERKj) { npad_state(c->x[0], ld32(c->x[1])); st32(c->x[0] + 32, 0); }
 
 HLE(_ZN2nn3hid15GetNpadStyleSetERKj) { c->x[0] = pad_connected(ld32(c->x[0])) ? STYLE_FULLKEY : 0; }
-HLE(_ZN2nn3hid19GetPlayerLedPatternERKj) { u32 id = ld32(c->x[0]); c->x[0] = id < 8 ? (0x1u << (id & 3)) | (id >= 4 ? 0x8 : 0) : 0; }
+HLE(_ZN2nn3hid19GetPlayerLedPatternERKj) {   /* the console's lights per player: 1, 12, 123, 1234, 14, 13, 134, 23 */
+    static const u8 LEDS[8] = {0x1, 0x3, 0x7, 0xF, 0x9, 0x5, 0xD, 0x6};
+    u32 id = ld32(c->x[0]);
+    c->x[0] = id < 8 ? LEDS[id] : 0;
+}
 HLE(_ZN2nn3hid20GetNpadJoyAssignmentERKj) { c->x[0] = 0; }   /* dual */
 HLE(_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj) {   /* { u32 main, sub } RGBA */
     st32(c->x[0], 0xFF2D2D2D); st32(c->x[0] + 4, 0xFFE6E6E6);
@@ -218,7 +204,11 @@ HLE(_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE) {   
     st32(c->x[0] + 8, 0);
 }
 
-/* ---- rumble ---------------------------------------------------------------------- */
+/* ---- rumble ----------------------------------------------------------------------
+ * A handle is npad id << 8 | device index; a Pro Controller's devices 0 and 1 are its left and
+ * right actuators (VibrationDevicePosition 1 and 2). */
+static u8 vibration_sent[PAD_SLOTS][2][16];   /* the last VibrationValue per actuator */
+
 HLE(_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE) {
     i32 n = (i32)c->x[1] < 2 ? (i32)c->x[1] : 2;
     for (i32 i = 0; i < n; i++) st32(c->x[0] + 4ull * i, ld32(c->x[2]) << 8 | (u32)i);
@@ -226,10 +216,34 @@ HLE(_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4u
 }
 HLE(_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE) { (void)c; }
 HLE(_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE) {
-    st32(c->x[0], 1);                         /* linear resonant actuator */
-    st32(c->x[0] + 4, ld32(c->x[1]) & 1);     /* left / right */
+    st32(c->x[0], 1);                             /* linear resonant actuator */
+    st32(c->x[0] + 4, (ld32(c->x[1]) & 1) + 1);   /* left / right */
 }
-HLE(_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE) { (void)c; }
-HLE(_ZN2nn3hid23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE) { memset(P(void, c->x[0]), 0, 16); }
-HLE(_ZN2nn3hid25SendVibrationGcErmCommandERKNS0_21VibrationDeviceHandleERKNS0_21VibrationGcErmCommandE) { (void)c; }
-HLE(_ZN2nn3hid30GetActualVibrationGcErmCommandEPNS0_21VibrationGcErmCommandERKNS0_21VibrationDeviceHandleE) { st32(c->x[0], 0); }
+/* VibrationValue { f32 amplitude low, frequency low, amplitude high, frequency high } */
+HLE(_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE) {
+    u32 handle = ld32(c->x[0]), id = handle >> 8 & 0xFF, side = handle & 1;
+    if (id >= PAD_SLOTS) return;
+    memcpy(vibration_sent[id][side], P(void, c->x[1]), 16);
+    f32 low, high;
+    memcpy(&low, P(void, c->x[1]), 4);
+    memcpy(&high, P(void, c->x[1] + 8), 4);
+    pad_rumble(id, (int)side + 1, low > high ? low : high);
+}
+HLE(_ZN2nn3hid23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE) {
+    u32 handle = ld32(c->x[1]), id = handle >> 8 & 0xFF;
+    if (id < PAD_SLOTS) memcpy(P(void, c->x[0]), vibration_sent[id][handle & 1], 16);
+    else memset(P(void, c->x[0]), 0, 16);
+}
+/* A GameCube pad's motor: VibrationGcErmCommand 0 stop, 1 start, 2 stop hard. */
+static u32 gc_erm_sent[PAD_SLOTS];
+HLE(_ZN2nn3hid25SendVibrationGcErmCommandERKNS0_21VibrationDeviceHandleERKNS0_21VibrationGcErmCommandE) {
+    u32 id = ld32(c->x[0]) >> 8 & 0xFF, command = ld32(c->x[1]);
+    if (id >= PAD_SLOTS) return;
+    gc_erm_sent[id] = command;
+    pad_rumble(id, 1, command == 1 ? 1.0f : 0.0f);
+    pad_rumble(id, 2, command == 1 ? 1.0f : 0.0f);
+}
+HLE(_ZN2nn3hid30GetActualVibrationGcErmCommandEPNS0_21VibrationGcErmCommandERKNS0_21VibrationDeviceHandleE) {
+    u32 id = ld32(c->x[1]) >> 8 & 0xFF;
+    st32(c->x[0], id < PAD_SLOTS ? gc_erm_sent[id] : 0);
+}

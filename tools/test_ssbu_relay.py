@@ -74,13 +74,17 @@ def info_of(session, owner, stations=(), most=8, policy=0, name=b"Host"):
 
 
 class Player:
-    def __init__(self, server, room="smash", build=BUILD, name="P"):
+    def __init__(self, server, room="smash", build=BUILD, name="P", ext=False, direct=True, lan=(0, 0), bind="127.0.0.1"):
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.s.bind(("127.0.0.1", 0))
+        self.s.bind((bind, 0))
         self.addr = ("127.0.0.1", server.port)
         self.nonce = secrets.token_bytes(8)
         self.room, self.build, self.name = room, build, name
         self.ip = self.cookie = None
+        # direct connections: a game that can (ext) says so in its PINGs; the PEERS it gets
+        self.ext, self.direct, self.lan = ext, direct, lan
+        self.have = 0          # the version of the last PEERS seen (what its PINGs report)
+        self.peer_lists = []   # PEERS packets that came, not yet looked at
 
     def close(self):
         self.s.close()
@@ -100,7 +104,10 @@ class Player:
                 data, _ = self.s.recvfrom(65536)
             except (socket.timeout, ConnectionResetError):
                 return out
-            out.append(data)
+            if data[3] == R.PEERS:
+                self.peer_lists.append(data)
+            else:
+                out.append(data)
 
     def first(self, kind, wait=0.6):
         """The first packet of this kind within wait seconds (others are dropped)."""
@@ -116,6 +123,8 @@ class Player:
                 return None
             if data[3] == kind:
                 return data
+            if data[3] == R.PEERS:
+                self.peer_lists.append(data)
 
     def join_packet(self, version=R.PROTOCOL, size=R.JOIN_SIZE):
         p = (R.header(R.JOIN, version) + self.nonce + self.room.encode().ljust(32, b"\0") +
@@ -132,9 +141,33 @@ class Player:
             self.ping()
         return self
 
-    def ping(self, ms=20):
-        self.send(R.header(R.PING) + self.nonce + struct.pack(">QQH", 1234, self.cookie, ms))
+    def ping(self, ms=20, have=None):
+        p = R.header(R.PING) + self.nonce + struct.pack(">QQH", 1234, self.cookie, ms)
+        if self.ext:
+            p += struct.pack(">IIHBB", self.have if have is None else have, *self.lan, 1 if self.direct else 0, 0)
+        self.send(p)
         return self.first(R.PONG)
+
+    def peers(self, wait=0.4):
+        """The newest PEERS that came (within wait seconds): (version, [entries]), or None. An entry
+        is (address, name, introduced, (public ip, port), (LAN ip, port), secret, flags)."""
+        self.recv(wait)
+        lists, self.peer_lists = self.peer_lists, []
+        if not lists:
+            return None
+        p = lists[-1]
+        cookie, version, count = struct.unpack_from(">QIB", p, 4)
+        assert cookie == self.cookie and len(p) == 17 + count * R.PEER.size
+        self.have = version
+        out = []
+        for i in range(count):
+            ip, name, flags, pip, pport, lip, lport, secret = R.PEER.unpack_from(p, 17 + i * R.PEER.size)
+            out.append((ip, name.rstrip(b"\0"), flags & 1, (pip, pport), (lip, lport), secret, flags))
+        return version, out
+
+    def bcast(self, skip, payload, dst=BCAST, sport=GAME_PORT, dport=GAME_PORT, src=None):
+        self.send(R.header(R.BCAST) + bytes((len(skip),)) + b"".join(struct.pack(">I", ip) for ip in skip) +
+                  struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
 
     def list(self, seq=7):
         self.send(R.header(R.LIST) + struct.pack(">QI", self.cookie, seq))
@@ -178,14 +211,14 @@ class LobbyTest(unittest.TestCase):
         self.players.append(p)
         return p.join() if join else p
 
-    def room(self, stations=0):
+    def room(self, stations=0, **kw):
         """A host with a network, and stations that joined it (asked and were accepted)."""
-        host = self.player(name="Host")
+        host = self.player(name="Host", **kw)
         session = secrets.token_bytes(16)
         host.advertise(session)
         joined = []
         for _ in range(stations):
-            s = self.player(name="Guest")
+            s = self.player(name="Guest", **kw)
             s.ldn(host.ip, R.LM_JOIN, session + b"Guest".ljust(32, b"\0") + b"\0\0")
             self.assertTrue(any(src == s.ip for src, *_ in host.datas()), "the JOIN did not reach the host")
             joined.append(s)
@@ -448,6 +481,241 @@ class Rooms(LobbyTest):
         self.assertEqual([p[1] for s, d, sp, p in a.datas()], [R.LM_KICK, R.LM_ADVERTISE])
 
 
+
+
+LOCAL = R.address_number("127.0.0.1")
+
+
+def talk(*players):
+    """Game packets between each two of these players (both ways), through the lobby."""
+    for a in players:
+        for b in players:
+            if a is not b:
+                a.data(b.ip, b"game")
+    for p in players:
+        p.recv(0.15)
+
+
+class Peers(LobbyTest):
+    def test_introduced_once_their_games_talk(self):
+        host, session, (a,) = self.room(1, ext=True)
+        v, (entry,) = host.peers()
+        self.assertEqual(entry[:3], (a.ip, b"Guest", 0))   # (listed, not introduced yet)
+        self.assertEqual(entry[3:], ((0, 0), (0, 0), 0, 0))
+        talk(host, a)
+        _, (to_a,) = host.peers()
+        _, (to_host,) = a.peers()
+        self.assertEqual(to_a[:3], (a.ip, b"Guest", 1))
+        self.assertEqual(to_host[:3], (host.ip, b"Host", 1))
+        self.assertEqual(to_a[3], (LOCAL, a.s.getsockname()[1]))      # (where the lobby sees each)
+        self.assertEqual(to_host[3], (LOCAL, host.s.getsockname()[1]))
+        self.assertEqual(to_a[5], to_host[5])
+        self.assertNotEqual(to_a[5], 0)
+        self.assertEqual(to_a[4], (0, 0))   # (no LAN address told)
+
+    def test_welcome_says_so(self):
+        p = self.player(join=False)
+        p.send(p.join_packet())
+        self.assertTrue(p.first(R.WELCOME)[24] & 2)
+
+    def test_one_way_talk_is_not_enough(self):
+        host, session, (a,) = self.room(1, ext=True)
+        host.peers()
+        a.peers()
+        host.data(a.ip, b"game")
+        host.data(BCAST, b"game")
+        a.data(BCAST, b"game")
+        self.assertIsNone(host.peers(0.4))   # (no change: still listed, not introduced)
+        self.assertIsNone(a.peers(0.1))
+
+    def test_not_across_rooms_nor_before_accepted(self):
+        host, session, (a,) = self.room(1, ext=True)
+        other, _, (b,) = self.room(1, ext=True)
+        talk(host, a)
+        talk(other, b)
+        a.data(b.ip, b"game")   # (another room: dropped, never talked)
+        b.data(a.ip, b"game")
+        self.assertEqual([e[0] for e in host.peers()[1]], [a.ip])
+        self.assertEqual([e[0] for e in b.peers()[1]], [other.ip])
+        asker = self.player(ext=True)
+        asker.ldn(host.ip, R.LM_JOIN, session + bytes(34))   # (asked; not in the host's advert)
+        host.recv(0.2)
+        self.assertIsNone(asker.peers(0.3))
+        self.assertIsNone(host.peers(0.1))
+
+    def test_direct_off_is_listed_not_introduced(self):
+        host = self.player(name="Host", ext=True)
+        session = secrets.token_bytes(16)
+        host.advertise(session)
+        a = self.player(name="Shy", ext=True, direct=False)
+        a.ldn(host.ip, R.LM_JOIN, session + b"Shy".ljust(32, b"\0") + b"\0\0")
+        host.advertise(session, [a.ip])
+        talk(host, a)
+        _, (entry,) = host.peers()
+        self.assertEqual(entry, (a.ip, b"Shy", 0, (0, 0), (0, 0), 0, 2))   # (2: it turned them off)
+        _, (entry,) = a.peers()
+        self.assertEqual(entry, (host.ip, b"Host", 0, (0, 0), (0, 0), 0, 0))
+
+    def test_old_game_gets_no_peers_and_is_relayed(self):
+        host = self.player(name="Host", ext=True)
+        session = secrets.token_bytes(16)
+        host.advertise(session)
+        old = self.player(name="Old")
+        old.ldn(host.ip, R.LM_JOIN, session + b"Old".ljust(32, b"\0") + b"\0\0")
+        host.advertise(session, [old.ip])
+        talk(host, old)
+        _, (entry,) = host.peers()
+        self.assertEqual(entry[:3], (old.ip, b"Old", 0))
+        self.assertEqual(entry[6], 4)   # (an older game)
+        old.recv(0.2)
+        self.assertEqual(old.peer_lists, [])
+        host.data(old.ip, b"still relayed")
+        self.assertEqual([p for *_, p in old.datas()], [b"still relayed"])
+
+    def test_lan_address_only_behind_the_same_router(self):
+        host = self.player(name="Host", ext=True, lan=(0x0A000005, 5000))
+        session = secrets.token_bytes(16)
+        host.advertise(session)
+        a = self.player(name="Guest", ext=True, lan=(0x0A000006, 6000))
+        a.ldn(host.ip, R.LM_JOIN, session + bytes(34))
+        host.advertise(session, [a.ip])
+        talk(host, a)
+        self.assertEqual(host.peers()[1][0][4], (0x0A000006, 6000))   # (both 127.0.0.1: same router)
+        self.assertEqual(a.peers()[1][0][4], (0x0A000005, 5000))
+        try:
+            far = self.player(name="Far", ext=True, lan=(0x0A000007, 7000), bind="127.0.0.2")
+        except OSError:
+            self.skipTest("no 127.0.0.2 here")
+        far.ldn(host.ip, R.LM_JOIN, session + bytes(34))
+        host.advertise(session, [a.ip, far.ip])
+        talk(host, far)
+        entries = {e[0]: e for e in host.peers()[1]}
+        self.assertEqual(entries[far.ip][2:5], (1, (R.address_number("127.0.0.2"), far.s.getsockname()[1]), (0, 0)))
+        self.assertEqual(far.peers()[1][0][4], (0, 0))
+
+    def test_leaving_empties_and_coming_back_is_a_new_secret(self):
+        host, session, (a, b) = self.room(2, ext=True)
+        talk(host, a, b)
+        first = {e[0]: e[5] for e in host.peers()[1]}
+        b.peers()
+        a.ldn(host.ip, R.LM_LEAVE, session)
+        self.assertEqual(a.peers()[1], [])
+        self.assertEqual([e[0] for e in b.peers()[1]], [host.ip])
+        host.advertise(session, [b.ip])
+        self.assertEqual([e[0] for e in host.peers()[1]], [b.ip])
+        a.ldn(host.ip, R.LM_JOIN, session + bytes(34))   # (back)
+        host.advertise(session, [b.ip, a.ip])
+        time.sleep(0.3)
+        talk(host, a)
+        again = {e[0]: e[5] for e in host.peers()[1]}
+        self.assertNotEqual(again[a.ip], 0)
+        self.assertNotEqual(again[a.ip], first[a.ip])
+        self.assertEqual(again[b.ip], first[b.ip])   # (b never left)
+
+    def test_kicked_and_closed(self):
+        host, session, (a, b) = self.room(2, ext=True)
+        talk(host, a, b)
+        for p in (host, a, b):
+            p.peers()
+        host.ldn(a.ip, R.LM_KICK, session)
+        host.advertise(session, [b.ip])
+        self.assertEqual(a.peers()[1], [])
+        host.advertise(session, [b.ip, a.ip])   # (listed again, its claim still there: in the room, but not introduced)
+        time.sleep(0.3)
+        entries = {e[0]: e[2] for e in host.peers()[1]}
+        self.assertEqual(entries, {a.ip: 0, b.ip: 1})
+        host.ldn(BCAST, R.LM_GONE, session)
+        time.sleep(0.3)
+        self.assertEqual(b.peers()[1], [])
+
+    def test_station_timeout_empties(self):
+        self.server.lobby.o.client_timeout = 1.0
+        host, session, (a,) = self.room(1, ext=True)
+        talk(host, a)
+        host.peers()
+        until, got = time.monotonic() + 2.5, None
+        while time.monotonic() < until and got != []:
+            host.ping()
+            host.advertise(session, [a.ip])
+            got = (host.peers(0.2) or (0, None))[1]
+        self.assertEqual(got, [])
+
+    def test_new_address_new_port(self):
+        host, session, (a,) = self.room(1, ext=True)
+        talk(host, a)
+        host.peers()
+        moved = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # (a's router gave it another port)
+        moved.bind(("127.0.0.1", 0))
+        a.s.close()
+        a.s = moved
+        a.send(a.join_packet())
+        self.assertIsNotNone(a.first(R.WELCOME))
+        a.ping()
+        self.assertEqual(host.peers()[1][0][3], (LOCAL, moved.getsockname()[1]))
+
+    def test_lost_peers_comes_again(self):
+        host, session, (a,) = self.room(1, ext=True)
+        talk(host, a)
+        v, entries = host.peers()
+        host.ping(have=v - 1)   # (as if it had not come)
+        self.assertEqual(host.peers(), (v, entries))
+        host.ping()
+        self.assertIsNone(host.peers(0.3))
+
+    def test_peers_not_flooded(self):
+        host, session, (a,) = self.room(1, ext=True)
+        talk(host, a)
+        a.peers()
+        b = self.player(ext=True)
+        b.ldn(host.ip, R.LM_JOIN, session + bytes(34))
+        for i in range(40):   # (a room changing fast)
+            host.advertise(session, [a.ip, b.ip] if i % 2 else [a.ip])
+        a.recv(0.6)
+        self.assertLessEqual(len(a.peer_lists), 4)
+        time.sleep(1.2)
+        a.recv(0.1)
+        self.assertEqual([e[0] for e in a.peers()[1]], [host.ip, b.ip][:1 + (39 % 2)])   # (the last state, in the end)
+
+    def test_rooms_an_hour(self):
+        old, R.INTRO_ROOMS = R.INTRO_ROOMS, 2
+        try:
+            roamer = self.player(name="Roamer", ext=True)
+            got = []
+            for _ in range(3):
+                host = self.player(name="Host", ext=True)
+                session = secrets.token_bytes(16)
+                host.advertise(session)
+                roamer.ldn(host.ip, R.LM_JOIN, session + bytes(34))
+                host.advertise(session, [roamer.ip])
+                talk(host, roamer)
+                time.sleep(0.3)
+                got.append(roamer.peers()[1][0][2])
+                roamer.ldn(host.ip, R.LM_LEAVE, session)
+                time.sleep(0.3)
+        finally:
+            R.INTRO_ROOMS = old
+        self.assertEqual(got, [1, 1, 0])
+
+    def test_broadcast_skips_the_listed(self):
+        host, session, (a, b) = self.room(2, ext=True)
+        other, _, (c,) = self.room(1, ext=True)
+        a.bcast([host.ip], b"to b only")
+        self.assertEqual([(d, p) for s, d, sp, p in b.datas()], [(BCAST, b"to b only")])
+        self.assertEqual(host.datas(0.1) + c.datas(0.1) + other.datas(0.1), [])
+        a.bcast([], b"all")
+        self.assertEqual([p for *_, p in host.datas()], [b"all"])
+        self.assertEqual([p for *_, p in b.datas(0.1)], [b"all"])
+
+    def test_bad_broadcasts_dropped(self):
+        host, session, (a, b) = self.room(2, ext=True)
+        stranger = self.player(ext=True)
+        a.bcast([0] * 8, b"too many")
+        a.bcast([], b"spoofed", src=host.ip)
+        a.bcast([], b"unicast", dst=b.ip)
+        a.bcast([], b"ldn", sport=R.LDN_PORT, dport=R.LDN_PORT)
+        stranger.bcast([], b"not in the room")
+        a.send(R.header(R.BCAST) + bytes((3,)) + bytes(8))   # (cut short)
+        self.assertEqual(host.datas(0.3) + b.datas(0.1), [])
 
 
 class Timeouts(LobbyTest):

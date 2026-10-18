@@ -13,6 +13,7 @@ The source tree contains the recompiler and host runtime. It does not contain th
 | Graphics | A Direct3D 11-capable GPU and working Windows driver. |
 | Python | **3.14** for the full workflow; `arc.py` uses `compression.zstd`. |
 | C toolchain | Visual Studio 2022 or newer with **Desktop development with C++**, **C++ Clang Compiler for Windows**, and a Windows SDK. |
+| Controllers | Optional: the SDL3 Windows development package (`SDL3-devel-<version>-VC.zip`) for pads other than Xbox; see step 6. |
 | Inputs | Your game version **11.0.0**, update already applied to RomFS, matching ExeFS, and your own firmware fonts. Package extraction also needs your own keys. |
 | Storage | Allow space for the game image, extracted modules, generated C, object files, and maps. Several tens of GB may be required; a local bundle needs additional free space. |
 
@@ -39,11 +40,13 @@ WindowSmash/
       aoc.cfg                 # optional installed DLC indices
     nro/                      # fighter/item modules; later bases.txt
     fonts/                    # six firmware font files
+  deps/
+    SDL3/                     # optional: SDL3's Windows development package
   build/                      # generated C, objects, exe, linker map
   save/                       # created locally when playing
 ```
 
-`dump/`, `build/`, saves, keys, and generated packages are ignored by Git.
+`dump/`, `deps/`, `build/`, saves, keys, and generated packages are ignored by Git.
 
 ## 1. Prepare matching ExeFS
 
@@ -130,7 +133,24 @@ $env:SSBU_VPX_DIR = 'D:\Codecs\libvpx'
 
 Supply libraries compatible with the Windows x64 toolchain. Without the optional libraries, the associated decoding paths are omitted. See [`tools/cc.py`](../tools/cc.py) for the exact link configuration.
 
-## 6. Optional installed DLC list
+## 6. Optional controller library (SDL3)
+
+Pads other than Xbox controllers (PlayStation, Switch Pro, and most others) go through [SDL3](https://github.com/libsdl-org/SDL/releases). Download the official Windows development package, `SDL3-devel-<version>-VC.zip`, from SDL's releases page and extract it so that `deps/SDL3/` holds its `include/`, `lib/`, and `LICENSE.txt`:
+
+```powershell
+Expand-Archive "D:\Libraries\SDL3-devel-3.x.y-VC.zip" deps
+Rename-Item deps\SDL3-3.x.y SDL3
+```
+
+Alternatively, leave it elsewhere and set `SSBU_SDL3_DIR` to the extracted `SDL3-<version>` folder:
+
+```powershell
+$env:SSBU_SDL3_DIR = 'D:\Libraries\SDL3-3.x.y'
+```
+
+The runtime is compiled against SDL3's headers only and loads `SDL3.dll` at run time; the link step copies `SDL3.dll` beside `build/ssbu.exe`. Without SDL3, the build still succeeds and XInput (Xbox) pads 1-4 are players 1-4. SDL3 is under the zlib license ([third-party notices](../NOTICE.md)); a local bundle ships it as `build/SDL3-LICENSE.txt`.
+
+## 7. Optional installed DLC list
 
 Generate the list from your own registered installed-content metadata:
 
@@ -140,7 +160,7 @@ python tools/nca.py aoc-cfg "D:\MyDump\registered" --keys "D:\MyKeys" --out dump
 
 Then rerun `arc.py nro` before compiling so DLC fighter code is present. [DLC setup and save unlocking](DLC-AND-UNLOCKS.md) are separate steps.
 
-## 7. Compile
+## 8. Compile
 
 Close the game before linking, then run:
 
@@ -152,13 +172,26 @@ Use a job count that fits available CPU and memory. The driver translates module
 
 A complete initial build can take a substantial amount of time. This repository does not claim a portable build-time benchmark. A successful compile also does not prove that every game mode is compatible.
 
-## 8. Start and verify
+## 9. Start and verify
 
-Run **`Play SSBU.bat`** from the root folder. Logs go to `build/play.log`; F1 toggles the overlay and F2 shows more details.
+Run **`Play SSBU.bat`** from the root folder. Logs go to `build/play.log`; F1 toggles the overlay, F2 shows more details (including the connected pads), and F11 or Alt+Enter switches to full screen. The first start writes `controllers.ini` and `display.ini` into the root folder with their defaults and explanations; the [runtime setup guide](RUNTIME-SETUP.md#controllers) describes them.
+
+A crash or a freeze (no new picture for five seconds) writes a text report and a minidump into `reports/`.
 
 If a fighter module is harvested at runtime, extract/collect the missing module and rebuild. If the runtime traps, preserve the relevant log section and the matching build revision. Locally generated linker maps can help diagnose host frames.
 
 For play with another person, follow the dedicated **[multiplayer setup guide](../NETPLAY.md)**.
+
+## 10. Optional: compile the shaders ahead of time
+
+The game's GPU programs are translated and compiled the first time each is used, so a new effect can appear a moment late the first time it is seen. Every shader compiled so far is kept in `dump/shadercache/` and made ready while the game starts. To compile the rest before playing, run **`Prepare Shaders.bat`** (it asks which built version) or:
+
+```powershell
+python tools/shader_aot.py --jobs 8
+python tools/shader_aot.py --tree v13.0.5 --jobs 8
+```
+
+`tools/shader_aot.py` finds the programs in the game's `data.arc` and has [`tools/shaderaot.c`](../tools/shaderaot.c) compile them into the version's cache with the renderer's own translation, keys, and compiler flags. It runs at low priority and can take from minutes to a couple of hours per game version; it can be stopped and run again, and keeps what is done. Its files are dated 2001 until the game first uses them, so the start-up preparation and local bundles include only shaders the game has actually used. Programs whose cache key depends on draw-time state are left for the game to compile.
 
 ## Tests and local packaging
 

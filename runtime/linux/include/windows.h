@@ -97,6 +97,7 @@ static inline LONG64 InterlockedDecrement64(volatile LONG64 *p) { return __atomi
 static inline LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, RT_SC); }
 static inline LONG64 InterlockedExchange64(volatile LONG64 *p, LONG64 v) { return __atomic_exchange_n(p, v, RT_SC); }
 static inline LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, RT_SC); }
+static inline LONG InterlockedAdd(volatile LONG *p, LONG v) { return __atomic_add_fetch(p, v, RT_SC); }
 static inline LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_fetch_add(p, v, RT_SC); }
 static inline LONG64 InterlockedAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_add_fetch(p, v, RT_SC); }
 static inline LONG InterlockedOr(volatile LONG *p, LONG v) { return __atomic_fetch_or(p, v, RT_SC); }
@@ -129,7 +130,12 @@ static inline void ReleaseSRWLockShared(SRWLOCK *l) { pthread_rwlock_unlock(&l->
 static inline BOOLEAN TryAcquireSRWLockExclusive(SRWLOCK *l) { return pthread_rwlock_trywrlock(&l->l) == 0; }
 static inline BOOLEAN TryAcquireSRWLockShared(SRWLOCK *l) { return pthread_rwlock_tryrdlock(&l->l) == 0; }
 
-typedef struct CRITICAL_SECTION { pthread_mutex_t m; } CRITICAL_SECTION, *LPCRITICAL_SECTION;   /* recursive, as on Windows */
+/* Recursive, as on Windows. OwningThread is glibc's __owner field of the mutex (the holder's
+ * thread id, 0 when free): read only, for freeze reports. */
+typedef union CRITICAL_SECTION {
+    pthread_mutex_t m;
+    struct { int glibc_lock_, glibc_count_, OwningThread; };
+} CRITICAL_SECTION, *LPCRITICAL_SECTION;
 void InitializeCriticalSection(CRITICAL_SECTION *cs);
 static inline BOOL InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return TRUE; }
 static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lock(&cs->m); }
@@ -185,6 +191,13 @@ HANDLE CreateEventA(void *security, BOOL manual_reset, BOOL initial, const char 
 HANDLE CreateEventW(void *security, BOOL manual_reset, BOOL initial, const WCHAR *name);
 BOOL SetEvent(HANDLE h);
 BOOL ResetEvent(HANDLE h);
+/* Waitable timers: one-shot, reset by the wait that sees them due (one waiting thread at a time:
+ * the one that sets it, as the runtime uses them). */
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x2
+#define TIMER_ALL_ACCESS 0x1F0003
+typedef void (CALLBACK *PTIMERAPCROUTINE)(LPVOID arg, DWORD low, DWORD high);
+HANDLE CreateWaitableTimerExW(void *security, LPCWSTR name, DWORD flags, DWORD access);
+BOOL SetWaitableTimer(HANDLE timer, const LARGE_INTEGER *due, LONG period, PTIMERAPCROUTINE fn, LPVOID arg, BOOL resume);
 /* Linux: the thread behind a handle (0 if none), and a thread's full description (pthread names
  * are cut at 15 characters) */
 pid_t rt_thread_tid(HANDLE thread);
@@ -213,6 +226,7 @@ ULONGLONG GetTickCount64(void);
 DWORD GetTickCount(void);
 void GetLocalTime(SYSTEMTIME *t);
 void GetSystemTime(SYSTEMTIME *t);
+void GetSystemTimeAsFileTime(FILETIME *t);
 static inline MMRESULT timeBeginPeriod(UINT ms) { (void)ms; return 0; }
 static inline MMRESULT timeEndPeriod(UINT ms) { (void)ms; return 0; }
 static inline errno_t localtime_s(struct tm *out, const time_t *t) { return localtime_r(t, out) ? 0 : errno; }
@@ -272,6 +286,8 @@ static inline void _aligned_free(void *p) { free(p); }
 #define FILE_SHARE_READ 0x1
 #define FILE_SHARE_WRITE 0x2
 #define FILE_SHARE_DELETE 0x4
+#define FILE_READ_ATTRIBUTES 0x80
+#define FILE_WRITE_ATTRIBUTES 0x100
 #define CREATE_NEW 1
 #define CREATE_ALWAYS 2
 #define OPEN_EXISTING 3
@@ -306,6 +322,8 @@ BOOL GetFileSizeEx(HANDLE h, LARGE_INTEGER *size);
 BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, LARGE_INTEGER *new_position, DWORD method);
 BOOL SetEndOfFile(HANDLE h);
 BOOL FlushFileBuffers(HANDLE h);
+BOOL GetFileTime(HANDLE h, FILETIME *created, FILETIME *accessed, FILETIME *written);
+BOOL SetFileTime(HANDLE h, const FILETIME *created, const FILETIME *accessed, const FILETIME *written);
 BOOL DeleteFileA(LPCSTR path);
 BOOL CreateDirectoryA(LPCSTR path, void *security);
 BOOL RemoveDirectoryA(LPCSTR path);
@@ -340,12 +358,15 @@ HMODULE GetModuleHandleW(LPCWSTR name);
 HMODULE GetModuleHandleA(LPCSTR name);
 USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash);
 void OutputDebugStringA(LPCSTR text);
+BOOL IsDebuggerPresent(void);   /* (a tracer is attached: /proc/self/status) */
+typedef struct _EXCEPTION_POINTERS EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;   /* (only pointed to: no SEH on Linux) */
 /* The game window's keyboard and focus, from the window system (runtime/linux/window.c). */
 #define VK_BACK 0x08
 #define VK_TAB 0x09
 #define VK_RETURN 0x0D
 #define VK_SHIFT 0x10
 #define VK_CONTROL 0x11
+#define VK_MENU 0x12
 #define VK_ESCAPE 0x1B
 #define VK_SPACE 0x20
 #define VK_LEFT 0x25

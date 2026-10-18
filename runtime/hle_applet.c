@@ -6,6 +6,8 @@
 #include "host.h"
 #include "gpu_backend.h"
 
+void watchdog_pause(int on);   /* debug_watchdog.c */
+
 #define R_CANCELED RESULT(162, 1)         /* "the user closed the applet" */
 #define R_SWKBD_CANCELED RESULT(159, 1)   /* nn::swkbd's own: what ShowKeyboard returns for "back" */
 
@@ -106,7 +108,10 @@ static int ask_text(Keyboard *k) {
     y = (short)(y + edit_h + 10);
     p = put_item(p, BS_DEFPUSHBUTTON | WS_TABSTOP, 186, y, 50, 14, IDOK, 0x80, L"OK");
     put_item(p, BS_PUSHBUTTON | WS_TABSTOP, 242, y, 50, 14, IDCANCEL, 0x80, L"Cancel");
-    return DialogBoxIndirectParamW(GetModuleHandleW(NULL), t, (HWND)gfx_window_handle(), keyboard_proc, (LPARAM)k) == 1;
+    watchdog_pause(1);   /* (the game waits for the dialog: no frames meanwhile) */
+    int ok = DialogBoxIndirectParamW(GetModuleHandleW(NULL), t, (HWND)gfx_window_handle(), keyboard_proc, (LPARAM)k) == 1;
+    watchdog_pause(0);
+    return ok;
 }
 
 HLE(_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE) {
@@ -218,7 +223,7 @@ static int run_dialog(char *const argv[], char *out, size_t cap) {
 }
 
 /* Ask for the text: 1 OK (answer in text), 0 cancelled. */
-static int ask_text(const char *prompt, const char *initial, int multiline, char *text, size_t cap) {
+static int ask_text_now(const char *prompt, const char *initial, int multiline, char *text, size_t cap) {
     char marked[4096];   /* (zenity reads its text as Pango markup) */
     size_t m = 0;
     for (const char *q = prompt; *q && m + 6 < sizeof marked; q++) {
@@ -246,6 +251,13 @@ static int ask_text(const char *prompt, const char *initial, int multiline, char
     fprintf(stderr, "[keyboard] no zenity, kdialog or terminal: answering with the initial text\n");
     snprintf(text, cap, "%s", initial);
     return 1;
+}
+
+static int ask_text(const char *prompt, const char *initial, int multiline, char *text, size_t cap) {
+    watchdog_pause(1);   /* (the game waits for the dialog: no frames meanwhile) */
+    int ok = ask_text_now(prompt, initial, multiline, text, cap);
+    watchdog_pause(0);
+    return ok;
 }
 
 HLE(_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE) {

@@ -100,7 +100,7 @@ HLE_WRAP(71000b41f0) {
  * network again; stations keep telling the host they are there, the host keeps advertising,
  * and either side going quiet for a few seconds ends the connection. The game's own traffic
  * then goes between node addresses - virtual addresses - through its sockets. */
-#define LDN_PORT 65511
+#define LDN_PORT NET_LDN_PORT
 #define LDN_TRACE do { if (net_log() > 1) fprintf(stderr, "[net] ldn %s\n", __func__ + 14); } while (0)
 #define R_LDN_CONNECT RESULT(203, 64)
 enum { LS_NONE, LS_INITIALIZED, LS_AP, LS_AP_CREATED, LS_STATION, LS_CONNECTED };
@@ -514,6 +514,12 @@ HLE(_ZN2nn3ldn10DisconnectEv) { LDN_TRACE;
 }
 
 static int has_network(void) { return L.state == LS_AP_CREATED || L.state == LS_CONNECTED; }
+int ldn_in_network(u32 ip) {
+    AcquireSRWLockShared(&L.lock);
+    int in = has_network() && node_of(ip) >= 0;
+    ReleaseSRWLockShared(&L.lock);
+    return in;
+}
 HLE(_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE) { LDN_TRACE;
     AcquireSRWLockShared(&L.lock);
     int ok = has_network();

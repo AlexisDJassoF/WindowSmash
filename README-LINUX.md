@@ -63,7 +63,9 @@ This folder holds the game's code and data. It's for your own machines, not for 
    game version create, on Windows or Linux (see `NETPLAY.md`). The first time, it asks for the
    name other players see, and keeps it in `online_name.txt`. To play offline, use
    `bash run-offline.sh`, or write `off` in `online_server.txt`. If the lobby doesn't answer, the
-   game plays offline by itself after a few seconds.
+   game plays offline by itself after a few seconds. The word `off` in `online_direct.txt`
+   keeps all of a room's traffic going through the lobby, as on Windows (no direct connections,
+   so the other players don't learn your internet address).
 
 ## In a VMware virtual machine
 
@@ -93,19 +95,52 @@ This folder holds the game's code and data. It's for your own machines, not for 
 
 Same as on Windows:
 
-- **Gamepad**: the first one SDL finds, laid out by position like an Xbox pad. The bottom face
-  button is the console's B, and so on.
-- **Keyboard** (while the window has focus):
+- **Gamepads**: up to 8 players on any pad SDL2 knows (Xbox, PlayStation, Switch Pro and most
+  others). Each pad that connects becomes the next free player, and a pad unplugged and plugged
+  back in gets its player back. Buttons go by position, as on a Switch pad: the bottom face
+  button is the console's B, and so on. **F2** lists the pads. A `gamecontrollerdb.txt` in this
+  folder adds SDL mappings for pads SDL doesn't know.
+- **Keyboard** (while the window has focus), on player 1 unless `controllers.ini` says otherwise:
   - Arrow keys move.
   - Z / X / C / V are A / B / X / Y.
   - A / S are L / R, and Q / W are ZL / ZR.
-  - Enter is +, Backspace is -.
+  - Enter is + (not with Alt), Backspace is -.
   - I / J / K / L move the right stick.
 - **F1** overlay, **F2** details, **F3** screenshot (`screenshots/`), **F4** log a frame,
   **F5** depth sampling on/off, **F6** 10-second profile (`build/profile_*.txt`).
-- **F11** or **Alt+Enter**: full screen.
+- **F11** or **Alt+Enter**: switch between the window and full screen.
 
 When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
+
+## Settings
+
+Two files in this folder, each written with its defaults and explanations the first time the game
+starts (delete one to get the defaults back). They mean the same as on Windows:
+
+- `controllers.ini`: the keyboard's player, whether pads work while the window isn't focused,
+  players kept for one pad, `layout = positional` or `labels`, dead zone, rumble strength,
+  trigger threshold and button remaps, for every pad or for one type (`[device ps5]`), name or
+  GUID. The log names each pad as it connects, with its type and GUID.
+- `display.ini`:
+  - `window = windowed | borderless | fullscreen` and `width`, `height`. On Linux, borderless and
+    fullscreen are both the desktop's full screen on the window's monitor (the monitor keeps its
+    resolution). The picture stays 16:9, with black bars when the window has another shape; the
+    window isn't held to 16:9 while you resize it, as it is on Windows.
+  - `pacing = clock` (the default): a steady 60 frames a second. DXVK presents each frame the
+    moment it's ready; a compositing desktop shows it at its next refresh, and full screen
+    without one may tear. To prevent that, start the game with
+    `DXVK_CONFIG="dxgi.tearFree = True" ./run.sh`.
+  - `pacing = vrr`: the same clock, for FreeSync / G-Sync monitors with VRR turned on in the
+    desktop or the driver. Best with `window = fullscreen`.
+  - `pacing = display` follows the monitor's refreshes on Windows. On Linux it's the clock.
+  - `latency = 1-3` (frames the GPU may work ahead) and `hide_cursor`.
+
+Shaders: this folder carries the Windows build's compiled shaders that the game has used. Any other
+shader is compiled the first time it's needed, so a new effect can show a moment late once. The
+start-up shader prewarm of the Windows build is off here: under DXVK it made a Vulkan pipeline for
+every cached shader at once and held up the first frame (`SSBU_SHADER_PREWARM=1` turns it on).
+The Windows build's ahead-of-time shaders (`Prepare Shaders.bat`) aren't in the package (1.5 GB
+for 13.0.5).
 
 ## Other launchers
 
@@ -131,8 +166,15 @@ stays.
 - **Black window, or `cannot create the window` / DXVK errors in the log**: run
   `vulkaninfo --summary`. If it lists no device, install `mesa-vulkan-drivers`.
 - **No sound**: SDL uses PulseAudio or PipeWire. Check the log for `[audio]`.
-- **A crash**: the log's last lines name the guest function and host frames (`*** host
-  exception`). Keep `build/play.log` for a report.
+- **A crash** writes `reports/crash_<date>_<time>.txt`: the guest function and host frames
+  (`*** host exception`), also at the end of the log. Send it with `build/play.log`. When the
+  port stops the game itself (something it can't do yet), it writes `reports/stopped_*.txt`.
+- **A freeze** (no new picture for 5 seconds) writes `reports/freeze_*.txt`, again at 30 and 120
+  seconds: every thread's stack and who holds the renderer's locks. `SSBU_WATCHDOG=0` turns
+  that off. Windows also writes minidumps (`.dmp`); Linux doesn't, so a core dump, if your
+  system keeps them, is the closest thing.
+- **Stutter**: `SSBU_HITCH=40 ./run.sh` logs every frame over 40 ms with what the game's main,
+  vsync and renderer threads spent it on (`[hitch]` lines in the log).
 - `SSBU_WRITE_WATCH=protect` makes the renderer track CPU writes with page protection instead
   of the kernel's write tracking (`userfaultfd` + `PAGEMAP_SCAN`, Linux 6.7 and later). Use it
   only to rule that out. The log's first lines say which one is in use.

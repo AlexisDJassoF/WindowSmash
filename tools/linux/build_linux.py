@@ -38,7 +38,7 @@ GEN = os.path.join(OUT, "gen")
 RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.path.join(DXVK_INCLUDE, "windows"),
                     "-I", os.path.join(DXVK_INCLUDE, "directx"), "-I", os.path.join(SYSROOT, "usr", "include", "SDL2"),
                     "-I", os.path.join(VKD3D_SRC, "include"), "-I", GEN]
-RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX"]
+RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL2"]
 
 
 def modules():
@@ -159,7 +159,7 @@ def runtime_jobs():
     headers = [os.path.join(RUNTIME, n) for n in os.listdir(RUNTIME) if n.endswith(".h")] + \
               [os.path.join(RUNTIME, "linux", "include", "windows.h")]
     sources = [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME))
-               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*)\.c", n)]
+               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
     sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
                 if n.endswith((".c", ".cpp"))]
     jobs = []

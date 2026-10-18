@@ -60,8 +60,13 @@ def copy_tree(src, dst, keep=lambda name: True, folders=False):
 
 
 def shader_cache_version():
-    with open(os.path.join(REPO, "runtime", "gpu_d3d11.c"), encoding="utf-8") as f:
+    with open(os.path.join(REPO, "runtime", "gpu_shader_cache.h"), encoding="utf-8") as f:
         return int(re.search(r"#define SHADER_CACHE_VERSION (\d+)", f.read()).group(1))
+
+
+# A cache file dated before 2002 is the ahead-of-time compiler's (tools/shader_aot.py), not yet used
+# by the game (runtime/gpu_shader_cache.h): left out, as the Windows kit leaves it out.
+PLAYED_AFTER = 1009843200   # 2002-01-01 UTC
 
 
 # The launchers' environment variables that name a RomFS file outright, by file name
@@ -143,7 +148,9 @@ def main():
     copied += copy(os.path.join(dump, "exefs", "main"), os.path.join(BUNDLE, "dump", "exefs", "main"))
     copied += copy_tree(os.path.join(dump, "fonts"), os.path.join(BUNDLE, "dump", "fonts"))
     version = shader_cache_version()   # (only the current translator's compiles: older ones are never read)
-    copied += copy_tree(os.path.join(dump, "shadercache"), os.path.join(BUNDLE, "dump", "shadercache"), lambda f: f.startswith(f"v{version}_"))
+    cache = os.path.join(dump, "shadercache")   # (and only what the game has used)
+    copied += copy_tree(cache, os.path.join(BUNDLE, "dump", "shadercache"),
+                        lambda f: f.startswith(f"v{version}_") and os.path.getmtime(os.path.join(cache, f)) >= PLAYED_AFTER)
     os.makedirs(os.path.join(BUNDLE, "dump", "nro"), exist_ok=True)
     os.makedirs(os.path.join(BUNDLE, "build"), exist_ok=True)
     if "--no-save" not in sys.argv and os.path.isdir(os.path.join(PORT, "save")) and not os.path.isdir(os.path.join(BUNDLE, "save")):

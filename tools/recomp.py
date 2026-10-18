@@ -534,18 +534,26 @@ def compile_dir(outdir, jobs):
     return not failures
 
 
-def link(dirs, exe):
-    """Compile the host runtime and link it with the given module build directories."""
+def link(dirs, exe, rt_dir=None):
+    """Compile the host runtime and link it with the given module build directories. The
+    runtime's objects go to rt_dir (default: rt beside the exe)."""
     import cc
     t0 = time.time()
-    rt_dir = os.path.join(os.path.dirname(exe), "rt")
+    rt_dir = rt_dir or os.path.join(os.path.dirname(exe), "rt")
     os.makedirs(rt_dir, exist_ok=True)
     headers = max(os.path.getmtime(os.path.join(cc.RUNTIME, n)) for n in os.listdir(cc.RUNTIME) if n.endswith(".h"))
+    # the compile command the objects were built with: cc.CFLAGS change as SDL3, libopus or libvpx come and go
+    stamp, flags = os.path.join(rt_dir, "cflags.txt"), " ".join([cc.CLANG, *cc.CFLAGS]) + "\n"
+    old = ""
+    if os.path.exists(stamp):
+        with open(stamp, encoding="utf-8") as f:
+            old = f.read()
+    every = old != flags
     sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*)\.c", n)]
     jobs = []
     for n in sources:
         src, obj = os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj")
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), headers):
+        if every or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), headers):
             jobs.append((src, obj, "/O2"))
     # Native implementations by name, for symbols no module defines.
     names = sorted(hle_names())
@@ -553,7 +561,7 @@ def link(dirs, exe):
     changed = write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
                                + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
                                + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
-    if changed or not os.path.exists(table[:-2] + ".obj"):
+    if changed or every or not os.path.exists(table[:-2] + ".obj"):
         jobs.append((table, table[:-2] + ".obj", "/O1"))
     # The run-time loadable modules (NROs) linked in, for nn::ro to find by build id.
     nros = [os.path.basename(os.path.normpath(d)) for d in dirs
@@ -564,18 +572,26 @@ def link(dirs, exe):
                                + "const RtModule *const rt_nro_modules[] = {"
                                + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
                                + f"const u32 rt_nro_count = {len(nros)};\n")
-    if changed or not os.path.exists(nro_table[:-2] + ".obj"):
+    if changed or every or not os.path.exists(nro_table[:-2] + ".obj"):
         jobs.append((nro_table, nro_table[:-2] + ".obj", "/O1"))
     failures = cc.compile_each(jobs, 4)
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
         return False
+    write_if_changed(stamp, flags)   # (only now: a failed compile is tried again)
     objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [table[:-2] + ".obj", nro_table[:-2] + ".obj"]
     for d in dirs:
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
     # a wrap no module has (another game version): its original is a stub nothing calls
     cc.link(objs, exe, [f"/alternatename:f_{a:x}_orig=rt_wrap_missing" for a in sorted(hle_wraps())])
+    # the controllers' SDL3.dll, which the runtime loads from the exe's own folder
+    if cc.SDL3_DLL:
+        import shutil
+        dll = os.path.join(os.path.dirname(exe), "SDL3.dll")
+        if not os.path.exists(dll) or os.path.getsize(dll) != os.path.getsize(cc.SDL3_DLL) or \
+                os.path.getmtime(dll) < os.path.getmtime(cc.SDL3_DLL):
+            shutil.copy2(cc.SDL3_DLL, dll)
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
 
@@ -649,7 +665,7 @@ if __name__ == "__main__":
     elif cmd == "compile":
         sys.exit(0 if compile_dir(nso, int(arg("--jobs", "16"))) else 1)
     elif cmd == "link":
-        sys.exit(0 if link(arg("--dirs").split(","), arg("--out")) else 1)
+        sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
         sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20"))) else 1)
     elif cmd == "check":

@@ -13,6 +13,7 @@
 
 #include "ipc.h"
 #include "present.h"
+#include "display.h"
 
 #define DISPLAY_ID 1
 #define LAYER_ID 1
@@ -40,23 +41,28 @@ static struct {
 
 u64 present_frames(void) { return queue.frames; }
 
+/* Who holds the queue's lock, and since when (freeze reports: an SRW lock has no owner field). */
+static volatile DWORD queue_holder;
+static volatile u64 queue_held_since;
+static void queue_lock(void) {
+    AcquireSRWLockExclusive(&queue.lock);
+    queue_held_since = GetTickCount64();
+    queue_holder = GetCurrentThreadId();
+}
+static void queue_unlock(void) {
+    queue_holder = 0;
+    ReleaseSRWLockExclusive(&queue.lock);
+}
+DWORD present_queue_holder(u64 *since_ms) { DWORD t = queue_holder; *since_ms = queue_held_since; return t; }
+
 /* ---- the consumer: vsync -------------------------------------------------------- */
 static DWORD WINAPI vsync_thread(LPVOID unused) {
     (void)unused;
     SetThreadDescription(GetCurrentThread(), L"vsync");
     timeBeginPeriod(1);
-    LARGE_INTEGER freq, next, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&next);
     for (;;) {
-        next.QuadPart += freq.QuadPart / 60;
-        for (;;) {
-            QueryPerformanceCounter(&now);
-            if (now.QuadPart >= next.QuadPart) break;
-            LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / freq.QuadPart;
-            Sleep(ms > 1 ? (DWORD)ms - 1 : 0);
-        }
-        AcquireSRWLockExclusive(&queue.lock);
+        display_wait_tick();   /* the next refresh (display.ini's pacing) */
+        queue_lock();
         int oldest = -1;
         for (int i = 0; i < SLOTS; i++)
             if (queue.slots[i].state == QUEUED && (oldest < 0 || queue.slots[i].queued_at < queue.slots[oldest].queued_at)) oldest = i;
@@ -68,7 +74,7 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
             kernel_signal_event(queue.buffer_event);
             WakeAllConditionVariable(&queue.freed);
         }
-        ReleaseSRWLockExclusive(&queue.lock);
+        queue_unlock();
         kernel_signal_event(queue.vsync_event);
     }
 }
@@ -114,7 +120,7 @@ static void queue_output(Out *o) {   /* QueueBufferOutput: width, height, transf
 static void transact(u32 code, In *in, Out *out, Cpu *c) {
     (void)c;
     skip_token(in);
-    AcquireSRWLockExclusive(&queue.lock);
+    queue_lock();
     switch (code) {
     case CONNECT:
         queue_output(out);
@@ -201,7 +207,7 @@ static void transact(u32 code, In *in, Out *out, Cpu *c) {
         fprintf(stderr, "[vi] buffer queue: transaction %u not implemented\n", code);
         w32(out, 0);
     }
-    ReleaseSRWLockExclusive(&queue.lock);
+    queue_unlock();
 }
 
 /* ---- IHOSBinderDriver ------------------------------------------------------------ */

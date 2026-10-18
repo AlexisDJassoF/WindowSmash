@@ -175,8 +175,8 @@ static int lines_of(const char *s, int *widest) {
 static double history[HISTORY];   /* milliseconds per frame, newest at [head - 1] */
 static unsigned head, filled;
 
-void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned w, unsigned h, int show,
-                     const char *detail) {
+void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w,
+                     unsigned h, int show, const char *detail) {
     static LARGE_INTEGER freq, last;
     LARGE_INTEGER now;
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
@@ -239,7 +239,7 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)cbuf, 0);
     }
     UINT stride = sizeof(Vertex), offset = 0;
-    D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+    D3D11_VIEWPORT vp = {(float)x0, (float)y0, (float)w, (float)h, 0, 1};
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     ID3D11DeviceContext_RSSetState(ctx, raster);

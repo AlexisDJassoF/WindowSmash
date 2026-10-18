@@ -62,10 +62,16 @@ The optional tools\ssbu_relay.py is the online lobby server; it requires Python.
 Nintendo's official online service is not used.
 
 CONTROLS
-First Xbox/XInput controller; face buttons follow Nintendo's physical positions.
+Up to 8 players on Xbox, PlayStation, Switch Pro and most other pads (SDL3);
+each pad that connects becomes the next free player. Face buttons follow
+Nintendo's physical positions. controllers.ini (written on the first start)
+sets the keyboard's player, remaps buttons, rumble strength and dead zones.
 Keyboard: arrows = move; Z/X/C/V = A/B/X/Y; A/S = L/R; Q/W = ZL/ZR;
 Enter = Plus; Backspace = Minus; I/J/K/L = right stick.
-F1 = overlay; F2 = details; F3 = screenshot.
+F1 = overlay; F2 = details (lists the pads); F3 = screenshot.
+F11 or Alt+Enter = full screen. display.ini (written on the first start) sets
+the window (windowed, borderless, fullscreen), its size, and the pacing:
+pacing = vrr is best on G-Sync / FreeSync monitors.
 
 Each install starts with a fresh save and generates its own netplay identity.
 If Unlock All Fighters.bat is included, first start the game, reach the main menu,
@@ -74,6 +80,8 @@ needed. DLC is enabled by the included aoc.cfg when present. This 11.0.0 build
 has DLC through Pyra/Mythra; Kazuya and Sora require a newer game version.
 Do not copy netplay_id.txt between PCs. Saves are under save\.
 Check build\play.log if launch fails. Initial shader compilation can stutter.
+A crash or a freeze (no picture for 5 s) writes a report and a minidump
+into the reports folder: send those when you report a problem.
 This is a snapshot of an existing port; packaging verification does not test
 gameplay or a complete network match on another PC.
 '''
@@ -133,9 +141,19 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
     payload.extend(file_payload('dump/fonts/' + name, source / 'dump/fonts' / name) for name in FONTS)
     for path in sorted((source / 'build').glob('*.dll')):
         payload.append(file_payload('build/' + path.name, path))
+    sdl_licence = source / 'deps/SDL3/LICENSE.txt'   # (the zlib licence of build/SDL3.dll)
+    if (source / 'build/SDL3.dll').is_file() and sdl_licence.is_file():
+        payload.append(file_payload('build/SDL3-LICENSE.txt', sdl_licence))
     if shader_cache:
-        for path in sorted((source / 'dump/shadercache').glob('*.dxbc')):
-            payload.append(file_payload('dump/shadercache/' + path.name, path))
+        # only the runtime's current cache version (older files are never read), and only what
+        # the game has used: tools/shader_aot.py's files stay dated 2001 until then
+        header = source / 'runtime/gpu_shader_cache.h'
+        version = re.search(r'#define SHADER_CACHE_VERSION (\d+)', header.read_text(encoding='utf-8')) if header.is_file() else None
+        pattern = f'v{version.group(1)}_*.dxbc' if version else '*.dxbc'
+        played_after = datetime(2002, 1, 1, tzinfo=timezone.utc).timestamp()
+        for path in sorted((source / 'dump/shadercache').glob(pattern)):
+            if path.stat().st_mtime >= played_after:
+                payload.append(file_payload('dump/shadercache/' + path.name, path))
     relay = source / 'tools/ssbu_relay.py'
     if relay.is_file():
         payload.append(file_payload('tools/ssbu_relay.py', relay))

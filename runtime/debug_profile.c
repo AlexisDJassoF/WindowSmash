@@ -1,7 +1,9 @@
 /* A sampling profiler, for the debug keys (F6): for a few seconds, every millisecond, where each
- * of the process's threads is; then a report of the busiest functions (named from
- * build\ssbu.map), modules and threads, written to build\profile_<time>.txt (and its top lines
- * to the log). Recompiled guest functions are named f_<guest address>. */
+ * of the process's threads is; then a report of the busiest functions (named from the exe's
+ * linker map, <exe>.map), modules and threads, written to profile_<time>.txt beside the exe (and
+ * its top lines to the log). Recompiled guest functions are named f_<guest address>.
+ * Also: every thread's stack for freeze reports (profile_dump_threads), and the hitch log
+ * (SSBU_HITCH=<ms>: what made each frame over that long late). */
 #define _CRT_SECURE_NO_WARNINGS
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00   /* (GetThreadDescription) */
@@ -100,32 +102,57 @@ static RUNTIME_FUNCTION *function_entry(int m, U64 rip) {
 }
 
 /* Walk a suspended thread's stack from its context. A function without unwind data is a leaf,
- * its return address on top of the stack; outside every module, the walk stops. */
+ * its return address on top of the stack; outside every module, the walk stops. A stack word
+ * that cannot be read ends the walk (rt_probing tells the crash handler it is expected). */
+extern __declspec(thread) int rt_probing;   /* host.c */
 static U32 walk(CONTEXT *ctx, U64 *pc) {
-    U32 d = 0;
+    volatile U32 d = 0;
     pc[d++] = ctx->Rip;
-    while (d < STACK_DEPTH) {
-        int m = module_of(ctx->Rip);
-        if (m < 0) break;
-        RUNTIME_FUNCTION *rf = function_entry(m, ctx->Rip);
-        U64 sp = ctx->Rsp;
-        if (rf) {
-            void *handler;
-            DWORD64 frame;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, modules[m].base, ctx->Rip, rf, ctx, &handler, &frame, NULL);
-        } else {
-            ctx->Rip = *(const U64 *)ctx->Rsp;
-            ctx->Rsp += 8;
+    rt_probing = 1;
+    __try {
+        while (d < STACK_DEPTH) {
+            int m = module_of(ctx->Rip);
+            if (m < 0) break;
+            RUNTIME_FUNCTION *rf = function_entry(m, ctx->Rip);
+            U64 sp = ctx->Rsp;
+            if (rf) {
+                void *handler;
+                DWORD64 frame;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, modules[m].base, ctx->Rip, rf, ctx, &handler, &frame, NULL);
+            } else {
+                ctx->Rip = *(const U64 *)ctx->Rsp;
+                ctx->Rsp += 8;
+            }
+            if (!ctx->Rip || ctx->Rsp <= sp) break;
+            pc[d++] = ctx->Rip - 1;   /* (inside the call instruction, so a call at a function's end names that function) */
         }
-        if (!ctx->Rip || ctx->Rsp <= sp) break;
-        pc[d++] = ctx->Rip - 1;   /* (inside the call instruction, so a call at a function's end names that function) */
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+    rt_probing = 0;
     return d;
+}
+
+/* <exe folder>\<name>, or <exe path> with another extension (ext starting with '.') */
+static void beside_exe(char *out, size_t n, const char *name) {
+    char exe[MAX_PATH];
+    DWORD len = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    exe[len < MAX_PATH ? len : MAX_PATH - 1] = 0;
+    if (name[0] == '.') {
+        char *dot = strrchr(exe, '.');
+        if (dot && dot > strrchr(exe, '\\')) *dot = 0;
+        snprintf(out, n, "%s%s", exe, name);
+    } else {
+        char *slash = strrchr(exe, '\\');
+        if (slash) *slash = 0;
+        snprintf(out, n, "%s\\%s", exe, name);
+    }
 }
 
 static int load_symbols(void) {
     if (sym_va) return 1;
-    FILE *map = fopen("build\\ssbu.map", "r");
+    char path[MAX_PATH];
+    beside_exe(path, sizeof path, ".map");
+    FILE *map = fopen(path, "r");
     if (!map) return 0;
     U32 cap = 1 << 18;
     size_t pool_used = 0, pool_cap = 1 << 22;
@@ -335,10 +362,11 @@ static void call_paths(FILE *f) {
 }
 
 static void report(U64 total, U64 busy) {
-    char path[128];
+    char path[MAX_PATH], name[64];
     SYSTEMTIME st;
     GetLocalTime(&st);
-    snprintf(path, sizeof path, "build\\profile_%04u%02u%02u_%02u%02u%02u.txt", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    snprintf(name, sizeof name, "profile_%04u%02u%02u_%02u%02u%02u.txt", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    beside_exe(path, sizeof path, name);
     FILE *f = fopen(path, "w");
     if (!f) { fprintf(stderr, "[profile] cannot write %s (errno %d)\n", path, errno); f = stderr; }
     fprintf(f, "Sampling profile: %.0f s, %llu samples (%llu busy, %llu in system calls - mostly waiting)\n\n", duration, total, busy, total - busy);
@@ -366,7 +394,7 @@ static void report(U64 total, U64 busy) {
             fprintf(f, "  %5.1f%%  %s\n", 100.0 * per_module[m] / busy, m < nmodules ? modules[m].name : "(no module: generated code?)");
 
     /* name the program's own samples from the map */
-    if (!load_symbols()) fprintf(f, "\n(build\\ssbu.map not found: functions unnamed)\n");
+    if (!load_symbols()) fprintf(f, "\n(the exe's .map not found: functions unnamed)\n");
     for (U32 i = 0; i < n; i++) s[i].name = symbol_of(s[i].rip);
     const char *pool = sym_pool;
 
@@ -472,4 +500,242 @@ void profile_start(double seconds) {
     duration = seconds;
     fprintf(stderr, "[profile] sampling for %.0f s\n", seconds);
     CloseHandle(CreateThread(NULL, 0, sampler, NULL, 0, NULL));
+}
+
+/* ---- thread dumps, for freeze reports --------------------------------------------------- */
+const char *rt_describe_host(unsigned long long pc, char *buf, size_t n);   /* host.c: a recompiled function's guest place */
+
+static U64 filetime(FILETIME t) { return (U64)t.dwHighDateTime << 32 | t.dwLowDateTime; }
+
+/* A code address for a report: the guest function of recompiled code, else the program's own
+ * function (when F6 has loaded the map) or module + offset (tools/hostsym.py names those). */
+static void describe_pc(U64 pc, char *buf, size_t n) {
+    char guest[96];
+    U32 sym = symbol_of(pc);
+    int m = module_of(pc);
+    if (rt_describe_host(pc, guest, sizeof guest)) snprintf(buf, n, "%s", guest);
+    else if (sym) snprintf(buf, n, "%s", sym_pool + sym - 1);
+    else if (m >= 0) snprintf(buf, n, "%s+%#llx", modules[m].name, pc - modules[m].base);
+    else snprintf(buf, n, "%#llx", pc);
+}
+
+/* Every thread's stack but the caller's, a line at a time to line. Each thread is suspended only
+ * while its stack is read; everything else (names, descriptions) after all run again. */
+int profile_dump_threads(void (*line)(const char *text)) {
+    if (InterlockedCompareExchange(&running, 1, 0)) { line("  (the profiler is running: no stacks)\n"); return 0; }
+    static struct { DWORD tid; U32 depth; U64 pc[STACK_DEPTH], cpu_ms; HANDLE h; } t[256];
+    U32 n = 0;
+    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    list_modules();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = {sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && n < 256; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        t[n].tid = te.th32ThreadID;
+        t[n].h = h;
+        t[n].depth = 0;
+        FILETIME c, e, k, u;
+        t[n].cpu_ms = GetThreadTimes(h, &c, &e, &k, &u) ? (filetime(k) + filetime(u)) / 10000 : 0;
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT ctx;
+            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(h, &ctx)) t[n].depth = walk(&ctx, t[n].pc);
+            ResumeThread(h);
+        }
+        n++;
+    }
+    CloseHandle(snap);
+    char text[400], where[160];
+    for (U32 i = 0; i < n; i++) {
+        WCHAR desc[64] = L"";
+        PWSTR d = NULL;
+        if (SUCCEEDED(GetThreadDescription(t[i].h, &d)) && d) { _snwprintf(desc, 63, L"%ls", d); LocalFree(d); }
+        snprintf(text, sizeof text, "thread %lu %ls (CPU %.1f s)%s\n", t[i].tid, desc, t[i].cpu_ms / 1000.0, t[i].depth ? "" : ": no stack");
+        line(text);
+        for (U32 f = 0; f < t[i].depth; f++) {
+            describe_pc(t[i].pc[f], where, sizeof where);
+            snprintf(text, sizeof text, "    %s\n", where);
+            line(text);
+        }
+        CloseHandle(t[i].h);
+    }
+    InterlockedExchange(&running, 0);
+    return 1;
+}
+
+/* ---- the hitch log (SSBU_HITCH=<ms>) ------------------------------------------------------
+ * A sampler wakes about every millisecond and notes where three threads are: the guest's main
+ * thread, the vsync thread (it presents), and the thread that last entered the renderer. At each
+ * present the samples since the last one are the frame's: a frame over the threshold is logged
+ * with the functions each thread spent it in (a sample is about a millisecond), the process's
+ * page faults and the whole system's CPU use during it (to tell other programs' load from ours);
+ * a table of the causes so far every minute. Nothing runs without SSBU_HITCH. */
+DWORD gfx_last_enter_thread(void);   /* gpu_d3d11.c */
+
+enum { ROLE_MAIN, ROLE_VSYNC, ROLE_RENDER, ROLES };
+static const char *const ROLE_NAMES[ROLES] = {"main", "vsync", "renderer"};
+typedef struct HitchSample { U64 key; unsigned char role, waiting; } HitchSample;
+#define HITCH_RING 8192
+static HitchSample hitch_ring[HITCH_RING];
+static U32 hitch_head, hitch_frame_start;
+static SRWLOCK hitch_lock = SRWLOCK_INIT;
+static int hitch_ms = -1;
+typedef struct HitchCause { U64 key; U32 role, frames; double ms; } HitchCause;
+static HitchCause hitch_causes[512];
+static U32 nhitch_causes, hitch_count;
+
+static int is_system_module(int m) {
+    return is_wait_module(m) || (m >= 0 && (!_stricmp(modules[m].name, "KERNELBASE.dll") || !_stricmp(modules[m].name, "KERNEL32.DLL")));
+}
+
+/* The sample's key: the function (its start) of the innermost frame outside system code. */
+static void hitch_sample(HANDLE h, int role) {
+    if (SuspendThread(h) == (DWORD)-1) return;
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    U64 pc[STACK_DEPTH];
+    U32 depth = GetThreadContext(h, &ctx) ? walk(&ctx, pc) : 0;
+    ResumeThread(h);
+    if (!depth) return;
+    HitchSample s = {0, (unsigned char)role, (unsigned char)is_wait_module(module_of(pc[0]))};
+    for (U32 i = 0; i < depth; i++) {
+        int m = module_of(pc[i]);
+        if (is_system_module(m)) continue;
+        RUNTIME_FUNCTION *rf = function_entry(m, pc[i]);
+        s.key = rf ? modules[m].base + rf->BeginAddress : pc[i];
+        break;
+    }
+    AcquireSRWLockExclusive(&hitch_lock);
+    hitch_ring[hitch_head++ % HITCH_RING] = s;
+    ReleaseSRWLockExclusive(&hitch_lock);
+}
+
+static DWORD WINAPI hitch_sampler(void *unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"hitch sampler");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    list_modules();
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    HANDLE main_h = NULL, vsync_h = NULL, render_h = NULL;
+    DWORD render_tid = 0, pid = GetCurrentProcessId();
+    for (U32 tick = 0;; tick++) {
+        if ((!main_h || !vsync_h) && tick % 500 == 0) {   /* find the two named threads */
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 te = {sizeof te};
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != pid) continue;
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                PWSTR d = NULL;
+                int keep = 0;
+                if (h && SUCCEEDED(GetThreadDescription(h, &d)) && d) {
+                    if (!main_h && !wcscmp(d, L"guest main thread")) { main_h = h; keep = 1; }
+                    else if (!vsync_h && !wcscmp(d, L"vsync")) { vsync_h = h; keep = 1; }
+                    LocalFree(d);
+                }
+                if (h && !keep) CloseHandle(h);
+            }
+            CloseHandle(snap);
+        }
+        DWORD r = gfx_last_enter_thread();
+        if (r && r != render_tid) {
+            if (render_h) CloseHandle(render_h);
+            render_tid = r;
+            render_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, r);
+        }
+        if (main_h) hitch_sample(main_h, ROLE_MAIN);
+        if (vsync_h) hitch_sample(vsync_h, ROLE_VSYNC);
+        if (render_h && render_tid != GetThreadId(main_h) && render_tid != GetThreadId(vsync_h)) hitch_sample(render_h, ROLE_RENDER);
+        LARGE_INTEGER due = {.QuadPart = -10000};
+        if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 20);
+        else Sleep(1);
+    }
+}
+
+static void hitch_add_cause(U64 key, U32 role, double ms) {
+    for (U32 i = 0; i < nhitch_causes; i++)
+        if (hitch_causes[i].key == key && hitch_causes[i].role == role) { hitch_causes[i].frames++; hitch_causes[i].ms += ms; return; }
+    if (nhitch_causes < 512) hitch_causes[nhitch_causes++] = (HitchCause){key, role, 1, ms};
+}
+
+static int by_cause_ms(const void *a, const void *b) {
+    double x = ((const HitchCause *)a)->ms, y = ((const HitchCause *)b)->ms;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* (gpu_d3d11.c, at each present) */
+void hitch_present(void) {
+    if (hitch_ms < 0) {
+        const char *v = getenv("SSBU_HITCH");
+        hitch_ms = v ? atoi(v) : 0;
+        if (hitch_ms > 0) {
+            fprintf(stderr, "[hitch] logging frames over %d ms\n", hitch_ms);
+            CloseHandle(CreateThread(NULL, 0, hitch_sampler, NULL, 0, NULL));
+        }
+    }
+    if (hitch_ms <= 0) return;
+    static LARGE_INTEGER freq, last;
+    static U64 last_faults, last_idle, last_total, frame, last_table;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    double ms = last.QuadPart ? (now.QuadPart - last.QuadPart) * 1000.0 / freq.QuadPart : 0;
+    last = now;
+    frame++;
+    PROCESS_MEMORY_COUNTERS pmc = {sizeof pmc};
+    U64 faults = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? pmc.PageFaultCount : 0;
+    FILETIME fi, fk, fu;
+    U64 idle = 0, total = 0;
+    if (GetSystemTimes(&fi, &fk, &fu)) { idle = filetime(fi); total = filetime(fk) + filetime(fu); }   /* (kernel time includes idle) */
+    AcquireSRWLockExclusive(&hitch_lock);
+    U32 from = hitch_frame_start, to = hitch_head;
+    hitch_frame_start = hitch_head;
+    if (ms > hitch_ms && to - from > 0) {
+        if (to - from > HITCH_RING) from = to - HITCH_RING;
+        /* per role, the most sampled functions of the frame */
+        struct { U64 key; U32 n, waiting; } top[ROLES][64];
+        U32 ntop[ROLES] = {0}, total_role[ROLES] = {0};
+        for (U32 i = from; i != to; i++) {
+            const HitchSample *s = &hitch_ring[i % HITCH_RING];
+            total_role[s->role]++;
+            U32 j = 0;
+            for (; j < ntop[s->role] && top[s->role][j].key != s->key; j++) {}
+            if (j == ntop[s->role]) { if (j == 64) continue; top[s->role][j].key = s->key; top[s->role][j].n = top[s->role][j].waiting = 0; ntop[s->role]++; }
+            top[s->role][j].n++;
+            top[s->role][j].waiting += s->waiting;
+        }
+        char text[1400], where[160];
+        int len = snprintf(text, sizeof text, "[hitch] frame %llu: %.1f ms; page faults +%llu; system CPU %.0f%%", frame, ms,
+                           faults - last_faults, total > last_total ? 100.0 * (1.0 - (double)(idle - last_idle) / (double)(total - last_total)) : 0.0);
+
+        for (int r = 0; r < ROLES; r++) {
+            if (!total_role[r]) continue;
+            len += snprintf(text + len, sizeof text - len, "\n[hitch]   %s:", ROLE_NAMES[r]);
+            for (int k = 0; k < 3; k++) {   /* the three biggest */
+                U32 best = 0, bn = 0;
+                for (U32 j = 0; j < ntop[r]; j++) if (top[r][j].n > bn) { bn = top[r][j].n; best = j; }
+                if (!bn) break;
+                describe_pc(top[r][best].key, where, sizeof where);
+                double est = ms * bn / total_role[r];   /* the role's samples cover the frame */
+                len += snprintf(text + len, sizeof text - len, " %.1f ms %s%s;", est, where, top[r][best].waiting * 2 > top[r][best].n ? " (waiting)" : "");
+                if (k == 0) hitch_add_cause(top[r][best].key, (U32)r, est);
+                top[r][best].n = 0;
+            }
+        }
+        hitch_count++;
+        fprintf(stderr, "%s\n", text);
+    }
+    ReleaseSRWLockExclusive(&hitch_lock);
+    last_faults = faults; last_idle = idle; last_total = total;
+    if (hitch_count && frame - last_table >= 3600 && nhitch_causes) {   /* every minute: the causes so far */
+        last_table = frame;
+        qsort(hitch_causes, nhitch_causes, sizeof *hitch_causes, by_cause_ms);
+        fprintf(stderr, "[hitch] %u frames over %d ms so far; the largest part of each, by total time:\n", hitch_count, hitch_ms);
+        char where[160];
+        for (U32 i = 0; i < nhitch_causes && i < 10; i++) {
+            describe_pc(hitch_causes[i].key, where, sizeof where);
+            fprintf(stderr, "[hitch]   %7.1f ms in %4u frames  %s: %s\n", hitch_causes[i].ms, hitch_causes[i].frames, ROLE_NAMES[hitch_causes[i].role], where);
+        }
+    }
 }

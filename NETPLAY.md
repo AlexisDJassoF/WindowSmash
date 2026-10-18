@@ -29,7 +29,28 @@ Rooms are visible to everyone in the lobby with the same game version. For frien
 
 `Play SSBU Offline.bat` never goes online. If the lobby does not answer for five seconds, the game plays offline by itself and keeps trying in the background.
 
-The overlay (**F1**) shows the connection, for example `Online: 37 players, 4 rooms - you are Alpha, ping 48 ms`, with the lobby code after `Online` when one is set. Each player's delay to another is roughly the sum of both players' pings to the lobby, so a lobby near the group plays best.
+The overlay (**F1**) shows the connection, for example `Online: 37 players, 4 rooms - you are Alpha, ping 48 ms`, with the lobby code after `Online` when one is set. A second line lists the other players in your room and how each is reached (see [Direct connections](#direct-connections)).
+
+## Direct connections
+
+Online, the games in a room send their traffic straight to each other when the players' routers allow it. The lobby introduces them and the games punch through their routers (UDP hole punching), so nobody forwards a port for this either. Where that fails, the traffic keeps going through the lobby: some mobile networks and providers that share one address between many customers (symmetric NAT) do not allow it. A direct path that goes quiet falls back to the lobby within about a second, and is tried again afterwards.
+
+Through the lobby, the delay between two players is roughly the sum of both players' pings to it; directly, it is about the network delay between the two PCs. Direct connections need a lobby from this version of `tools/ssbu_relay.py`. With an older lobby, or with a player whose build has no direct connections, play goes through the lobby as before.
+
+The overlay's second line shows each player in your room, for example `Room: Bravo direct 12 ms, Kim relayed`:
+
+| Shown | Meaning |
+| :--- | :--- |
+| `direct 12 ms` | Straight to that player, with a 12 ms round trip. |
+| `relayed` | Through the lobby. |
+| `relayed (trying direct)` | Still punching through. |
+| `relayed (direct off)` | That player turned direct connections off. |
+| `relayed (direct off here)` | You turned them off. |
+| `relayed (older game)` | That player's build has no direct connections. |
+
+**Your internet address.** The players in a room with you learn your internet (IP) address, as they would playing online on a console. The lobby introduces only players whose games are already exchanging game traffic in a room, and each player is introduced in at most 20 rooms an hour. To keep your address to yourself, put the word `off` in a file named `online_direct.txt` next to `Play SSBU.bat` (on Linux, next to `run.sh`). All your traffic then goes through the lobby, which gives your address to nobody.
+
+Private rooms (`Host SSBU Netplay.bat`) always go through the host's relay.
 
 ## Quick setup: host
 
@@ -76,7 +97,7 @@ Allow inbound UDP 39420 on that machine and any network firewall in front of it.
 
 `python tools/ssbu_relay.py --probe <address>` checks that a lobby answers. On a Linux server, `tools/deploy/deploy_lobby.sh <ssh host> install` installs it as a sandboxed systemd service (`ssbu-lobby`). The lobby logs a statistics line every minute, and `--banlist FILE` turns away the addresses or networks listed in that file, re-read when it changes.
 
-The lobby checks message sources, rate-limits clients and carries each room's traffic only between that room's players, but it is still a transport for trusted players. Lobby codes and room names are not passwords; the protocol is not encrypted or authenticated.
+The lobby checks message sources, rate-limits clients and carries each room's traffic only between that room's players. A game accepts direct packets only from the addresses the lobby gave it, with the pair's secret, and only from players of its own room. It is still a transport for trusted players. Lobby codes and room names are not passwords; the protocol is not encrypted or authenticated.
 
 ## If the room does not appear
 
@@ -90,7 +111,8 @@ The lobby checks message sources, rate-limits clients and carries each room's tr
 | Two people look like one player | Each install needs its own identity. Close the game and **rename** the duplicated `netplay_id.txt` so a new one is generated. Keep each player's save. |
 | Communication error after joining | Check packet loss, relay reachability, matching versions/configuration, and whether the host/relay closed or changed networks. |
 | LAN works, internet does not | Investigate host firewall, UDP forwarding, double NAT/CGNAT, or use a virtual LAN/standalone relay. |
-| Works but feels delayed | All traffic goes through the relay. Prefer a low-latency host near the other players. |
+| Online, a player is always `relayed` | Their router or yours does not allow direct connections (symmetric NAT, common on mobile networks), a firewall drops the game's packets, or the lobby predates direct connections. Play goes on through the lobby. If Windows Firewall was told to block `ssbu.exe`, allow it in Windows Security > Firewall > Allow an app. |
+| Works but feels delayed | Traffic through a relay or lobby adds both players' pings to it. Prefer a low-latency host or lobby near the other players, or check the overlay for players that are not `direct`. |
 
 The host has no relay network hop to itself. Each joining player's path includes its connection to the relay; communication between joining players passes through that relay. The game's Local Wireless mode was designed for nearby peers, so internet latency can affect behavior.
 
@@ -109,6 +131,8 @@ Launchers write `build/play.log`. For more network diagnostics, set `SSBU_NET_LO
 | `SSBU_NET_PORT` | Relay port; default `39420`. |
 | `SSBU_NET_UPNP=0` | Disable automatic router mapping. |
 | `SSBU_NET_BIND` | Restrict the integrated relay's bind address; used by local diagnostics. |
+| `SSBU_NET_DIRECT=0` | Online, keep all traffic going through the lobby (`Play SSBU.bat` sets it when `online_direct.txt` says `off`). |
+| `SSBU_NET_TEST_NAT=1`, `SSBU_NET_TEST_BLOCK=<seconds>` | Local diagnostics: filter incoming packets like a router, or cut direct paths that many seconds after the start. |
 | `SSBU_NET_LOG=1` / `2` | Enable summary / more detailed network logging. |
 
 Without a host or relay setting, the runtime stays offline. `Play SSBU Offline.bat` clears both; `Play SSBU.bat` sets the relay from `online_server.txt`, and the host and join launchers choose their corresponding modes.

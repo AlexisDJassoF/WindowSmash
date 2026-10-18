@@ -1,7 +1,9 @@
 import contextlib
+from datetime import datetime, timezone
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -120,6 +122,31 @@ class BundleTests(unittest.TestCase):
             status = bundler.main(['--source', str(self.root), '--output-dir', str(self.output), '--dry-run'])
         self.assertEqual(status, 0)
         self.assertFalse(self.output.exists())
+
+    def test_sdl3_licence_ships_with_the_dll(self):
+        licence = self.root / 'deps/SDL3/LICENSE.txt'
+        licence.parent.mkdir(parents=True)
+        licence.write_bytes(b'zlib licence text')
+        names = [item.name for item in bundler.build_plan(self.root)]
+        self.assertNotIn('build/SDL3-LICENSE.txt', names)   # no SDL3.dll in this build
+        (self.root / 'build/SDL3.dll').write_bytes(b'MZ-sdl3')
+        path = self.package()
+        with zipfile.ZipFile(path) as archive:
+            self.assertEqual(archive.read('SSBU-Portable/build/SDL3.dll'), b'MZ-sdl3')
+            self.assertEqual(archive.read('SSBU-Portable/build/SDL3-LICENSE.txt'), b'zlib licence text')
+            self.assertFalse(any('deps/' in name for name in archive.namelist()))
+
+    def test_shader_cache_ships_only_played_files_of_the_current_version(self):
+        header = self.root / 'runtime/gpu_shader_cache.h'
+        header.parent.mkdir(parents=True)
+        header.write_text('#define SHADER_CACHE_VERSION 7\n')
+        cache = self.root / 'dump/shadercache'
+        for name in ('v7_played.dxbc', 'v7_ahead_of_time.dxbc', 'v6_old.dxbc'):
+            (cache / name).write_bytes(b'shader')
+        unplayed = datetime(2001, 6, 1, tzinfo=timezone.utc).timestamp()   # tools/shader_aot.py's date
+        os.utime(cache / 'v7_ahead_of_time.dxbc', (unplayed, unplayed))
+        names = [item.name for item in bundler.build_plan(self.root) if item.name.endswith('.dxbc')]
+        self.assertEqual(names, ['dump/shadercache/v7_played.dxbc'])
 
     def test_verification_rejects_tampering(self):
         path = self.package()

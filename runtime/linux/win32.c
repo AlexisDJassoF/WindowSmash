@@ -58,6 +58,9 @@ DWORD rt_win32_error(int err) {
 static BOOL fail_errno(void) { last_error = rt_win32_error(errno); return FALSE; }
 
 /* ---- locks and condition variables ------------------------------------------------------- */
+_Static_assert(offsetof(CRITICAL_SECTION, OwningThread) == offsetof(pthread_mutex_t, __data.__owner) && sizeof(CRITICAL_SECTION) == sizeof(pthread_mutex_t),
+               "CRITICAL_SECTION's OwningThread is glibc's mutex owner");
+
 void InitializeCriticalSection(CRITICAL_SECTION *cs) {
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
@@ -135,7 +138,7 @@ BOOL InitOnceComplete(LPINIT_ONCE once, DWORD flags, LPVOID context) {
 }
 
 /* ---- handles ------------------------------------------------------------------------------ */
-enum { H_THREAD = 1, H_EVENT, H_FILE, H_FIND };
+enum { H_THREAD = 1, H_EVENT, H_FILE, H_FIND, H_TIMER };
 #define H_MAGIC 0x52544831u
 
 typedef struct Obj {
@@ -151,6 +154,8 @@ typedef struct Obj {
     void *param;
     int fd;                        /* files */
     DIR *dir;                      /* searches */
+    u64 due_ns;                    /* timers: when (CLOCK_MONOTONIC), while armed */
+    int armed;
     char dir_path[1024], pattern[256];
 } Obj;
 
@@ -203,8 +208,40 @@ BOOL CloseHandle(HANDLE h) {
     return TRUE;
 }
 
+static u64 monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+
+static void sleep_until_ns(u64 t) {
+    struct timespec ts = {(time_t)(t / 1000000000ull), (long)(t % 1000000000ull)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+}
+
+/* A timer: sleeps until it is due (then disarms it) or ms have passed. */
+static DWORD wait_timer(Obj *o, DWORD ms) {
+    pthread_mutex_lock(&o->m);
+    u64 due = o->due_ns;
+    int armed = o->armed;
+    pthread_mutex_unlock(&o->m);
+    u64 now = monotonic_ns(), limit = ms == INFINITE ? ~0ull : now + (u64)ms * 1000000ull;
+    if (!armed) {
+        if (ms == INFINITE) { last_error = ERROR_INVALID_PARAMETER; return WAIT_FAILED; }   /* (it would never be due) */
+        sleep_until_ns(limit);
+        return WAIT_TIMEOUT;
+    }
+    sleep_until_ns(due < limit ? due : limit);
+    if (due > limit) return WAIT_TIMEOUT;
+    pthread_mutex_lock(&o->m);
+    if (o->due_ns == due) o->armed = 0;
+    pthread_mutex_unlock(&o->m);
+    return WAIT_OBJECT_0;
+}
+
 DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
     Obj *o = obj_of(h, 0);
+    if (o && o->type == H_TIMER) return wait_timer(o, ms);
     if (!o || (o->type != H_THREAD && o->type != H_EVENT)) { last_error = ERROR_INVALID_HANDLE; return WAIT_FAILED; }
     struct timespec until;
     if (ms != INFINITE) {
@@ -242,6 +279,31 @@ BOOL SetEvent(HANDLE h) {
     obj_signal(o);
     return TRUE;
 }
+HANDLE CreateWaitableTimerExW(void *security, LPCWSTR name, DWORD flags, DWORD access) {
+    (void)security; (void)name; (void)flags; (void)access;
+    return new_obj(H_TIMER);
+}
+
+/* due < 0: relative, in 100 ns units; else an absolute FILETIME (UTC). No period or callback. */
+BOOL SetWaitableTimer(HANDLE timer, const LARGE_INTEGER *due, LONG period, PTIMERAPCROUTINE fn, LPVOID arg, BOOL resume) {
+    (void)resume; (void)arg;
+    Obj *o = obj_of(timer, H_TIMER);
+    if (!o || period || fn) { last_error = ERROR_INVALID_PARAMETER; return FALSE; }
+    u64 now = monotonic_ns(), at;
+    if (due->QuadPart < 0) at = now + (u64)(-due->QuadPart) * 100;
+    else {
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        long long unix_ns = (due->QuadPart - 116444736000000000LL) * 100, real = (long long)rt.tv_sec * 1000000000LL + rt.tv_nsec;
+        at = unix_ns > real ? now + (u64)(unix_ns - real) : now;
+    }
+    pthread_mutex_lock(&o->m);
+    o->due_ns = at;
+    o->armed = 1;
+    pthread_mutex_unlock(&o->m);
+    return TRUE;
+}
+
 BOOL ResetEvent(HANDLE h) {
     Obj *o = obj_of(h, H_EVENT);
     if (!o) return FALSE;
@@ -538,6 +600,22 @@ static void system_time(SYSTEMTIME *out, int local) {
 }
 void GetLocalTime(SYSTEMTIME *t) { system_time(t, 1); }
 void GetSystemTime(SYSTEMTIME *t) { system_time(t, 0); }
+
+/* FILETIME: 100 ns units since 1601 (UTC) */
+static FILETIME filetime_of(struct timespec ts) {
+    u64 v = ((u64)ts.tv_sec + 11644473600ull) * 10000000ull + (u64)ts.tv_nsec / 100;
+    return (FILETIME){(DWORD)v, (DWORD)(v >> 32)};
+}
+static struct timespec timespec_of(const FILETIME *t) {
+    u64 v = (u64)t->dwHighDateTime << 32 | t->dwLowDateTime;
+    long long unix100 = (long long)v - 116444736000000000LL;
+    return (struct timespec){(time_t)(unix100 / 10000000LL), (long)(unix100 % 10000000LL) * 100};
+}
+void GetSystemTimeAsFileTime(FILETIME *t) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    *t = filetime_of(ts);
+}
 
 /* ---- memory ------------------------------------------------------------------------------- */
 #define PAGE 4096ull
@@ -1005,6 +1083,27 @@ BOOL FlushFileBuffers(HANDLE h) {
     return o && !fsync(o->fd) ? TRUE : fail_errno();
 }
 
+/* (Linux keeps no creation time: the change time stands in for it) */
+BOOL GetFileTime(HANDLE h, FILETIME *created, FILETIME *accessed, FILETIME *written) {
+    Obj *o = obj_of(h, H_FILE);
+    struct stat st;
+    if (!o || fstat(o->fd, &st)) return fail_errno();
+    if (created) *created = filetime_of(st.st_ctim);
+    if (accessed) *accessed = filetime_of(st.st_atim);
+    if (written) *written = filetime_of(st.st_mtim);
+    return TRUE;
+}
+
+BOOL SetFileTime(HANDLE h, const FILETIME *created, const FILETIME *accessed, const FILETIME *written) {
+    (void)created;
+    Obj *o = obj_of(h, H_FILE);
+    if (!o) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
+    struct timespec t[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+    if (accessed) t[0] = timespec_of(accessed);
+    if (written) t[1] = timespec_of(written);
+    return futimens(o->fd, t) ? fail_errno() : TRUE;
+}
+
 BOOL DeleteFileA(LPCSTR path) {
     char buf[4096];
     return unlink(rt_unix_path(path, buf, sizeof buf)) ? fail_errno() : TRUE;
@@ -1052,6 +1151,8 @@ static BOOL find_next(Obj *o, WIN32_FIND_DATAA *data) {
             data->dwFileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
             data->nFileSizeHigh = (DWORD)((u64)st.st_size >> 32);
             data->nFileSizeLow = (DWORD)st.st_size;
+            data->ftCreationTime = data->ftLastWriteTime = filetime_of(st.st_mtim);   /* (no birth time in stat) */
+            data->ftLastAccessTime = filetime_of(st.st_atim);
         } else data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
         return TRUE;
     }
@@ -1104,3 +1205,13 @@ USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash
 }
 
 void OutputDebugStringA(LPCSTR text) { fputs(text, stderr); }
+
+BOOL IsDebuggerPresent(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    int tracer = 0;
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "TracerPid:", 10)) { tracer = atoi(line + 10); break; }
+    if (f) fclose(f);
+    return tracer != 0;
+}
