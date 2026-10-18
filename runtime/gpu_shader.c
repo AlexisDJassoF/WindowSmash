@@ -22,6 +22,15 @@
 
 #include "gpu_shader.h"
 
+/* The Linux build compiles HLSL with vkd3d-shader, which lacks a few things fxc has
+ * (CalculateLevelOfDetail, RWByteAddressBuffer.Load, gathers with four offsets): for it the
+ * translator writes those the long way. SSBU_HLSL_FOR_VKD3D does the same on Windows, to test. */
+#if !defined(_WIN32) || defined(SSBU_HLSL_FOR_VKD3D)
+#define VKD3D_FORMS 1
+#else
+#define VKD3D_FORMS 0
+#endif
+
 #define BITS(w, pos, n) ((u32)(((w) >> (pos)) & ((1ull << (n)) - 1)))
 #define RZ 255
 #define PT 7
@@ -507,6 +516,17 @@ static void emit_tld4(Ctx *c, const Insn *in, int scalar) {
     }
     if (dc) dref = F(c, m);
     u32 k = texture_slot(c, handle, type, dc);
+    if (offmode == 2 && VKD3D_FORMS) {   /* four gathers, each with its own offset, one component of each (what the four-offset form returns) */
+        const char *o0 = R(c, m - 2), *o1 = R(c, m - 1);   /* (the two offset registers read above) */
+        static const char *const part[4][2] = {{"<< 26", "<< 18"}, {"<< 10", "<< 2"}, {"<< 26", "<< 18"}, {"<< 10", "<< 2"}};
+        static const char *const xyzw[4] = {"x", "y", "z", "w"};
+        line(c, "{ float4 %s;", v);
+        for (u32 i = 0; i < 4; i++) {
+            const char *o = i < 2 ? o0 : o1;
+            const char *one = tmp("int2(((int)(%s %s)) >> 26, ((int)(%s %s)) >> 26)", o, part[i][0], o, part[i][1]);
+            line(c, "  %s.%s = (%s).%s;", v, xyzw[i], gather(c, k, comp, coord_of(type, x, y, z, layer), dref, one), xyzw[i]);
+        }
+    } else
     line(c, "{ float4 %s = %s;", v, gather(c, k, comp, coord_of(type, x, y, z, layer), dref, offset));
     c->indent++;
     store_seq(c, v, mask, d);
@@ -1119,7 +1139,34 @@ static void emit_insn(Ctx *c, const Insn *in) {
         }
         u32 k = texture_slot(c, handle, type, 0);
         const char *v = tmp("t%u", tex_counter++);
-        if (gradients(c))
+        if (gradients(c) && VKD3D_FORMS) {
+            /* the level from the texel-space derivatives of the coordinates, as for isotropic
+             * filtering (cube maps: on the face the direction points at), clamped to the mips */
+            switch (type) {
+            case TEX_1D:
+                line(c, "{ float lw_, ll_; tex%u.GetDimensions(0, lw_, ll_); float lc_ = (%s) * lw_; float lr_ = max(ddx(lc_) * ddx(lc_), ddy(lc_) * ddy(lc_));", k, coord);
+                break;
+            case TEX_2D:
+                line(c, "{ float lw_, lh_, ll_; tex%u.GetDimensions(0, lw_, lh_, ll_); float2 lc_ = (%s) * float2(lw_, lh_);", k, coord);
+                line(c, "  float2 lx_ = ddx(lc_), ly_ = ddy(lc_); float lr_ = max(dot(lx_, lx_), dot(ly_, ly_));");
+                break;
+            case TEX_ARRAY_2D:
+                line(c, "{ float lw_, lh_, le_, ll_; tex%u.GetDimensions(0, lw_, lh_, le_, ll_); float2 lc_ = (%s) * float2(lw_, lh_);", k, coord);
+                line(c, "  float2 lx_ = ddx(lc_), ly_ = ddy(lc_); float lr_ = max(dot(lx_, lx_), dot(ly_, ly_));");
+                break;
+            case TEX_3D:
+                line(c, "{ float lw_, lh_, ld_, ll_; tex%u.GetDimensions(0, lw_, lh_, ld_, ll_); float3 lc_ = (%s) * float3(lw_, lh_, ld_);", k, coord);
+                line(c, "  float3 lx_ = ddx(lc_), ly_ = ddy(lc_); float lr_ = max(dot(lx_, lx_), dot(ly_, ly_));");
+                break;
+            default:   /* TEX_CUBE */
+                line(c, "{ float lw_, lh_, ll_; tex%u.GetDimensions(0, lw_, lh_, ll_); float3 ld_ = (%s);", k, coord);
+                line(c, "  float3 lc_ = ld_ / max(max(abs(ld_.x), abs(ld_.y)), max(abs(ld_.z), 1e-20f)) * (0.5f * lw_);");
+                line(c, "  float3 lx_ = ddx(lc_), ly_ = ddy(lc_); float lr_ = max(dot(lx_, lx_), dot(ly_, ly_));");
+                break;
+            }
+            line(c, "  float lu_ = 0.5f * log2(max(lr_, 1e-20f));");
+            line(c, "  float4 %s = float4(clamp(lu_, 0.0f, max(ll_ - 1.0f, 0.0f)), lu_, 0, 0);", v);
+        } else if (gradients(c))
             line(c, "{ float4 %s = float4(tex%u.CalculateLevelOfDetail(smp%u, %s), tex%u.CalculateLevelOfDetailUnclamped(smp%u, %s), 0, 0);",
                  v, k, k, coord, k, k, coord);
         else line(c, "{ float4 %s = 0;", v);
@@ -1608,18 +1655,22 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
     if (!c->uses_gmem) info->sb_count = 0;
     else {   /* a global address is looked up in each storage buffer in turn; outside them, 0 */
         u32 first = stage == SHADER_PIXEL ? 16 : 0;
+        /* (vkd3d-shader cannot read a RWByteAddressBuffer: there, the same words as a structured buffer) */
+        int words = stage == SHADER_COMPUTE && VKD3D_FORMS;
         for (u32 k = 0; k < info->sb_count; k++)
-            put(&out, stage == SHADER_COMPUTE ? "RWByteAddressBuffer gm%u : register(u%u);\n" : "ByteAddressBuffer gm%u : register(t%u);\n",
-                k, stage == SHADER_COMPUTE ? k : 96 + k);
+            put(&out, stage != SHADER_COMPUTE ? "ByteAddressBuffer gm%u : register(t%u);\n" : words ? "RWStructuredBuffer<uint> gm%u : register(u%u);\n"
+                      : "RWByteAddressBuffer gm%u : register(u%u);\n", k, stage == SHADER_COMPUTE ? k : 96 + k);
         put(&out, "uint gload_(uint lo, uint hi) {\n");
         for (u32 k = 0; k < info->sb_count; k++)
-            put(&out, "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u.Load(d); }\n",
+            put(&out, words ? "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u[d >> 2u]; }\n"
+                            : "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u.Load(d); }\n",
                 first + k, k);
         put(&out, "  return 0u;\n}\n");
         if (stage == SHADER_COMPUTE) {
             put(&out, "void gstore_(uint lo, uint hi, uint v) {\n");
             for (u32 k = 0; k < info->sb_count; k++)
-                put(&out, "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u.Store(d, v); return; } }\n",
+                put(&out, words ? "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u[d >> 2u] = v; return; } }\n"
+                                : "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u.Store(d, v); return; } }\n",
                     first + k, k);
             put(&out, "}\n");
             put(&out, "void gstore_part_(uint lo, uint hi, uint v, uint bits) {\n"

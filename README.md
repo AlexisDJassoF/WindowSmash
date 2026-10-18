@@ -8,7 +8,8 @@
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
   <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
-  <a href="docs/UPDATES.md"><strong>Later versions</strong></a>
+  <a href="docs/UPDATES.md"><strong>Later versions</strong></a> ·
+  <a href="README-LINUX.md"><strong>Linux</strong></a>
 </p>
 
 ---
@@ -34,7 +35,7 @@ The result is a locally built Windows executable backed by your own extracted ga
 
 ## Status
 
-The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
+The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). An experimental **Linux x64** build is cross-compiled from the same source ([Linux](README-LINUX.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
 
 | Area | Current position |
 | :--- | :--- |
@@ -73,6 +74,10 @@ python tools/recomp.py all dump/exefs --out build --jobs 16
 ```
 
 Choose a job count appropriate to your CPU and available memory. The output is `build/ssbu.exe`; generated files and game inputs remain ignored by Git.
+
+### Linux (experimental)
+
+The same game can also be built as a native x86-64 Linux program, cross-compiled on Windows from the Windows build's generated C. The renderer stays Direct3D 11, running on Vulkan through DXVK, with shaders compiled by vkd3d-shader; SDL2 handles the window, controllers and sound. `tools/linux/package_linux.py` turns the build into a folder to copy to the Linux machine, with launchers that find your game data there. See **[Linux](README-LINUX.md)** for the toolchain, the build commands, and running it, including in a virtual machine.
 
 ## Play and connect
 

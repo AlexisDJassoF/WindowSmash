@@ -17,11 +17,23 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_RAND_S
 #define COBJMACROS
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <natupnp.h>
 #include <oleauto.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket close
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -203,7 +215,7 @@ static DWORD WINAPI relay_thread(LPVOID unused) {
     u64 last_sweep = now_ms();
     for (;;) {
         struct sockaddr_in from;
-        int flen = sizeof from;
+        socklen_t flen = sizeof from;
         int n = recvfrom(relay_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
         if (n > 0) relay_packet(buf, n, &from);
         if (now_ms() - last_sweep >= 1000) {   /* members gone silent */
@@ -216,11 +228,13 @@ static DWORD WINAPI relay_thread(LPVOID unused) {
 }
 
 /* ---- UPnP: open the relay's port on the router ---------------------------------------- */
+#ifdef _WIN32
 static const CLSID CLSID_UPnPNAT_ = {0xAE1E00AA, 0x3FD5, 0x403C, {0x8A, 0x27, 0x2B, 0xBD, 0xC3, 0x0C, 0xD0, 0xE1}};
 static const IID IID_IUPnPNAT_ = {0xB171C812, 0xCC76, 0x485A, {0x94, 0xD8, 0xB6, 0xB3, 0xA2, 0x79, 0x4E, 0x99}};
+static IStaticPortMappingCollection *upnp_mappings;
+#endif
 static volatile LONG upnp_state;   /* 0 trying, 1 port open, 2 no UPnP router, 3 refused, 4 open but the router is behind another NAT */
 static char lan_ip[64], public_ip[64];
-static IStaticPortMappingCollection *upnp_mappings;
 
 static void lan_address(void) {   /* the address this PC goes out on (no packet is sent) */
     SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -228,18 +242,25 @@ static void lan_address(void) {   /* the address this PC goes out on (no packet 
     a.sin_family = AF_INET;
     a.sin_port = htons(53);
     inet_pton(AF_INET, "8.8.8.8", &a.sin_addr);
-    int len = sizeof a;
+    socklen_t len = sizeof a;
     if (s != INVALID_SOCKET && !connect(s, (struct sockaddr *)&a, sizeof a) && !getsockname(s, (struct sockaddr *)&a, &len))
         inet_ntop(AF_INET, &a.sin_addr, lan_ip, sizeof lan_ip);
     if (s != INVALID_SOCKET) closesocket(s);
 }
 
+#ifdef _WIN32
 static void upnp_close(void) {
     if (!upnp_mappings) return;
     BSTR udp = SysAllocString(L"UDP");
     IStaticPortMappingCollection_Remove(upnp_mappings, port, udp);
     SysFreeString(udp);
 }
+#else
+/* (linux/upnp.c: the router's port mapping through SSDP and SOAP, as Windows' UPnP NAT API does) */
+int rt_upnp_add(u16 port, const char *lan_ip, const char *what, char *public_ip, size_t n);
+void rt_upnp_remove(void);
+static void upnp_close(void) { rt_upnp_remove(); }
+#endif
 
 /* Whether an address is one the internet cannot reach: private, or carrier-grade NAT's 100.64/10 -
  * a router reporting one of these as its own outside address sits behind another NAT. */
@@ -269,6 +290,13 @@ static void write_share_file(void) {
 static DWORD WINAPI upnp_thread(LPVOID unused) {
     (void)unused;
     lan_address();
+#ifndef _WIN32
+    LONG state = rt_upnp_add(port, lan_ip, "SSBU netplay relay", public_ip, sizeof public_ip);
+    if (state == 1) {
+        atexit(upnp_close);
+        if (unreachable_address(public_ip)) state = 4;
+    }
+#else
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     IUPnPNAT *nat = NULL;
     LONG state = 2;
@@ -298,6 +326,7 @@ static DWORD WINAPI upnp_thread(LPVOID unused) {
         }
         IUPnPNAT_Release(nat);
     }
+#endif
     InterlockedExchange(&upnp_state, state);
     if (state == 1) fprintf(stderr, "[net] UPnP: port %u opened; friends join %s:%u (LAN address %s)\n", port, public_ip, port, lan_ip);
     else if (state == 4) fprintf(stderr, "[net] UPnP: port %u opened, but the router's outside address %s is behind another NAT; LAN address %s\n", port, public_ip, lan_ip);
@@ -331,7 +360,9 @@ void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *da
     if (p != stack) free(p);
 }
 
-/* (ICMP "port unreachable" would otherwise make a UDP socket's next receive fail) */
+/* (ICMP "port unreachable" would otherwise make a UDP socket's next receive fail; Linux reports
+ * that only for connected sockets) */
+#ifdef _WIN32
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
@@ -340,6 +371,9 @@ static void no_connreset(SOCKET s) {
     DWORD bytes = 0;
     WSAIoctl(s, SIO_UDP_CONNRESET, &off, sizeof off, NULL, 0, &bytes, NULL, NULL);
 }
+#else
+static void no_connreset(SOCKET s) { (void)s; }
+#endif
 
 static int resolve_relay(void) {
     char hostpart[256];
@@ -409,7 +443,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             fprintf(stderr, "[net] lost the relay %s; reconnecting\n", relay_text);
         }
         struct sockaddr_in from;
-        int flen = sizeof from;
+        socklen_t flen = sizeof from;
         int n = recvfrom(client_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
         if (n < 4 || buf[0] != MAGIC0 || buf[1] != MAGIC1 || !same_addr(&from, &relay_at)) continue;
         switch (buf[3]) {
@@ -422,7 +456,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             read_members(buf + 16, n - 16);
             last_pong = now_ms();
             reject_text[0] = 0;
-            if (!joined) fprintf(stderr, "[net] joined room %s on %s as 10.13.%u.%u (%ld players)\n", room, relay_text, my_ip >> 8 & 255, my_ip & 255, members);
+            if (!joined) fprintf(stderr, "[net] joined room %s on %s as 10.13.%u.%u (%ld players)\n", room, relay_text, my_ip >> 8 & 255, my_ip & 255, (long)members);
             InterlockedExchange(&joined, 1);
             break;
         case T_REJECT:
@@ -461,12 +495,16 @@ static void start(void) {
     if (!pending) return;
     configure();
     if (configured) {
+#ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
+        DWORD timeout = 100;
+#else
+        struct timeval timeout = {0, 100000};
+#endif
         unsigned int r1, r2;
         rand_s(&r1); rand_s(&r2);
         nonce = (u64)r1 << 32 | r2;
-        DWORD timeout = 100;
         if (hosting) {
             relay_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             struct sockaddr_in a = {0};
@@ -513,6 +551,6 @@ void net_status(char *out, size_t n) {
         else if (u == 4) snprintf(share, sizeof share, "  | router behind another NAT: only same-network friends can join (%s:%u)", lan_ip, port);
         else snprintf(share, sizeof share, "  | UPnP %s: only same-network friends can join (%s:%u)", u == 2 ? "unavailable" : "refused", lan_ip, port);
     }
-    snprintf(out, n, "Netplay: room %s, %ld player%s, %s 10.13.%u.%u, ping %ld ms%s", room, members, members == 1 ? "" : "s",
-             name, my_ip >> 8 & 255, my_ip & 255, ping_ms, share);
+    snprintf(out, n, "Netplay: room %s, %ld player%s, %s 10.13.%u.%u, ping %ld ms%s", room, (long)members, members == 1 ? "" : "s",
+             name, my_ip >> 8 & 255, my_ip & 255, (long)ping_ms, share);
 }

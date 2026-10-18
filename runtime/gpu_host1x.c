@@ -24,12 +24,14 @@
 #include "gpu_vp9.h"
 #ifdef SSBU_HAVE_VPX
 #include <math.h>
-#include <process.h>
 #include <vpx/vpx_decoder.h>
 #include <vpx/vp8dx.h>
+#ifdef _WIN32
+#include <process.h>
 /* libvpx was built against the DLL C runtime: the linker finds its imports in the static one
  * only among what something else has pulled in already, which for these two is this. */
 void *const vpx_crt_imports[] = {(void *)_beginthreadex, (void *)round};
+#endif
 #endif
 
 enum { CLASS_HOST1X = 0x01, CLASS_VIC = 0x5D, CLASS_NVJPG = 0xC0, CLASS_NVDEC = 0xF0 };

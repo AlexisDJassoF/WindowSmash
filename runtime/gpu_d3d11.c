@@ -263,6 +263,7 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
  * 10-second sampling profile. */
 static volatile LONG hotkeys;
 
+#ifdef _WIN32
 static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); ExitProcess(0); }
     if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F6 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
@@ -283,6 +284,12 @@ static DWORD WINAPI window_thread(LPVOID done) {
     while (GetMessageW(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
     return 0;
 }
+#else
+/* Linux: the window is SDL's, made and run by the main thread (linux/window.c), which passes
+ * the debug keys on here; DXVK takes the SDL_Window as the swap chain's HWND. */
+void *rt_window(void);
+void gfx_hotkey(int n) { InterlockedOr(&hotkeys, 1 << n); }
+#endif
 
 static ID3DBlob *compile_hlsl(const char *src, const char *entry, const char *target) {
     ID3DBlob *code = NULL, *errors = NULL;
@@ -310,9 +317,13 @@ static const char BLIT_HLSL[] =
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&lock);
+#ifdef _WIN32
     HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, window_thread, done, 0, NULL);
     WaitForSingleObject(done, INFINITE);
+#else
+    window = (HWND)rt_window();
+#endif
     if (!window) { fprintf(stderr, "[gfx] cannot create the window\n"); return TRUE; }
 
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -330,6 +341,18 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      * shader first on our compiler threads (see "shaders"). SSBU_COMPILE_DEVICE=0/1 overrides. */
     DXGI_ADAPTER_DESC ad;
     int nvidia = SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)) && ad.VendorId == 0x10DE;
+#ifndef _WIN32
+    {   /* (DXVK: which Vulkan device it chose) */
+        char name[128];
+        size_t i = 0;
+        for (; i < 127 && ad.Description[i]; i++) name[i] = ad.Description[i] < 128 ? (char)ad.Description[i] : '?';
+        name[i] = 0;
+        fprintf(stderr, "[gfx] Direct3D 11 through DXVK on %s (vendor %#x)\n", name, ad.VendorId);
+        if (ad.VendorId == 0x10005 || strstr(name, "llvmpipe") || strstr(name, "lavapipe"))
+            fprintf(stderr, "[gfx] note: this is a software renderer (no Vulkan GPU driver found): expect a low frame rate\n");
+    }
+    nvidia = 0;   /* (the compile device is for NVIDIA's Direct3D driver; DXVK compiles its own way) */
+#endif
     const char *cd = getenv("SSBU_COMPILE_DEVICE");
     if ((cd ? atoi(cd) : nvidia) &&
         FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
@@ -631,7 +654,7 @@ static void enqueue_shader(Shader *s) {
             CloseHandle(t);
             ncompilers++;
         }
-        if (!ncompilers) rt_fatal("cannot start the shader compiler threads (error %lu)", GetLastError());
+        if (!ncompilers) rt_fatal("cannot start the shader compiler threads (error %lu)", (unsigned long)GetLastError());
         fprintf(stderr, "[gfx] %u shader compiler threads\n", ncompilers);
     }
     InterlockedIncrement(&compiles_pending);
@@ -678,7 +701,7 @@ void gfx_report_compiles(void) {
             FILE *f = fopen(path, "wb");
             if (f) { fwrite(dxbc, 1, size, f); fclose(f); saved = s->hlsl ? "; HLSL and DXBC saved" : "; DXBC saved"; }
         }
-        fprintf(stderr, "  thread %lu%s: %s - %s, for %.1f s%s\n", compilers[i].thread, compilers[i].thread == self ? " (the faulting thread)" : "",
+        fprintf(stderr, "  thread %lu%s: %s - %s, for %.1f s%s\n", (unsigned long)compilers[i].thread, compilers[i].thread == self ? " (the faulting thread)" : "",
                 s->name, what[step], (now - compilers[i].since_ms) / 1000.0, saved);
     }
     if (busy) fprintf(stderr, "  (programs in %s/../shadercrash)\n", rt_data_dir);
@@ -3034,7 +3057,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  (gfx_stat_upload_kind[0] - last_kind[0]) / 1048576.0 / frames, (gfx_stat_upload_kind[1] - last_kind[1]) / 1048576.0 / frames,
                  (gfx_stat_upload_kind[2] - last_kind[2]) / 1048576.0 / frames, (gfx_stat_upload_kind[3] - last_kind[3]) / 1048576.0 / frames,
                  (gfx_stat_drawn - last_drawn) / frames, (gfx_stat_dispatched - last_dispatched) / frames, gfx_stat_gpu_waits - last_waits,
-                 (gfx_stat_skipped - last_skipped) / secs, gfx_stat_shaders, compiles_pending, ntextures, nsurfaces, nresidents,
+                 (gfx_stat_skipped - last_skipped) / secs, gfx_stat_shaders, (long)compiles_pending, ntextures, nsurfaces, nresidents,
                  (gfx_stat_watch_us - last_watch) / 1000.0 / secs, depth_sampling != 0 ? "on" : "off",
                  profile_running() ? "  (profiling...)" : "");
         char net[256];

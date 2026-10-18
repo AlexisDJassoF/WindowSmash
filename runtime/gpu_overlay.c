@@ -54,8 +54,14 @@ static ID3DBlob *compile(const char *entry, const char *target) {
     return code;
 }
 
-/* The glyphs: drawn white on black by GDI, kept as coverage in a one-channel texture. */
+/* The glyphs: drawn white on black by GDI, kept as coverage in a one-channel texture. (Linux:
+ * the same drawing, done at build time on Windows - tools/linux/make_overlay_font.c.) */
+#ifndef _WIN32
+#include "overlay_font.h"
+#endif
 static int make_atlas(ID3D11Device *dev) {
+    static unsigned char coverage[ATLAS_W * ATLAS_H];
+#ifdef _WIN32
     HDC dc = CreateCompatibleDC(NULL);
     BITMAPINFO bi;
     memset(&bi, 0, sizeof bi);
@@ -75,16 +81,20 @@ static int make_atlas(ID3D11Device *dev) {
         TextOutA(dc, (c - 32) % COLS * CELL_W, (c - 32) / COLS * CELL_H + 1, &ch, 1);
     }
     GdiFlush();
-    static unsigned char coverage[ATLAS_W * ATLAS_H];
     const unsigned *px = bits;
     for (int i = 0; i < ATLAS_W * ATLAS_H; i++) coverage[i] = (unsigned char)(px[i] >> 16);   /* red */
+#else
+    memcpy(coverage, overlay_font, sizeof coverage);
+#endif
     int solid = 127 - 32;
     for (int y = 0; y < CELL_H; y++) memset(coverage + (solid / COLS * CELL_H + y) * ATLAS_W + solid % COLS * CELL_W, 255, CELL_W);
+#ifdef _WIN32
     SelectObject(dc, old_font);
     SelectObject(dc, old_bmp);
     DeleteObject(font);
     DeleteObject(bmp);
     DeleteDC(dc);
+#endif
     D3D11_TEXTURE2D_DESC td = {ATLAS_W, ATLAS_H, 1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
     D3D11_SUBRESOURCE_DATA sd = {coverage, ATLAS_W, 0};
     ID3D11Texture2D *tex;

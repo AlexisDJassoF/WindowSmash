@@ -15,6 +15,9 @@
 /netplay_id.txt
 # A game version's own folder (tools/update.py --tree), laid out like the above
 /v[0-9]*/
+# Linux build outputs (tools/linux)
+/build-linux*/
+/dist-linux*/
 *.keys
 *.nca
 *.nsp
