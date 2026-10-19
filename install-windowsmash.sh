@@ -24,7 +24,9 @@
     py=$(find_python)
     if [ -z "$py" ]; then
         echo "Setting up WindowSmash needs Python 3.10 or newer: installing it (sudo asks for your password)."
-        if command -v apt-get >/dev/null 2>&1; then
+        if [ -e /run/ostree-booted ] && command -v rpm-ostree >/dev/null 2>&1; then   # (an image-based system)
+            sudo rpm-ostree install --idempotent --allow-inactive --apply-live python3
+        elif command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y python3 python3-venv
         elif command -v dnf >/dev/null 2>&1; then
             sudo dnf install -y python3

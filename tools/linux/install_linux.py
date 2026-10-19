@@ -89,7 +89,9 @@ PACKAGES = {
 OPTIONAL = {"libvulkan1", "vulkan-loader", "vulkan-icd-loader", "mesa-vulkan-drivers", "vulkan-tools", "zenity",
             "fontconfig", "fonts-dejavu-core", "dejavu-sans-mono-fonts", "ttf-dejavu", "dejavu-fonts"}
 INSTALL = {"apt": ["apt-get", "install", "-y"], "dnf": ["dnf", "install", "-y"],
-           "pacman": ["pacman", "-S", "--needed", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install"]}
+           "pacman": ["pacman", "-S", "--needed", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install"],
+           "rpm-ostree": ["rpm-ostree", "install", "--idempotent", "--allow-inactive"]}
+PACKAGES["rpm-ostree"] = PACKAGES["dnf"]   # (an image-based Fedora: the same packages, layered)
 
 
 class Stop(Exception):
@@ -174,9 +176,13 @@ def os_release(text):
     return out
 
 
-def package_manager(fields, have=lambda tool: True):
+def package_manager(fields, have=lambda tool: True, image_based=False):
     """The package manager for this distribution (apt, dnf, pacman or zypper), from os-release's
-    ID and ID_LIKE, among those installed (have); None for one it does not know."""
+    ID and ID_LIKE, among those installed (have); None for one it does not know. On an image-based
+    system booted by ostree (Fedora Silverblue and Kinoite, and the ones built on them: Bazzite,
+    Bluefin, Aurora and others) the system's own folders are read-only: rpm-ostree adds packages."""
+    if image_based and have("rpm-ostree"):
+        return "rpm-ostree"
     ids = [fields.get("ID", "").lower()] + fields.get("ID_LIKE", "").lower().split()
     by_family = [("apt", {"debian", "ubuntu", "linuxmint", "pop", "elementary", "zorin", "kali", "raspbian"}),
                  ("dnf", {"fedora", "rhel", "centos", "rocky", "almalinux", "nobara", "ultramarine"}),
@@ -573,11 +579,12 @@ def step_check_pc():
 
 # ---- step 3: the distribution's packages --------------------------------------------------------------
 def installed(manager, pkg):
-    """Whether a package (or, for dnf, zypper and pacman, something that provides it) is installed."""
+    """Whether a package (or, for dnf, zypper, rpm-ostree and pacman, something that provides it) is
+    installed - in the running system (rpm-ostree: not one layered for the next start)."""
     if manager == "apt":
         r = subprocess.run(["dpkg-query", "-W", "-f=${Status}", pkg], capture_output=True, text=True)
         return r.returncode == 0 and "install ok installed" in r.stdout
-    if manager in ("dnf", "zypper"):
+    if manager in ("dnf", "zypper", "rpm-ostree"):
         return subprocess.run(["rpm", "-q", "--whatprovides", pkg], capture_output=True).returncode == 0
     if manager == "pacman":
         return subprocess.run(["pacman", "-T", pkg], capture_output=True).returncode == 0
@@ -590,6 +597,24 @@ def sudo_run(cmd, dry):
     if dry:
         return True
     return subprocess.run(full).returncode == 0
+
+
+def install_layered(missing, run):
+    """rpm-ostree: the packages layered onto the system image and applied to the running one at once
+    (--apply-live), so that no restart is needed; where that can't be done (an update waiting for
+    the next start, say), the build's own for the next start. One name the repositories don't know
+    fails a whole transaction: the second try leaves out those the build does without. Whether
+    rpm-ostree took the build's packages (step_packages then sees whether they are there yet)."""
+    needed = [p for p in missing if p not in OPTIONAL]
+    for pkgs in [missing] + ([needed] if needed != missing else []):
+        if pkgs and run([*INSTALL["rpm-ostree"], "--apply-live", *pkgs]):
+            return True
+    return bool(needed) and run([*INSTALL["rpm-ostree"], *needed])
+
+
+def still_missing(wanted, is_installed):
+    """The build's packages that are not installed (the ones it does without left out)."""
+    return [p for p in wanted if p not in OPTIONAL and not is_installed(p)]
 
 
 def debian_cxx_headers(manager, dry):
@@ -619,7 +644,8 @@ def vulkan_ready():
 def step_packages(a):
     step("[3/8] Packages from your distribution")
     fields = os_release(read_text("/etc/os-release"))
-    manager = package_manager(fields, lambda tool: shutil.which(INSTALL[tool][0]) is not None)
+    manager = package_manager(fields, lambda tool: shutil.which(INSTALL[tool][0]) is not None,
+                              image_based=os.path.exists("/run/ostree-booted"))
     if not manager:
         info(f"{fields.get('PRETTY_NAME', 'this distribution')}: no package list for it here. Install these (or what "
              "your distribution calls them) yourself, then run this again with --no-packages:")
@@ -633,6 +659,15 @@ def step_packages(a):
         info(f"installed ({manager}): {', '.join(wanted)}")
     elif a.no_packages:
         info(f"not installing (--no-packages); missing: {', '.join(missing)}")
+    elif manager == "rpm-ostree":
+        info(f"adding {', '.join(missing)} to the system with rpm-ostree (an image-based system); sudo asks for your "
+             "password. This takes some minutes.")
+        needed = [p for p in missing if p not in OPTIONAL]
+        if not install_layered(missing, lambda cmd: sudo_run(cmd, a.dry_run)):
+            if needed:
+                raise Stop(f"rpm-ostree could not add {', '.join(needed)} (see above). If it says another transaction "
+                           "is running (an update), wait for it, then run this again.")
+            info(f"not added, and not needed for the build: {', '.join(missing)}")
     else:
         info(f"installing {', '.join(missing)} with {manager}; sudo asks for your password")
         if manager == "apt" and not sudo_run(["apt-get", "update"], a.dry_run):
@@ -649,6 +684,14 @@ def step_packages(a):
                 info(f"not installed, and not needed for the build: {', '.join(failed)}")
     if manager == "apt" and not a.no_packages:
         debian_cxx_headers(manager, a.dry_run)
+    if missing and not a.no_packages and not a.dry_run:   # (installed, as far as the package manager said: are they there?)
+        still = still_missing(wanted, lambda p: installed(manager, p))
+        if still and manager == "rpm-ostree":
+            raise Stop("The packages are added to the system for its next start (they could not be applied to the "
+                       "running one): restart the PC, then run bash install-windowsmash.sh again.")
+        if still:
+            raise Stop(f"These packages are still not installed: {', '.join(still)} (see above). Install them (or what "
+                       "your distribution calls them) yourself, then run this again with --no-packages.")
     if not a.dry_run and not vulkan_ready():
         info("note: no Vulkan driver is installed. The game draws through Vulkan: install your graphics card's driver "
              "(Mesa's covers AMD and Intel, and has a software one, lavapipe; NVIDIA has its own)")

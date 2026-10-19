@@ -68,6 +68,45 @@ class SystemTests(unittest.TestCase):
         self.assertIsNone(pm('ID=fedora\n', have=lambda tool: tool != 'dnf'))   # (its tool missing)
         self.assertEqual(set(il.PACKAGES), set(il.INSTALL))
 
+    def test_image_based_fedora(self):
+        """An ostree-booted system (Silverblue, Kinoite, Bazzite, Bluefin, Aurora): rpm-ostree, whatever its ID;
+        dnf is there too, but its system folders are read-only."""
+        bazzite = 'NAME="Bazzite"\nID=bazzite\nID_LIKE="fedora"\nVERSION_ID=42\nVARIANT_ID=bazzite\n'
+        silverblue = 'NAME="Fedora Linux"\nID=fedora\nVERSION_ID=42\nVARIANT_ID=silverblue\n'
+        for text in (bazzite, silverblue):
+            self.assertEqual(il.package_manager(il.os_release(text), image_based=True), 'rpm-ostree')
+            self.assertEqual(il.package_manager(il.os_release(text), image_based=False), 'dnf')
+        self.assertEqual(il.package_manager(il.os_release(bazzite), lambda tool: tool != 'rpm-ostree', image_based=True), 'dnf')
+        self.assertEqual(il.PACKAGES['rpm-ostree'], il.PACKAGES['dnf'])
+
+    def test_layering(self):
+        def run_with(results):
+            calls = []
+
+            def run(cmd):
+                calls.append(cmd)
+                return results.pop(0)
+            return run, calls
+        missing = ['clang', 'SDL2-devel', 'vulkan-tools']
+        run, calls = run_with([True])                       # applied to the running system
+        self.assertTrue(il.install_layered(missing, run))
+        self.assertEqual(calls, [['rpm-ostree', 'install', '--idempotent', '--allow-inactive', '--apply-live', *missing]])
+        run, calls = run_with([False, True])                # (an unknown optional one) again without it
+        self.assertTrue(il.install_layered(missing, run))
+        self.assertEqual(calls[1][-2:], ['clang', 'SDL2-devel'])
+        run, calls = run_with([False, False, True])         # not live: for the next start
+        self.assertTrue(il.install_layered(missing, run))
+        self.assertNotIn('--apply-live', calls[2])
+        run, calls = run_with([False, False, False])
+        self.assertFalse(il.install_layered(missing, run))
+        run, calls = run_with([False])                      # only optional ones, not taken: no more tries
+        self.assertFalse(il.install_layered(['vulkan-tools'], run))
+        self.assertEqual(len(calls), 1)
+
+    def test_still_missing(self):
+        here = {'clang', 'lld'}
+        self.assertEqual(il.still_missing(['clang', 'lld', 'bison', 'zenity'], lambda p: p in here), ['bison'])
+
     def test_packages_cover_the_build(self):
         for manager, pkgs in il.PACKAGES.items():
             text = ' '.join(pkgs).lower()

@@ -44,7 +44,10 @@ the build needs, finds your game files, and builds the game. It needs:
 - **An x86-64 PC with AVX2**, a Vulkan driver, and 8 GB of RAM or more (16 GB builds faster).
 - **About 30 GB of free space**, and an internet connection.
 - **Your password for `sudo`**, to install packages. It knows the package managers of Ubuntu,
-  Debian, Linux Mint, Fedora, Arch, Manjaro and openSUSE, and the families built on them.
+  Debian, Linux Mint, Fedora, Arch, Manjaro and openSUSE, and the families built on them. On an
+  image-based Fedora (Silverblue, Kinoite, Bazzite, Bluefin, Aurora and the like), whose system
+  folders are read-only, it adds them with `rpm-ostree`, to the running system where it can. If
+  they can only come with the next start, it says so: restart the PC and run the installer again.
 - **Your own game files**: the game (its `.nca` files, or an `.nsp` or `.xci`), with its update
   and DLC if you have them; your keys (`prod.keys` and `title.keys`); and your firmware's `.nca`
   files. An emulator's own folders work as they are.
