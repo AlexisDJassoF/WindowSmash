@@ -138,7 +138,11 @@ class Nca:
         self.rights_id = hdr[0x230:0x240]
         self.has_rights = any(self.rights_id)
 
-        if self.has_rights:
+        if self.plaintext:
+            # nothing to decrypt, so no key: a copy `decrypt` wrote keeps its rights id, and the
+            # ticket with its title key stayed in the NSP it came from
+            self.body_key = None
+        elif self.has_rights:
             tk = title.get(self.rights_id.hex())
             kek = prod.get(f"titlekek_{self.key_gen:02x}")
             if tk is None or kek is None:
