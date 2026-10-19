@@ -40,7 +40,7 @@ static ID3D11RenderTargetView *final_rtv;
 static ID3D11ShaderResourceView *final_srv;
 enum { FINAL_W = 1920, FINAL_H = 1080 };
 static ID3D11VertexShader *blit_vs;
-static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps;
+static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps, *decode_ps;
 static ID3D11SamplerState *linear_sampler;
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -324,6 +324,12 @@ static const char BLIT_HLSL[] =
     "cbuffer R : register(b1) { float4 src0_step; float4 dst0_inv; };\n"
     "float4 ps2d(V i) : SV_Target { return t.Sample(s, (src0_step.xy + (i.pos.xy - dst0_inv.xy) * src0_step.zw) * dst0_inv.zw); }\n";
 
+/* (get_texture) one level of a block-compressed texture, texel by texel, into its exact-size copy */
+static const char DECODE_HLSL[] =
+    "Texture2DArray<float4> src : register(t0);\n"
+    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float4 main(V i) : SV_Target { return src.Load(int4(int2(i.pos.xy), 0, 0)); }\n";
+
 static void start_compilers(void);                 /* (see "shaders") */
 static DWORD WINAPI prewarm_main(void *unused);
 
@@ -340,10 +346,72 @@ static int on_dxvk(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* ---- the graphics driver's threads: big stacks --------------------------------------------
+ * NVIDIA's driver starts its worker threads (which compile shaders to GPU code, among their
+ * work) with 64 KB stacks, and its compiler (nvgpucomp64.dll) recurses over a program's blocks:
+ * some of the game's programs run that out, and the stack overflow ends the game the moment the
+ * driver compiles one - players saw it when an effect first showed (the Daybreak item,
+ * Sephiroth's specials). The compile device below does not cover every compile the rendering
+ * device makes. So every thread a driver DLL (one from the system's DriverStore) starts gets a
+ * 16 MB stack reservation: as each DLL loads, its CreateThread import is pointed here.
+ * SSBU_DRIVER_STACKS=0: the driver's own sizes. */
+#define DRIVER_STACK (16ull << 20)
+
+static HANDLE WINAPI driver_create_thread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags,
+                                          LPDWORD id) {
+    if (stack < DRIVER_STACK) {
+        stack = DRIVER_STACK;
+        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+    }
+    return CreateThread(sa, stack, fn, arg, flags, id);
+}
+
+static void driver_imports(BYTE *base) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++) {
+        if (!d->OriginalFirstThunk) continue;
+        IMAGE_THUNK_DATA *name = (IMAGE_THUNK_DATA *)(base + d->OriginalFirstThunk), *slot = (IMAGE_THUNK_DATA *)(base + d->FirstThunk);
+        for (; name->u1.AddressOfData; name++, slot++) {
+            if (IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal) || strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(base + name->u1.AddressOfData))->Name, "CreateThread"))
+                continue;
+            DWORD old;
+            if (!VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, PAGE_READWRITE, &old)) continue;
+            slot->u1.Function = (ULONG_PTR)driver_create_thread;
+            VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, old, &old);
+        }
+    }
+}
+
+typedef struct { USHORT length, max; WCHAR *text; } NtString;
+typedef struct { ULONG flags; const NtString *path, *name; void *base; ULONG size; } DllLoaded;
+
+static void CALLBACK on_dll_loaded(ULONG reason, const DllLoaded *dll, void *unused) {
+    (void)unused;
+    if (reason != 1) return;   /* (LDR_DLL_NOTIFICATION_REASON_LOADED) */
+    static const WCHAR store[] = L"\\DriverStore\\";
+    const size_t n = sizeof store / sizeof *store - 1, len = dll->path->length / sizeof(WCHAR);
+    for (size_t i = 0; i + n <= len; i++)
+        if (!_wcsnicmp(dll->path->text + i, store, n)) { driver_imports(dll->base); return; }
+}
+
+static void driver_stacks(void) {
+    static void *cookie;
+    if (getenv("SSBU_DRIVER_STACKS") && !atoi(getenv("SSBU_DRIVER_STACKS"))) return;
+    LONG (NTAPI *reg)(ULONG, void (CALLBACK *)(ULONG, const DllLoaded *, void *), void *, void **) =
+        (LONG (NTAPI *)(ULONG, void (CALLBACK *)(ULONG, const DllLoaded *, void *), void *, void **))(void *)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    if (!reg || reg(0, on_dll_loaded, NULL, &cookie) < 0) fprintf(stderr, "[gfx] note: the driver's threads keep their own stack size\n");
+}
+#endif
+
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&lock);
 #ifdef _WIN32
+    driver_stacks();   /* (before Direct3D loads the driver) */
     HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, window_thread, done, 0, NULL);
     WaitForSingleObject(done, INFINITE);
@@ -423,6 +491,10 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     }
     if ((ps = compile_hlsl(BLIT_HLSL, "ps2d", "ps_5_0"))) {
         ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &blit2d_ps);
+        ID3D10Blob_Release(ps);
+    }
+    if ((ps = compile_hlsl(DECODE_HLSL, "main", "ps_5_0"))) {
+        ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &decode_ps);
         ID3D10Blob_Release(ps);
     }
     D3D11_SAMPLER_DESC smp = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -553,9 +625,9 @@ static void dump_shaders(const u32 *regs) {
 /* Translated at their first draw (on the submitting thread, well under a millisecond), then
  * made ready by compiler threads of our own: from the DXBC an earlier run kept on disk, else
  * from fxc's (seconds on large programs, minutes on some dispatch loops) - cache loads first.
- * Left to itself NVIDIA's driver compiles to GPU code after Create*Shader returns, on threads
- * with 64 KB stacks (which one of our programs overflowed), and the first draw with the shader
- * waits for that (the hitch when a move is first used). So a second device, with the driver's
+ * Left to itself NVIDIA's driver compiles to GPU code after Create*Shader returns, on threads of
+ * its own (see driver_stacks), and the first draw with the shader waits for that (the hitch when
+ * a move is first used). So a second device, with the driver's
  * threading off, compiles each one first - inside Create*Shader, on our thread, with our stack;
  * the rendering device keeps its threading (without it the renderer took twice as long a
  * frame). A draw whose
@@ -999,11 +1071,13 @@ static u64 fingerprint(int stage, const u8 *p, u32 size) {   /* 32 words spread 
     return h;
 }
 
-/* The shader for the program at guest address g, ready (state 1) or not. */
-static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
+/* The shader for the program at guest address g, ready (state 1) or not. alpha_tested: a pixel
+ * shader's variant that does the fixed-function alpha test (its own hash, so its own cache file). */
+static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared, int alpha_tested) {
     /* a compute program has no header: it is translated as if it had one (never read) */
     const u8 *p = stage == SHADER_COMPUTE ? P(u8, g) - 0x50 : P(u8, g);
-    u64 key = (u64)stage | (u64)vs_outputs << 4 | (stage == SHADER_COMPUTE ? ((u64)local[0] ^ (u64)local[1] << 11 ^ (u64)local[2] << 22 ^ (u64)shared << 33) << 36 : 0);
+    u64 key = (u64)stage | (u64)vs_outputs << 4 | (stage == SHADER_COMPUTE ? ((u64)local[0] ^ (u64)local[1] << 11 ^ (u64)local[2] << 22 ^ (u64)shared << 33) << 36 : 0)
+            | (u64)(alpha_tested != 0) << 63;
     ShaderSlot *slot = &shader_slots[((g >> 4) * 0x9E3779B97F4A7C15ull ^ key) >> 50 & (SHADER_SLOTS - 1)];
     if (slot->s && slot->g == g && slot->key == key && slot->print == fingerprint(stage, p, slot->size)) {
         Shader *s = slot->s;
@@ -1016,6 +1090,8 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     u32 size = shader_size(p, 0x40000), skip = stage == SHADER_COMPUTE ? 0x50 : 0;
     u64 h = shader_program_hash(p + skip, size - skip);
     if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
+    u64 program_hash = h;
+    if (alpha_tested) h = (h ^ 0x616C706861746573ull) * 1099511628211ull;
     CbufSource src = {stage_cb};
     for (u32 i = 0; i < shader_count; i++) {
         Shader *s = shader_cache[i];
@@ -1029,8 +1105,10 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     shader_cache[shader_count++] = s;
     s->hash = h; s->stage = stage; s->vs_outputs = vs_outputs;
     *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s};
-    snprintf(s->name, sizeof s->name, "%s_%016llx", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", h);
+    snprintf(s->name, sizeof s->name, "%s_%016llx%s", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", program_hash,
+             alpha_tested ? "_alphatest" : "");
     s->hlsl = stage == SHADER_COMPUTE ? shader_hlsl_cs(p, size, local, shared, &s->info, read_cbuf_word, &src)
+            : alpha_tested            ? shader_hlsl_alpha_tested(p, size, vs_outputs, &s->info, read_cbuf_word, &src)
                                       : shader_hlsl_ex(p, size, stage, vs_outputs, &s->info, read_cbuf_word, &src);
     const char *cdump = getenv("SSBU_DUMP_SHADERS");
     if (cdump && stage == SHADER_COMPUTE) {   /* C_<hash>_<local x>x<y>x<z>_<shared>.bin, behind 0x50 zero bytes */
@@ -1095,7 +1173,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
 
 /* The ready shader for the program at guest address g, or NULL while it compiles. */
 static Shader *get_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
-    Shader *s = find_shader_ex(g, stage, vs_outputs, stage_cb, local, shared);
+    Shader *s = find_shader_ex(g, stage, vs_outputs, stage_cb, local, shared, 0);
     return s && s->state == 1 ? s : NULL;
 }
 
@@ -1789,6 +1867,7 @@ typedef struct Texture {
 static Texture textures[4096];
 static u32 ntextures;
 u64 gfx_stat_textures, gfx_stat_watch_us;
+u64 gfx_stat_unpacked;   /* block-compressed textures copied to their exact size (unpack_texture) */
 
 static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
     static u64 rest;
@@ -1889,6 +1968,75 @@ static void texture_index_add(Texture *t) {
 
 static int depth_sampling = -1;   /* depth buffers as textures (shadow maps, ...); SSBU_NO_DEPTH_SAMPLING or F5: off */
 
+/* Block-compressed textures whose size is not a multiple of the 4x4 block: Direct3D 11 makes
+ * level 0 whole blocks, and a texture a few texels bigger is sampled wrongly at its right and
+ * bottom edges - coordinates are scaled by size / padded size, and clamping repeats the padding
+ * (ui2d's window frames stretch their last column across the middle of a button: the Spirits
+ * menu's selected button showed grey bars there). Such a texture is made padded as a source,
+ * then copied level by level, texel by texel, into an uncompressed texture of its exact size.
+ * Formats: the source's (typeless), how it is read, the copy's, its render target view. */
+typedef struct { DXGI_FORMAT bc, read, tex, rtv; } Unpacked;
+static int unpacked_formats(DXGI_FORMAT f, Unpacked *u) {
+    switch (f) {
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM}; break;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC2_TYPELESS, DXGI_FORMAT_BC2_UNORM}; break;
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC3_UNORM}; break;
+    case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC7_TYPELESS, DXGI_FORMAT_BC7_UNORM}; break;
+    case DXGI_FORMAT_BC4_UNORM: *u = (Unpacked){DXGI_FORMAT_BC4_TYPELESS, f, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_UNORM}; return 1;
+    case DXGI_FORMAT_BC4_SNORM: *u = (Unpacked){DXGI_FORMAT_BC4_TYPELESS, f, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_SNORM}; return 1;
+    case DXGI_FORMAT_BC5_UNORM: *u = (Unpacked){DXGI_FORMAT_BC5_TYPELESS, f, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_UNORM}; return 1;
+    case DXGI_FORMAT_BC5_SNORM: *u = (Unpacked){DXGI_FORMAT_BC5_TYPELESS, f, DXGI_FORMAT_R16G16_SNORM, DXGI_FORMAT_R16G16_SNORM}; return 1;
+    case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+        *u = (Unpacked){DXGI_FORMAT_BC6H_TYPELESS, f, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT}; return 1;
+    default: return 0;
+    }
+    u->tex = DXGI_FORMAT_R8G8B8A8_TYPELESS;   /* (an sRGB one read as UNORM and viewed as sRGB: the bytes unchanged) */
+    u->rtv = DXGI_FORMAT_R8G8B8A8_UNORM;
+    return 1;
+}
+
+static ID3D11DeviceContext *unpack_ctx;   /* deferred: the copy runs with the immediate context's state kept (mid-draw) */
+static u32 gfx_debug(void);
+
+static ID3D11Texture2D *unpack_texture(ID3D11Texture2D *bc, const TextureDesc *d, u32 levels, u32 layers, UINT misc, const Unpacked *u) {
+    if (!decode_ps || (!unpack_ctx && FAILED(ID3D11Device_CreateDeferredContext(dev, 0, &unpack_ctx)))) return NULL;
+    D3D11_TEXTURE2D_DESC td = {d->width, d->height, levels, layers, u->tex, {1, 0}, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, misc};
+    ID3D11Texture2D *out;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &out))) return NULL;
+    ID3D11DeviceContext *c = unpack_ctx;
+    ID3D11DeviceContext_VSSetShader(c, blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, decode_ps, NULL, 0);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    int ok = 1;
+    for (u32 layer = 0; layer < layers && ok; layer++)
+        for (u32 l = 0; l < levels && ok; l++) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {u->read, D3D11_SRV_DIMENSION_TEXTURE2DARRAY};
+            sd.Texture2DArray = (D3D11_TEX2D_ARRAY_SRV){l, 1, layer, 1};
+            D3D11_RENDER_TARGET_VIEW_DESC rd = {u->rtv, D3D11_RTV_DIMENSION_TEXTURE2DARRAY};
+            rd.Texture2DArray = (D3D11_TEX2D_ARRAY_RTV){l, layer, 1};
+            ID3D11ShaderResourceView *srv = NULL;
+            ID3D11RenderTargetView *rtv = NULL;
+            ok = SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)bc, &sd, &srv)) &&
+                 SUCCEEDED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)out, &rd, &rtv));
+            if (ok) {
+                D3D11_VIEWPORT vp = {0, 0, (float)(d->width >> l ? d->width >> l : 1), (float)(d->height >> l ? d->height >> l : 1), 0, 1};
+                ID3D11DeviceContext_OMSetRenderTargets(c, 1, &rtv, NULL);
+                ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+                ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &srv);
+                ID3D11DeviceContext_Draw(c, 3, 0);
+            }
+            if (srv) ID3D11ShaderResourceView_Release(srv);
+            if (rtv) ID3D11RenderTargetView_Release(rtv);
+        }
+    ID3D11CommandList *list = NULL;
+    if (FAILED(ID3D11DeviceContext_FinishCommandList(c, FALSE, &list))) ok = 0;
+    if (ok) ID3D11DeviceContext_ExecuteCommandList(ctx, list, TRUE);
+    if (list) ID3D11CommandList_Release(list);
+    if (!ok) { ID3D11Texture2D_Release(out); return NULL; }
+    return out;
+}
+
 static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     TextureDesc d;
     int ok = tic_decode(tic, &d);
@@ -1959,8 +2107,11 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     D3D11_TEXTURE2D_DESC td = {d.width, d.height, levels, layers, d.dxgi, {1, 0}, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0,
                                layers == 6 || (d.type == TIC_CUBE_ARRAY) ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0};
     if (d.type != TIC_CUBE && d.type != TIC_CUBE_ARRAY) td.MiscFlags = 0;
+    Unpacked unpacked;
+    int unpack = 0;
     if (d.bw > 1 && ((d.width % 4) || (d.height % 4))) {   /* block-compressed sizes must be multiples of 4 at level 0 */
         td.Width = (d.width + 3) & ~3u; td.Height = (d.height + 3) & ~3u;
+        if (!(gfx_debug() & 128) && (unpack = unpacked_formats(d.dxgi, &unpacked))) td.Format = unpacked.bc;
     }
     D3D11_SUBRESOURCE_DATA *init = calloc(levels * layers, sizeof *init);
     u8 **mem = calloc(levels * layers, sizeof *mem);
@@ -1968,11 +2119,19 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
         for (u32 l = 0; l < levels; l++) {
             u32 w = (d.width >> l) ? d.width >> l : 1, h = (d.height >> l) ? d.height >> l : 1;
             u32 bw = (w + d.bw - 1) / d.bw, bh = (h + d.bh - 1) / d.bh;
-            u8 *buf = malloc((size_t)bw * bh * d.bytes + 64);
+            /* a padded texture's level can be a block wider or taller than the image's (9 wide: 12, level 1 6) */
+            u32 pw = (td.Width >> l) ? td.Width >> l : 1, ph = (td.Height >> l) ? td.Height >> l : 1;
+            u32 pbw = (pw + d.bw - 1) / d.bw, pbh = (ph + d.bh - 1) / d.bh;
+            if (pbw < bw) pbw = bw;
+            if (pbh < bh) pbh = bh;
+            u8 *buf = pbw > bw || pbh > bh ? calloc(1, (size_t)pbw * pbh * d.bytes + 64) : malloc((size_t)bw * bh * d.bytes + 64);
             texture_read(&d, g, layer, l, buf);
+            for (u32 y = bh; pbw > bw && y-- > 0;)   /* rows spread out to the wider pitch, from the last */
+                memmove(buf + (size_t)y * pbw * d.bytes, buf + (size_t)y * bw * d.bytes, (size_t)bw * d.bytes);
+            for (u32 y = 0; pbw > bw && y < bh; y++) memset(buf + ((size_t)y * pbw + bw) * d.bytes, 0, (size_t)(pbw - bw) * d.bytes);
             gfx_stat_upload_bytes += (u64)bw * bh * d.bytes;
             gfx_stat_upload_kind[3] += (u64)bw * bh * d.bytes;
-            init[layer * levels + l] = (D3D11_SUBRESOURCE_DATA){buf, bw * d.bytes, bw * bh * d.bytes};
+            init[layer * levels + l] = (D3D11_SUBRESOURCE_DATA){buf, pbw * d.bytes, pbw * pbh * d.bytes};
             mem[layer * levels + l] = buf;
         }
     HRESULT hr = ID3D11Device_CreateTexture2D(dev, &td, init, &t->tex);
@@ -1983,6 +2142,14 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     D3D11_SHADER_RESOURCE_VIEW_DESC sd;
     memset(&sd, 0, sizeof sd);
     sd.Format = d.dxgi == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : d.dxgi;
+    ID3D11Texture2D *exact = unpack ? unpack_texture(t->tex, &d, levels, layers, td.MiscFlags, &unpacked) : NULL;
+    if (exact) {   /* (else the padded one, as before) */
+        ID3D11Texture2D_Release(t->tex);
+        t->tex = exact;
+        sd.Format = unpacked.tex != DXGI_FORMAT_R8G8B8A8_TYPELESS ? unpacked.tex
+                  : unpacked.read != d.dxgi ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        gfx_stat_unpacked++;
+    }
     switch (shader_type) {
     case TEX_ARRAY_2D: sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY; sd.Texture2DArray.MipLevels = levels; sd.Texture2DArray.ArraySize = layers; break;
     case TEX_CUBE: sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; sd.TextureCube.MipLevels = levels; break;
@@ -2145,7 +2312,8 @@ STATE_CACHE(blend_state, D3D11_BLEND_DESC, ID3D11BlendState, ID3D11Device_Create
 /* ---- draws ------------------------------------------------------------------------- */
 u64 gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target;
 /* SSBU_GFX_DEBUG bits: 1 all colour channels written, 2 no depth/stencil test, 4 no culling,
- * 8 no blending, 16 log every draw of one frame (after SSBU_GFX_LOG_AT seconds) */
+ * 8 no blending, 16 log every draw of one frame (after SSBU_GFX_LOG_AT seconds), 64 no alpha test,
+ * 128 block-compressed textures left padded (no exact-size copies) */
 static u32 gfx_debug(void) {
     static int checked;
     static u32 v;
@@ -2591,9 +2759,16 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     u64 ps_g = regs[M_PIPELINE(5)] & 1 ? gpu_va_to_guest(region + regs[M_PIPELINE(5) + 1]) : 0;
     /* the pixel shader is asked for once the vertex shader is translated (its outputs are the
      * pixel shader's inputs), not once it is compiled: both compile at the same time */
-    Shader *vs_e = vs_g ? find_shader_ex(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], NULL, 0) : NULL;
-    Shader *ps_e = vs_e && vs_e->state != 2 && ps_g ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0) : NULL;
-    Shader *vs = vs_e && vs_e->state == 1 ? vs_e : NULL, *ps = ps_e && ps_e->state == 1 ? ps_e : NULL;
+    Shader *vs_e = vs_g ? find_shader_ex(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], NULL, 0, 0) : NULL;
+    Shader *ps_e = vs_e && vs_e->state != 2 && ps_g ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 0) : NULL;
+    /* The fixed-function alpha test (ui2d's alpha compare: the main menu's stencil masks are cut
+     * from a texture's alpha this way) needs the pixel shader's variant that discards; while that
+     * compiles, the plain one draws as before. */
+    D3D11_COMPARISON_FUNC alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : D3D11_COMPARISON_ALWAYS;
+    Shader *pa_e = alpha_func != D3D11_COMPARISON_ALWAYS && ps_e && ps_e->state != 2 && (ps_e->info.color_mask & 1)
+                 ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 1) : NULL;
+    Shader *vs = vs_e && vs_e->state == 1 ? vs_e : NULL;
+    Shader *ps = pa_e && pa_e->state == 1 ? pa_e : ps_e && ps_e->state == 1 ? ps_e : NULL;
     /* no fragment stage (depth only: shadow maps, depth pre-passes) draws with no pixel shader */
     if (!vs || (ps_g && !ps) || topo == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) {
         gfx_stat_skipped++;
@@ -2653,6 +2828,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.fix[3] = minus_one ? 0.5f : 0.0f;
     params.frag[0] = lower_left ? 1.0f : 0.0f;
     params.frag[1] = (float)rt_h;
+    if (pa_e && ps == pa_e) { params.frag[2] = (float)alpha_func; params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * D3D judges the winding as seen on the target, which after the fix-up above is the window
@@ -2758,13 +2934,13 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         u32 sh = regs[M_SCISSOR(0) + 1], sv = regs[M_SCISSOR(0) + 2];
         fprintf(stderr, "[draw]   scissor %s x %u-%u y %u-%u | stencil %d func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
                 "two-sided %u: back func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
-                "blend src %d dst %d op %d, alpha src %d dst %d op %d\n",
+                "blend src %d dst %d op %d, alpha src %d dst %d op %d | alpha test %u func %#x ref %g\n",
                 regs[M_SCISSOR(0)] & 1 ? "on" : "off", sh & 0xFFFF, sh >> 16, sv & 0xFFFF, sv >> 16, dd.StencilEnable, regs[M_STENCIL_FUNC],
                 regs[M_STENCIL_REF] & 0xFF, regs[M_STENCIL_FUNC_MASK] & 0xFF, regs[M_STENCIL_MASK] & 0xFF, regs[M_STENCIL_OP_FAIL],
                 regs[M_STENCIL_OP_ZFAIL], regs[M_STENCIL_OP_ZPASS], regs[M_TWO_SIDED_STENCIL] & 1, regs[M_BACK_STENCIL_FUNC],
                 regs[M_BACK_STENCIL_REF] & 0xFF, regs[M_BACK_STENCIL_FUNC_MASK] & 0xFF, regs[M_BACK_STENCIL_MASK] & 0xFF,
                 regs[M_BACK_STENCIL_OP_FAIL], regs[M_BACK_STENCIL_OP_ZFAIL], regs[M_BACK_STENCIL_OP_ZPASS], t->SrcBlend, t->DestBlend, t->BlendOp,
-                t->SrcBlendAlpha, t->DestBlendAlpha, t->BlendOpAlpha);
+                t->SrcBlendAlpha, t->DestBlendAlpha, t->BlendOpAlpha, regs[M_ALPHA_TEST] & 1, regs[M_ALPHA_FUNC], f32_of(regs[M_ALPHA_REF]));
     }
 
     /* vertex streams: each attribute the shader reads gets its stream's data at t18 + n */

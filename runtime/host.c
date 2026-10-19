@@ -44,7 +44,8 @@ static const char *phase = "start-up";
 int rt_trace;
 static int status_every;   /* seconds between thread dumps, 0 for none */
 extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_stat_dispatched, gfx_stat_residents, gfx_stat_clears, gfx_stat_drawn, gfx_stat_skipped,
-    gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology, gfx_skip_target;
+    gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology,
+    gfx_skip_target;
 u64 present_frames(void);
 void gfx_report_compiles(void (*line)(const char *text));
 const char *rt_data_dir;
@@ -307,22 +308,18 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
     }
 }
 
-/* A host fault inside recompiled code is a guest fault: report where, and what it touched. */
-static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
+/* A host fault inside recompiled code is a guest fault: report where, and what it touched.
+ * The report is written by a thread of its own, the faulting one only waits: its stack may be
+ * what ran out - and after a stack overflow, too little of it is left for writing a report (on
+ * the graphics driver's threads, whose stacks are 64 KB, there is no room to keep for one). */
+static struct { HANDLE go; EXCEPTION_POINTERS *e; DWORD tid; } fault;
+
+static _Noreturn void crash_report(EXCEPTION_POINTERS *e, DWORD tid) {
     DWORD code = e->ExceptionRecord->ExceptionCode;
-    if (rt_probing) return EXCEPTION_CONTINUE_SEARCH;
-    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
-        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_IN_PAGE_ERROR)
-        return EXCEPTION_CONTINUE_SEARCH;
-    static volatile LONG faulting;
-    if (InterlockedExchange(&faulting, 1)) {   /* another thread is reporting its fault: let it finish */
-        Sleep(90000);
-        TerminateProcess(GetCurrentProcess(), 6);
-    }
     char name[96], report[MAX_PATH];
     fflush(stdout);
     report_open("crash", report, sizeof report);
-    out("\n*** host exception %#lx during %s", code, phase);
+    out("\n*** host exception %#lx%s during %s", code, code == EXCEPTION_STACK_OVERFLOW ? " (stack overflow)" : "", phase);
     if (code == EXCEPTION_ACCESS_VIOLATION)
         out(": %s address %s", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
             rt_describe(e->ExceptionRecord->ExceptionInformation[1], name, sizeof name));
@@ -333,8 +330,13 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     u64 pc = (u64)e->ExceptionRecord->ExceptionAddress;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &mod))
         GetModuleFileNameA(mod, modname, sizeof modname);
-    out("host pc %#llx: %s +%#llx (thread %lu)\n", pc, strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname,
-        pc - (u64)mod, GetCurrentThreadId());
+    WCHAR *desc = NULL;   /* (which thread: unnamed ones are the system's or the driver's) */
+    HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (thread && FAILED(GetThreadDescription(thread, &desc))) desc = NULL;
+    out("host pc %#llx: %s +%#llx (thread %lu%s%ls)\n", pc, strrchr(modname, '\\') ? strrchr(modname, '\\') + 1 : modname,
+        pc - (u64)mod, tid, desc && desc[0] ? ", " : "", desc && desc[0] ? desc : L"");
+    if (desc) LocalFree(desc);
+    if (thread) CloseHandle(thread);
     {   /* and the host frames above it */
         CONTEXT ctx = *e->ContextRecord;
         for (int i = 0; i < 24; i++) {
@@ -357,11 +359,42 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     print_frames(frames, unwind(*e->ContextRecord, frames, 62));   /* from the faulting frame */
     char dump[MAX_PATH];
     snprintf(dump, sizeof dump, "%.*s.dmp", (int)strlen(report) - 4, report);
-    int dumped = report_file != INVALID_HANDLE_VALUE && rt_write_dump(dump, GetCurrentThreadId(), e, 100000);
+    int dumped = report_file != INVALID_HANDLE_VALUE && rt_write_dump(dump, tid, e, 100000);
     if (report_file != INVALID_HANDLE_VALUE) out("report: %s%s%s\n", report, dumped ? "; minidump: " : "", dumped ? dump : "");
     if (report_file != INVALID_HANDLE_VALUE) CloseHandle(report_file);
     fflush(stderr);
     ExitProcess(5);
+}
+
+static DWORD WINAPI crash_reporter(void *unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"crash reporter");
+    WaitForSingleObject(fault.go, INFINITE);
+    crash_report(fault.e, fault.tid);
+}
+
+static void crash_reporter_start(void) {
+    fault.go = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HANDLE t = fault.go ? CreateThread(NULL, 0, crash_reporter, NULL, 0, NULL) : NULL;
+    if (t) CloseHandle(t);
+    else fault.go = NULL;
+}
+
+static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
+    DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (rt_probing) return EXCEPTION_CONTINUE_SEARCH;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_IN_PAGE_ERROR)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG faulting;
+    if (InterlockedExchange(&faulting, 1)) {   /* another thread is reporting its fault: let it finish */
+        Sleep(90000);
+        TerminateProcess(GetCurrentProcess(), 6);
+    }
+    fault.e = e;
+    fault.tid = GetCurrentThreadId();
+    if (fault.go && SetEvent(fault.go)) for (;;) Sleep(INFINITE);   /* (the reporter ends the process) */
+    crash_report(e, fault.tid);
 }
 #else
 /* ---- Linux: faults and other threads' stacks come through signals ---------------------- */
@@ -836,8 +869,9 @@ static void print_status(void) {
             (double)rt_now_ns() / 1e9, phase, gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gfx_stat_clears, gpu_stat_dispatches,
             gfx_stat_dispatched, gfx_stat_residents,
             present_frames());
-    fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures; %llu ms watching writes\n",
-            gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us / 1000);
+    fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures (%llu unpacked); %llu ms watching writes\n",
+            gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked,
+            gfx_stat_watch_us / 1000);
     u32 fiber_slots, fibers_finalized;
     u64 fibers_made;
     fiber_counts(&fiber_slots, &fibers_finalized, &fibers_made);
@@ -907,6 +941,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--status") && i + 1 < argc) status_every = atoi(argv[++i]);
     }
 #ifdef _WIN32
+    crash_reporter_start();
     AddVectoredExceptionHandler(1, on_fault);
     dump_helper_start();
 #else
