@@ -39,6 +39,7 @@ void rt_call(Cpu *c, u64 guest_addr);                  /* call a guest function 
  * From native code running on a guest thread, using that thread's context. */
 u64 rt_callsym(Cpu *c, const char *symbol, int n, ...);
 u64 rt_now_ns(void);                                   /* monotonic time since the process started */
+u64 rt_clock_ns(void);                                 /* monotonic time on the system timer's time line, cheap to ask */
 u64 rt_guest_copy(const void *data, size_t size);      /* permanent guest-visible copy (e.g. a string) */
 u64 rt_native(GuestFn *fn, const char *name);          /* guest address for a native function */
 u64 rt_symbol(const char *name);                       /* guest address of an exported symbol, or 0 */

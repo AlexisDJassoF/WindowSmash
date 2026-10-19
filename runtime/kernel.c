@@ -54,20 +54,11 @@ static Region regions[4096];
 static u32 region_count;
 static struct { u64 dst, src, size; } maps[1024];
 static u64 heap_size, tlr_next = KERNEL_BASE, next_thread_id = 1, wait_order;
-static LARGE_INTEGER qpc_freq;
 
 /* ---- time ------------------------------------------------------------------------ */
-static u64 now_ns(void) {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return (u64)(t.QuadPart / qpc_freq.QuadPart) * 1000000000ull + (u64)(t.QuadPart % qpc_freq.QuadPart) * 1000000000ull / qpc_freq.QuadPart;
-}
+static u64 now_ns(void) { return rt_clock_ns(); }
 
-u64 rt_ticks(void) {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return (u64)(t.QuadPart / qpc_freq.QuadPart) * 19200000ull + (u64)(t.QuadPart % qpc_freq.QuadPart) * 19200000ull / qpc_freq.QuadPart;
-}
+u64 rt_ticks(void) { return rt_clock_ns() * 12 / 625; }   /* (19.2 MHz) */
 
 static u64 deadline_of(i64 timeout_ns) { return timeout_ns < 0 ? ~0ull : now_ns() + (u64)timeout_ns; }
 
@@ -647,7 +638,7 @@ u32 rt_attach_system_event(Cpu *c, u64 system_event, int auto_clear) {
 void kernel_init(void) {
     InitializeCriticalSection(&klock);
     InitializeConditionVariable(&kchanged);
-    QueryPerformanceFrequency(&qpc_freq);
+    rt_clock_ns();   /* (the clock set up - and its line logged - before the game asks it) */
     /* Reserve the areas the guest maps into; pages are committed as they are used. The alias
      * area, where the game keeps its GPU memory, has its writes watched so that the renderer
      * learns which textures the CPU changed (GetWriteWatch). */

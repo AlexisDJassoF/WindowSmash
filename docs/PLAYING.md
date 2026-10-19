@@ -11,6 +11,7 @@ Everything about playing once the game is built: how to start it, the controls, 
 - [Controllers](#controllers)
 - [Window and display](#window-and-display)
 - [Shaders and first-time stutter](#shaders-and-first-time-stutter)
+- [Low frame rate](#low-frame-rate)
 - [Where your files are](#where-your-files-are)
 - [Problem reports](#problem-reports)
 
@@ -135,6 +136,14 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 The game's graphics programs (*shaders*) are prepared the first time each one is used, so a new effect can show a moment late, or stutter, the first time you see it. WindowSmash keeps every prepared shader in `dump\shadercache\` and loads them in the background each time the game starts, so each stutter happens only once.
 
 To prepare them all before playing, double-click **`Prepare Shaders.bat`**. It runs once per game version, from a few minutes to about two hours, at low priority so the PC stays usable. You can close it at any time and start it again later; what's done stays done. It needs Python and Visual Studio, as for [building](BUILDING.md).
+
+## Low frame rate
+
+If matches run slowly on a PC that should manage them (press <kbd>F1</kbd> for the frame rate), check these first:
+
+- **Prepare Shaders is still running.** It uses most of the processor; let it finish, or close it while you play.
+- **NVIDIA's shader cache is off.** In NVIDIA Control Panel → *Manage 3D settings*, set **Shader Cache Size** to *Driver default* (not *Disabled*). Without it, the graphics driver redoes its part of every shader each time the game starts.
+- **Windows uses a slow system timer.** Some "gaming tweaks" set Windows to time everything with an old, slow timer (the HPET). WindowSmash notices and works around it, and says so near the top of `build\play.log`: a `[clock]` line ending in *slow*. Other programs stay slower, though; to undo the tweak, run `bcdedit /deletevalue useplatformclock` in a Command Prompt opened as administrator, then restart the PC.
 
 ## Where your files are
 

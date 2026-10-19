@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "clock.h"
 #include "display.h"
 #include "gpu_menu.h"
 #include "gpu_precompile.h"
@@ -569,13 +570,12 @@ u64 rt_callsym(Cpu *c, const char *symbol, int n, ...) {
     return c->x[0];
 }
 
+/* ---- the clock: cheap to ask, also where Windows' timer is slow (clock.h) ------------ */
+u64 rt_clock_ns(void) { return clock_now_ns(); }
+
 u64 rt_now_ns(void) {
-    static LARGE_INTEGER freq, start;
-    LARGE_INTEGER t;
-    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&start); }
-    QueryPerformanceCounter(&t);
-    u64 d = (u64)(t.QuadPart - start.QuadPart);
-    return d / (u64)freq.QuadPart * 1000000000ull + d % (u64)freq.QuadPart * 1000000000ull / (u64)freq.QuadPart;
+    u64 t = clock_now_ns();   /* (sets up the clock, and clock_start_ns, the first time) */
+    return t > clock_start_ns ? t - clock_start_ns : 0;
 }
 
 /* The second half of the native region holds small constant data handed to the guest. */
