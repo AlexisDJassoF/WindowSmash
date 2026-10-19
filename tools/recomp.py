@@ -43,10 +43,13 @@ import time
 from collections import Counter
 from multiprocessing import Pool
 
-import modcache
-from funcs import discover
-from lift import Lifter
-from nso import Module
+# this folder, for the modules below: a Python with a ._pth file (the embeddable one the installer
+# sets up when the PC has none) does not put a script's own folder on the path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import modcache  # noqa: E402
+from funcs import discover  # noqa: E402
+from lift import Lifter  # noqa: E402
+from nso import Module  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TREE = ROOT   # --tree
