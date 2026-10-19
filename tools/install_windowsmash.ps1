@@ -267,8 +267,31 @@ function Get-VsModifyArguments {
     param([string]$InstallPath, [string]$ProductId)
     $workload = 'Microsoft.VisualStudio.Workload.NativeDesktop'
     if ($ProductId -match 'BuildTools') { $workload = 'Microsoft.VisualStudio.Workload.VCTools' }
+    # (no --wait: only the bootstrapper takes it, the installer's setup.exe does not; Start-Process -Wait waits)
     return @('modify', '--installPath', $InstallPath, '--add', $workload, '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
-             '--includeRecommended', '--passive', '--norestart', '--wait')
+             '--includeRecommended', '--passive', '--norestart')
+}
+
+function Get-VsExitMessage {
+    <# What a Visual Studio Installer exit code means for the person, or $null when it succeeded
+       (Microsoft's list: "Use command-line parameters to install Visual Studio", Error codes). #>
+    param([int]$Code)
+    switch ($Code) {
+        0 { return $null }
+        3010 { return $null }   # done; Windows wants a restart before the tools are used
+        1641 { return $null }   # done, and a restart was started
+        740 { return 'it needs administrator rights, so allow it when Windows asks' }
+        1001 { return 'the Visual Studio Installer is already open, so close it first' }
+        1003 { return 'Visual Studio is in use, so close it first' }
+        8006 { return 'Visual Studio is running, so close it first' }
+        1602 { return 'it was cancelled' }
+        5004 { return 'it was cancelled' }
+        1618 { return 'another installation is running, so wait for it to finish' }
+        5007 { return "this PC doesn't meet its requirements" }
+        87 { return 'it did not accept its options' }
+        -1073720687 { return "it couldn't connect to the internet" }
+        default { return 'it stopped' }
+    }
 }
 
 function Get-FolderCandidates {
@@ -743,6 +766,20 @@ function Get-VsInstances {
     return $out
 }
 
+function Invoke-VsModify {
+    <# Runs the Visual Studio Installer's modify command and waits for it; stops with what its exit
+       code means when it fails. Its arguments go as one quoted command line: given a list,
+       Start-Process joins it unquoted and the installation path breaks at its spaces (code 87). #>
+    param([string]$Setup, [string[]]$Arguments)
+    $p = Start-Process -FilePath $Setup -ArgumentList (Join-CommandLine $Arguments) -Wait -PassThru
+    $why = Get-VsExitMessage $p.ExitCode
+    if ($why) {
+        throw ("The Visual Studio Installer could not add the C++ tools: $why (code $($p.ExitCode)). Run this again; if it keeps " +
+               "failing, open Visual Studio Installer, click Modify, tick 'Desktop development with C++' and 'C++ Clang tools for Windows', " +
+               "install, then run this again.")
+    }
+}
+
 function Step-Compiler {
     Write-Step '[4/10] The compiler (Visual Studio Build Tools with Clang)'
     $check = Test-Compiler
@@ -759,8 +796,7 @@ function Step-Compiler {
         $modify = Get-VsModifyArguments $inst.Path $inst.Product
         if ($DryRun) { Write-Would "add the C++ workload and Clang to the Visual Studio in $($inst.Path): setup.exe $($modify -join ' ')"; return }
         Write-Info "adding the C++ workload and Clang to the Visual Studio in $($inst.Path) (a progress window opens; this downloads up to a few GB)"
-        $p = Start-Process -FilePath $setup -ArgumentList $modify -Wait -PassThru
-        if ($p.ExitCode -notin @(0, 3010)) { throw "The Visual Studio installer stopped with code $($p.ExitCode). Open Visual Studio Installer, click Modify, tick 'Desktop development with C++' and 'C++ Clang tools for Windows', then run this again." }
+        Invoke-VsModify $setup $modify
     } else {
         $winget = Get-Command winget -ErrorAction SilentlyContinue
         if (-not $winget) {
@@ -777,8 +813,7 @@ function Step-Compiler {
             $instances = @(Get-VsInstances)
             if ($instances.Count -eq 0 -or -not (Test-Path -LiteralPath $setup)) { throw "winget says the Build Tools are installed, but they could not be found. Open Visual Studio Installer, click Modify, tick 'Desktop development with C++' and 'C++ Clang tools for Windows', then run this again." }
             $inst = $instances[0]
-            $p = Start-Process -FilePath $setup -ArgumentList (Get-VsModifyArguments $inst.Path $inst.Product) -Wait -PassThru
-            if ($p.ExitCode -notin @(0, 3010)) { throw "The Visual Studio installer stopped with code $($p.ExitCode)." }
+            Invoke-VsModify $setup (Get-VsModifyArguments $inst.Path $inst.Product)
         } elseif ($code -notin @(0, 3010)) {
             throw "winget stopped with code $code. Install the Build Tools by hand from $VsBuildToolsUrl (tick 'Desktop development with C++' and 'C++ Clang tools for Windows'), then run this again."
         }
