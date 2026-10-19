@@ -1433,8 +1433,10 @@ static int emit_flow(Ctx *c, const Insn *in, u32 next) {
 
 /* Jump tables of indirect branches. The compiler emits
  *     IMNMX.U32 rI, rI, N-1 ;  SHL rI, rI, 2 ;  LDC rT, c[bank][rI + off] ;  BRX rT - k
- * with the table's entries relative to the BRX. If every BRX of the program resolves, only
- * their targets need to be blocks; otherwise every instruction must be one. */
+ * with the table's entries relative to the BRX - the shift sometimes into another register
+ * (SHL rJ, rI, 2 ; LDC rT, c[bank][rJ + off]: the main menu's UI vertex shader). If every BRX of
+ * the program resolves, only their targets need to be blocks; otherwise every instruction must
+ * be one, which a graphics card runs many times slower. */
 static int brx_resolved(Ctx *c) {
     if (!c->read_cbuf) return 0;
     int all = 1;
@@ -1450,8 +1452,18 @@ static int brx_resolved(Ctx *c) {
                 found = 1;
                 break;
             }
-        for (int k = j - 1; found && k >= 0 && k > j - 24; k--)
-            if ((c->ins[k].op == OP_IMNMX_imm) && BITS(c->ins[k].w, 0, 8) == index_reg) { count = imm20(c->ins[k].w) + 1; break; }
+        u32 shifted_from = RZ;   /* (the register the index was shifted from into index_reg) */
+        for (int k = j - 1; found && k >= 0 && k > j - 24; k--) {
+            const Insn *p = &c->ins[k];
+            if (p->op == OP_SHL_imm && shifted_from == RZ && BITS(p->w, 0, 8) == index_reg && imm20(p->w) == 2 && BITS(p->w, 8, 8) != index_reg) {
+                shifted_from = BITS(p->w, 8, 8);
+                continue;
+            }
+            if (p->op == OP_IMNMX_imm && (BITS(p->w, 0, 8) == index_reg || (shifted_from != RZ && BITS(p->w, 0, 8) == shifted_from))) {
+                count = imm20(p->w) + 1;
+                break;
+            }
+        }
         if (!found || !count || count > 256) { all = 0; continue; }
         if (c->info->ntables < 4) {
             c->info->table[c->info->ntables].bank = bank; c->info->table[c->info->ntables].offset = off;
