@@ -175,11 +175,18 @@ class ToolchainTests(unittest.TestCase):
                {('/usr/lib/llvm-21/bin', 'clang'), ('/usr/bin', 'clang'), ('/usr/bin', 'ld.lld'), ('/usr/bin', 'llvm-ar'), ('/usr/bin', 'llvm-nm')}
         dirs = sorted(['/usr/lib/llvm-18/bin', '/usr/lib/llvm-21/bin', '/usr/lib/llvm-9/bin'], key=toolchain.llvm_version, reverse=True)
         self.assertEqual(dirs, ['/usr/lib/llvm-21/bin', '/usr/lib/llvm-18/bin', '/usr/lib/llvm-9/bin'])
-        # llvm-21 has only clang (no lld-21): the newest folder with all four
-        self.assertEqual(toolchain.pick_llvm_bin(dirs + ['/usr/bin'], lambda d, t: (d, t) in have), '/usr/lib/llvm-18/bin')
-        self.assertEqual(toolchain.pick_llvm_bin(['/usr/bin'], lambda d, t: (d, t) in have), '/usr/bin')
+        has = lambda d, t: (d, t) in have   # noqa: E731
+        # Ubuntu: llvm-21 has only clang (no lld-21); /usr/bin is llvm-18's: the newest folder with all four
+        self.assertEqual(toolchain.pick_llvm_bin(dirs + ['/usr/bin'], has, lambda d: toolchain.llvm_version(d) or 18),
+                         '/usr/lib/llvm-18/bin')
+        self.assertEqual(toolchain.pick_llvm_bin(['/usr/bin'], has), '/usr/bin')
         self.assertIsNone(toolchain.pick_llvm_bin(['/nowhere'], lambda d, t: False))
         self.assertEqual(toolchain.llvm_version('/usr/lib64/llvm17/bin'), 17)
+        self.assertEqual(toolchain.llvm_version('/usr/lib/llvm14/bin'), 14)
+        # Arch, Fedora: an older compatibility LLVM next to the system's newest in /usr/bin
+        arch = {(d, t) for d in ('/usr/lib/llvm14/bin', '/usr/bin') for t in toolchain.LLVM_TOOLS}
+        self.assertEqual(toolchain.pick_llvm_bin(['/usr/lib/llvm14/bin', '/usr/bin'], lambda d, t: (d, t) in arch,
+                                                 lambda d: toolchain.llvm_version(d) or 21), '/usr/bin')
 
 
 class BuildOnLinuxTests(unittest.TestCase):

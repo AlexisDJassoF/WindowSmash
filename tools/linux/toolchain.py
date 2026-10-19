@@ -76,23 +76,41 @@ def llvm_version(folder):
     return int(m.group(1)) if m else 0
 
 
-def pick_llvm_bin(candidates, has):
-    """The first folder that has every tool LLVM_TOOLS names (has(folder, tool)), or None."""
+def pick_llvm_bin(candidates, has, version_of=llvm_version):
+    """Of the folders that have every tool LLVM_TOOLS names (has(folder, tool)), the one with the
+    newest LLVM (version_of(folder); the first of equals), or None. (Debian's newest is a
+    /usr/lib/llvm-<n>; Arch's and Fedora's is /usr/bin, their numbered ones older copies.)"""
+    best, best_version = None, -1
     for d in candidates:
         if d and all(has(d, t) for t in LLVM_TOOLS):
-            return d
-    return None
+            v = version_of(d)
+            if v > best_version:
+                best, best_version = d, v
+    return best
+
+
+def clang_major(folder):
+    """The clang major version of a folder's clang (its name says it, or clang -dumpversion), else 0."""
+    v = llvm_version(folder)
+    if v:
+        return v
+    try:
+        out = subprocess.run([os.path.join(folder, "clang"), "-dumpversion"], capture_output=True, text=True, timeout=30).stdout
+        return int(out.strip().split(".")[0])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0
 
 
 def _find_llvm():
     if os.environ.get("SSBU_LLVM_BIN"):
         return os.environ["SSBU_LLVM_BIN"]
     if HOST_LINUX:
-        # the distribution's versioned LLVMs, newest first (Debian, Ubuntu: /usr/lib/llvm-<n>/bin;
-        # Fedora's older ones: /usr/lib64/llvm<n>/bin), then the folders on PATH
-        versioned = sorted(glob.glob("/usr/lib/llvm-*/bin") + glob.glob("/usr/lib64/llvm*/bin"), key=llvm_version, reverse=True)
+        # the newest of the distribution's versioned LLVMs (Debian, Ubuntu: /usr/lib/llvm-<n>/bin;
+        # Fedora, Arch: older ones in /usr/lib64/llvm<n>/bin, /usr/lib/llvm<n>/bin) and the folders on PATH
+        versioned = sorted(set(glob.glob("/usr/lib/llvm-*/bin") + glob.glob("/usr/lib/llvm[0-9]*/bin") +
+                               glob.glob("/usr/lib64/llvm*/bin")), key=llvm_version, reverse=True)
         found = pick_llvm_bin(versioned + os.environ.get("PATH", "").split(os.pathsep),
-                              lambda d, t: os.access(os.path.join(d, t), os.X_OK))
+                              lambda d, t: os.access(os.path.join(d, t), os.X_OK), clang_major)
         if not found:
             raise SystemExit("clang, ld.lld, llvm-ar and llvm-nm were not found: install clang, lld and llvm "
                              "(install-windowsmash.sh does), or name their folder in SSBU_LLVM_BIN")
