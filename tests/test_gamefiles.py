@@ -127,7 +127,7 @@ class SummaryTests(unittest.TestCase):
         self.assertIn('DLC: 2 add-on contents', text)
         self.assertIn('1 other game here, ignored', text)
         self.assertIn('1 file could not be read', text)
-        self.assertEqual(gamefiles.summary({'contents': [], 'unread': []}), ['No game files (.nca or .nsp) found here.'])
+        self.assertEqual(gamefiles.summary({'contents': [], 'unread': []}), ['No game files (.nca, .nsp or .xci) found here.'])
 
 
 class FolderTests(unittest.TestCase):

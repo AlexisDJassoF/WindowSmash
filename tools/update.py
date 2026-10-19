@@ -84,7 +84,7 @@ def bucket_tree(table, entry_size, fmt):
 
 class Patch:
     def __init__(self, nsp, keydir):
-        ncas = [n for _, n in nsp_ncas(nsp, keydir)] if nsp.lower().endswith(".nsp") else [Nca(nsp, keydir)]
+        ncas = [n for _, n in nsp_ncas(nsp, keydir)]   # (a package, or the program .nca itself)
         progs = [n for n in ncas if n.content_type == 0]
         if len(progs) != 1:
             raise SystemExit(f"{nsp}: expected one Program NCA, found {len(progs)}")

@@ -9,10 +9,10 @@ The folder can be the setup guide's (program.nca and friends: docs/BUILDING.md) 
 emulator's installed-content folder - yuzu's nand\\user\\Contents\\registered, Ryujinx's
 bis\\user\\Contents\\registered - where every content is <content id>.nca, as a file or as a
 folder holding the file as 00, next to other games' contents, which are ignored. Folders one
-level down are read too (the guide's dlc\\, the emulators' numbered folders), and .nsp packages
-anywhere in them: the game's update and DLC as dumped (an update .nsp holds the update's
-program; tools/build_game.py reads it in place with nca.py --inner, and tools/update.py applies
-its data over the base's).
+level down are read too (the guide's dlc\\, the emulators' numbered folders), and packages
+anywhere in them: the game as a game card dump (.xci) or an .nsp, its update and DLC as dumped
+(.nsp). tools/build_game.py reads an NCA inside a package in place with nca.py --inner, and
+tools/update.py applies an update's data over the base's.
 
 Title ids: an application's ends in 000, its update's in 800, and its add-on contents' are the
 application's + 0x1000 + the DLC's index (Super Smash Bros. Ultimate: 01006A800016E000,
@@ -59,8 +59,8 @@ def version_string(version):
 # ---- the folder's files -------------------------------------------------------------------------
 def list_ncas(folder, depth=1):
     """[(path, name)] of the NCAs in a folder and `depth` levels of subfolders: <name>.nca as a
-    file, or a folder <name>.nca holding the file as 00 (Ryujinx); .nsp packages likewise,
-    as (path, name) in the second list."""
+    file, or a folder <name>.nca holding the file as 00 (Ryujinx); .nsp and .xci packages
+    likewise, as (path, name) in the second list."""
     ncas, nsps = [], []
 
     def visit(d, level):
@@ -76,7 +76,7 @@ def list_ncas(folder, depth=1):
                     ncas.append((p, n))
                 elif os.path.isfile(os.path.join(p, "00")):
                     ncas.append((os.path.join(p, "00"), n))
-            elif low.endswith(".nsp") and os.path.isfile(p):
+            elif low.endswith((".nsp", ".xci")) and os.path.isfile(p):
                 nsps.append((p, n))
             elif os.path.isdir(p) and level < depth:
                 visit(p, level + 1)
@@ -258,7 +258,7 @@ def summary(result, app=APP_ID):
     ours = [c for c in contents if int(c["app"], 16) == app]
     others = {c["app"] for c in contents if int(c["app"], 16) != app}
     if not contents:
-        lines.append("No game files (.nca or .nsp) found here.")
+        lines.append("No game files (.nca, .nsp or .xci) found here.")
     for c in ours:
         if c["type"] != "program":
             continue

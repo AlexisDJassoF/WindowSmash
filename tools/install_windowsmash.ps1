@@ -921,7 +921,7 @@ function Show-Wizard {
     $rows = @{}
     $y = 58
     foreach ($spec in @(
-        @{ Key = 'Game'; Title = 'Game files'; Hint = "yuzu's or Ryujinx's game folder, or yours: the game, its update .nsp, DLC .nsp files" },
+        @{ Key = 'Game'; Title = 'Game files'; Hint = "yuzu's or Ryujinx's game folder, or yours: the game (.xci, .nsp or .nca), update, DLC" },
         @{ Key = 'Keys'; Title = 'Keys'; Hint = "The folder with prod.keys and title.keys" },
         @{ Key = 'Firmware'; Title = 'Firmware'; Hint = "The folder with your Switch firmware's .nca files (for the fonts)" }
     )) {
