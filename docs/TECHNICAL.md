@@ -138,9 +138,9 @@ This is a targeted mitigation, not a claim of driver-independent behavior. Rende
 
 ### Audio and video
 
-`ipc_audio.c` supplies the audio-service path; `ipc_opus.c` can use a statically linked libopus build. The video path reconstructs VP9 frame information and can use libvpx for decode. [`gpu_vp9.c`](../runtime/gpu_vp9.c) contains frame/header logic; its default probability tables carry [libvpx attribution](../NOTICE.md).
+`ipc_audio.c` supplies the audio-service path; `ipc_opus.c` uses a statically linked libopus. The video path reconstructs VP9 frame information and decodes with libvpx. [`gpu_vp9.c`](../runtime/gpu_vp9.c) contains frame/header logic; its default probability tables carry [libvpx attribution](../NOTICE.md).
 
-These optional codecs are selected at build time. Their presence is not implied by a successful core build.
+Both codecs are built from the sources in [`third_party/`](../third_party/README.md) by [`codec_libs.py`](../tools/codec_libs.py) when the program is linked (`cc.py` adds `SSBU_HAVE_OPUS` and `SSBU_HAVE_VPX`); a developer's own builds take their place through `SSBU_OPUS_LIBS` and `SSBU_VPX_DIR`. Without either, the game builds and runs with that codec silent.
 
 ## 5. Multiplayer transport
 
@@ -171,7 +171,11 @@ Paths below are relative to the repository root. Diagnostic tools may require `r
 | Tool | Role |
 | :--- | :--- |
 | [`nca.py`](../tools/nca.py) | Inspect packages; extract ExeFS/RomFS files; generate `romfs.cfg` and installed-content `aoc.cfg`. |
-| [`arc.py`](../tools/arc.py) | Inspect `data.arc`, extract named paths, and collect known embedded NRO modules. Requires Python 3.14. |
+| [`arc.py`](../tools/arc.py) | Inspect `data.arc`, extract named paths, and collect known embedded NRO modules. Uses Python 3.14's `compression.zstd`, or the `zstandard` package on older Pythons. |
+| [`gamefiles.py`](../tools/gamefiles.py) | Say what a folder of game files holds (the guide's folder or an emulator's installed-content folder): the program to build from, base or update, DLC, versions. |
+| [`build_game.py`](../tools/build_game.py) | The one-command build behind `Build WindowSmash.bat`: tools check, packages, program, fonts, data (decrypting or applying an update when needed), DLC, fighters, build. |
+| [`codec_libs.py`](../tools/codec_libs.py) | Build libopus and libvpx's VP9 decoder from `third_party/` into static libraries, when they are missing or stale ([third-party sources](../third_party/README.md)). |
+| [`install_windowsmash.ps1`](../tools/install_windowsmash.ps1) | What `Install WindowSmash.bat` runs: PC checks, Python, the compiler, SDL3, the folder wizard, then `build_game.py`. |
 | [`update.py`](../tools/update.py) | Apply an update package as a layered RomFS in a version folder, checking every block against the update's hashes ([later versions](UPDATES.md)). |
 | [`install_version.py`](../tools/install_version.py) | Install and build a game version in a folder of its own with one command ([several versions](VERSIONS.md)). |
 | [`modcache.py`](../tools/modcache.py) | Share module addresses and reuse module builds across version folders by build ID. |

@@ -1,5 +1,6 @@
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 import unittest
 
@@ -31,6 +32,18 @@ class PickProgramTests(unittest.TestCase):
             pick_program([('a.nca', PROGRAM, BASE), ('b.nca', PROGRAM, BASE)])
         with self.assertRaises(Failed):
             pick_program([('a.nca', PROGRAM, UPDATE), ('b.nca', PROGRAM, UPDATE)])
+
+
+class MarkerTests(unittest.TestCase):
+    def test_python_version_markers(self):
+        marker_applies = BUILD['marker_applies']
+        here = sys.version_info[:2]
+        self.assertEqual(marker_applies('python_version < "3.14"'), here < (3, 14))
+        self.assertEqual(marker_applies(' python_version >= "3.14" '), here >= (3, 14))
+        self.assertTrue(marker_applies('python_version >= "3.10"'))
+        self.assertFalse(marker_applies('python_version < "3.0"'))
+        self.assertFalse(marker_applies('python_version >= "3.10" and python_version < "3.1"'))
+        self.assertTrue(marker_applies('platform_system == "Linux"'))   # (unknown clauses are taken as holding)
 
 
 class JobsTests(unittest.TestCase):

@@ -8,22 +8,26 @@ No project-wide license has been specified for the WindowSmash source outside th
 
 ## libvpx
 
-[`runtime/gpu_vp9_tables.h`](runtime/gpu_vp9_tables.h) contains default VP9 probability tables derived from libvpx, as its header states. The upstream WebM Project license and additional patent grant are kept in [`third_party/libvpx/`](third_party/libvpx/):
+The VP9 decoder of the WebM Project's libvpx, release v1.15.2, is included as source in [`third_party/libvpx/`](third_party/libvpx/) and compiled into the game when it is built (the game's movies are VP9). [`third_party/README.md`](third_party/README.md) says exactly which files and how they were taken from the upstream release; none is modified. The upstream license and additional patent grant are kept there:
 
 - [BSD license and copyright notice](third_party/libvpx/LICENSE)
 - [Additional IP rights grant](third_party/libvpx/PATENTS)
 
-These notice files come from the upstream `webmproject/libvpx` repository at tag `v1.14.1`.
+[`runtime/gpu_vp9_tables.h`](runtime/gpu_vp9_tables.h) also contains default VP9 probability tables derived from libvpx, as its header states.
 
 ## libopus
 
-The libopus 1.3.1 notice is kept at [`third_party/opus/COPYING`](third_party/opus/COPYING), for builds and runtime packages that statically link that codec.
+libopus 1.5.2 (Xiph.Org Foundation and contributors) is included as source in [`third_party/opus/`](third_party/opus/) and compiled into the game when it is built (the game's music is Opus), under its [BSD license](third_party/opus/COPYING). [`third_party/README.md`](third_party/README.md) says which files; none is modified.
 
 ## SDL3
 
 Controller input can use [SDL3](https://www.libsdl.org/) (Simple DirectMedia Layer), copyright Sam Lantinga, under the [zlib license](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt).
 
-SDL3 is an external dependency: this repository contains no SDL source or binaries. The runtime is compiled against the headers of the official SDL3 Windows development package (`deps/SDL3`, or `SSBU_SDL3_DIR`) and loads `SDL3.dll` from the executable's folder at run time. A package that includes `SDL3.dll` should include that package's `LICENSE.txt` too; the local bundler (`tools/bundle_ssbu.py`) adds it as `build/SDL3-LICENSE.txt`.
+SDL3 is an external dependency: this repository contains no SDL source or binaries. The runtime is compiled against the headers of the official SDL3 Windows development package (`deps/SDL3`, which `Install WindowSmash.bat` downloads from SDL's GitHub releases, or `SSBU_SDL3_DIR`) and loads `SDL3.dll` from the executable's folder at run time. A package that includes `SDL3.dll` should include that package's `LICENSE.txt` too; the local bundler (`tools/bundle_ssbu.py`) adds it as `build/SDL3-LICENSE.txt`.
+
+## Python
+
+`Install WindowSmash.bat` may put a copy of [Python](https://www.python.org/) (the embeddable package from python.org, under the [PSF license](https://docs.python.org/3/license.html)) into `deps/python`, with [pip](https://pip.pypa.io/) and the packages below, when the PC has no Python it can use. Nothing from it is distributed with WindowSmash.
 
 ## Other external dependencies
 
@@ -31,13 +35,12 @@ These are external dependencies, not bundled implementations. Their own licenses
 
 | Dependency | Used for | How it's obtained |
 | :--- | :--- | :--- |
-| libopus | Music (Opus decoding) | Optional static libraries, named by `SSBU_OPUS_LIBS` at build time. |
-| libvpx | Movies (VP9 decoding) | Optional, named by `SSBU_VPX_DIR` at build time. |
 | SDL3 | Controllers other than Xbox pads | Optional, the official Windows development package. |
 | PyCryptodome (`pycryptodomex`) | Reading game packages | `requirements.txt`. |
+| zstandard | Reading `data.arc` on Pythons older than 3.14 | `requirements.txt` (Python 3.14 has `compression.zstd` built in). |
 | Capstone, Unicorn | Disassembly and differential tests | `requirements-dev.txt`, optional. |
 
-No codec binaries are checked into this repository.
+A developer can link their own libopus or libvpx builds instead of the included sources (`SSBU_OPUS_LIBS`, `SSBU_VPX_DIR`: [`tools/cc.py`](tools/cc.py)). No binaries of any library are checked into this repository.
 
 ## Game content and names
 

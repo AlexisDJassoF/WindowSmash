@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 set "SSBU_BUNDLER=%~dp0tools\bundle_ssbu.py"
 if not exist "%SSBU_BUNDLER%" set "SSBU_BUNDLER=%~dp0bundle_ssbu.py"
 if not exist "%SSBU_BUNDLER%" (
@@ -7,12 +8,8 @@ if not exist "%SSBU_BUNDLER%" (
     pause
     exit /b 1
 )
-where py >nul 2>&1
-if not errorlevel 1 (
-    py -3 "%SSBU_BUNDLER%" %*
-) else (
-    python "%SSBU_BUNDLER%" %*
-)
+call tools\find_python.bat || (pause & exit /b 1)
+%PY% "%SSBU_BUNDLER%" %*
 set "SSBU_BUNDLE_RESULT=%ERRORLEVEL%"
 echo.
 if not "%SSBU_BUNDLE_RESULT%"=="0" echo Bundle failed. See the error above.

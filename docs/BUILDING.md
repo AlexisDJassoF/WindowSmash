@@ -2,12 +2,49 @@
 
 [← README](../README.md) · [Playing](PLAYING.md) · [Multiplayer](../NETPLAY.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md) · [Game updates](UPDATES.md)
 
-This guide takes you from a fresh download to playing. No programming knowledge is needed: you copy each command from this page and paste it into PowerShell.
+This guide takes you from a fresh download to playing. No programming knowledge is needed.
 
 > [!IMPORTANT]
 > WindowSmash doesn't include the game. You need your own copy of Super Smash Bros. Ultimate, dumped from your own Nintendo Switch, together with your console's keys and firmware. This guide starts once you have those files.
 
-**How long it takes:** about an hour, plus 30 minutes to a few hours while your PC builds the game.
+## Install in one go
+
+**What you need:** a Windows 10 or 11 PC (64-bit, a processor with AVX2, 16 GB of RAM is comfortable, about 60 GB free) and your own game files: the game as dumped from your Switch, with its update if you have one, your console's keys (`prod.keys` and `title.keys`) and its firmware. If you have played the game in **yuzu or Ryujinx on this PC, you already have all three**, and the installer finds them by itself. Otherwise, [Part 2](#part-2-gather-your-game-files) below says what the files are and where to put them.
+
+1. On **<https://github.com/SNO2207/WindowSmash>**, click the green **Code** button, then **Download ZIP**. Extract the ZIP somewhere with room, for example to `C:\WindowSmash`. Keep it out of the Desktop and Documents folders: OneDrive may try to upload them, and the finished build is around 30 GB.
+2. Double-click **`Install WindowSmash.bat`** in that folder. If **Windows protected your PC** appears, click **More info**, then **Run anyway**: Windows says this about any program it hasn't seen before.
+3. A window opens with the folders it found for your game files, keys and firmware, and a line under each saying what is in it. Change a folder with **Browse…** if it is wrong or empty. Type the online name other players will see, and click **Set up and build**.
+4. Wait. The installer gets what is missing (Python, the Visual Studio build tools, SDL3), prepares your game files, and builds the game: **30 minutes to a few hours**, depending on your PC. You can keep using the PC meanwhile. If it stops, run `Install WindowSmash.bat` again: it carries on where it stopped.
+5. Play: double-click **`Play SSBU.bat`**, or the **Play SSBU** shortcut it put on the desktop.
+
+<details>
+<summary><strong>What the installer does</strong></summary>
+
+<br>
+
+Each step is skipped when it is already done, so running it again never repeats work:
+
+- **Checks the PC:** 64-bit Windows 10 or 11, a processor with AVX2, the installed RAM, and the free space on the drive. A failed check stops with a message saying what is missing.
+- **Python:** uses the Python you have if it is 3.10 or newer, otherwise puts a copy of Python 3.14 into `deps\python`. Nothing else on the PC changes: no PATH, no file associations.
+- **The compiler:** if Visual Studio's Clang tools aren't there, installs the free Visual Studio Build Tools with the C++ workload and Clang through winget, which is part of Windows. That download is a few GB; a progress window shows it. Without winget, it prints the link and the two boxes to tick.
+- **SDL3** for PlayStation, Switch Pro and other controllers, into `deps\SDL3`, from SDL's own releases, checked against the SHA-256 the release lists.
+- **Music and movies:** nothing to download. The codecs (libopus and libvpx) are built from the sources in `third_party` as part of the game build.
+- **Your folders:** suggests yuzu's and Ryujinx's (keys, firmware and installed games), shows what it finds, and remembers your answers. The game's program, data and DLC are taken from there, even when they are still encrypted as the Switch stores them, or when an update sits next to the game.
+- **Afterwards:** writes `online_name.txt`, puts a shortcut on the desktop, adds a Windows Firewall rule for the game if you leave that ticked (it asks for administrator rights once), runs the build ([`Build WindowSmash.bat`](#shortcut-build-windowsmashbat)'s steps), and if ticked starts `Prepare Shaders.bat` in a window of its own.
+- Everything it prints also goes to `install.log` in the WindowSmash folder.
+
+Options for a PowerShell window: `tools\install_windowsmash.ps1 -DryRun` says what each step would do without doing it; `-NoWizard` asks in the window instead; `-Game`, `-Keys` and `-Firmware` give the folders.
+
+</details>
+
+Prefer to do it yourself, or want to know what each step does? The rest of this page is the same setup by hand.
+
+<details>
+<summary><strong>By hand: the setup step by step</strong></summary>
+
+<br>
+
+**How long it takes:** about an hour, plus 30 minutes to a few hours while your PC builds the game. You copy each command from this page and paste it into PowerShell.
 
 **Want it done for you?** After step 5, [`Build WindowSmash.bat`](#shortcut-build-windowsmashbat) does steps 7–14 in one go. **Comfortable with a command line?** Skip to the [quick version](#quick-version).
 
@@ -96,7 +133,7 @@ WindowSmash needs two free tools: **Python**, which runs its helper programs, an
 
 ### Step 3: Install Python
 
-1. Go to **<https://www.python.org/downloads/windows/>**, find the newest **Python 3.14** release (for example *3.14.8*), and download its **Windows installer (64-bit)**.
+1. Go to **<https://www.python.org/downloads/windows/>**, find the newest **Python 3.14** release (for example *3.14.8*), and download its **Windows installer (64-bit)**. (Any Python from 3.10 on works; 3.14 is the one the installer uses.)
 2. Run it. On the first screen, tick **Add python.exe to PATH**, then click **Install Now**.
 
 To check, open PowerShell (Start menu → type `powershell`) and run:
@@ -105,7 +142,7 @@ To check, open PowerShell (Start menu → type `powershell`) and run:
 python --version
 ```
 
-It should answer `Python 3.14` followed by a number.
+It should answer `Python 3.` followed by a version of 3.10 or higher.
 
 > [!NOTE]
 > If python.org offers only the **Python install manager**, install that, then run `py install 3.14` in PowerShell, open a new PowerShell window, and check again.
@@ -336,6 +373,8 @@ Double-click **`Play SSBU.bat`** in `C:\WindowSmash`.
 
 The game's graphics programs (*shaders*) are prepared the first time each one is needed, which is why a new effect can stutter once. To prepare them all in advance, double-click **`Prepare Shaders.bat`**. It takes from a few minutes to about two hours at low priority, so you can keep using the PC. You can close it at any time and start it again later; it keeps what it has done.
 
+</details>
+
 ---
 
 ## Afterwards
@@ -363,9 +402,12 @@ Your game files, settings and save are in folders the ZIP doesn't contain, so th
 
 | What you see | What to do |
 | :--- | :--- |
-| `python` is not recognized, or *Python was not found* | Python isn't installed, or **Add python.exe to PATH** wasn't ticked. Install it again ([step 3](#step-3-install-python)), then open a new PowerShell window. |
-| `No module named 'compression'` | Another Python version answers instead of 3.14 (check with `python --version`). Write `py -3.14` in place of `python` in the commands. |
-| `No module named 'Cryptodome'` | Run [step 7](#step-7-install-windowsmashs-helpers) (with the same Python as the failing command). |
+| `Install WindowSmash.bat` stops at a check | It says what the PC lacks: 64-bit Windows 10 or 11, a processor with AVX2, 8 GB of RAM, or free space (about 60 GB, less what is built already). Free some space or move WindowSmash to a drive with room, then run it again. |
+| `Install WindowSmash.bat` says winget is not available | Install the compiler by hand: download the **Build Tools for Visual Studio** from <https://visualstudio.microsoft.com/visual-cpp-build-tools/>, tick **Desktop development with C++** and, under Installation details, **C++ Clang tools for Windows**, install, then run `Install WindowSmash.bat` again. |
+| The installer's window says a folder has a problem | The line under the folder says what: no `prod.keys`, no `.nca` files, no program among the game files. Point it at the right folder ([Part 2](#part-2-gather-your-game-files)) and click **Check files**. |
+| `is the game's update, whose data is a patch over the game's own` | Your folder has the update but not the game itself. Put the game's own (base) program `.nca` next to it; from yuzu or Ryujinx, the installed-content folder has both. |
+| `python` is not recognized, or *Python was not found* | Python isn't installed, or **Add python.exe to PATH** wasn't ticked. Install it again ([step 3](#step-3-install-python)), then open a new PowerShell window. Or double-click `Install WindowSmash.bat`, which brings its own. |
+| `No module named 'Cryptodome'` or `No module named 'zstandard'` | Run [step 7](#step-7-install-windowsmashs-helpers) (with the same Python as the failing command). |
 | **Windows protected your PC** | Click **More info**, then **Run anyway**. Unblocking the ZIP first ([step 5](#step-5-download-windowsmash)) prevents it. |
 | `Cannot find path 'D:\MyDump…'` or `No such file or directory` | A file or folder isn't where the command expects it. Check the names from [step 2](#step-2-put-your-game-files-in-three-folders), including the ending (`program.nca`). No D: drive? Change `D:\` to `C:\` in the command. |
 | `bad header_key?`, `missing title key` or `missing key_area_key` | Your keys are missing or too old. Check that `prod.keys` and `title.keys` are in `D:\MyKeys`, dumped from your Switch after its latest system update. |
@@ -377,13 +419,13 @@ Your game files, settings and save are in folders the ZIP doesn't contain, so th
 | The build says `FAILED`, or the PC runs out of memory | Run the build again with a smaller `--jobs` number, such as `--jobs 4`. |
 | `No game version is built here yet` when starting the game | The build hasn't finished. Run [step 14](#step-14-build-the-game) again. |
 | The game closes, or stays black | Look at the end of `C:\WindowSmash\build\play.log` and in the `reports` folder. [Getting help](../README.md#getting-help) says what to send. |
-| No music | The build was made without libopus. See [Optional: audio and video codecs](#optional-audio-and-video-codecs). |
+| No music, or movies don't play | The build was made before the codecs came with WindowSmash. Download the newest WindowSmash and build again ([Update WindowSmash](#update-windowsmash)); see [Audio and video codecs](#audio-and-video-codecs). |
 | A controller does nothing | Press <kbd>F2</kbd> in the game to see which pads it found. Anything other than an Xbox pad needs [step 12](#step-12-optional-support-more-kinds-of-controllers), then step 14 again. |
 | Effects stutter the first time | That's shaders being prepared. [Step 16](#step-16-optional-prepare-the-shaders) does them all ahead of time. |
 
 ### Quick version
 
-The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`; `python` must be 3.14.
+The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`; `python` must be 3.10 or newer. (`Build WindowSmash.bat` does the same from `python -m pip` on, and takes an emulator's installed-content folder as the game folder.)
 
 ```powershell
 git clone https://github.com/SNO2207/WindowSmash.git
@@ -409,8 +451,8 @@ python tools/recomp.py all dump/exefs --out build --jobs 16
 | Operating system | Windows 10 or 11, 64-bit. |
 | CPU | x64 with AVX2, FMA and F16C. |
 | Graphics | A Direct3D 11 GPU and a working driver. |
-| Python | **3.14**: `arc.py` uses its `compression.zstd`. Packages from `requirements.txt` (`pycryptodomex`). |
-| C toolchain | Visual Studio 2022 or newer with **Desktop development with C++** (which includes a Windows SDK) and **C++ Clang tools for Windows**. `tools/cc.py` finds Visual Studio's `clang-cl`; set `SSBU_CLANG` to use another. |
+| Python | **3.10 or newer**, with the packages from `requirements.txt` (`pycryptodomex`, and `zstandard` on Pythons before 3.14, which has `compression.zstd` built in). `Install WindowSmash.bat` puts a copy of 3.14 into `deps/python` when there is none. |
+| C toolchain | Visual Studio 2022 or newer, or its Build Tools, with **Desktop development with C++** (which includes a Windows SDK) and **C++ Clang tools for Windows**. `tools/cc.py` finds Visual Studio's `clang-cl`; set `SSBU_CLANG` to use another. |
 | Game inputs | Any version (tested: 11.0.0 and 13.0.5): the matching ExeFS (from the Program NCA), an unencrypted RomFS with the update applied, and six firmware fonts. Keys for reading packages. |
 | Disk space | About 17 GB for the game data, which stays where it is, and around 30 GB for `build/`. A local bundle needs more. |
 
@@ -438,7 +480,10 @@ WindowSmash/
     shadercache/              compiled shaders, made while playing
   deps/
     SDL3/                     optional: SDL3's Windows development package (step 12)
+    python/                   optional: the Python Install WindowSmash.bat set up
+  third_party/                the music and movie codecs' sources (libopus, libvpx)
   build/                      generated C, objects, ssbu.exe, play.log (step 14)
+    codecs/                   the codec libraries, built from third_party
   save/                       your save, made when you first play
   v13.0.5/                    optional: another game version, laid out the same way
 ```
@@ -468,9 +513,11 @@ Step 9 tries every firmware file. To read one archive (the shared-font system ar
 python tools/nca.py romfs-get "D:\MyFirmware\font-archive.nca" --keys "D:\MyKeys" --match .bfttf --flat --out dump/fonts
 ```
 
-### Optional: audio and video codecs
+### Audio and video codecs
 
-The game's music is Opus, and its movies are VP9. Both are decoded with optional libraries linked in at build time. Without them the game still runs, but music is silent and movies don't play.
+The game's music is Opus, and its movies are VP9. Their decoders, libopus and libvpx's VP9 decoder, come with WindowSmash as source in `third_party/` and are compiled into the game by the build (`tools/codec_libs.py`, a few seconds the first time): nothing to install. [`third_party/README.md`](../third_party/README.md) says which upstream versions and files they are.
+
+To link your own builds of them instead, set these before the build command, in the same PowerShell window:
 
 - **libopus:** list your static Windows x64 `.lib` files in `SSBU_OPUS_LIBS`, separated by semicolons:
 
@@ -484,7 +531,7 @@ The game's music is Opus, and its movies are VP9. Both are decoded with optional
   $env:SSBU_VPX_DIR = 'D:\Codecs\libvpx'
   ```
 
-Set them in the same PowerShell window before the build command. [`tools/cc.py`](../tools/cc.py) has the exact link settings.
+[`tools/cc.py`](../tools/cc.py) has the exact link settings.
 
 ### SDL3 somewhere else
 

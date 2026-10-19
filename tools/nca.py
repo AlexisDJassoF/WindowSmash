@@ -397,9 +397,54 @@ def aoc_cfg(root, keydir, out, app):
     print(f"wrote {out}: {len(entries)} add-on contents")
 
 
+def decrypt_nca(nca, out, chunk=64 << 20):
+    """Write the NCA decrypted - its header and every section as plain bytes - so that it can
+    be read in place afterwards (romfs-cfg, the runtime, update.py's base). Resumes a cut-off
+    copy (<out>.partial) at the chunk it stopped in. A patch (BKTR) section is refused: an
+    update's RomFS is only meaningful applied over its base (update.py)."""
+    nca.f.seek(nca.base)
+    raw = nca.f.read(0xC00)
+    header = raw if nca.plaintext else xts_decrypt(nca.prod["header_key"], raw)
+    # the file as regions: the header, then each section where it lies, zeros in between
+    regions, at = [(header, None, 0, 0xC00)], 0xC00
+    for sec in sorted(nca.sections, key=lambda s: s.start):
+        if sec.enc_type == 4:
+            raise SystemExit(f"section {sec.index} is a patch (BKTR) over another NCA: not decryptable on its own")
+        if sec.start > at:
+            regions.append((None, None, 0, sec.start - at))
+        regions.append((None, sec, 0, sec.end - sec.start))
+        at = sec.end
+    if nca.size > at:
+        regions.append((None, None, 0, nca.size - at))
+    partial = out + ".partial"
+    done = os.path.getsize(partial) // chunk * chunk if os.path.exists(partial) else 0
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    with open(partial, "r+b" if done else "wb") as o:
+        o.seek(done)
+        o.truncate()
+        pos = 0
+        for data, sec, _off, length in regions:
+            if pos + length <= done:
+                pos += length
+                continue
+            skip = max(0, done - pos)
+            for rel in range(skip, length, chunk):
+                n = min(chunk, length - rel)
+                if data is not None:
+                    o.write(data[rel:rel + n])
+                elif sec is None:
+                    o.write(bytes(n))
+                else:
+                    o.write(sec.read_raw(rel, n))
+                print(f"\r  {out}: {(pos + rel + n) * 100 // nca.size}%", end="", file=sys.stderr)
+            pos += length
+    print(file=sys.stderr)
+    os.replace(partial, out)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["info", "exefs", "romfs-ls", "romfs-get", "romfs-cfg", "aoc-cfg"])
+    ap.add_argument("cmd", choices=["info", "exefs", "romfs-ls", "romfs-get", "romfs-cfg", "aoc-cfg", "decrypt"])
     ap.add_argument("nca")
     ap.add_argument("--keys")
     ap.add_argument("--out")
@@ -453,6 +498,14 @@ def main():
             if a.match in path:
                 print(f"  {path} ({size})")
                 copy_out(sec, off, size, os.path.join(a.out, os.path.basename(path) if a.flat else path.replace("/", os.sep)))
+    elif a.cmd == "decrypt":   # the whole NCA as plain bytes: readable in place from then on
+        if not a.out:
+            raise SystemExit("decrypt needs --out <file>")
+        if nca.plaintext:
+            print(f"{a.nca} is already decrypted")
+        else:
+            decrypt_nca(nca, a.out)
+            print(f"wrote {a.out}: {nca.size} bytes")
 
 
 if __name__ == "__main__":

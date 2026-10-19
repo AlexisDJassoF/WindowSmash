@@ -2,8 +2,11 @@
 """Apply a game update (a Patch NSP) to the port's data.
 
 Usage:
-  update.py apply  <update.nsp> --base <base romfs.cfg> --keys <dir> --tree <dir>
-  update.py verify <update.nsp> --keys <dir> --tree <dir>
+  update.py apply  <update> --base <base romfs.cfg> --keys <dir> --tree <dir>
+  update.py verify <update> --keys <dir> --tree <dir>
+
+<update> is the update's Patch NSP, or its Program NCA on its own (a .nca file, or the 00 file
+of one an emulator installed).
 
 `apply` fills <tree>/dump, a game version's folder laid out like the port's own (dump/, then
 build/, save/, cache/ next to it: tools/recomp.py --tree, the runtime's data dir argument):
@@ -81,7 +84,8 @@ def bucket_tree(table, entry_size, fmt):
 
 class Patch:
     def __init__(self, nsp, keydir):
-        progs = [n for _, n in nsp_ncas(nsp, keydir) if n.content_type == 0]
+        ncas = [n for _, n in nsp_ncas(nsp, keydir)] if nsp.lower().endswith(".nsp") else [Nca(nsp, keydir)]
+        progs = [n for n in ncas if n.content_type == 0]
         if len(progs) != 1:
             raise SystemExit(f"{nsp}: expected one Program NCA, found {len(progs)}")
         self.nca = progs[0]
@@ -650,7 +654,7 @@ def apply(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["apply", "verify"])
-    ap.add_argument("nsp", help="the update (a Patch NSP)")
+    ap.add_argument("nsp", help="the update: a Patch NSP, or its Program NCA (a .nca file, or an installed one's 00 file)")
     ap.add_argument("--keys", required=True, help="folder with prod.keys (and title.keys)")
     ap.add_argument("--tree", required=True, help="the game version's folder to fill, e.g. v13.0.5")
     ap.add_argument("--base", help="apply: romfs.cfg of the installed base (e.g. dump/modules/romfs.cfg)")
