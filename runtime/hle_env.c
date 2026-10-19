@@ -219,15 +219,44 @@ HLE(_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE) { st64(c->x[0], USER[0]); st64
 HLE(_ZN2nn7account9CloseUserERKNS0_10UserHandleE) { (void)c; }
 HLE(_ZN2nn7account34IsUserRegistrationRequestPermittedEPb) { st8(c->x[0], 0); c->x[0] = 0; }
 HLE(_ZN2nn7account16LoadProfileImageEPmPvmRKNS0_3UidE) { st64(c->x[0], 0); c->x[0] = R_UNAVAILABLE; }
-HLE(_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE) { st8(c->x[0], 0); c->x[0] = 0; }
-HLE(_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE) { c->x[0] = R_UNAVAILABLE; }
-HLE(_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE) { c->x[0] = R_UNAVAILABLE; }
-HLE(_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm) { c->x[0] = R_UNAVAILABLE; }
-HLE(_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE) { c->x[0] = R_UNAVAILABLE; }
-HLE(_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE) { c->x[0] = R_UNAVAILABLE; }
-/* An AsyncContext here never has an operation behind it: it is always finished, failed. */
+/* The network service account, for the game's Online mode (runtime/hle_online.c): with netplay
+ * configured the user has one, named by the netplay id, and its id token - which only the NEX
+ * server of tools/nex reads - carries that id and the player's name. Offline there is none. */
+static u64 nsa_id(void) { u64 id = USER[0] ^ USER[1]; return id ? id : 1; }
+HLE(_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE) { st8(c->x[0], net_configured() != 0); c->x[0] = 0; }
+HLE(_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE) { c->x[0] = net_configured() ? 0 : R_UNAVAILABLE; }
+HLE(_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE) {
+    if (!net_configured()) { c->x[0] = R_UNAVAILABLE; return; }
+    st64(c->x[0], nsa_id());
+    c->x[0] = 0;
+}
+/* CachedNintendoAccountInfo { char birthday[16]; char gender[8]; char country[4]; ... } (its
+ * getters read these): Online's matchmaking asks for the country. SSBU_ONLINE_COUNTRY (two
+ * letters) picks it; US otherwise. */
+HLE(_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm) {
+    if (!net_configured()) { c->x[0] = R_UNAVAILABLE; return; }
+    char *info = P(char, c->x[0]);
+    const char *country = getenv("SSBU_ONLINE_COUNTRY");
+    memset(info, 0, 36);
+    memcpy(info, "1990-01-01", 10);
+    memcpy(info + 16, "unknown", 7);
+    memcpy(info + 32, country && strlen(country) == 2 ? country : "US", 2);
+    c->x[0] = 0;
+}
+HLE(_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE) {   /* (u64 *size, char *buf, u64 capacity, handle) */
+    if (!net_configured()) { c->x[0] = R_UNAVAILABLE; return; }
+    char token[160];
+    int n = snprintf(token, sizeof token, "ssbu-port.1.%016llx.%s", (unsigned long long)nsa_id(), net_player_name());
+    if (n < 0 || (u64)n >= sizeof token || (u64)n + 1 > c->x[2]) { c->x[0] = R_UNAVAILABLE; return; }
+    memcpy(P(char, c->x[1]), token, (size_t)n + 1);
+    st64(c->x[0], (u64)n);
+    c->x[0] = 0;
+}
+HLE(_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE) { c->x[0] = net_configured() ? 0 : R_UNAVAILABLE; }
+/* An AsyncContext here never has an operation behind it: it is always finished - successfully
+ * when netplay (and so the token cache above) is there. */
 HLE(_ZN2nn7account12AsyncContext7HasDoneEPb) { st8(c->x[1], 1); c->x[0] = 0; }
-HLE(_ZN2nn7account12AsyncContext9GetResultEv) { c->x[0] = R_UNAVAILABLE; }
+HLE(_ZN2nn7account12AsyncContext9GetResultEv) { c->x[0] = net_configured() ? 0 : R_UNAVAILABLE; }
 HLE(_ZN2nn7account12AsyncContext6CancelEv) { c->x[0] = 0; }
 HLE(_ZN2nn7account12AsyncContext14GetSystemEventEPNS_2os11SystemEventE) {
     u64 event = c->x[1];
@@ -285,6 +314,7 @@ HLE(_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_) { memcpy(P(void, c->x[0]), P(void, c-
 /* ---- errors ---------------------------------------------------------------------- */
 HLE(_ZN2nn3err9ShowErrorENS0_9ErrorCodeE) {   /* ErrorCode { u32 category; u32 number } in x0 */
     fprintf(stderr, "[game] error shown: %04u-%04u\n", (u32)(c->x[0] & 0xFFFFFFFF), (u32)(c->x[0] >> 32));
+    if (net_log() > 1) rt_backtrace();
 }
 HLE(_ZN2nn3err9ShowErrorENS_6ResultE) {
     fprintf(stderr, "[game] error shown: result %#x (module %u, description %u)\n", (u32)c->x[0],

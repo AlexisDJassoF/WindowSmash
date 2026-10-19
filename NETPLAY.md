@@ -2,16 +2,17 @@
 
 [← README](README.md) · [Setup guide](docs/BUILDING.md) · [Playing](docs/PLAYING.md) · [Technical guide](docs/TECHNICAL.md)
 
-WindowSmash plays the game's **Local Wireless** mode over the internet. To the game, the other players look like Switches nearby. Nintendo's online service isn't used.
+WindowSmash plays the game's **Local Wireless** mode over the internet. To the game, the other players look like Switches nearby. The game's own **Online** mode works too, for Quickplay against WindowSmash's own game server ([Online mode](#online-mode-quickplay)). Nintendo's online service isn't used.
 
 > [!NOTE]
-> **Tested so far:** connecting and finding rooms, including the online lobby with several games on one PC, through the public lobby, and between a Windows and a Linux PC. Full matches between two PCs, every DLC fighter online, and every kind of home network haven't been fully verified yet.
+> **Tested so far:** connecting and finding rooms, including the online lobby with several games on one PC, through the public lobby, and between a Windows and a Linux PC. Full matches between two PCs, every DLC fighter online, and every kind of home network haven't been fully verified yet. Online mode is newer still: see [what works](#online-mode-quickplay).
 
 ## Contents
 
 - [Choose how to play](#choose-how-to-play)
 - [Before you play](#before-you-play)
 - [Online lobby](#online-lobby)
+- [Online mode (Quickplay)](#online-mode-quickplay)
 - [Direct connections and your internet address](#direct-connections-and-your-internet-address)
 - [Private room](#private-room)
 - [If a room doesn't appear](#if-a-room-doesnt-appear)
@@ -25,6 +26,7 @@ WindowSmash plays the game's **Local Wireless** mode over the internet. To the g
 | :--- | :--- | :--- | :--- |
 | [**Online lobby**](#online-lobby) | Playing with anyone | None | `Play SSBU.bat` |
 | [**Lobby code**](#friends-only-a-lobby-code) | Friends only, through the lobby | None | `Play SSBU.bat` |
+| [**Online mode**](#online-mode-quickplay) | Quickplay with anyone searching (new) | None | `Play SSBU.bat` |
 | [**Private room**](#private-room) | A group with one host | The host may need to open a port | `Host SSBU Netplay.bat` and `Join SSBU Netplay.bat` |
 | [**Your own lobby**](#run-your-own-lobby) | Communities with a server | The server's port | `Play SSBU.bat` |
 
@@ -54,7 +56,7 @@ This is what `Play SSBU.bat` does by default. Every Local Wireless room that any
    - **To join:** open **Rooms List** and pick a room. Open rooms come first, fuller ones before emptier ones.
 4. Press <kbd>F1</kbd> to see the connection, for example `Online: 37 players, 4 rooms - you are Alpha, ping 48 ms`. A second line lists the other players in your room and how each one is reached ([see below](#direct-connections-and-your-internet-address)).
 
-`online_server.txt`, in the WindowSmash folder, names the lobby. Its first line that doesn't start with `#` is the lobby's address, `smash.recomps.wtf:39420` (the public lobby) unless you change it.
+`online_server.txt`, in the WindowSmash folder, names the lobby. Its first line that doesn't start with `#` is the lobby's address, `smash.recomps.wtf:39421` (the public lobby) unless you change it. Port 39421 is the lobby with the game server for [Online mode](#online-mode-quickplay); port 39420 is the older lobby without it, which older WindowSmash versions use. Rooms on one don't show up on the other, so everyone in a group should use the same one.
 
 ### Friends only: a lobby code
 
@@ -64,7 +66,7 @@ A lobby code hides your rooms from everyone who doesn't use the same code.
 2. Add a space and your code after the address, for example:
 
    ```text
-   smash.recomps.wtf:39420 ourcode
+   smash.recomps.wtf:39421 ourcode
    ```
 
 3. Save it. Everyone in your group does the same, with the same code.
@@ -76,6 +78,27 @@ The overlay shows the code after `Online`. A lobby code is not a password: anyon
 - `Play SSBU Offline.bat` never goes online.
 - To make `Play SSBU.bat` start offline too, write `off` in `online_server.txt` in place of the address.
 - If the lobby doesn't answer for five seconds, the game plays offline by itself and keeps trying in the background.
+
+## Online mode (Quickplay)
+
+The game's own **Online** menu works with WindowSmash's game server, which runs inside the online lobby. **Quickplay** matches you with other WindowSmash players who are searching at the same time.
+
+> [!WARNING]
+> Online mode is new. Logging in, the Online menus, Quickplay's search, and two players being matched into one room have been tested, on one PC. The matches themselves, more than two players, and results and GSP afterwards haven't been tested yet. The Linux version has Online mode built in, but it hasn't been tried there.
+
+1. Start the game with **`Play SSBU.bat`**. `online_server.txt` must name a lobby with the game server: `smash.recomps.wtf:39421`, the default, has one.
+2. In the main menu, choose **Online**, then **Smash**, then **Quickplay**.
+3. Choose your rules and fighter, then **Ready to fight**. The game waits in its practice room until it finds another player.
+
+- **Who you meet:** players with the same game version and the same lobby code (or none) who are searching too.
+- **Your account:** the game server knows you by your `netplay_id.txt` and keeps your player name and ratings. Keep that file to keep your account, and don't give it to anyone: a copy of it plays as you.
+- **Your connection:** the game reaches the game server through the lobby, over TCP and UDP on the lobby's port. Nobody needs to open a port. Once players are matched, the match's traffic goes through the lobby: [direct connections](#direct-connections-and-your-internet-address) are only for Local Wireless rooms so far.
+
+| What you see | What to check |
+| :--- | :--- |
+| An error as soon as you choose **Online** | Start the game with `Play SSBU.bat`, not `Play SSBU Offline.bat`, and check that the overlay (<kbd>F1</kbd>) says `Online`. |
+| An error code starting with **2306** | The game can't reach the game server. The lobby in `online_server.txt` has none (port 39420, or a lobby of your own run with `ssbu_relay.py`), or something blocks TCP to it. |
+| Quickplay keeps waiting | Nobody with your game version and lobby code is searching right now. Find players on the [Discord server](https://discord.gg/pkgyYGf3YB). |
 
 ## Direct connections and your internet address
 
@@ -183,11 +206,19 @@ python tools/ssbu_relay.py --port 39420 --verbose
 | Turn addresses away | `--banlist FILE` refuses the addresses or networks listed in that file, and re-reads it when it changes. |
 | Watch it | It logs a line of statistics every minute. |
 
+To offer [Online mode](#online-mode-quickplay) too, run `tools/ssbu_online_lobby.py` in place of `ssbu_relay.py`. It takes the same options, plus `--state <folder>` for the players' accounts and ratings, and it needs **TCP as well as UDP** on its port:
+
+```powershell
+python tools/ssbu_online_lobby.py --port 39421 --state online-state --verbose
+```
+
+`tools/deploy/deploy_online_lobby.sh <ssh host> install` sets it up on a Linux server as the service `ssbu-online`, next to `ssbu-lobby`. Its game server lets each player act only on their own account and on matches they're in, and limits how much each connection can ask of it.
+
 The lobby checks where messages come from, limits how fast each player can send, and carries each room's traffic only between that room's players. A game accepts direct packets only from addresses the lobby gave it, carrying that pair's secret, and only from players in its own room. Even so, it's a transport for players you trust: lobby codes and room names aren't passwords, and the traffic isn't encrypted or authenticated.
 
 ## Logs and privacy
 
-The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG=1` before starting the game (`2` logs every call). Logs and the overlay can show player names, folder names and internet addresses, so read any excerpt before you share it.
+The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG=1` before starting the game (`2` logs every call). Logs and the overlay can show player names, folder names and internet addresses, so read any excerpt before you share it. With Online mode, the lobby's game server also keeps your player name and ratings.
 
 ## Reference: environment variables
 
@@ -203,5 +234,7 @@ The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG
 | `SSBU_NET_DIRECT=0` | Online, send all traffic through the lobby. `Play SSBU.bat` sets it when `online_direct.txt` says `off`. |
 | `SSBU_NET_TEST_NAT=1`, `SSBU_NET_TEST_BLOCK=<seconds>` | Local tests: filter incoming packets as a router would, or cut direct paths that many seconds after the start. |
 | `SSBU_NET_LOG=1` / `2` | Network logging: a summary, or more detail. |
+| `SSBU_ONLINE_COUNTRY` | The country Online mode reports, as two letters such as `GB`. Default `US`. |
+| `SSBU_ONLINE_SERVER` | `off` turns Online mode off. Otherwise the game server's address inside the lobby, `10.13.0.1:60000` by default; only for tests. |
 
 Without a host or relay setting, the game stays offline. `Play SSBU Offline.bat` clears both; `Play SSBU.bat` takes the relay from `online_server.txt`; the host and join launchers set their own.

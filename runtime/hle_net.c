@@ -17,6 +17,7 @@
 
 #include "host.h"
 #include "net.h"
+#include "online.h"
 
 #define R_UNAVAILABLE RESULT(124, 300)
 #define R_LDN_STATE   RESULT(203, 32)
@@ -606,6 +607,22 @@ static VSock *sock_of(i32 fd) {
     return &socks[fd - FD_BASE];
 }
 
+/* Stream sockets are the Online mode's (runtime/hle_online.c: NEX's TCP to the game server).
+ * (It wakes poll() and blocking calls through net_wake: the lock first, so a waiter is either
+ * still looking - and sees the change - or already asleep.) */
+static int is_stream(i32 fd) {
+    AcquireSRWLockShared(&lock);
+    VSock *s = sock_of(fd);
+    int r = s && s->type == SOCK_STREAM_;
+    ReleaseSRWLockShared(&lock);
+    return r;
+}
+void net_wake(void) {
+    AcquireSRWLockExclusive(&lock);
+    ReleaseSRWLockExclusive(&lock);
+    WakeAllConditionVariable(&activity);
+}
+
 static void set_errno(Cpu *c, int e) {
     u64 p = rt_symbol("__errno_location") ? rt_callsym(c, "__errno_location", 0) : 0;
     if (p) st32(p, (u32)e);
@@ -733,14 +750,17 @@ static void do_connect(Cpu *c, i32 fd, u64 addr, u32 len) {
     char t[16];
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
-    int err = !s ? E_BADF : !read_addr(addr, len, &ip, &port) ? E_INVAL : s->type == SOCK_STREAM_ ? E_CONNREFUSED : 0;
+    int err = !s ? E_BADF : !read_addr(addr, len, &ip, &port) ? E_INVAL : 0;
+    int stream = s && s->type == SOCK_STREAM_, nonblock = s && s->nonblock;
     if (!err) {
         if (!s->port) s->port = ephemeral(s);
         s->peer_ip = ip;
         s->peer_port = port;
     }
+    u16 my_port = s ? s->port : 0;
     ReleaseSRWLockExclusive(&lock);
-    if (net_log()) fprintf(stderr, "[net] connect(%d, %s:%u) = %d%s\n", fd, ip_text(ip, t), port, err, err == E_CONNREFUSED ? " (streams: not implemented)" : "");
+    if (!err && stream) err = online_stream_connect(fd, ip, port, net_local_ip(), my_port, nonblock);
+    if (net_log()) fprintf(stderr, "[net] connect(%d, %s:%u) = %d%s\n", fd, ip_text(ip, t), port, err, stream ? " (stream: Online)" : "");
     if (err) fail(c, err); else c->x[0] = 0;
 }
 
@@ -748,7 +768,15 @@ static void do_sendto(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u32
     u32 dst = 0;
     u16 dport = 0;
     char t[16];
-    (void)flags;
+    if (is_stream(fd)) {
+        AcquireSRWLockShared(&lock);
+        VSock *ss = sock_of(fd);
+        int nonblock = ss && (ss->nonblock || (flags & MSG_DONTWAIT_));
+        ReleaseSRWLockShared(&lock);
+        i64 r = online_stream_send(fd, P(void, buf), len, nonblock);
+        if (r < 0) fail(c, (int)-r); else c->x[0] = (u64)r;
+        return;
+    }
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
     int err = 0;
@@ -791,6 +819,19 @@ static int wait_activity(u64 deadline) {
 }
 
 static void do_recvfrom(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u64 alen_p) {
+    if (is_stream(fd)) {
+        AcquireSRWLockShared(&lock);
+        VSock *ss = sock_of(fd);
+        int nonblock = ss && (ss->nonblock || (flags & MSG_DONTWAIT_));
+        u32 ip = ss ? ss->peer_ip : 0;
+        u16 port = ss ? ss->peer_port : 0;
+        ReleaseSRWLockShared(&lock);
+        i64 r = online_stream_recv(fd, P(void, buf), len, (flags & MSG_PEEK_) != 0, nonblock);
+        if (r < 0) { fail(c, (int)-r); return; }
+        write_addr(addr, alen_p, ip, port);
+        c->x[0] = (u64)r;
+        return;
+    }
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
     u64 deadline = s && s->rcvtimeo_ms ? rt_now_ns() / 1000000 + s->rcvtimeo_ms : ~0ull;
@@ -836,6 +877,7 @@ static void do_poll(Cpu *c, u64 fds, u64 nfds, i32 timeout) {
             if (fd < 0) { st16(p + 6, 0); continue; }
             VSock *s = sock_of(fd);
             if (!s) revents = POLLNVAL_;
+            else if (s->type == SOCK_STREAM_) revents = online_stream_revents(fd, events);
             else {
                 if (s->head) revents |= events & (POLLIN_ | POLLRDNORM_);
                 if (s->type == SOCK_DGRAM_ && !s->shut_wr) revents |= events & POLLOUT_;
@@ -888,7 +930,7 @@ static void do_getsockopt(Cpu *c, i32 fd, i32 level, i32 opt, u64 val, u64 len_p
     u32 v = 0;
     int err = !s ? E_BADF : 0;
     if (s && level == SOL_SOCKET_) {
-        if (opt == SO_ERROR_) v = 0;
+        if (opt == SO_ERROR_) v = s->type == SOCK_STREAM_ ? (u32)online_stream_error(fd) : 0;
         else if (opt == SO_TYPE_) v = (u32)s->type;
         else if (opt == SO_RCVBUF_) v = s->rcvbuf;
         else if (opt == SO_SNDBUF_) v = s->sndbuf;
@@ -925,6 +967,7 @@ static void do_shutdown(Cpu *c, i32 fd, i32 how) {
 }
 
 static void do_close(Cpu *c, i32 fd) {
+    if (is_stream(fd)) online_stream_close(fd);
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
     if (s) { drop_queue(s); memset(s, 0, sizeof *s); }
