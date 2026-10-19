@@ -840,6 +840,11 @@ static void print_status(void) {
             present_frames());
     fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures; %llu ms watching writes\n",
             gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us / 1000);
+    u32 fiber_slots, fibers_finalized;
+    u64 fibers_made;
+    fiber_counts(&fiber_slots, &fibers_finalized, &fibers_made);
+    fprintf(stderr, "[status] fibers: %llu started, %u host fibers (%u finalized, kept for the next ones)\n",
+            (unsigned long long)fibers_made, fiber_slots, fibers_finalized);
     kernel_dump_threads();
     fflush(stderr);
 }
