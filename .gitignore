@@ -14,10 +14,10 @@
 /netplay_address.txt
 /netplay_id.txt
 /online_name.txt
-# This PC's settings, written on the first start (docs/RUNTIME-SETUP.md)
+# This PC's settings, written on the first start (docs/PLAYING.md)
 /controllers.ini
 /display.ini
-# Crash, freeze and stop reports with their minidumps (docs/RUNTIME-SETUP.md)
+# Crash, freeze and stop reports with their minidumps (docs/PLAYING.md)
 /reports/
 # Third-party packages as downloaded (SDL3 for controllers: docs/BUILDING.md)
 /deps/
