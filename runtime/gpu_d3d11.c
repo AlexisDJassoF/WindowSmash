@@ -23,6 +23,11 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
+#ifndef _WIN32
+#include <errno.h>
+#include <sys/uio.h>   /* process_vm_readv */
+#include <unistd.h>
+#endif
 
 static HWND window;
 static ID3D11Device *dev, *compile_dev;
@@ -1254,8 +1259,8 @@ typedef struct Resident {
     ResidentView views[64];
     u32 nviews;
     /* Guest memory under the region's first and last partial pages (head and tail bytes), as
-     * it was when the GPU copy last took it: the write watch says a page was written, these
-     * say whether the bytes inside the region were (rather than someone's data next to it). */
+     * it was when the GPU copy last took it: whether the bytes inside the region were written
+     * (rather than someone's data next to it) is told by comparing with these. */
     u8 *edge;
     u32 head, tail;
     u64 checked;   /* the submission it was last checked against the write watch in */
@@ -1301,35 +1306,84 @@ static void resident_snapshot(Resident *r) {
     memcpy(r->edge + head, P(void, r->guest + r->size - tail), tail);
 }
 
+/* n bytes of guest memory at g, or 0 if they are not there any more: the guest can unmap the
+ * memory under a resident region (svc UnmapPhysicalMemory) and the renderer does not hear of it. */
+#ifdef _WIN32
+extern __declspec(thread) int rt_probing;   /* host.c: the crash handler leaves a fault to us */
+static __declspec(noinline) void copy_guest(void *dst, const void *src, u32 n) { memcpy(dst, src, n); }
+static int read_guarded(void *dst, u64 g, u32 n) {
+    volatile int ok = 1;
+    rt_probing = 1;
+    __try {
+        copy_guest(dst, P(void, g), n);   /* (a call of its own: a fault inside __try is only caught reliably in a callee) */
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = 0;
+    }
+    rt_probing = 0;
+    return ok;
+}
+#else   /* (Linux: process_vm_readv fails with EFAULT where a read would fault) */
+static int read_guarded(void *dst, u64 g, u32 n) {
+    struct iovec to = {dst, n}, from = {P(void, g), n};
+    ssize_t got = process_vm_readv(getpid(), &to, 1, &from, 1, 0);
+    if (got == (ssize_t)n) return 1;
+    if (got >= 0 || errno == EFAULT) return 0;
+    memcpy(dst, P(void, g), n);   /* (where the call isn't allowed, as in some sandboxes: a plain read) */
+    return 1;
+}
+#endif
+
+/* A partial page's bytes inside the region (n at g; was: as the GPU copy last took them): taken
+ * from guest memory if they changed. 0 if that memory is gone. */
+static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
+    u8 now[0x1000];   /* (an edge lies within one page) */
+    if (!n) return 1;
+    if (!read_guarded(now, g, n)) return 0;
+    if (!memcmp(was, now, n)) return 1;
+    memcpy(was, now, n);
+    D3D11_BOX box = {(UINT)(g - r->guest), 0, 0, (UINT)(g - r->guest + n), 1, 1};
+    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, was, 0, 0);
+    gfx_stat_resident_pages++;
+    return 1;
+}
+
+/* The write watch over the region's whole pages starts over (after its GPU copy took guest
+ * memory). Not over its partial pages: their bits belong to whatever shares them as well. */
+static void resident_watch_reset(Resident *r) {
+    u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;
+    if (lo < hi) ResetWriteWatch((void *)lo, hi - lo);
+}
+
 /* Has the CPU written guest memory inside the region since its GPU copy last took it? Pages
- * wholly inside that it wrote are taken from guest memory; a page the region only partly
- * covers is taken only where the bytes inside the region changed - the CPU may have written
- * just its own data next to the region, or (memory reused) right over a region no program
- * writes any more. Checked when a draw or dispatch uses the region (once a submission) and
- * once a frame for all. */
+ * wholly inside that it wrote (the write watch says) are taken from guest memory. The partial
+ * pages at either end are compared byte for byte, every time, and taken where the bytes inside
+ * the region changed - the CPU may have written just its own data next to the region, or
+ * (memory reused) right over a region no program writes any more. Not by the write watch:
+ * it has one bit a page, and whoever checks a page first resets it for everyone. Small regions
+ * pack several to a page in the effect ring (GPU particle output among the CPU's per-draw
+ * attributes); the first one checked took the bit and its neighbours kept stale data for good,
+ * which drew effect meshes at a stale size over the whole screen (the white-outs). Checked
+ * when a draw or dispatch uses the region (once a submission) and once a frame for all. */
 static void resident_sync(Resident *r, int every_frame) {
     static void *pages[16384];
     static int no_pages = -1;   /* debug: leave resident regions alone */
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
     if (no_pages || (!every_frame && r->checked == gpu_stat_batches) || !r->edge || !watched(r->guest, r->size)) return;
     r->checked = gpu_stat_batches;
+    if (!resident_take_edge(r, r->guest, r->edge, r->head) || !resident_take_edge(r, r->guest + r->size - r->tail, r->edge + r->head, r->tail))
+        return;   /* (its memory is gone: left alone; once mapped again its bytes differ, and are taken) */
+    u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;   /* the whole pages */
+    if (lo >= hi) return;
     ULONG_PTR count = 16384;
     ULONG granularity;
-    if (GetWriteWatch(0, (void *)r->guest, r->size, pages, &count, &granularity) != 0 || !count) return;
-    u64 end = r->guest + r->size;
+    if (GetWriteWatch(0, (void *)lo, hi - lo, pages, &count, &granularity) != 0 || !count) return;
+    ResetWriteWatch((void *)lo, hi - lo);   /* (before taking them: what the CPU writes meanwhile is seen next time) */
     for (ULONG_PTR k = 0; k < count; k++) {
-        u64 pg = (u64)pages[k], lo = pg > r->guest ? pg : r->guest, hi = pg + granularity < end ? pg + granularity : end;
-        if (lo >= hi) continue;
-        if (lo != pg || hi != pg + granularity) {   /* partly covered: compare the bytes inside */
-            u8 *was = lo - r->guest < r->head ? r->edge + (lo - r->guest) : r->edge + r->head + (lo - (end - r->tail));
-            if (!memcmp(was, P(void, lo), (size_t)(hi - lo))) continue;
-            memcpy(was, P(void, lo), (size_t)(hi - lo));
-        }
-        D3D11_BOX box = {(UINT)(lo - r->guest), 0, 0, (UINT)(hi - r->guest), 1, 1};
-        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, P(void, lo), 0, 0);
+        u64 pg = (u64)pages[k];
+        D3D11_BOX box = {(UINT)(pg - r->guest), 0, 0, (UINT)(pg + granularity - r->guest), 1, 1};
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, P(void, pg), 0, 0);
         gfx_stat_resident_pages++;
     }
-    ResetWriteWatch((void *)r->guest, r->size);
 }
 
 static Resident *resident_covering(u64 lo, u64 hi) {
@@ -1446,7 +1500,7 @@ static Resident *resident_acquire(u64 va, u32 size) {
         residents[nresidents++] = merged;
         n = &residents[nresidents - 1];
     }
-    if (n->guest >= ALIAS_BASE && n->guest + n->size <= ALIAS_BASE + ALIAS_SIZE) ResetWriteWatch((void *)n->guest, n->size);
+    if (n->guest >= ALIAS_BASE && n->guest + n->size <= ALIAS_BASE + ALIAS_SIZE) resident_watch_reset(n);
     return n;
 }
 
@@ -1566,7 +1620,7 @@ void gfx_resident_flush(u64 va, u64 bytes) {
             ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)st, 0);
         }
         ID3D11Buffer_Release(st);
-        if (r->guest >= ALIAS_BASE && r->guest + r->size <= ALIAS_BASE + ALIAS_SIZE) { ResetWriteWatch((void *)r->guest, r->size); resident_snapshot(r); }
+        if (r->guest >= ALIAS_BASE && r->guest + r->size <= ALIAS_BASE + ALIAS_SIZE) { resident_watch_reset(r); resident_snapshot(r); }
     }
     leave();
 }
@@ -1592,7 +1646,7 @@ void gfx_resident_written(u64 va, u64 bytes) {
         D3D11_BOX box = {(UINT)(lo - r->va), 0, 0, (UINT)(hi - r->va), 1, 1};
         ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, data, 0, 0);
         free(data);
-        if (r->guest >= ALIAS_BASE && r->guest + r->size <= ALIAS_BASE + ALIAS_SIZE) { ResetWriteWatch((void *)r->guest, r->size); resident_snapshot(r); }
+        if (r->guest >= ALIAS_BASE && r->guest + r->size <= ALIAS_BASE + ALIAS_SIZE) { resident_watch_reset(r); resident_snapshot(r); }
     }
     leave();
 }
