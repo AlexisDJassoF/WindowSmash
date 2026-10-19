@@ -55,6 +55,11 @@ char *shader_hlsl(const u8 *program, u32 size, int stage, u32 vs_outputs, Shader
 typedef u32 CbufReader(void *user, u32 bank, u32 offset);
 char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
 
+/* A pixel shader that also does the fixed-function alpha test (ALPHA_TEST): render target 0's
+ * alpha compared with DrawParams.frag[3] by the comparison in frag[2], the pixel discarded when
+ * it fails. Draws with the test on use it in place of the plain one. */
+char *shader_hlsl_alpha_tested(const u8 *program, u32 size, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
+
 /* A compute program (no header: pass it with 0x50 bytes of anything in front, so that its
  * addresses line up with those of the other stages), its workgroup size and shared memory. */
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user);
@@ -63,7 +68,7 @@ char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared
 typedef struct DrawParams {
     u32 attr[32][4];       /* vertex attribute: format word, stream stride, instance divisor (0: per vertex), stream bound */
     float fix[4];          /* clip-space fix-up: x sign, y sign, z scale, z offset */
-    float frag[4];         /* fragment y: flip (nonzero), render target height */
+    float frag[4];         /* fragment y: flip (nonzero), render target height; alpha test: D3D11_COMPARISON_FUNC, reference */
     u32 base[4];           /* base vertex, base instance */
     u32 swz[2][32];        /* per texture of each stage (vertex, pixel): component sources, 3 bits each */
     u32 sb[2][16][4];      /* per storage buffer of each stage: GPU address low, high, size */
