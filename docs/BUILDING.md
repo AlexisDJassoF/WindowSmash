@@ -375,7 +375,7 @@ Double-click **`Play SSBU.bat`** in `C:\WindowSmash`.
 
 ### Step 16: (Optional) Prepare the shaders
 
-The game's graphics programs (*shaders*) are prepared the first time each one is needed, which is why a new effect can stutter once. To prepare them all in advance, double-click **`Prepare Shaders.bat`**. It takes from a few minutes to about two hours at low priority, so you can keep using the PC. You can close it at any time and start it again later; it keeps what it has done.
+The game's graphics programs (*shaders*) are prepared the first time each one is needed, which is why a new effect can stutter once. To prepare them all in advance, double-click **`Prepare Shaders.bat`**. It runs at low priority, so you can keep using the PC, and shows a progress bar with the time left: about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; it keeps what it has done.
 
 </details>
 

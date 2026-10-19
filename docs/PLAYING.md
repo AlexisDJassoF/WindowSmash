@@ -129,7 +129,7 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 
 The game's graphics programs (*shaders*) are prepared the first time each one is used, so a new effect can show a moment late, or stutter, the first time you see it. WindowSmash keeps every prepared shader in `dump\shadercache\` and loads them in the background each time the game starts, so each stutter happens only once.
 
-To prepare them all before playing, double-click **`Prepare Shaders.bat`**. It runs once per game version, from a few minutes to about two hours, at low priority so the PC stays usable. You can close it at any time and start it again later; what's done stays done. It needs Python and Visual Studio, as for [building](BUILDING.md).
+To prepare them all before playing, double-click **`Prepare Shaders.bat`**. It runs once per game version, at low priority so the PC stays usable, and shows a progress bar with the time left. A first run compiles about 40,000 shaders (for 13.0.5): about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; what's done stays done, so a later run takes minutes. It needs Python and Visual Studio, as for [building](BUILDING.md).
 
 ## Where your files are
 
