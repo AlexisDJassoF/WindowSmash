@@ -64,42 +64,137 @@ The game itself still comes from your files. This repository holds only the tran
 | **Graphics** | Any graphics card or chip that supports DirectX 11, with an up-to-date driver. |
 | **Memory** | 16 GB recommended. |
 | **Free space** | About 60 GB on the drive WindowSmash goes on, plus room for your game files (about 17 GB). |
-| **Your game files** | Super Smash Bros. Ultimate from your own Switch, with your console's keys and firmware. Any version should work; **11.0.0** and **13.0.5** have been tested. The [setup guide](docs/BUILDING.md#part-2-gather-your-game-files) lists exactly which files. |
+| **Your game files** | Super Smash Bros. Ultimate from your own Switch (a game card dump, an `.nsp`, or the game installed in yuzu or Ryujinx), with your console's keys and firmware. Any version should work; **11.0.0** and **13.0.5** have been tested. [Step 2](#step-2-have-your-game-files-ready) below says where to put them. |
 | **Two free tools** | Python and the Visual Studio build tools. `Install WindowSmash.bat` installs them for you. |
-| **Time** | About 15 minutes of your own time, plus 30 minutes to a few hours of waiting while your PC builds the game. |
+| **Time** | About 15 minutes of your own time, plus up to half an hour while the tools install and 30 minutes to a few hours while your PC builds the game. |
 
 ## Install and play
 
+**`Install WindowSmash.bat` does the setup for you.** It installs the tools WindowSmash needs, finds your game files, and builds the game. Your part is to have your game files ready, start it, and choose a few things in one window. No programming knowledge is needed.
+
+The whole journey at a glance:
+
 | Step | What happens | Your time |
 | :---: | :--- | :--- |
-| **1** | **Have your game files ready.** Played the game in yuzu or Ryujinx on this PC? Then you already do. Otherwise, the [setup guide](docs/BUILDING.md#part-2-gather-your-game-files) says which files you need. | 10 minutes |
-| **2** | **Download WindowSmash** (the green **Code** button → **Download ZIP**, extract it) and double-click **`Install WindowSmash.bat`**. It checks your PC, installs the two tools if they are missing, shows the folders it found for your game files, keys and firmware, and builds the game. | 5 minutes, then waiting |
-| **3** | **Play.** Double-click `Play SSBU.bat`, or the shortcut it put on the desktop. | |
+| **1** | **Check your PC** against [what you need](#what-you-need). | 2 minutes |
+| **2** | **Have your game files ready**: the game, its update and DLC, your keys and firmware. | 10 minutes |
+| **3** | **Download WindowSmash** and extract it. | 5 minutes |
+| **4** | **Start the installer**: double-click `Install WindowSmash.bat`. | 1 minute |
+| **5** | **Let it install the tools** it needs: Python, the Visual Studio build tools and SDL3, if they are missing. | 10–30 minutes, mostly waiting |
+| **6** | **Choose your folders** and your online name in its setup window. | 5 minutes |
+| **7** | **Wait while it builds the game.** | 30 minutes to a few hours |
+| **8** | **Play.** Double-click the **Play SSBU** shortcut on your desktop. | |
 
-To update later, double-click `Install WindowSmash.bat` again: it fetches the newest WindowSmash and builds it. The [setup guide](docs/BUILDING.md) has the details, and every step by hand for those who prefer it.
+### Step 1: Check your PC
 
-<p align="center"><a href="docs/BUILDING.md"><strong>Open the setup guide →</strong></a></p>
+Compare your PC with [what you need](#what-you-need) above. (**Settings → System → About** shows the system type, the installed RAM and the processor.) The installer checks too: if your PC lacks something, such as a processor with AVX2 or enough free space, it stops and says what.
+
+### Step 2: Have your game files ready
+
+**Played the game in yuzu or Ryujinx on this PC?** Then your files are ready: the installer finds your keys, your firmware and the installed game, with its update and DLC, by itself.
+
+**Otherwise**, put your files in three folders. The names are examples; any folders will do:
+
+| Folder | What goes in it |
+| :--- | :--- |
+| `D:\MyDump` | The game: a game card dump (`.xci`), an `.nsp`, or its `.nca` files. Its update `.nsp`, if you have one. Your DLC `.nsp` files, loose or in a folder named `dlc`. |
+| `D:\MyKeys` | `prod.keys` and `title.keys`, from your Switch. |
+| `D:\MyFirmware` | Your Switch's firmware: a few hundred `.nca` files. WindowSmash takes the game's fonts from them. |
+
+- **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. With an update file next to the game, the installer applies it for you. The game as first released (1.0.0) is the best base for an update.
+- **Compressed files** (`.nsz`, `.xcz`) have to be turned back into `.nsp` or `.xci` first.
+- **Leave your game files where they are** after the install: depending on their kind, the game keeps reading its data from them.
+
+### Step 3: Download WindowSmash
+
+1. At the top of this page, click the green **Code** button, then **Download ZIP**.
+2. Right-click `WindowSmash-main.zip`, choose **Extract All…**, pick a drive with about 60 GB free (for example `C:\`), and click **Extract**. You get a folder named `WindowSmash-main`; rename it to `WindowSmash` if you like.
+
+> [!TIP]
+> Keep WindowSmash out of the Desktop and Documents folders: OneDrive may try to upload them, and the finished build is around 30 GB. With [Git](https://git-scm.com/download/win), `git clone https://github.com/SNO2207/WindowSmash.git` does the same as the download.
+
+### Step 4: Start the installer
+
+1. Open the WindowSmash folder and double-click **`Install WindowSmash.bat`**.
+2. Windows asks whether to run it (**The publisher could not be verified**): click **Run**. On some PCs a blue **Windows protected your PC** box comes instead: click **More info**, then **Run anyway**. Windows asks this once, about anything downloaded that isn't signed.
+
+A window opens and shows each step as it goes. First it fetches the newest WindowSmash from GitHub, if there is a newer one, and checks your PC. Everything it shows is also kept in `install.log` in the WindowSmash folder.
+
+### Step 5: Let it install the tools
+
+The installer installs only what your PC is missing:
+
+- **Python**, which runs WindowSmash's helper programs. If your PC has none, the installer puts a copy in the WindowSmash folder; nothing else on your PC changes.
+- **The Visual Studio Build Tools**, Microsoft's free tools that build the game. They download several gigabytes, and a progress window shows how far it is. Windows asks whether to allow the changes: click **Yes**. If it asks you to restart, do so, then double-click `Install WindowSmash.bat` again.
+- **SDL3**, for PlayStation, Switch Pro and most other controllers.
+
+Music and movies need nothing extra: their decoders come with WindowSmash and are built with the game.
+
+### Step 6: Choose your folders
+
+When the tools are ready, the setup window opens:
+
+| Box | What to choose |
+| :--- | :--- |
+| **Game files** | `D:\MyDump`, or the yuzu or Ryujinx folder it found. |
+| **Keys** | `D:\MyKeys`, or the one it found. |
+| **Firmware** | `D:\MyFirmware`, or the one it found. |
+
+Folders it found on your PC are filled in already; change any of them with **Browse…**. The line under each box says what is in the folder, for example *the game's update: 13.0.5* and *DLC: 99 add-on contents*. Green means it's fine; red says what's missing.
+
+Then:
+
+- Type your **online name**, the name other players see.
+- Leave the three boxes ticked, or untick what you don't want: a **desktop shortcut**, a **Windows Firewall rule** for playing online (Windows asks for permission once), and **preparing the shaders** after the build.
+- Click **Set up and build**.
+
+### Step 7: Wait while it builds the game
+
+First it prepares your game files, which takes a few minutes: it decrypts the game if needed and applies your update (up to about 17 GB more space). Then it builds the game: your PC translates it into a Windows program, which takes **30 minutes to a few hours**.
+
+- You can keep using the PC, though it will be slower. Set it not to sleep while plugged in (**Settings → System → Power**) until the build is done.
+- If the build stops (a restart, the PC going to sleep, an error you fixed), double-click `Install WindowSmash.bat` again: it carries on where it stopped.
+- It's finished when the window says **Done**. Press a key to close it.
+
+### Step 8: Play
+
+Double-click the **Play SSBU** shortcut on your desktop, or `Play SSBU.bat` in the WindowSmash folder.
+
+- A small window called **SSBU log** opens minimized next to the game. Leave it: it closes with the game.
+- If Windows Security asks whether to allow `ssbu.exe` on networks, allow it: it's needed for playing online.
+- The first start takes a little longer. If you left *preparing the shaders* ticked, it runs in its own window at low priority; until it's done, some effects can stutter the first time they appear.
+
+Then see the [controls](#controls) and how to [play with friends](#play-with-friends) below. The [playing guide](docs/PLAYING.md) covers settings, saves and screenshots.
+
+### Updating WindowSmash
+
+Double-click `Install WindowSmash.bat` again. It downloads the newest WindowSmash from GitHub if there is one, and builds again, which takes minutes rather than hours. Your game files, settings, save and online name stay as they are.
+
+### If something goes wrong
+
+The installer stops with a message saying what went wrong and what to do; `install.log` keeps everything it showed. [If something goes wrong](docs/BUILDING.md#if-something-goes-wrong) in the setup guide lists the usual problems, and [getting help](#getting-help) says where to ask. Prefer to set it up yourself, step by step? The [setup guide](docs/BUILDING.md) has every step by hand.
 
 <details>
 <summary><strong>Already know your way around? The short version</strong></summary>
 
 <br>
 
-You need Windows 10/11 x64, Python 3.10 or newer as `python`, and Visual Studio 2022 or newer (or its Build Tools) with **Desktop development with C++** and **C++ Clang tools for Windows**. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`. Music and movie codecs are built from `third_party/` as part of the build.
+You need Windows 10/11 x64. `Install WindowSmash.bat` installs Python 3.10 or newer and the Visual Studio Build Tools with **C++ Clang tools for Windows** when they are missing. `-NoWizard` asks its questions in the console instead of the setup window, with the folders you give as the answers to accept. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`.
 
 ```powershell
 git clone https://github.com/SNO2207/WindowSmash.git
 cd WindowSmash
-python -m pip install -r requirements.txt
-python tools/nca.py exefs "D:\MyDump\program.nca" --keys "D:\MyKeys" --out dump/exefs
-Get-ChildItem D:\MyFirmware\*.nca | ForEach-Object { python tools/nca.py romfs-get $_.FullName --keys D:\MyKeys --match .bfttf --flat --out D:\MyDump\fonts 2>$null }
-& ".\Configure Game Data.bat"    # asks for your patched, unencrypted romfs.bin and D:\MyDump\fonts
-python tools/arc.py nro
-python tools/recomp.py all dump/exefs --out build --jobs 16
+& ".\Install WindowSmash.bat" -Game "D:\MyDump" -Keys "D:\MyKeys" -Firmware "D:\MyFirmware" -NoWizard
+```
+
+With Python and the build tools already installed, `tools/build_game.py` does the build on its own:
+
+```powershell
+python tools/build_game.py --game "D:\MyDump" --keys "D:\MyKeys" --firmware "D:\MyFirmware"
 & ".\Play SSBU.bat"
 ```
 
-The setup guide's [reference section](docs/BUILDING.md#reference) covers DLC, SDL3 for controllers, the audio and video codecs, and the folder layout.
+`-DryRun` makes the installer say what each step would do without doing it. The setup guide has the [manual commands](docs/BUILDING.md#quick-version) and a [reference section](docs/BUILDING.md#reference) on DLC, SDL3, the codecs and the folder layout.
 
 </details>
 
