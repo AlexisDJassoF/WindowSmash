@@ -409,6 +409,28 @@ def decrypt_once(record, keys):
     return out
 
 
+def write_version():
+    """version.txt: the game version the launchers name (tools/pick_version.bat), data.arc's, as
+    install_version.py describe writes it for a version's own folder. Once: one folder holds one
+    game version. (Only a label: one that can't be read doesn't stop the build.)"""
+    path = os.path.join(ROOT, "version.txt")
+    if os.path.isfile(path):
+        return
+    try:
+        from arc import Arc
+        from nso import Module
+        v = Arc(os.path.join(MODULES, "romfs.cfg")).version
+        data = f"{v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}"
+        text = (f"{data}\n# game version of this folder (tools/build_game.py): the version, then what it is made of\n"
+                f"main {Module(os.path.join(EXEFS, 'main')).build_id}\ndata.arc {data}\n")
+    except Exception as e:
+        log(f"  (the game version could not be read for the launchers: {e})")
+        return
+    with open(path, "w", newline="\n") as f:
+        f.write(text)
+    log(f"  game version {data} (version.txt)")
+
+
 def build_is_current():
     """build/ssbu.exe is newer than the runtime, the tools and the modules it is built from, and
     has SDL3.dll beside it if SDL3 is there to build with."""
@@ -526,6 +548,7 @@ def build(a):
     run([sys.executable, os.path.join("tools", "arc.py"), "nro"],
         "Could not read the fighters from the game data (see above). Check that the game data from step 6 is "
         "the game's, with your update applied.")
+    write_version()
 
     log("\n[9/9] Build the game (build\\ssbu.exe)")
     if a.prepare_only:

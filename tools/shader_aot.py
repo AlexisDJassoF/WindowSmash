@@ -74,6 +74,8 @@ def find_programs(arc):
     programs, ids = [], {}
     unread = 0
     for ext, (off, stored, size, flags) in containers(arc):
+        if not stored or not size:   # (an empty file - data.arc has a few, marked compressed: nothing in it)
+            continue
         data = arc.read(off, stored)
         if flags & 3:
             try:
