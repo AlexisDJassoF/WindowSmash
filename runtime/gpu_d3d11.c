@@ -355,7 +355,11 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     if (getenv("SSBU_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
-    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx))) {
+    /* SSBU_D3D_DRIVER_THREADS=0: the driver does its work on the thread that calls it (as AMD's
+     * and Intel's mostly do) - for measuring what the renderer costs such a driver */
+    UINT render_flags = getenv("SSBU_D3D_DRIVER_THREADS") && !atoi(getenv("SSBU_D3D_DRIVER_THREADS"))
+                        ? D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS : 0;
+    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx))) {
         fprintf(stderr, "[gfx] cannot create a Direct3D 11 device\n");
         return TRUE;
     }
@@ -1099,15 +1103,18 @@ static Upload uploads[3][128];   /* per stage (vertex, pixel, compute), per SRV 
 static const u32 ring_chunk[RING_CLASSES] = {256, 1024, 4096, 16384, 65536};
 static const u32 ring_count[RING_CLASSES] = {8192, 2048, 1024, 256, 64};
 #define RING_ROOM 40   /* chunks of each size one draw may take, at most */
-static struct { ID3D11Buffer *buf; ID3D11ShaderResourceView **srv; u32 next; } rings[RING_CLASSES];
+static struct { ID3D11Buffer *buf; ID3D11ShaderResourceView **srv; u32 next, gen; } rings[RING_CLASSES];   /* (gen: discards so far) */
 static int rings_ok = -1;
 
 static int rings_init(void) {
     D3D11_FEATURE_DATA_D3D11_OPTIONS o;
     memset(&o, 0, sizeof o);
     if (getenv("SSBU_NO_UPLOAD_RINGS") || FAILED(ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o)) ||
-        !o.MapNoOverwriteOnDynamicBufferSRV)
+        !o.MapNoOverwriteOnDynamicBufferSRV) {
+        fprintf(stderr, "[gfx] upload rings off (%s): every upload renames a buffer\n",
+                getenv("SSBU_NO_UPLOAD_RINGS") ? "SSBU_NO_UPLOAD_RINGS" : "the driver does not allow writing a buffer the GPU reads through a view");
         return 0;
+    }
     for (u32 c = 0; c < RING_CLASSES; c++) {
         D3D11_BUFFER_DESC bd = {ring_chunk[c] * ring_count[c], D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
                                 D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
@@ -1131,7 +1138,10 @@ static void rings_start_draw(void) {
     if (rings_ok < 0) rings_ok = rings_init();
     if (!rings_ok) return;
     for (u32 c = 0; c < RING_CLASSES; c++)
-        if (rings[c].next + RING_ROOM > ring_count[c]) rings[c].next = ring_count[c];
+        if (rings[c].next + RING_ROOM > ring_count[c]) {
+            if (rings[c].next < ring_count[c]) rings[c].gen++;   /* (its chunks are as good as gone: not handed out again) */
+            rings[c].next = ring_count[c];
+        }
 }
 
 /* A chunk for `size` bytes, mapped for writing at *dst (unmap with ring_done(*cls)). */
@@ -1140,7 +1150,7 @@ static ID3D11ShaderResourceView *ring_alloc(u32 size, u8 **dst, u32 *cls) {
     while (c < RING_CLASSES && ring_chunk[c] < size) c++;
     if (c == RING_CLASSES || rings_ok != 1) return NULL;
     D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
-    if (rings[c].next >= ring_count[c]) { rings[c].next = 0; how = D3D11_MAP_WRITE_DISCARD; }
+    if (rings[c].next >= ring_count[c]) { rings[c].next = 0; rings[c].gen++; how = D3D11_MAP_WRITE_DISCARD; }
     u32 i = rings[c].next++;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)rings[c].buf, 0, how, 0, &m))) return NULL;
@@ -1164,33 +1174,67 @@ static ID3D11ShaderResourceView *ring_upload(const void *data, u32 size) {
 
 static void read_gpu(u64 va, u32 size, void *dst);
 
+/* What each stage's slot was given last, with a copy of the bytes: a draw that uploads the same
+ * bytes from the same place again - most of a menu's constants, draw after draw - gets the same
+ * view, whose data is still there (the ring has not been discarded since, or the slot's own
+ * buffer not written since): no map, no copy, and the view stays bound. Drivers that do their
+ * work on the calling thread (AMD's, Intel's) pay for every map and bind there, in the game's
+ * frame. */
+#define REUSE_MAX 65536
+typedef struct LastUpload { u64 va; u32 size, cls, gen, cap; ID3D11ShaderResourceView *srv; u8 *copy; } LastUpload;
+static LastUpload last_upload[3][128];
+u64 gfx_stat_reused;
+
 /* Guest GPU memory [va, va + size) uploaded for a stage's slot: straight from guest memory into
  * a ring chunk when it fits one (else through a copy). */
 static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *data, u32 size);
 static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 size) {
     u32 padded = (size + 15) & ~15u;
     if (!padded) padded = 16;
+    LastUpload *lu = &last_upload[stage][slot];
+    u64 g = size && size <= REUSE_MAX ? gpu_va_to_guest(va) : 0;
+    const u8 *src = g && gpu_va_to_guest(va + size - 1) == g + size - 1 ? P(const u8, g) : NULL;   /* (one mapping) */
+    if (src && lu->srv && lu->va == va && lu->size == size &&
+        lu->gen == (lu->cls < RING_CLASSES ? rings[lu->cls].gen : 0) && !memcmp(src, lu->copy, size)) {
+        gfx_stat_reused++;
+        return lu->srv;
+    }
+    if (src) {   /* (the copy, taken now: what is compared next time) */
+        if (lu->cap < size) {
+            free(lu->copy);
+            lu->cap = size;
+            if (!(lu->copy = malloc(size))) lu->cap = 0;
+        }
+        if (lu->copy) memcpy(lu->copy, src, size);
+        else src = NULL;
+    }
     u8 *dst;
     u32 c;
     ID3D11ShaderResourceView *v = ring_alloc(padded, &dst, &c);
     if (v) {
-        read_gpu(va, size, dst);
+        if (src) memcpy(dst, lu->copy, size);
+        else read_gpu(va, size, dst);
         if (padded > size) memset(dst + size, 0, padded - size);
         ring_done(c);
         gfx_stat_upload_bytes += padded;
         gfx_stat_upload_kind[slot < 18 ? 0 : slot < 96 ? 1 : 2] += padded;
+        *lu = (LastUpload){va, size, c, rings[c].gen, lu->cap, src ? v : NULL, lu->copy};
         return v;
     }
     static u8 *tmp;
     static u32 tmp_cap;
     if (padded > tmp_cap) { tmp = realloc(tmp, padded); tmp_cap = padded; }
-    read_gpu(va, size, tmp);
+    if (src) memcpy(tmp, lu->copy, size);
+    else read_gpu(va, size, tmp);
     if (padded > size) memset(tmp + size, 0, padded - size);
-    return upload_raw(stage, slot, tmp, size);
+    v = upload_raw(stage, slot, tmp, size);   /* (the slot's own buffer, unless a ring took it) */
+    if (src && v && v == uploads[stage][slot].srv) *lu = (LastUpload){va, size, RING_CLASSES, 0, lu->cap, v, lu->copy};
+    return v;
 }
 
 static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *data, u32 size) {
     Upload *u = &uploads[stage][slot];
+    last_upload[stage][slot].srv = NULL;   /* (the slot's buffer may be written below) */
     size = (size + 15) & ~15u;
     if (!size) size = 16;
     gfx_stat_upload_bytes += size;
@@ -1222,6 +1266,8 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
 
 static ID3D11Buffer *params_buffer, *index_buffer;
 static u32 index_cap, index_pos, index_first;   /* the index ring: its size, where the next indices go, where this draw's start (in indices) */
+static DrawParams params_written;   /* what params_buffer holds (a draw with the same parameters writes nothing) */
+static int params_known;
 
 /* Copy guest GPU memory [va, va + size) into dst (zeros where unmapped). */
 static void read_gpu(u64 va, u32 size, void *dst) {
@@ -2580,10 +2626,15 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         ID3D11Device_CreateBuffer(dev, &pd, NULL, &params_buffer);
     }
     D3D11_MAPPED_SUBRESOURCE m;
-    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)params_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, &params, sizeof params);
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)params_buffer, 0);
-    }
+    if (!params_known || memcmp(&params_written, &params, sizeof params)) {
+        params_known = 0;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)params_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, &params, sizeof params);
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)params_buffer, 0);
+            params_written = params;
+            params_known = 1;
+        }
+    } else gfx_stat_reused++;
     if (!cur.fixed_set) {
         ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &params_buffer);
         ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &params_buffer);
@@ -2635,7 +2686,16 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         /* indices go one after another into a ring (no renaming per draw): the draw starts at
          * its place in it, a new pass round discards */
         u32 bytes = n * (isz == 1 ? 2 : isz);
-        if (bytes > index_cap) {
+        /* the same indices from the same place as the last indexed draw's, which the ring still
+         * holds (not discarded since): used where they are */
+        static struct { u64 va; u32 bytes, isz, first, gen; int ok; u8 copy[65536]; } last_ix;
+        static u32 index_gen;
+        u64 ig = isz != 1 && bytes <= sizeof last_ix.copy ? gpu_va_to_guest(va) : 0;
+        const u8 *isrc = ig && gpu_va_to_guest(va + bytes - 1) == ig + bytes - 1 ? P(const u8, ig) : NULL;
+        int again = isrc && last_ix.ok && last_ix.va == va && last_ix.bytes == bytes && last_ix.isz == isz && last_ix.gen == index_gen &&
+                    !memcmp(isrc, last_ix.copy, bytes);
+        if (again) { index_first = last_ix.first; gfx_stat_reused++; }
+        if (!again && bytes > index_cap) {
             if (index_buffer) bury(index_buffer);
             index_cap = 4u << 20;
             while (index_cap < bytes) index_cap *= 2;
@@ -2644,15 +2704,22 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
             index_pos = index_cap;   /* (discard first) */
         }
         u32 unit = isz == 4 ? 4 : 2;
-        index_pos = (index_pos + 3) & ~3u;
         D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (index_pos + bytes > index_cap) { index_pos = 0; how = D3D11_MAP_WRITE_DISCARD; }
-        index_first = index_pos / unit;
-        gfx_stat_upload_bytes += bytes;
-        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)index_buffer, 0, how, 0, &m))) {
+        if (!again) {
+            index_pos = (index_pos + 3) & ~3u;
+            if (index_pos + bytes > index_cap) { index_pos = 0; index_gen++; how = D3D11_MAP_WRITE_DISCARD; }
+            index_first = index_pos / unit;
+            gfx_stat_upload_bytes += bytes;
+            last_ix.ok = 0;
+        }
+        if (!again && SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)index_buffer, 0, how, 0, &m))) {
             m.pData = (u8 *)m.pData + index_pos;
             index_pos += bytes;
-            if (isz == 1) {   /* 8-bit indices widen to 16 */
+            if (isrc) {   /* (kept, to compare the next draw's with) */
+                memcpy(last_ix.copy, isrc, bytes);
+                memcpy(m.pData, last_ix.copy, bytes);
+                last_ix.va = va; last_ix.bytes = bytes; last_ix.isz = isz; last_ix.first = index_first; last_ix.gen = index_gen; last_ix.ok = 1;
+            } else if (isz == 1) {   /* 8-bit indices widen to 16 */
                 static u8 tmp8[1 << 16];
                 u32 left = n, done = 0;
                 while (left) {
@@ -3034,6 +3101,7 @@ void gfx_dispatch(const u32 *regs, const u32 *q) {
     }
     ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 16, uav, NULL);
     D3D11_MAPPED_SUBRESOURCE m;
+    params_known = 0;   /* (the next draw writes its own) */
     if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)params_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &params, sizeof params);
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)params_buffer, 0);
@@ -3366,7 +3434,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     if (profile_at >= 0 && rt_now_ns() > (u64)(profile_at * 1e9)) { profile_at = -2; keys |= 32; }
     if (keys & 32) profile_start(10.0);   /* F6 */
     static char detail[1800], hint[640];
-    static u64 last_ns, last_presented, last_drawn, last_dispatched, last_skipped, last_watch, last_busy, last_upload, last_waits, last_composed, last_kind[4];
+    static u64 last_ns, last_presented, last_drawn, last_dispatched, last_skipped, last_watch, last_busy, last_upload, last_waits, last_composed, last_reused, last_kind[4];
     u64 now = rt_now_ns();
     if (now - last_ns >= 500000000ull) {   /* the details, twice a second */
         double secs = (now - last_ns) / 1e9;
@@ -3378,7 +3446,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         u64 gpu_frames = gfx_stat_inflight_frames - last_inflight_frames;
         snprintf(detail, sizeof detail,
                  "GPU behind by %.1f frames  Present blocked %.1f ms/frame\n"
-                 "renderer %.1f ms/frame  uploads %.1f MB/frame (%llu composed)\n"
+                 "renderer %.1f ms/frame  uploads %.1f MB/frame (%llu composed, %llu reused)\n"
                  "  constants %.1f  vertices %.1f  storage %.1f  textures %.1f MB/frame\n"
                  "draws %llu/frame  compute %llu/frame  GPU waits %llu  skipped %.0f/s\n"
                  "shaders %llu (%ld compiling, prewarm %ld/%ld)  textures %u  surfaces %u\n"
@@ -3389,6 +3457,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  (gfx_stat_present_ticks - last_present_ticks) * 1000.0 / (double)freq.QuadPart / frames,
                  (gfx_stat_busy_ticks - last_busy) * 1000.0 / (double)freq.QuadPart / frames,
                  (gfx_stat_upload_bytes - last_upload) / 1048576.0 / frames, (gfx_stat_composed - last_composed) / frames,
+                 (gfx_stat_reused - last_reused) / frames,
                  (gfx_stat_upload_kind[0] - last_kind[0]) / 1048576.0 / frames, (gfx_stat_upload_kind[1] - last_kind[1]) / 1048576.0 / frames,
                  (gfx_stat_upload_kind[2] - last_kind[2]) / 1048576.0 / frames, (gfx_stat_upload_kind[3] - last_kind[3]) / 1048576.0 / frames,
                  (gfx_stat_drawn - last_drawn) / frames, (gfx_stat_dispatched - last_dispatched) / frames, gfx_stat_gpu_waits - last_waits,
@@ -3420,7 +3489,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         last_ns = now; last_presented = gfx_stat_presented; last_drawn = gfx_stat_drawn;
         last_dispatched = gfx_stat_dispatched; last_skipped = gfx_stat_skipped; last_watch = gfx_stat_watch_us;
         memcpy(last_kind, gfx_stat_upload_kind, sizeof last_kind);
-        last_busy = gfx_stat_busy_ticks; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed;
+        last_busy = gfx_stat_busy_ticks; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed; last_reused = gfx_stat_reused;
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
     overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
