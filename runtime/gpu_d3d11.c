@@ -450,10 +450,11 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     return TRUE;
 }
 
-/* Time spent in the renderer (the outermost enter to its leave), for the overlay. */
+/* Time spent in the renderer (the outermost enter to its leave), for the overlay - from
+ * rt_clock_ns, as this is twice a draw (clock.h: the system timer can be slow). */
 static u32 enter_depth;
-static LARGE_INTEGER enter_t0;
-u64 gfx_stat_busy_ticks, gfx_stat_upload_bytes, gfx_stat_gpu_waits, gfx_stat_composed, gfx_stat_upload_kind[4];
+static u64 enter_t0;
+u64 gfx_stat_busy_ns, gfx_stat_upload_bytes, gfx_stat_gpu_waits, gfx_stat_composed, gfx_stat_upload_kind[4];
 static struct { u32 size, bank, extent; char shader[24]; } gfx_stat_biggest_cb;
 
 static volatile DWORD last_enter_thread;
@@ -465,16 +466,12 @@ static int enter(void) {
     if (!ready) return 0;
     EnterCriticalSection(&lock);
     last_enter_thread = GetCurrentThreadId();
-    if (!enter_depth++) QueryPerformanceCounter(&enter_t0);
+    if (!enter_depth++) enter_t0 = rt_clock_ns();
     return 1;
 }
 
 static void leave(void) {
-    if (!--enter_depth) {
-        LARGE_INTEGER t;
-        QueryPerformanceCounter(&t);
-        gfx_stat_busy_ticks += (u64)(t.QuadPart - enter_t0.QuadPart);
-    }
+    if (!--enter_depth) gfx_stat_busy_ns += rt_clock_ns() - enter_t0;
     LeaveCriticalSection(&lock);
 }
 
@@ -1193,7 +1190,19 @@ static void read_gpu(u64 va, u32 size, void *dst);
  * work on the calling thread (AMD's, Intel's) pay for every map and bind there, in the game's
  * frame. */
 #define REUSE_MAX 65536
-typedef struct LastUpload { u64 va; u32 size, cls, gen, cap; ID3D11ShaderResourceView *srv; u8 *copy; u64 batch, seq; } LastUpload;
+/* A slot whose bytes keep changing (most of a match's per-draw constants) is not compared or
+ * copied for a while: after a frame of at least REUSE_TRIES uploads with none reused, its next
+ * REUSE_PAUSE frames go straight from guest memory, then it is tried again (in a player's
+ * 8-fighter match the comparing alone was 3-7.5% of the main thread, and the extra copy came on
+ * top, for next to nothing). A slot reused at all in a frame - a menu's - keeps being compared. */
+#define REUSE_TRIES 8
+#define REUSE_PAUSE 8
+typedef struct LastUpload {
+    u64 va; u32 size, cls, gen, cap; ID3D11ShaderResourceView *srv; u8 *copy;
+    u64 batch, seq;         /* compared in submission batch, write log at seq (see untouched_since) */
+    u64 frame, paused_to;   /* the frame counted (gfx_stat_presented); not compared before frame paused_to */
+    u32 tries, hits;        /* in that frame */
+} LastUpload;
 static LastUpload last_upload[3][128];
 u64 gfx_stat_reused, gfx_stat_reuse_compared;
 
@@ -1239,8 +1248,17 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
     LastUpload *lu = &last_upload[stage][slot];
     u64 g = size && size <= REUSE_MAX ? gpu_va_to_guest(va) : 0;
     const u8 *src = g && gpu_va_to_guest(va + size - 1) == g + size - 1 ? P(const u8, g) : NULL;   /* (one mapping) */
-    if (src && lu->srv && lu->va == va && lu->size == size && lu->gen == (lu->cls < RING_CLASSES ? rings[lu->cls].gen : 0)) {
+    int keep = src != NULL;   /* compared now, and a copy kept to compare with next time */
+    if (lu->frame != gfx_stat_presented) {   /* a new frame: was the last one counted all misses? */
+        if (lu->tries >= REUSE_TRIES && !lu->hits) lu->paused_to = gfx_stat_presented + REUSE_PAUSE;
+        lu->frame = gfx_stat_presented;
+        lu->tries = lu->hits = 0;
+    }
+    if (gfx_stat_presented < lu->paused_to) keep = 0;
+    if (keep) lu->tries++;
+    if (keep && lu->srv && lu->va == va && lu->size == size && lu->gen == (lu->cls < RING_CLASSES ? rings[lu->cls].gen : 0)) {
         if (untouched_since(lu->batch, lu->seq, g, size)) {   /* compared already in this submission, and not written since */
+            lu->hits++;
             gfx_stat_reused++;
             return lu->srv;
         }
@@ -1248,40 +1266,45 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
         if (!memcmp(src, lu->copy, size)) {
             lu->batch = gpu_stat_batches;
             lu->seq = wrote_seq;
+            lu->hits++;
             gfx_stat_reused++;
             return lu->srv;
         }
     }
-    if (src) {   /* (the copy, taken now: what is compared next time) */
+    if (keep) {   /* (the copy, taken now: what is compared next time) */
         if (lu->cap < size) {
             free(lu->copy);
             lu->cap = size;
             if (!(lu->copy = malloc(size))) lu->cap = 0;
         }
         if (lu->copy) memcpy(lu->copy, src, size);
-        else src = NULL;
+        else keep = 0;
     }
     u8 *dst;
     u32 c;
     ID3D11ShaderResourceView *v = ring_alloc(padded, &dst, &c);
     if (v) {
-        if (src) memcpy(dst, lu->copy, size);
+        if (keep) memcpy(dst, lu->copy, size);
+        else if (src) memcpy(dst, src, size);
         else read_gpu(va, size, dst);
         if (padded > size) memset(dst + size, 0, padded - size);
         ring_done(c);
         gfx_stat_upload_bytes += padded;
         gfx_stat_upload_kind[slot < 18 ? 0 : slot < 96 ? 1 : 2] += padded;
-        *lu = (LastUpload){va, size, c, rings[c].gen, lu->cap, src ? v : NULL, lu->copy, gpu_stat_batches, wrote_seq};
+        *lu = (LastUpload){va, size, c, rings[c].gen, lu->cap, keep ? v : NULL, lu->copy, gpu_stat_batches, wrote_seq,
+                           lu->frame, lu->paused_to, lu->tries, lu->hits};
         return v;
     }
     static u8 *tmp;
     static u32 tmp_cap;
     if (padded > tmp_cap) { tmp = realloc(tmp, padded); tmp_cap = padded; }
-    if (src) memcpy(tmp, lu->copy, size);
+    if (keep) memcpy(tmp, lu->copy, size);
+    else if (src) memcpy(tmp, src, size);
     else read_gpu(va, size, tmp);
     if (padded > size) memset(tmp + size, 0, padded - size);
     v = upload_raw(stage, slot, tmp, size);   /* (the slot's own buffer, unless a ring took it) */
-    if (src && v && v == uploads[stage][slot].srv) *lu = (LastUpload){va, size, RING_CLASSES, 0, lu->cap, v, lu->copy, gpu_stat_batches, wrote_seq};
+    if (keep && v && v == uploads[stage][slot].srv)
+        *lu = (LastUpload){va, size, RING_CLASSES, 0, lu->cap, v, lu->copy, gpu_stat_batches, wrote_seq, lu->frame, lu->paused_to, lu->tries, lu->hits};
     return v;
 }
 
@@ -1761,38 +1784,52 @@ typedef struct Texture {
     int watched, stale;    /* in the write-watched alias area; written since it was read */
     ID3D11ShaderResourceView *srv;
     ID3D11Texture2D *tex;
-    u64 used;
+    u64 used, asked;       /* (asked: the frame the write watch was last asked about it, gfx_stat_presented) */
 } Texture;
 static Texture textures[4096];
 static u32 ntextures;
 u64 gfx_stat_textures, gfx_stat_watch_us;
 
+static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
+    static u64 rest;
+    rest += ns;
+    gfx_stat_watch_us += rest / 1000;
+    rest %= 1000;
+}
+
 /* Which textures has the CPU (or a copy) written since they were read? The alias area is
- * reserved with MEM_WRITE_WATCH, so Windows tracks the pages written. Once a frame, each
- * texture's range is asked about; only after every texture has been asked are the ranges
- * found written reset, so textures sharing memory all see the write. */
+ * reserved with MEM_WRITE_WATCH, so Windows tracks the pages written. A texture's range is
+ * asked about the first time a frame draws with it - not every texture every frame: the
+ * system's cost goes by the pages asked about, and a match keeps thousands of textures from
+ * earlier screens it never draws (a player's 8-fighter match: about 4,000, some 0.7 ms a
+ * frame). Pages found written start over at once (before the texture is read again, so what
+ * the CPU writes meanwhile is seen next time), and as one bit a page belongs to every texture
+ * on it, each of those is taken again at its next use. */
 static int watched(u64 g, u64 size) { return g >= ALIAS_BASE && g + size <= ALIAS_BASE + ALIAS_SIZE; }
 
-static void note_writes(void) {
-    LARGE_INTEGER t0, t1, freq;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-    static u8 written[4096];
-    for (u32 i = 0; i < ntextures; i++) {
-        Texture *t = &textures[i];
-        written[i] = 0;
-        if (!t->srv || !t->watched || t->stale) continue;
-        void *page;
-        ULONG_PTR count = 1;
-        ULONG granularity;
-        if (GetWriteWatch(0, (void *)t->guest, t->size, &page, &count, &granularity) == 0 && count) written[i] = 1;
+static void texture_ask(Texture *t) {
+    if (!t->watched || t->stale || t->asked == gfx_stat_presented) return;
+    t->asked = gfx_stat_presented;
+    u64 t0 = rt_clock_ns();
+    void *page;
+    ULONG_PTR count = 1;
+    ULONG granularity;
+    if (GetWriteWatch(0, (void *)t->guest, t->size, &page, &count, &granularity) == 0 && count) {
+        ResetWriteWatch((void *)t->guest, t->size);
+        u64 lo = t->guest & ~0xFFFull, hi = (t->guest + t->size + 0xFFF) & ~0xFFFull;
+        for (u32 i = 0; i < ntextures; i++) {   /* (t among them) */
+            Texture *o = &textures[i];
+            if (o->srv && o->watched && (o->guest & ~0xFFFull) < hi && ((o->guest + o->size + 0xFFF) & ~0xFFFull) > lo) o->stale = 1;
+        }
     }
-    for (u32 i = 0; i < ntextures; i++)
-        if (written[i]) { textures[i].stale = 1; ResetWriteWatch((void *)textures[i].guest, textures[i].size); }
-    /* GPU-resident buffers the CPU has written to (those no draw has checked yet) */
+    watch_time(rt_clock_ns() - t0);
+}
+
+/* Once a frame: GPU-resident buffers the CPU has written to (those no draw has checked yet). */
+static void note_writes(void) {
+    u64 t0 = rt_clock_ns();
     for (u32 i = 0; i < nresidents; i++) resident_sync(&residents[i], 1);
-    QueryPerformanceCounter(&t1);
-    gfx_stat_watch_us += (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
+    watch_time(rt_clock_ns() - t0);
 }
 
 /* A sparse checksum of guest memory, to notice when a texture's pixels change. */
@@ -1879,6 +1916,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     u64 sh = watch ? 0 : sample_hash(g, size);
     Texture *free_slot = NULL, *lru = NULL, *hit = texture_find(g, tic);
     if (hit) {
+        if (watch) texture_ask(hit);
         if (watch ? !hit->stale : hit->sample_hash == sh) { hit->used = ++tick; return hit->srv; }
         free_slot = hit;   /* contents changed: rebuild in place */
     } else
@@ -1910,7 +1948,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
             ID3D11Texture3D_Release(tex3); t->srv = NULL; return NULL;
         }
         t->tex = (ID3D11Texture2D *)tex3;   /* only ever released, and skipped by captures */
-        t->guest = g; t->size = size; t->watched = watch; t->stale = 0;
+        t->guest = g; t->size = size; t->watched = watch; t->stale = 0; t->asked = gfx_stat_presented;
         memcpy(t->tic, tic, 32); t->sample_hash = sh; t->used = ++tick;
         gfx_stat_textures++;
         return t->srv;
@@ -1956,7 +1994,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)t->tex, &sd, &t->srv))) {
         ID3D11Texture2D_Release(t->tex); t->tex = NULL; t->srv = NULL; return NULL;
     }
-    t->guest = g; t->size = size; t->watched = watch; t->stale = 0;
+    t->guest = g; t->size = size; t->watched = watch; t->stale = 0; t->asked = gfx_stat_presented;
     memcpy(t->tic, tic, 32); t->sample_hash = sh; t->used = ++tick;
     gfx_stat_textures++;
     return t->srv;
@@ -3620,7 +3658,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  "F5 depth sampling on/off  F6 profile 10 s%s",
                  gpu_frames ? (double)(gfx_stat_inflight - last_inflight) / gpu_frames : 0.0,
                  (gfx_stat_present_ticks - last_present_ticks) * 1000.0 / (double)freq.QuadPart / frames,
-                 (gfx_stat_busy_ticks - last_busy) * 1000.0 / (double)freq.QuadPart / frames,
+                 (gfx_stat_busy_ns - last_busy) / 1e6 / frames,
                  (gfx_stat_upload_bytes - last_upload) / 1048576.0 / frames, (gfx_stat_composed - last_composed) / frames,
                  (gfx_stat_reused - last_reused) / frames,
                  (gfx_stat_upload_kind[0] - last_kind[0]) / 1048576.0 / frames, (gfx_stat_upload_kind[1] - last_kind[1]) / 1048576.0 / frames,
@@ -3660,7 +3698,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         last_ns = now; last_presented = gfx_stat_presented; last_drawn = gfx_stat_drawn;
         last_dispatched = gfx_stat_dispatched; last_skipped = gfx_stat_skipped; last_watch = gfx_stat_watch_us;
         memcpy(last_kind, gfx_stat_upload_kind, sizeof last_kind);
-        last_busy = gfx_stat_busy_ticks; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed; last_reused = gfx_stat_reused;
+        last_busy = gfx_stat_busy_ns; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed; last_reused = gfx_stat_reused;
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
     overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
