@@ -3119,6 +3119,7 @@ static void capture(ID3D11Texture2D *back) {
     char path[1024];
     snprintf(path, sizeof path, "%s/frame_%03d.bmp", dir, count);
     save_bmp(back, path);
+    fprintf(stderr, "[capture] frame_%03d at %.2f s\n", count, rt_now_ns() / 1e9);   /* (to line captures up with scripted input) */
     if (getenv("SSBU_CAPTURE_SURFACES")) capture_surfaces(dir, count);
     count++;
 }
@@ -3587,6 +3588,9 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     static double f4_at = -1;   /* SSBU_F4_AT: the second to press F4 at (debug runs) */
     if (f4_at == -1) f4_at = getenv("SSBU_F4_AT") ? atof(getenv("SSBU_F4_AT")) : -2;
     if (f4_at >= 0 && rt_now_ns() > (u64)(f4_at * 1e9)) { f4_at = -2; keys |= 8; }
+    static double f7_at = -1;   /* SSBU_F7_AT: the second to press F7 at (benchmarks: menus at 60, the match unlocked) */
+    if (f7_at == -1) f7_at = getenv("SSBU_F7_AT") ? atof(getenv("SSBU_F7_AT")) : -2;
+    if (f7_at >= 0 && rt_now_ns() > (u64)(f7_at * 1e9)) { f7_at = -2; keys |= 64; }
     static int overlay = -1, details;
     if (overlay < 0) overlay = !getenv("SSBU_OVERLAY") || atoi(getenv("SSBU_OVERLAY")) != 0;
     if (keys & 1) overlay = !overlay;

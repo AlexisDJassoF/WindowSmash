@@ -57,6 +57,13 @@ HLE(_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb) { (void)c; }
 static const u8 STEADY_SOURCE[16] = {0x53, 0x53, 0x42, 0x55, 0x2D, 0x6E, 0x61, 0x74, 0x69, 0x76, 0x65, 0x2D, 0x63, 0x6C, 0x6B, 0x01};
 
 static i64 steady_seconds(void) { return 1000000 + (i64)(rt_now_ns() / 1000000000ull); }
+/* The wall clock in seconds; SSBU_FIXED_TIME=<seconds since 1970> stops it there (benchmarks: the
+ * game's clock-seeded choices, such as "Random" fighters and stages, then repeat run to run). */
+static i64 wall_seconds(void) {
+    static i64 fixed = -1;
+    if (fixed == -1) fixed = getenv("SSBU_FIXED_TIME") ? strtoll(getenv("SSBU_FIXED_TIME"), NULL, 10) : 0;
+    return fixed > 0 ? fixed : (i64)time(NULL);
+}
 
 static void steady_point(u64 out) {   /* SteadyClockTimePoint: { s64 seconds; Uuid source } */
     st64(out, (u64)steady_seconds());
@@ -87,8 +94,8 @@ static void calendar(u64 out, u64 info, i64 posix) {
 HLE(_ZN2nn4time10InitializeEv) { c->x[0] = 0; }
 HLE(_ZN2nn4time8FinalizeEv) { c->x[0] = 0; }
 HLE(_ZN2nn4time13IsInitializedEv) { c->x[0] = 1; }
-HLE(_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { st64(c->x[0], (u64)time(NULL)); c->x[0] = 0; }
-HLE(_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { st64(c->x[0], (u64)time(NULL)); c->x[0] = 0; }
+HLE(_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { st64(c->x[0], (u64)wall_seconds()); c->x[0] = 0; }
+HLE(_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { st64(c->x[0], (u64)wall_seconds()); c->x[0] = 0; }
 HLE(_ZN2nn4time19StandardSteadyClock3nowEv) { steady_point(c->x[8]); }   /* 24-byte result: returned through x8 */
 HLE(_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE) {
     calendar(c->x[0], c->x[1], (i64)ld64(c->x[2]));
@@ -113,7 +120,7 @@ HLE(_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE) {   /* (c
  * network times, their calendar forms, a steady time point and the location name. */
 HLE(_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_) {
     u64 s = c->x[0];
-    i64 now = (i64)time(NULL), steady = steady_seconds();
+    i64 now = wall_seconds(), steady = steady_seconds();
     memset(P(void, s), 0, 0xD0);
     for (u64 ctx = s; ctx <= s + 0x20; ctx += 0x20) {
         st64(ctx, (u64)(now - steady));
