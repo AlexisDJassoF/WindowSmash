@@ -3,169 +3,224 @@
 </p>
 
 <p align="center">
-  <a href="docs/BUILDING.md"><strong>Build guide</strong></a> ·
-  <a href="https://github.com/SNO2207/WindowSmash/releases"><strong>Windows releases</strong></a> ·
-  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a> ·
-  <a href="NETPLAY.md"><strong>Netplay</strong></a> ·
+  <strong>Super Smash Bros. Ultimate as a native Windows program, built on your own PC from your own copy of the game.</strong>
+</p>
+
+<p align="center">
+  <a href="docs/BUILDING.md"><strong>Setup guide</strong></a> ·
+  <a href="docs/PLAYING.md"><strong>Playing</strong></a> ·
+  <a href="NETPLAY.md"><strong>Multiplayer</strong></a> ·
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
-  <a href="docs/UPDATES.md"><strong>Later versions</strong></a> ·
-  <a href="README-LINUX.md"><strong>Linux</strong></a>
+  <a href="docs/UPDATES.md"><strong>Game updates</strong></a> ·
+  <a href="README-LINUX.md"><strong>Linux</strong></a> ·
+  <a href="docs/TECHNICAL.md"><strong>How it works</strong></a>
 </p>
 
 ---
 
-## The project
+> [!IMPORTANT]
+> **This source code does not contain the game.** It has no game files, keys or firmware. You need your own copy of Super Smash Bros. Ultimate, dumped from your own Nintendo Switch. WindowSmash builds a Windows program from that copy, on your PC.
 
-WindowSmash translates the game's AArch64 CPU code into C ahead of time, compiles it for Windows x64, and links it with a purpose-built runtime. That runtime supplies the operating-system services, controller input, file access, audio interfaces, graphics translation, and networking the game expects.
+## Contents
 
-The result is a locally built Windows executable backed by your own extracted game data. The original game logic still comes from your game files; this repository provides the recompiler and runtime source.
+- [What is WindowSmash?](#what-is-windowsmash)
+- [What you need](#what-you-need)
+- [Install and play](#install-and-play)
+- [Controls](#controls)
+- [Play with friends](#play-with-friends)
+- [All guides](#all-guides)
+- [Project status](#project-status)
+- [How it works](#how-it-works)
+- [Getting help](#getting-help)
+- [For developers](#for-developers)
+- [Legal](#legal)
 
-> **Source tree and runtime releases are separate.** The Git source tree contains no game executable, recompiled game functions, assets, firmware fonts, keys, or saves. A prebuilt Windows runtime is available under [Releases](https://github.com/SNO2207/WindowSmash/releases); supply your own matching game data and fonts using the [runtime setup guide](docs/RUNTIME-SETUP.md).
+## What is WindowSmash?
 
-## What is inside
+A Nintendo Switch and a Windows PC have different kinds of processors, so a Switch game can't run on a PC as it is. An emulator solves that by translating the game *while you play*. WindowSmash translates it **once, ahead of time**: it turns the game's code into C, compiles that into an ordinary Windows program, and adds a runtime that gives the game what it expects from a Switch: graphics, sound, controllers, files and networking.
 
-| Component | What it does |
+The game itself still comes from your files. This repository holds only the translator (the *recompiler*) and the runtime.
+
+**What you get**
+
+- **Up to eight controllers**: Xbox, PlayStation, Switch Pro and most others, plus the keyboard.
+- **Windowed, borderless or full screen**, always 16:9, with settings for G-Sync and FreeSync monitors.
+- **Online play through Local Wireless**: rooms appear for every player in the online lobby, and nobody has to set up their router.
+- **Your DLC fighters**, and a tool that unlocks the base-game roster on your own save.
+- **Any game version**, including 13.0.5 with Kazuya and Sora, and several versions side by side.
+- **An experimental Linux version**, built from the same source.
+
+## What you need
+
+| | Requirement |
 | :--- | :--- |
-| **Ahead-of-time recompiler** | Discovers guest functions, lifts AArch64 and NEON instructions to C, and incrementally compiles module code with Clang. |
-| **Native Windows runtime** | Maps module images, resolves symbols, dispatches guest calls, and implements selected console services with Windows APIs. |
-| **Direct3D 11 renderer** | Processes guest GPU commands, translates Maxwell shaders to HLSL, and manages textures, render targets, and compute work. |
-| **Asynchronous shader compilation** | Uses dedicated compiler threads, a persistent DXBC cache made ready while the game starts, an optional ahead-of-time pass over the game's shaders, and a separate D3D device to warm driver compilation. |
-| **Controllers and display** | Up to eight players on Xbox, PlayStation, Switch Pro and most other pads through SDL3; windowed, borderless or full-screen play with a 16:9 picture and optional variable-refresh pacing. |
-| **Local Wireless relay** | Carries the game's existing Local Wireless traffic over a UDP relay, with host/join launchers and a standalone relay option. |
-| **Developer tools** | Includes instruction and function differential tests, disassembly helpers, symbol lookup, archive readers, captures, and profiling tools. |
+| **Computer** | A Windows 10 or Windows 11 PC, 64-bit. |
+| **Processor** | One with AVX2: an Intel Core i3, i5, i7 or i9 of the 4th generation (2013) or newer, or any AMD Ryzen. Most Pentium and Celeron processors don't have it. |
+| **Graphics** | Any graphics card or chip that supports DirectX 11, with an up-to-date driver. |
+| **Memory** | 16 GB recommended. |
+| **Free space** | About 60 GB on the drive WindowSmash goes on, plus room for your game files (about 17 GB). |
+| **Your game files** | Super Smash Bros. Ultimate from your own Switch, with your console's keys and firmware. Any version should work; **11.0.0** and **13.0.5** have been tested. The [setup guide](docs/BUILDING.md#part-2-gather-your-game-files) lists exactly which files. |
+| **Two free tools** | Python and Visual Studio Community. The setup guide shows how to install them. |
+| **Time** | About an hour of your own time, plus 30 minutes to a few hours of waiting while your PC builds the game. |
 
-## Status
+## Install and play
 
-The current implementation targets **game version 11.0.0** and **Windows x64**. Later versions, such as **13.0.5** with Kazuya and Sora, can be built from your own update package with `tools/update.py` ([later game versions](docs/UPDATES.md)). `tools/install_version.py` installs and builds a version in a folder of its own with one command, and the launchers ask which built version to start ([several game versions](docs/VERSIONS.md)). An experimental **Linux x64** build is cross-compiled from the same source ([Linux](README-LINUX.md)). The local development build has reached menus, rendered gameplay, loaded fighter modules natively, and exercised the Local Wireless connection path. It is an experimental port, not a broadly validated release.
+**Follow the [setup guide](docs/BUILDING.md).** It goes step by step, and no programming knowledge is needed: you copy each command from the guide and paste it.
 
-| Area | Current position |
-| :--- | :--- |
-| CPU and loading | AArch64-to-C translation, native symbol replacements, and deferred loading of compiled fighter modules are implemented. |
-| Graphics | D3D11 rendering and shader caching are implemented; cached shaders are prepared while the game starts, and `Prepare Shaders.bat` can compile the rest ahead of time. Shader translation, driver behavior, and first-use compilation remain compatibility risks. |
-| Controllers | Up to eight local players per instance on any pad SDL3 supports, plus the keyboard; without `SDL3.dll`, up to four XInput (Xbox) pads. Testing with real pads has been limited so far. |
-| Display | Windowed, borderless, or full screen (F11), with the picture kept 16:9; frame pacing for fixed-refresh or G-Sync / FreeSync monitors. |
-| Audio and movies | Optional static libopus and libvpx integration; functionality depends on the build configuration. |
-| DLC | Installed-content reporting and module extraction support the content present in the supplied game version. The 11.0.0 target contains fighters through Pyra/Mythra. |
-| Multiplayer | Relay-backed Local Wireless is implemented. Complete two-PC matches and the full DLC/stage roster have not been comprehensively verified. |
+The whole journey at a glance:
 
-There is no Nintendo online-service integration, general Switch compatibility claim, verified performance target, or bundled game-data download.
+| Step | What happens | Your time |
+| :---: | :--- | :--- |
+| **1** | **Check your PC** can run the game. | 5 minutes |
+| **2** | **Gather your game files** into three folders. | 10 minutes |
+| **3** | **Install two free tools**, Python and Visual Studio. | 30 minutes, mostly waiting |
+| **4** | **Download WindowSmash** and install its helpers. | 5 minutes |
+| **5** | **Prepare the game.** Paste a few commands that take what's needed from your files. | 15 minutes |
+| **6** | **Build the game.** Paste one command, then wait while your PC translates the game. | 30 minutes to a few hours |
+| **7** | **Play.** Double-click `Play SSBU.bat`. | |
 
-## Download and run
+Steps 5 and 6 can also run in one go: after downloading WindowSmash, double-click **`Build WindowSmash.bat`** ([how](docs/BUILDING.md#shortcut-build-windowsmashbat)).
 
-**[Get the Windows x64 runtime →](https://github.com/SNO2207/WindowSmash/releases)**
+<p align="center"><a href="docs/BUILDING.md"><strong>Start the setup guide →</strong></a></p>
 
-Extract the runtime ZIP, run **Configure Game Data.bat** to select your own compatible RomFS and firmware fonts, then use **Play SSBU.bat**. The runtime ZIP has the compiled files needed to execute the game; it excludes source, debug maps, object files, caches, saves, keys, and game-data archives. A compiler and Python are not required to play.
+<details>
+<summary><strong>Already know your way around? The short version</strong></summary>
 
-See **[runtime setup](docs/RUNTIME-SETUP.md)** for fresh installs and updates. Developers can build the runtime themselves using the next section.
+<br>
 
-## Build your copy
-
-You will need Windows 10/11 x64, an AVX2/FMA/F16C-capable CPU, a D3D11-capable GPU, Python 3.14, and a Visual Studio C++/Clang toolchain. Keep generous free disk space: game data, generated C, object files, and linker maps are separate allocations.
+You need Windows 10/11 x64, Python 3.14 as `python`, and Visual Studio 2022 or newer with **Desktop development with C++** and **C++ Clang tools for Windows**. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`.
 
 ```powershell
 git clone https://github.com/SNO2207/WindowSmash.git
 cd WindowSmash
-py -3.14 -m pip install -r requirements.txt
-```
-
-Prepare your ExeFS, patched RomFS, and firmware fonts as described in the **[complete build guide](docs/BUILDING.md)**. Then extract the embedded fighter modules and build:
-
-```powershell
+python -m pip install -r requirements.txt
+python tools/nca.py exefs "D:\MyDump\program.nca" --keys "D:\MyKeys" --out dump/exefs
+Get-ChildItem D:\MyFirmware\*.nca | ForEach-Object { python tools/nca.py romfs-get $_.FullName --keys D:\MyKeys --match .bfttf --flat --out D:\MyDump\fonts 2>$null }
+& ".\Configure Game Data.bat"    # asks for your patched, unencrypted romfs.bin and D:\MyDump\fonts
 python tools/arc.py nro
 python tools/recomp.py all dump/exefs --out build --jobs 16
+& ".\Play SSBU.bat"
 ```
 
-Choose a job count appropriate to your CPU and available memory. The output is `build/ssbu.exe`; generated files and game inputs remain ignored by Git.
+The setup guide's [reference section](docs/BUILDING.md#reference) covers DLC, SDL3 for controllers, the audio and video codecs, and the folder layout.
 
-### Linux (experimental)
+</details>
 
-The same game can also be built as a native x86-64 Linux program, cross-compiled on Windows from the Windows build's generated C. The renderer stays Direct3D 11, running on Vulkan through DXVK, with shaders compiled by vkd3d-shader; SDL2 handles the window, controllers and sound. `tools/linux/package_linux.py` turns the build into a folder to copy to the Linux machine, with launchers that find your game data there. See **[Linux](README-LINUX.md)** for the toolchain, the build commands, and running it, including in a virtual machine.
+## Controls
 
-## Play and connect
+Plug in a controller and press a button: each pad becomes the next free player, up to eight. The keyboard plays as player 1.
 
-### Multiplayer setup
-
-1. Put the same WindowSmash release/build and game version on both PCs. Configure each PC's own data and keep separate player IDs.
-2. **Online lobby:** run **Play SSBU.bat**. It joins the lobby named in `online_server.txt`, the public lobby unless you change it. Every Local Wireless room created in that lobby appears in the Rooms List of players with the same game version; nobody forwards a port. The players of a room connect directly where their routers allow it, and through the lobby where not.
-3. **Private room:** the host runs **Host SSBU Netplay.bat**, chooses a room name, permits incoming UDP, and shares the displayed address. The friend runs **Join SSBU Netplay.bat**, enters that address and the same room name.
-4. Both open **Local Wireless** in-game. The host creates a room; the friend selects it and the host accepts.
-
-**[Complete multiplayer setup, VPN/port-forwarding options, and troubleshooting →](NETPLAY.md)**
-
-| Launcher | Use |
-| :--- | :--- |
-| [`Play SSBU.bat`](Play%20SSBU.bat) | Start the game and join the online lobby in `online_server.txt`; it plays offline if the lobby does not answer or the file says `off`. |
-| [`Play SSBU Offline.bat`](Play%20SSBU%20Offline.bat) | Start an offline session. |
-| [`Host SSBU Netplay.bat`](Host%20SSBU%20Netplay.bat) | Run the relay and host a Local Wireless room. |
-| [`Join SSBU Netplay.bat`](Join%20SSBU%20Netplay.bat) | Connect to a host or a standalone relay. |
-| [`Unlock All Fighters.bat`](Unlock%20All%20Fighters.bat) | Back up and edit your own compatible save while the game is closed. |
-
-For multiplayer, use matching game versions and build revisions, use the same lobby (and lobby code) or relay room name, and open **Local Wireless** in the game. See the [networking guide](NETPLAY.md) for the online lobby, firewall, UPnP, VPN, and standalone-relay details.
-
-<details>
-<summary><strong>Keyboard and controller controls</strong></summary>
-
-Up to eight pads can play at once: Xbox, PlayStation, Switch Pro, and most other controllers that SDL3 recognizes. Each pad that connects becomes the next free player, and a pad that reconnects gets its player back. Face buttons follow Nintendo's physical positions by default, so on an Xbox controller **B** corresponds to Nintendo **A**; `layout = labels` in `controllers.ini` uses the printed letters instead.
-
-`controllers.ini` is written with its defaults and explanations on the first start. It sets which player the keyboard adds to, button remaps, rumble strength, stick dead zones, and the trigger threshold, for every pad or for one kind of pad. F2 lists the connected pads. Without `SDL3.dll` beside `ssbu.exe`, XInput pads 1-4 are players 1-4.
-
-| Input | Keyboard (player 1 by default) |
+| Switch button | Keyboard |
 | :--- | :--- |
 | Left stick | Arrow keys |
-| A / B / X / Y | Z / X / C / V |
-| L / R | A / S |
-| ZL / ZR | Q / W |
-| Plus / Minus | Enter / Backspace |
-| Right stick | I / J / K / L |
-| Overlay / details / screenshot | F1 / F2 / F3 |
-| Full screen on/off | F11 or Alt+Enter |
+| A / B / X / Y | <kbd>Z</kbd> / <kbd>X</kbd> / <kbd>C</kbd> / <kbd>V</kbd> |
+| L / R | <kbd>A</kbd> / <kbd>S</kbd> |
+| ZL / ZR | <kbd>Q</kbd> / <kbd>W</kbd> |
+| + / − | <kbd>Enter</kbd> / <kbd>Backspace</kbd> |
+| Right stick | <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> |
 
-</details>
-
-<details>
-<summary><strong>Window and display</strong></summary>
-
-`display.ini` is written with its defaults on the first start:
-
-| Setting | Values |
+| Key | What it does |
 | :--- | :--- |
-| `window` | `windowed` (default; kept 16:9 while resized), `borderless` (covers its monitor), or `fullscreen` (borderless and on top; the monitor keeps its resolution). |
-| `width`, `height` | The window's inside size at 100% display scaling (default 1280 x 720). |
-| `pacing` | `clock` (default: a steady 60 frames a second), `vrr` (for G-Sync / FreeSync monitors: each frame is shown as soon as it is ready; best with `borderless`), or `display` (follow a 60, 120, or 240 Hz monitor's own refresh). |
-| `latency` | 1-3 frames the GPU may work ahead (default 3; lower is more responsive). |
-| `hide_cursor` | 1 hides the mouse pointer after two seconds without movement. |
+| <kbd>F1</kbd> | Show or hide the overlay (frame rate, online status). |
+| <kbd>F2</kbd> | Show more details, including the connected pads. |
+| <kbd>F3</kbd> | Take a screenshot (saved in the `screenshots` folder). |
+| <kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> | Switch between a window and full screen. |
 
-The game draws at 1920 x 1080 and scales that picture to the window with black bars where the shapes differ. Screenshots (F3) keep the game's own 1920 x 1080 picture.
+> [!NOTE]
+> Buttons go by **position**, as on a Switch controller. On an Xbox controller, the right-hand button (**B**) is the Switch's **A**. To use the printed letters instead, or to remap anything, see [Playing: controllers](docs/PLAYING.md#controllers). PlayStation, Switch Pro and most other pads need SDL3, which [step 12](docs/BUILDING.md#step-12-optional-support-more-kinds-of-controllers) of the setup guide adds.
 
-</details>
+## Play with friends
 
-## Under the hood
+| Way | For | How |
+| :--- | :--- | :--- |
+| **Online lobby** (the default) | Anyone, anywhere | Double-click `Play SSBU.bat`, open **Local Wireless** in the game, then create a room or pick one from **Rooms List**. |
+| **Lobby code** | Friends only, through the online lobby | Everyone adds the same code to `online_server.txt`. Only players with that code see your rooms. |
+| **Private room** | A group with one host | The host runs `Host SSBU Netplay.bat`; the others run `Join SSBU Netplay.bat` and type the host's address. |
+
+Everyone needs the **same game version**, and each PC uses its own save. The [multiplayer guide](NETPLAY.md) walks through each way and what to do when a room doesn't show up.
+
+## All guides
+
+| Guide | Read it to |
+| :--- | :--- |
+| [Setup guide](docs/BUILDING.md) | install WindowSmash and build the game, step by step. |
+| [Playing](docs/PLAYING.md) | change the controls or the window, and find saves, screenshots and problem reports. |
+| [Multiplayer](NETPLAY.md) | play with other people online or in a private room. |
+| [DLC and unlocks](docs/DLC-AND-UNLOCKS.md) | use your DLC, or unlock every base-game fighter on your save. |
+| [Game updates](docs/UPDATES.md) | apply an update file, such as 13.0.5, as a version of its own. |
+| [Several versions](docs/VERSIONS.md) | keep more than one game version and choose one when you start. |
+| [Linux](README-LINUX.md) | build and run the experimental Linux version. |
+| [Runtime packages](docs/RUNTIME-SETUP.md) | set up a ready-built runtime package with your own game data. |
+| [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
+| [Third-party notices](NOTICE.md) | see attributions and licenses. |
+
+## Project status
+
+WindowSmash is **experimental**. Menus and matches run and Local Wireless connects, but much of it hasn't been tested widely yet.
+
+| Area | Where it stands |
+| :--- | :--- |
+| **Game versions** | Any version should work. **11.0.0** is the most tested. **13.0.5** has been checked through its menus and full roster, its matches less so. Other versions haven't been tried. |
+| **CPU and loading** | The game's code is translated to C ahead of time; fighter modules are compiled too and loaded when the game asks for them. |
+| **Graphics** | Direct3D 11. Shaders compile the first time each is used, so a new effect can hitch once. `Prepare Shaders.bat` can compile them ahead of time. |
+| **Controllers** | Up to eight players on most pads, plus the keyboard. Testing with real pads has been limited so far. |
+| **Display** | Windowed, borderless or full screen, kept 16:9, with pacing for fixed-refresh and variable-refresh monitors. |
+| **Audio and movies** | Music needs libopus and movies need libvpx, both optional when building. |
+| **DLC** | The DLC fighters your version has: 11.0.0 has them up to Pyra/Mythra; Kazuya came with 12.0.0 and Sora with 13.0.0. |
+| **Multiplayer** | The online lobby (with direct connections) and private rooms work. Complete matches between two PCs, and the whole roster online, haven't been fully verified. |
+| **Linux** | Experimental, cross-compiled from the same source and drawn through DXVK on Vulkan. |
+
+There is no connection to Nintendo's online service, no claim of general Switch compatibility, and no verified performance target.
+
+## How it works
 
 ```mermaid
 flowchart LR
-    A[Your extracted game modules] --> B[AArch64 / NEON to C]
+    A[Your game's code] --> B[Recompiler: ARM64 and NEON to C]
     B --> C[Clang: Windows x64]
-    C --> D[Local executable]
+    C --> D[ssbu.exe on your PC]
     E[WindowSmash runtime] --> D
-    F[Your RomFS and fonts] --> D
-    D --> G[Direct3D 11 / SDL3 / Windows services]
+    F[Your game data and fonts] --> D
+    D --> G[Direct3D 11, SDL3 and Windows]
 ```
 
-The **[technical guide](docs/TECHNICAL.md)** explains the CPU state model, function discovery, relocation and symbol binding, service shims, GPU command path, shader compilation fix, relay protocol, save handling, and the role of every tool in `tools/`.
+The recompiler finds every function in the game's ARM64 code and writes it out as C. Clang compiles that C for Windows, and it is linked with the runtime, which stands in for the parts of the Switch the game talks to. The game's graphics commands go to Direct3D 11, its shaders are translated to HLSL, and its Local Wireless traffic travels over the internet through a relay.
 
-## Working on WindowSmash
+The **[technical guide](docs/TECHNICAL.md)** explains each part: the CPU model, function discovery, symbol binding, the services, the graphics path, shader compilation, the network protocol, save handling, and every tool in `tools/`.
+
+## Getting help
+
+When something goes wrong, first look at [If something goes wrong](docs/BUILDING.md#if-something-goes-wrong) in the setup guide. To report a problem, open an issue and include:
+
+- the game version, your Windows version, and your graphics card and driver version;
+- which WindowSmash you have (the date you downloaded it, or the output of `git rev-parse --short HEAD`);
+- what you did, what you expected, and what happened instead;
+- after a crash or a freeze, the `.txt` report from the `reports\` folder, and the end of `build\play.log`.
+
+> [!WARNING]
+> Logs and reports can contain your folder names, player names and internet addresses. Read them before posting. A crash report's `.dmp` file contains part of the game's memory: share it only privately, with someone who asked for it. Never post game files, keys, saves or generated game code in issues or pull requests.
+
+## For developers
+
+Run the source-only tests. They use made-up data, need no game files, and don't start the game:
 
 ```powershell
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-The source-only tests exercise packaging and save-editing behavior with synthetic fixtures. They require no game data and do not launch the game. Windows PowerShell is used for the unlock-tool tests. Game-backed instruction and function differential tests are documented separately in the [technical guide](docs/TECHNICAL.md#verification-and-debugging).
+The game-backed instruction and function tests are in the [technical guide](docs/TECHNICAL.md#verification-and-debugging).
 
-When reporting a problem, include the game version, GPU/driver, build revision, reproduction steps, and a short relevant log excerpt. After a crash or a freeze (no new picture for five seconds), the `reports/` folder has a text report naming what each thread was doing; attach it. Review logs and reports for local paths, player names, and network addresses before posting. The minidump beside a report contains parts of the game's memory: share it only privately, with someone who asked for it. Keep extracted content, generated game code, keys, and saves out of issues and pull requests.
+| Folder | Contents |
+| :--- | :--- |
+| `runtime/` | The native runtime: services, graphics, input, audio, networking. |
+| `tools/` | The recompiler, game-file readers, launch helpers and diagnostic tools. |
+| `tests/` | Source-only tests. |
+| `third_party/` | License texts of third-party code. |
+| `docs/` | These guides. |
 
-## Repository boundaries
+Everything generated or personal stays out of Git: `build/`, `dump/`, `deps/`, `save/`, version folders such as `v13.0.5/`, caches, captures, reports and local bundles.
 
-`runtime/` and `tools/` are source. `build/`, `dump/`, `data/`, `save/`, caches, captures, and local bundles are generated or private inputs and are ignored. The local full-install bundler is for managing your own build; public runtime releases use the smaller file set described in [runtime setup](docs/RUNTIME-SETUP.md).
+## Legal
 
-See [third-party notices](NOTICE.md) for attribution and licensing information. No project-wide license has been specified for the remaining source. Super Smash Bros. Ultimate and related names belong to their respective owners. WindowSmash is an independent project and is not affiliated with Nintendo.
+No project-wide license has been chosen for the WindowSmash source yet; see the [third-party notices](NOTICE.md) for the parts that have their own. Super Smash Bros. Ultimate and related names belong to their respective owners. WindowSmash is an independent project and is not affiliated with or endorsed by Nintendo.

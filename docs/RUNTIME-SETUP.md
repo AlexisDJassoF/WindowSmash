@@ -1,31 +1,45 @@
-# Run a Windows binary release
+# Runtime packages
 
-[README](../README.md) · [Releases](https://github.com/SNO2207/WindowSmash/releases) · [Multiplayer setup](../NETPLAY.md)
+[← README](../README.md) · [Setup guide](BUILDING.md) · [Playing](PLAYING.md) · [Multiplayer](../NETPLAY.md)
 
-The Windows x64 runtime ZIP contains the prebuilt executable, required relocated module images, launchers, setup helper, unlock helper, and dependency notices. **A compiler and Python are not required to play.**
+A **runtime package** is a ZIP with a ready-built `ssbu.exe`, the module images it needs, the launchers, and the setup and unlock helpers. With one, you don't need Python or Visual Studio to play.
 
-It does not include game-data archives, firmware fonts, console keys, a preconfigured installed-DLC list, a personal save, debug maps, object files, or shader caches. Supply compatible game data and fonts separately.
+A package contains no game data, firmware fonts, keys, DLC list, save, debug maps, object files or shader caches. You still supply your own game data and fonts.
 
-## Requirements
+## Contents
 
-- Windows 10/11 x64 and a CPU with AVX2, FMA, and F16C.
-- A Direct3D 11-capable GPU and working Windows driver.
-- Your own **11.0.0 patched, unencrypted RomFS** and six shared-font `.bfttf` files.
-- A writable local folder. Keep the game-data file available at its configured location.
+- [What you need](#what-you-need)
+- [First-time setup](#first-time-setup)
+- [Updating a package](#updating-a-package)
+- [After setup](#after-setup)
+
+## What you need
+
+- A Windows 10 or 11 PC, 64-bit, with a processor that has AVX2, FMA and F16C ([which ones](BUILDING.md#step-1-check-your-pc)).
+- A graphics card or chip with DirectX 11 and a working driver.
+- Your own copy of the game's data at **the game version the package was built for** (the release says which): patched with that update and unencrypted, usually as `romfs.bin`. [Part 2 of the setup guide](BUILDING.md#part-2-gather-your-game-files) explains what that means.
+- The six firmware font files (`.bfttf`). If you only have your firmware's `.nca` files, [step 9 of the setup guide](BUILDING.md#step-9-take-the-fonts-out-of-your-firmware) takes the fonts out; it needs Python and the WindowSmash source.
+- A folder you can write to, such as `C:\WindowSmash` (not `Program Files`).
 
 ## First-time setup
 
-1. Download **`WindowSmash-Windows-x64-runtime.zip`** from the release, rather than GitHub's automatically generated source archives.
-2. Extract the entire ZIP to a writable folder.
-3. Double-click **Configure Game Data.bat**.
-4. Enter the path to your patched `romfs.bin`. For a raw RomFS, keep offset **0**. If using an already unencrypted RomFS embedded in another file, enter its known byte offset.
-5. Enter the folder containing your six firmware fonts. The helper validates their presence and copies them into `dump/fonts/`.
-6. Optionally provide your existing compatible `aoc.cfg` for installed DLC, or leave that prompt blank.
-7. Double-click **Play SSBU.bat**.
+1. On the release page, download **`WindowSmash-Windows-x64-runtime.zip`**, not the *Source code* archives GitHub adds to every release.
+2. Right-click the ZIP, choose **Properties**, tick **Unblock** at the bottom if it's there, and click **OK**.
+3. Right-click the ZIP, choose **Extract All…**, pick a folder such as `C:\WindowSmash`, and click **Extract**.
+4. Open that folder and double-click **`Configure Game Data.bat`**. If **Windows protected your PC** appears, click **More info**, then **Run anyway**. Then answer its questions:
 
-The helper validates the RomFS header, writes `dump/modules/romfs.cfg`, and preserves an existing config with a timestamped backup. It does not extract, decrypt, or apply a game update. Use the [source build preparation guide](BUILDING.md) to prepare inputs if you do not already have them.
+   | It asks for | Type |
+   | :--- | :--- |
+   | The path to your romfs.bin | The full path, for example `D:\MyDump\romfs.bin`. |
+   | The byte offset | Press <kbd>Enter</kbd> for a plain `romfs.bin`. For a RomFS inside another unencrypted file, type the byte where it starts. |
+   | The folder with your fonts | The folder holding the six `.bfttf` files, for example `D:\MyDump\fonts`. |
+   | An aoc.cfg (optional) | Press <kbd>Enter</kbd> to skip. To use a DLC list you already have, type its path **without quote marks**. |
 
-Required fonts:
+5. When it says **Game-data setup complete**, press any key, then double-click **`Play SSBU.bat`**.
+
+The helper checks the RomFS header, the offset and the six fonts, copies the fonts into `dump\fonts\`, and writes `dump\modules\romfs.cfg`. An existing configuration is kept as a dated backup. It doesn't extract, decrypt or update anything, and the game reads the RomFS file in place, so keep it where it is.
+
+These are the six fonts it looks for:
 
 ```text
 nintendo_udsg-r_std_003.bfttf
@@ -36,61 +50,19 @@ nintendo_udsg-r_ko_003.bfttf
 nintendo_ext_003.bfttf
 ```
 
-## Updating an existing portable install
+## Updating a package
 
-Close the game. Extract the runtime ZIP's contents into the existing folder containing **Play SSBU.bat**, merging folders and replacing files. The package does not contain `romfs.cfg`, fonts, saves, or a network identity, so existing local setup is retained. Run the configuration helper only if the data path or required inputs need changing.
+1. Close the game.
+2. Extract the new package's contents into the folder that has `Play SSBU.bat`, and choose **Replace the files in the destination**.
 
-Every player in a multiplayer session should use the same runtime release and game version. Follow the complete **[multiplayer setup guide](../NETPLAY.md)**.
+The package contains no `romfs.cfg`, fonts, save or multiplayer identity, so your setup stays as it was. Run `Configure Game Data.bat` again only if your game data moved.
 
-## Optional fighter unlocks
+## After setup
 
-After the first successful launch, close the game and use **Unlock All Fighters.bat**. It validates and backs up this PC's save. Details and version limitations are in the [DLC/unlock guide](DLC-AND-UNLOCKS.md).
+- **Controls, controllers and the window:** the [playing guide](PLAYING.md). Pads other than Xbox controllers need `SDL3.dll` next to `build\ssbu.exe`; a package that includes it also includes its license, `SDL3-LICENSE.txt`.
+- **Multiplayer:** every player needs the same package release and the same game version. See the [multiplayer guide](../NETPLAY.md).
+- **Unlocking fighters:** after the first start, close the game and double-click `Unlock All Fighters.bat` ([DLC and unlocks](DLC-AND-UNLOCKS.md#unlock-every-base-game-fighter)).
+- **Shaders:** shaders are prepared as you play, so a new effect can stutter once. `Prepare Shaders.bat` needs Python and Visual Studio, as for [building](BUILDING.md#step-16-optional-prepare-the-shaders).
+- **Problems:** the log is `build\play.log`, and crashes or freezes write a report into `reports\` ([problem reports](PLAYING.md#problem-reports)).
 
-## Controllers
-
-Up to eight players can use Xbox, PlayStation, Switch Pro, and most other pads at once. Each pad that connects becomes the next free player; one unplugged and plugged back in gets its player back. The keyboard adds to player 1, with the keys listed in the [README](../README.md#play-and-connect). F2 lists the connected pads.
-
-Pads other than Xbox controllers need `SDL3.dll` beside `build\ssbu.exe` (a build made with SDL3 puts it there; a package that includes it also has its license, `SDL3-LICENSE.txt`). Without it, XInput pads 1-4 are players 1-4.
-
-The first start writes **`controllers.ini`** into the folder with **Play SSBU.bat**, with the defaults and an explanation of every setting:
-
-| Section / setting | What it does |
-| :--- | :--- |
-| `[general]` `keyboard_player` | The player the keyboard adds to (1-8), or 0 for none. |
-| `[general]` `background` | 1: pads keep working while the game's window is not focused. |
-| `[players]` | Reserve a player for one pad, by its name, type, or GUID (the log names every pad as it connects). |
-| `layout` | `positional` (default): buttons by position, as on a Switch pad, so the bottom face button is B. `labels`: by the printed letters. |
-| `deadzone`, `rumble`, `trigger_threshold` | Stick dead zone and rumble strength in percent; how far a trigger is pulled to press ZL/ZR. |
-| Remaps | `<console button> = <pad control>`, for example `ZR = rightshoulder`. |
-
-`[device default]` applies to every pad; `[device ps5]`, `[device <name>]`, or `[device <GUID>]` applies to one kind of pad or one pad. Delete the file to get the defaults back.
-
-## Window and display
-
-The first start also writes **`display.ini`**. F11 or Alt+Enter switches between the window and full screen at any time.
-
-| Setting | Values |
-| :--- | :--- |
-| `window` | `windowed` (default), `borderless` (covers its monitor), or `fullscreen` (borderless and on top; the monitor keeps its resolution). |
-| `width`, `height` | The window's inside size at 100% display scaling (default 1280 x 720). |
-| `pacing` | `clock` (default: a steady 60 frames a second), `vrr` (for G-Sync / FreeSync monitors; best with `borderless`), or `display` (follow a 60, 120, or 240 Hz monitor's refresh). |
-| `latency` | How many frames the GPU may work ahead, 1-3 (default 3; lower is more responsive). |
-| `hide_cursor` | 1: hide the mouse pointer after two seconds without movement. |
-
-The picture stays 16:9, with black bars when the window's shape differs. Both files apply to every game version started from the same folder.
-
-## Shaders
-
-The game's shaders are compiled the first time each is used, so a new effect can appear a moment late or hitch the first time it is seen. Everything compiled is kept in `dump/shadercache/` and made ready in the background each time the game starts, so it is seen only once.
-
-Builds from source can also compile the game's shaders ahead of time with **Prepare Shaders.bat** (Python and the build toolchain required; see the [build guide](BUILDING.md#10-optional-compile-the-shaders-ahead-of-time)). It runs once per game version and can be stopped and resumed.
-
-## Problem reports
-
-A crash, or a freeze in which no new picture appears for five seconds, writes a report into the **`reports\`** folder: `crash_<time>.txt` or `freeze_<time>.txt`, with a minidump (`.dmp`) beside it. A stop with an error message writes `stopped_<time>.txt`. When reporting a problem, attach the `.txt` report and the relevant part of `build\play.log`, after checking them for local paths, player names, and network addresses. The minidump contains parts of the game's memory: share it only privately, with someone who asked for it.
-
-## Logs and first-run behavior
-
-The log is `build/play.log`. Shader caches are generated locally; first-use compilation can cause hitches or temporarily incomplete visuals. F1 toggles the overlay, F2 shows details, and F11 switches to full screen. If startup fails, check the configured data path, matching game version, font files, CPU requirements, and GPU driver before reporting a problem.
-
-This is an experimental runtime release. Archive verification and local startup checks do not establish that every fighter, stage, mode, or two-PC match works.
+This is an experimental runtime. Checking the archive and starting the game doesn't establish that every fighter, stage, mode or online match works.

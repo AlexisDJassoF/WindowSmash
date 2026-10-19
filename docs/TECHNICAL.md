@@ -1,10 +1,24 @@
 # How WindowSmash works
 
-[README](../README.md) · [Build guide](BUILDING.md) · [Multiplayer](../NETPLAY.md) · [DLC and saves](DLC-AND-UNLOCKS.md)
+[← README](../README.md) · [Setup guide](BUILDING.md) · [Multiplayer](../NETPLAY.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md) · [Several versions](VERSIONS.md)
 
 WindowSmash is a static recompiler plus a Windows compatibility runtime, specialized for this game. CPU code is translated before launch. GPU programs are translated when encountered. Selected operating-system and SDK entry points are implemented natively, while the remaining game and SDK code executes as compiled guest functions.
 
 This document describes the checked-in implementation. Implemented paths and developer test tools should not be read as a compatibility guarantee for every mode, fighter, stage, or machine.
+
+## Contents
+
+| Section | Covers |
+| :--- | :--- |
+| [1. From extracted modules to a Windows executable](#1-from-extracted-modules-to-a-windows-executable) | Inputs, function discovery, translation, module placement. |
+| [2. Loading, symbols, and guest execution](#2-loading-symbols-and-guest-execution) | Mapping, binding, native replacements, exceptions. |
+| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts. |
+| [4. The graphics path](#4-the-graphics-path) | GPU commands, the D3D11 back end, shader compilation, audio and video. |
+| [5. Multiplayer transport](#5-multiplayer-transport) | The relay, the lobby and direct connections. |
+| [6. DLC and fighter unlocks](#6-dlc-and-fighter-unlocks) | Installed-content reporting and save editing. |
+| [7. Tool reference](#7-tool-reference) | Every tool in `tools/`. |
+| [Verification and debugging](#verification-and-debugging) | Tests, the overlay, reports and diagnostic switches. |
+| [Build boundaries](#build-boundaries) | What is source, and what stays local. |
 
 ## 1. From extracted modules to a Windows executable
 
@@ -146,7 +160,7 @@ Lobby codes and room names are routing identifiers, not passwords. The protocol 
 
 The target game's content archive already contains assets and code for the DLC available in that version. `aoc.cfg` reports locally installed add-on indices to `nn::aoc`; it does not add newer game data. DLC fighter NROs must also be extracted and compiled.
 
-The unlock tools edit the known save layout of 11.0.0, which 13.0.5 shares; they identify a version folder by its program's build ID, validate the fighter tables, and create a backup. Base-game selection flags and associated milestones are separate from installed DLC reporting. Mii Fighters may still need to be created in-game. See the [DLC/save guide](DLC-AND-UNLOCKS.md) for usage and limitations.
+The unlock tools edit the known save layout of 11.0.0, which 13.0.5 shares; they identify a version folder by its program's build ID, validate the fighter tables, and create a backup. Base-game selection flags and associated milestones are separate from installed DLC reporting. Mii Fighters may still need to be created in-game. See the [DLC and unlocks guide](DLC-AND-UNLOCKS.md) for usage and limitations.
 
 ## 7. Tool reference
 
@@ -233,7 +247,7 @@ The overlay exposes frame/rendering counters. F1 toggles the overlay, F2 shows d
 
 A host exception writes `reports/crash_<time>.txt` with a minidump, and a runtime stop writes `reports/stopped_<time>.txt`. The minidump is written by a second process (the same executable started with `--write-dump`), because a process that dumps itself can deadlock on a lock held by one of its suspended threads. A watchdog ([`debug_watchdog.c`](../runtime/debug_watchdog.c)) writes `reports/freeze_<time>.txt` and a minidump when no frame has been presented for 5 s (again at 30 s and 120 s): the owners of the renderer's, present queue's, kernel's, and GPU channel's locks, the shader compiles in flight, the guest threads' states, and every thread's stack, with guest functions named by module offset. `SSBU_WATCHDOG=0` turns the watchdog off; `SSBU_MINIDUMP=0` writes no minidumps and `SSBU_MINIDUMP=full` writes all memory. `SSBU_HITCH=<ms>` logs every frame longer than that with what the main, vsync, and renderer threads spent it on. Locally generated linker maps are useful to `hostsym.py` and profiling tools, but are not required to run a release build.
 
-Useful environment variables include `SSBU_DATA_ROOT`, `SSBU_SHADER_CACHE`, `SSBU_SHADER_PREWARM`, `SSBU_COMPILE_THREADS`, `SSBU_DUMP_SHADERS`, `SSBU_DUMP_HLSL`, `SSBU_INPUT`, `SSBU_CAPTURE`, `SSBU_CONTROLLERS` (another `controllers.ini`), `SSBU_PAD_BACKEND=xinput`, `SSBU_DISPLAY` (another `display.ini`), `SSBU_WINDOW`, `SSBU_WINDOW_SIZE`, `SSBU_PACING`, `SSBU_WATCHDOG`, `SSBU_MINIDUMP`, `SSBU_HITCH`, and the [network variables](../NETPLAY.md#environment-reference). Several other `SSBU_*` switches are implementation-level debugging controls; consult their use sites before enabling them.
+Useful environment variables include `SSBU_DATA_ROOT`, `SSBU_SHADER_CACHE`, `SSBU_SHADER_PREWARM`, `SSBU_COMPILE_THREADS`, `SSBU_DUMP_SHADERS`, `SSBU_DUMP_HLSL`, `SSBU_INPUT`, `SSBU_CAPTURE`, `SSBU_CONTROLLERS` (another `controllers.ini`), `SSBU_PAD_BACKEND=xinput`, `SSBU_DISPLAY` (another `display.ini`), `SSBU_WINDOW`, `SSBU_WINDOW_SIZE`, `SSBU_PACING`, `SSBU_WATCHDOG`, `SSBU_MINIDUMP`, `SSBU_HITCH`, and the [network variables](../NETPLAY.md#reference-environment-variables). Several other `SSBU_*` switches are implementation-level debugging controls; consult their use sites before enabling them.
 
 ## Build boundaries
 

@@ -1,5 +1,6 @@
-# Build WindowSmash
+# Set up WindowSmash
 
-The maintained setup instructions are in the **[build guide](docs/BUILDING.md)**.
+This page has moved. The step-by-step instructions are in the **[setup guide](docs/BUILDING.md)**.
 
-For implementation details and the tool reference, see **[How WindowSmash works](docs/TECHNICAL.md)**.
+- Controls, settings and your files: **[Playing](docs/PLAYING.md)**
+- How everything works, and every tool: **[How WindowSmash works](docs/TECHNICAL.md)**
