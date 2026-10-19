@@ -94,17 +94,22 @@ class InstallerDecisionTests(unittest.TestCase):
 
     def test_visual_studio_modify_command_line(self):
         # setup.exe gets one quoted command line (a list reached it unquoted: the path broke at its
-        # spaces, exit code 87) and no --wait, which only the bootstrapper takes
+        # spaces, exit code 87), no --wait, which only the bootstrapper takes, and administrator
+        # rights from the start (without them it refuses --passive: exit code 5007)
         path = 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community'
         with tempfile.TemporaryDirectory(prefix='installer-test-') as tmp:
             Path(tmp, 'setup.exe').write_bytes(b'')
             script = (f"$VsInstallerDir = '{tmp}'; $global:n = 0; "
                       "function Test-Compiler { $global:n++; @{ Ok = ($global:n -gt 1); Output = 'clang-cl: ok' } }; "
                       f"function Get-VsInstances {{ @{{ Path = '{path}'; Product = 'Microsoft.VisualStudio.Product.Community' }} }}; "
-                      "function Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru) "
-                      "  $global:seen = $ArgumentList; [pscustomobject]@{ ExitCode = $global:code } }; ")
-            out = ps_text(script + "$global:code = 0; Step-Compiler; 'IS STRING: ' + ($global:seen -is [string]); 'LINE: ' + $global:seen")
+                      "function Start-Process { param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru) "
+                      "  $global:seen = $ArgumentList; $global:verb = $Verb; "
+                      "  if ($global:code -eq 'declined') { throw 'The operation was canceled by the user.' } "
+                      "  [pscustomobject]@{ ExitCode = $global:code } }; ")
+            out = ps_text(script + "$global:code = 0; Step-Compiler; 'IS STRING: ' + ($global:seen -is [string]); "
+                          "'VERB: ' + $global:verb; 'LINE: ' + $global:seen")
             self.assertIn('IS STRING: True', out)
+            self.assertIn('VERB: RunAs', out)
             line = out.split('LINE: ', 1)[1].strip()
             r = subprocess.run(f'"{sys.executable}" -c "import sys, json; print(json.dumps(sys.argv[1:]))" {line}',
                                capture_output=True, text=True)
@@ -115,14 +120,18 @@ class InstallerDecisionTests(unittest.TestCase):
             out = ps_text(script + "$global:code = 8006; try { Step-Compiler } catch { 'STOPPED: ' + $_.Exception.Message }")
             self.assertIn('STOPPED: The Visual Studio Installer could not add the C++ tools: Visual Studio is running', out)
             self.assertIn('(code 8006)', out)
+            out = ps_text(script + "$global:code = 'declined'; try { Step-Compiler } catch { 'STOPPED: ' + $_.Exception.Message }")
+            self.assertIn('STOPPED: The Visual Studio Installer needs administrator rights', out)
+            self.assertIn('click Yes when Windows asks', out)
 
     def test_visual_studio_exit_codes(self):
         got = ps("@{ ok = (Get-VsExitMessage 0); reboot = (Get-VsExitMessage 3010); running = (Get-VsExitMessage 8006); "
-                 "bad = (Get-VsExitMessage 87); other = (Get-VsExitMessage 1603) }")
+                 "bad = (Get-VsExitMessage 87); blocked = (Get-VsExitMessage 5007); other = (Get-VsExitMessage 1603) }")
         self.assertIsNone(got['ok'])
         self.assertIsNone(got['reboot'])
         self.assertIn('close it', got['running'])
         self.assertIn('options', got['bad'])
+        self.assertIn('administrator rights', got['blocked'])
         self.assertEqual(got['other'], 'it stopped')
 
     def test_folder_candidates_and_resolution(self):
