@@ -48,6 +48,10 @@ WindowSmash/
 
 `dump/`, `deps/`, `build/`, saves, keys, and generated packages are ignored by Git.
 
+## The quick way: Build WindowSmash.bat
+
+With Python 3.14 and Visual Studio's Clang tools installed, double-click **`Build WindowSmash.bat`** in the WindowSmash folder. It asks for the folders with your game files, keys and firmware (for example `D:\MyDump`, `D:\MyKeys` and `D:\MyFirmware`) and then does steps 1–4, 7 and 8 below for you: it finds the Program NCA, extracts the ExeFS and the fonts, writes `romfs.cfg` (from a `romfs.bin` in the game-files folder, or else from a decrypted Program NCA), lists your DLC if the game-files folder has a `dlc` folder, extracts the fighter modules, and builds with a `--jobs` number that fits your RAM. It stops with a message at the first problem; run it again once that is fixed, and it skips what is already done. Set up the optional codecs and SDL3 (steps 5 and 6) first if you want them.
+
 ## 1. Prepare matching ExeFS
 
 Extract the program modules from the Program NCA for the installed game version:
