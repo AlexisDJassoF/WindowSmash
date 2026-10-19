@@ -20,9 +20,11 @@ depends on a draw's constant buffers), as are compute programs (on their launch'
 import argparse
 import hashlib
 import os
+import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 try:
     from compression.zstd import decompress as zstd_decompress   # Python 3.14
@@ -149,11 +151,14 @@ def main():
                               stdout=subprocess.PIPE if a.dry else subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                               creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
              for i in range(jobs)]
-    outs = [p.communicate() for p in procs]
-    for _, err in outs:
-        for line in err.splitlines():
-            if line.startswith("part "):
-                print(line)
+    if a.dry:
+        outs = [p.communicate() for p in procs]
+        print("\n".join(line for _out, err in outs for line in err.splitlines() if line.startswith("part ")))
+    else:
+        print(f"compiling with {jobs} processes at low priority (the PC stays usable; close this window to stop: "
+              "what is done stays done)", flush=True)
+        parts = follow(procs, Progress(sys.stdout))
+        print(summary(parts) or "\n".join(parts))
     if a.dry:
         keys = {tuple(l.split()) for l in outs[0][0].splitlines()}
         have = set()
@@ -165,8 +170,121 @@ def main():
     print(f"done in {time.time() - t0:.0f} s")
 
 
+# ---- progress: shaderaot's "progress <done> <of>" lines, from every part, as one bar ------------
+def parse_progress(line):
+    """(done, of) from a "progress <done> <of>" line, else None."""
+    p = line.split()
+    if len(p) == 3 and p[0] == "progress" and p[1].isdigit() and p[2].isdigit():
+        return int(p[1]), int(p[2])
+    return None
+
+
+def time_left(seconds):
+    """A time left, as a person says it."""
+    minutes = round(seconds / 60)
+    if minutes < 1:
+        return "under a minute left"
+    if minutes < 60:
+        return f"about {minutes} min left"
+    return f"about {minutes // 60} h {minutes % 60:02d} min left"
+
+
+def progress_text(done, of, rate=None, width=30):
+    """The bar, the share done, and the time left at `rate` shaders a second (once there is one)."""
+    frac = min(1.0, done / of) if of else 1.0
+    filled = int(frac * width)
+    text = f"[{'#' * filled}{'-' * (width - filled)}] {frac:4.0%}  {done:,} of {of:,} shaders"
+    if rate and 0 < done < of:
+        text += ", " + time_left((of - done) / rate)
+    return text
+
+
+class Progress:
+    """Shows the parts' combined progress: one line drawn over itself in a console, else a line
+    every 5 % (for a log)."""
+
+    WINDOW = 120   # seconds of recent pace the time left goes by (the pace picks up after the start)
+
+    def __init__(self, out, console=None):
+        self.out = out
+        self.console = out.isatty() if console is None else console
+        self.samples = []   # (time, shaders done), once every part has said how much it has
+        self.ready_said = False
+        self.shown = -1     # (the last 5 % step a log line was written for)
+        self.last = None
+        self.width = 0
+
+    def rate(self, now, done):
+        """Shaders a second over the last WINDOW seconds, once there are 10 seconds of them."""
+        self.samples.append((now, done))
+        while len(self.samples) > 2 and self.samples[1][0] <= now - self.WINDOW:
+            self.samples.pop(0)
+        t0, d0 = self.samples[0]
+        return (done - d0) / (now - t0) if now - t0 >= 10 and done > d0 else None
+
+    def __call__(self, state, now=None, final=False):
+        now = time.time() if now is None else now
+        if any(of is None for _done, of in state):
+            if not self.ready_said:
+                self.out.write("getting ready: translating the vertex programs...\n")
+                self.out.flush()
+                self.ready_said = True
+            return
+        done, of = sum(d for d, _o in state), sum(o for _d, o in state)
+        text = progress_text(done, of, self.rate(now, done))
+        if self.console:
+            self.out.write("\r" + text.ljust(self.width) + ("\n" if final else ""))
+            self.width = len(text)
+            self.out.flush()
+        else:
+            step = int(100 * done / of) // 5 if of else 20
+            if step > self.shown or (final and text != self.last):
+                self.out.write(text + "\n")
+                self.out.flush()
+                self.shown, self.last = step, text
+
+
+def follow(procs, show, every=1.0):
+    """Waits for the parts, showing their progress as it comes; returns their last lines ("part ...")."""
+    state = [(0, None)] * len(procs)
+    lasts = []
+
+    def read(i, p):
+        for line in p.stderr:
+            got = parse_progress(line)
+            if got:
+                state[i] = got
+            elif line.startswith("part "):
+                lasts.append(line.rstrip())
+    readers = [threading.Thread(target=read, args=(i, p), daemon=True) for i, p in enumerate(procs)]
+    for r in readers:
+        r.start()
+    while any(r.is_alive() for r in readers):
+        show(state)
+        time.sleep(every)
+    for p in procs:
+        p.wait()
+    show([(d, o if o is not None else d) for d, o in state], final=True)
+    return lasts
+
+
+def summary(lines):
+    """The parts' last lines added up into one, or None if they don't read as expected."""
+    fields = ("keys", "compiled", "already cached", "with jump tables", "fxc failures", "not translated")
+    total = dict.fromkeys(fields, 0)
+    for line in lines:
+        m = re.search(r": (\d+) keys; (\d+) compiled, (\d+) already cached, (\d+) with jump tables \(left out\), "
+                      r"(\d+) fxc failures, (\d+) not translated", line)
+        if not m:
+            return None
+        for k, v in zip(fields, m.groups()):
+            total[k] += int(v)
+    return (f"{total['keys']:,} shaders: {total['compiled']:,} compiled, {total['already cached']:,} already there, "
+            f"{total['with jump tables']:,} left out (jump tables), {total['fxc failures']:,} that fxc could not compile, "
+            f"{total['not translated']:,} not translated")
+
+
 def cache_version():
-    import re
     text = open(os.path.join(ROOT, "runtime", "gpu_shader_cache.h"), encoding="utf-8").read()
     return int(re.search(r"#define SHADER_CACHE_VERSION (\d+)", text).group(1))
 
