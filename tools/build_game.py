@@ -377,7 +377,8 @@ def write_romfs_cfg(game, keys, the_program):
         run([sys.executable, os.path.join("tools", "nca.py"), "romfs-cfg", *base_ref, "--keys", keys, "--out", base_cfg],
             f"The game data inside {gamefiles.where(base)} can't be read (see above).")
         log("  applying the update over the game's data (a few minutes; every block of the result is checked)")
-        run([sys.executable, os.path.join("tools", "update.py"), "apply", path, "--base", base_cfg, "--keys", keys,
+        inner = ["--inner", program["name"]] if program["container"] else []   # (the package may hold the game too)
+        run([sys.executable, os.path.join("tools", "update.py"), "apply", path, *inner, "--base", base_cfg, "--keys", keys,
              "--tree", ROOT],
             "The update could not be applied over the game's data (see above).")
     else:

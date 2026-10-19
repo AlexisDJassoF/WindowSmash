@@ -5,8 +5,9 @@ Usage:
   update.py apply  <update> --base <base romfs.cfg> --keys <dir> --tree <dir>
   update.py verify <update> --keys <dir> --tree <dir>
 
-<update> is the update's Patch NSP, or its Program NCA on its own (a .nca file, or the 00 file
-of one an emulator installed).
+<update> is the update's Patch NSP, an NSP holding the game and its update together (the update's
+Program NCA is the one whose RomFS is a patch; --inner <name> names it), or its Program NCA on its
+own (a .nca file, or the 00 file of one an emulator installed).
 
 `apply` fills <tree>/dump, a game version's folder laid out like the port's own (dump/, then
 build/, save/, cache/ next to it: tools/recomp.py --tree, the runtime's data dir argument):
@@ -82,13 +83,30 @@ def bucket_tree(table, entry_size, fmt):
     return out, end
 
 
+def pick_patch_program(ncas, inner=None, where="the update"):
+    """The update's Program NCA among a package's [(name, Nca)]: the one named `inner` if given;
+    else the only Program NCA; of several (a package holding the game and its update together),
+    the one whose RomFS is a patch (BKTR) - the base game's is a whole RomFS."""
+    if inner:
+        named = [n for name, n in ncas if name.lower() == inner.lower()]
+        if not named:
+            raise SystemExit(f"{where} holds no {inner}")
+        return named[0]
+    progs = [n for _name, n in ncas if n.content_type == 0]
+    if len(progs) > 1:
+        patches = [n for n in progs if n.section(0) is not None and n.section(0).enc_type == 4]
+        progs = patches or progs
+    if len(progs) != 1:
+        raise SystemExit(f"{where}: expected one update Program NCA, found {len(progs)}")
+    return progs[0]
+
+
 class Patch:
-    def __init__(self, nsp, keydir):
-        ncas = [n for _, n in nsp_ncas(nsp, keydir)]   # (a package, or the program .nca itself)
-        progs = [n for n in ncas if n.content_type == 0]
-        if len(progs) != 1:
-            raise SystemExit(f"{nsp}: expected one Program NCA, found {len(progs)}")
-        self.nca = progs[0]
+    def __init__(self, nsp, keydir, inner=None):
+        """The update in `nsp`: an update package, a package of the game with its update, or the
+        update's Program NCA itself; `inner` names the Program NCA inside the package."""
+        ncas = nsp_ncas(nsp, keydir)   # (a package, or the program .nca itself)
+        self.nca = pick_patch_program(ncas, inner, nsp)
         self.exefs = self.nca.section(1)
         sec = self.sec = self.nca.section(0)
         if sec is None or sec.enc_type != 4:
@@ -591,8 +609,8 @@ def write_patch_data(patch, path, end):
     os.replace(path + ".partial", path)
 
 
-def open_patch(nsp, keydir):
-    patch = Patch(nsp, keydir)
+def open_patch(nsp, keydir, inner=None):
+    patch = Patch(nsp, keydir, inner)
     log(f"update: patch data {patch.data_end / 2**30:.2f} GiB, {len(patch.ind):,} patch pieces, "
         f"new RomFS {patch.l6size / 2**30:.2f} GiB in {patch.blocks:,} blocks")
     return patch
@@ -646,7 +664,7 @@ def apply_romfs(patch, base_cfg, keydir, tree):
 
 
 def apply(a):
-    patch = open_patch(a.nsp, a.keys)
+    patch = open_patch(a.nsp, a.keys, a.inner)
     apply_exefs(patch, a.tree)
     apply_romfs(patch, a.base, a.keys, a.tree)
 
@@ -658,13 +676,15 @@ def main():
     ap.add_argument("--keys", required=True, help="folder with prod.keys (and title.keys)")
     ap.add_argument("--tree", required=True, help="the game version's folder to fill, e.g. v13.0.5")
     ap.add_argument("--base", help="apply: romfs.cfg of the installed base (e.g. dump/modules/romfs.cfg)")
+    ap.add_argument("--inner", help="the update's Program NCA inside the package, by name (a package can hold the "
+                                    "game and its update together; without it, the Program NCA with a patch RomFS)")
     a = ap.parse_args()
     if a.cmd == "apply":
         if not a.base:
             raise SystemExit("apply needs --base <the base's romfs.cfg>")
         apply(a)
     else:
-        patch = Patch(a.nsp, a.keys)
+        patch = Patch(a.nsp, a.keys, a.inner)
         modules = os.path.join(a.tree, "dump", "modules")
         sys.exit(1 if verify(patch, os.path.join(modules, "romfs.cfg"), os.path.join(modules, "romfs.unverified.txt")) else 0)
 
