@@ -51,6 +51,7 @@ The game itself still comes from your files. This repository holds only the tran
 - **Up to eight controllers**: Xbox, PlayStation, Switch Pro and most others, plus the keyboard.
 - **Windowed, borderless or full screen**, always 16:9, with settings for G-Sync and FreeSync monitors.
 - **Online play through Local Wireless**: rooms appear for every player in the online lobby, and nobody has to set up their router.
+- **The game's own Online mode**, new and still being tested: Quickplay against WindowSmash's own game server.
 - **Your DLC fighters**, and a tool that unlocks the base-game roster on your own save.
 - **Any game version**, including 13.0.5 with Kazuya and Sora, and several versions side by side.
 - **An experimental Linux version**, built from the same source.
