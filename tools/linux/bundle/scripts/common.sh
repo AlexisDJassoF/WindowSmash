@@ -1,5 +1,10 @@
 # Shared by the launchers (sourced from the folder the game is in).
 #
+# They serve two kinds of folder: this package, copied over from Windows (the game is ./ssbu), and
+# a WindowSmash folder the game was built in on Linux (install-windowsmash.sh), whose launchers
+# (play-ssbu.sh and so on) set SSBU_GAME_DIR to it and SSBU_EXE to build-linux/ssbu, and run
+# these. There the game data is where the build found it: dump/modules/romfs.cfg says where.
+#
 # The game's data - its RomFS, about 17 GB - stays in the files it came in, read in place. For
 # the original game that is one NCA. For an update (tools/update.py) it is pieced together from
 # several files by the layer map dump/modules/romfs.layers: the base game's NCA and the update's
@@ -16,6 +21,8 @@ ROMFS_KIND="@ROMFS_KIND@"
 ROMFS_OFFSET="@ROMFS_OFFSET@"
 ROMFS_FILES='@ROMFS_FILES@'
 ROMFS_MAP=dump/modules/romfs.layers
+SSBU_EXE=${SSBU_EXE:-./ssbu}
+SSBU_DEPS_HINT=${SSBU_DEPS_HINT:-bash install-deps.sh}
 
 # romfs.cfg (runtime/hle_fs.c) for the files at the given paths
 romfs_cfg_text() {
@@ -44,6 +51,10 @@ romfs_cfg_paths() {
 
 find_game_data() {
     local cfg=dump/modules/romfs.cfg old=() paths=() i=0 var name size windir path d text
+    if [ -n "$SSBU_GAME_DIR" ]; then
+        built_game_data
+        return
+    fi
     if [ "$ROMFS_KIND" = layered ] && [ ! -f "$ROMFS_MAP" ]; then
         echo "$ROMFS_MAP is missing: copy the whole ssbu-linux folder again."
         return 1
@@ -86,18 +97,43 @@ find_game_data() {
     return 0
 }
 
+# A folder the game was built in: the files its romfs.cfg reads (plain: the file; layered: the
+# layer map and its sources) are there
+built_game_data() {
+    local cfg=dump/modules/romfs.cfg path
+    if [ ! -f "$cfg" ]; then
+        echo "The game is not set up yet: run  $SSBU_DEPS_HINT"
+        return 1
+    fi
+    while IFS= read -r path; do
+        if [ -n "$path" ] && [ ! -f "$path" ]; then
+            echo "The game data is not where it was when the game was built: $path"
+            echo "Make it reachable there again (a disk or shared folder that is not mounted?), or run"
+            echo "  $SSBU_DEPS_HINT"
+            echo "to set it up again from where it is now."
+            return 1
+        fi
+    done < <(if [ "$(head -n 1 "$cfg")" = layered ]; then tail -n +2 "$cfg"; else head -n 1 "$cfg"; fi)
+    return 0
+}
+
 check_libraries() {
-    chmod +x ./ssbu 2>/dev/null
-    local missing
-    missing=$(LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd ./ssbu 2>/dev/null | grep "not found")
+    if [ ! -f "$SSBU_EXE" ]; then
+        echo "The game is not built yet ($SSBU_EXE): run  $SSBU_DEPS_HINT"
+        return 1
+    fi
+    chmod +x "$SSBU_EXE" 2>/dev/null
+    local missing lib
+    lib="$(cd "$(dirname "$SSBU_EXE")" && pwd)/lib"
+    missing=$(LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$SSBU_EXE" 2>/dev/null | grep "not found")
     if [ -n "$missing" ]; then
         echo "Some libraries the game needs are not installed:"
         echo "$missing"
-        echo "Install them with:  bash install-deps.sh"
+        echo "Install them with:  $SSBU_DEPS_HINT"
         return 1
     fi
     if ! vulkan_installed; then
-        echo "No Vulkan driver is installed (the renderer needs one). Install them with:  bash install-deps.sh"
+        echo "No Vulkan driver is installed (the renderer needs one). Install them with:  $SSBU_DEPS_HINT"
         return 1
     fi
     return 0

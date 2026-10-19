@@ -1,22 +1,35 @@
-"""Cross toolchain for the Linux build: the Visual Studio clang, targeting x86_64-linux-gnu.
+"""Toolchain for the Linux build: clang, targeting x86_64-linux-gnu.
 
-Everything third-party lives outside the repository, in linux-toolchain/ next to this checkout
+On Windows it cross-compiles, with the Visual Studio clang and an Ubuntu 22.04 sysroot. On Linux
+it builds natively, with the system's clang and lld and its headers and libraries
+(install-windowsmash.sh installs them).
+
+Everything third-party lives outside the repository: in this checkout's deps/linux-toolchain
+(where install-windowsmash.sh puts it), else in linux-toolchain/ next to the checkout
 (SSBU_LINUX_TOOLCHAIN overrides; docs/LINUX.md says where each part comes from):
-  sysroot/        Ubuntu 22.04 packages (glibc 2.35, libgcc, libstdc++, SDL2, libopus, libvpx)
+  sysroot/        (cross-compiling only) Ubuntu 22.04 packages (glibc 2.35, libgcc, libstdc++,
+                  SDL2, libopus, libvpx)
   dxvk-native/    DXVK's native Linux libraries (Direct3D 11 on Vulkan)
   dxvk-headers/   their headers (DXVK's include/native and mingw-directx-headers)
   src/vkd3d-*/    vkd3d source; build-vkd3d/ holds its generated parsers and libraries
-Linking against glibc 2.35 keeps the program runnable on Ubuntu 22.04 and anything newer."""
+Cross-compiled, linking against glibc 2.35 keeps the program runnable on Ubuntu 22.04 and
+anything newer."""
 import glob
 import os
+import re
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 RUNTIME = os.path.join(REPO, "runtime")
-TOOLCHAIN = os.environ.get("SSBU_LINUX_TOOLCHAIN") or os.path.join(os.path.dirname(REPO), "linux-toolchain")
-SYSROOT = os.path.join(TOOLCHAIN, "sysroot")
+HOST_LINUX = sys.platform.startswith("linux")   # building on Linux itself, not cross-compiling on Windows
+EXE = "" if HOST_LINUX else ".exe"
+OWN_TOOLCHAIN = os.path.join(REPO, "deps", "linux-toolchain")
+TOOLCHAIN = os.environ.get("SSBU_LINUX_TOOLCHAIN") or (
+    OWN_TOOLCHAIN if os.path.isdir(OWN_TOOLCHAIN) else os.path.join(os.path.dirname(REPO), "linux-toolchain"))
+SYSROOT = "/" if HOST_LINUX else os.path.join(TOOLCHAIN, "sysroot")
 DXVK_LIBS = os.path.join(TOOLCHAIN, "dxvk-native", "usr", "lib")
 DXVK_INCLUDE = os.path.join(TOOLCHAIN, "dxvk-headers", "include", "native")
 VKD3D_SRC = sorted(glob.glob(os.path.join(TOOLCHAIN, "src", "vkd3d-*")))[-1:] or [""]
@@ -54,9 +67,36 @@ def write_port_stamp(folder, port):
         f.write(port + "\n")
 
 
+LLVM_TOOLS = ("clang", "ld.lld", "llvm-ar", "llvm-nm")
+
+
+def llvm_version(folder):
+    """The LLVM major version in a folder's name (/usr/lib/llvm-18/bin: 18), else 0."""
+    m = re.search(r"llvm-?(\d+)", folder)
+    return int(m.group(1)) if m else 0
+
+
+def pick_llvm_bin(candidates, has):
+    """The first folder that has every tool LLVM_TOOLS names (has(folder, tool)), or None."""
+    for d in candidates:
+        if d and all(has(d, t) for t in LLVM_TOOLS):
+            return d
+    return None
+
+
 def _find_llvm():
     if os.environ.get("SSBU_LLVM_BIN"):
         return os.environ["SSBU_LLVM_BIN"]
+    if HOST_LINUX:
+        # the distribution's versioned LLVMs, newest first (Debian, Ubuntu: /usr/lib/llvm-<n>/bin;
+        # Fedora's older ones: /usr/lib64/llvm<n>/bin), then the folders on PATH
+        versioned = sorted(glob.glob("/usr/lib/llvm-*/bin") + glob.glob("/usr/lib64/llvm*/bin"), key=llvm_version, reverse=True)
+        found = pick_llvm_bin(versioned + os.environ.get("PATH", "").split(os.pathsep),
+                              lambda d, t: os.access(os.path.join(d, t), os.X_OK))
+        if not found:
+            raise SystemExit("clang, ld.lld, llvm-ar and llvm-nm were not found: install clang, lld and llvm "
+                             "(install-windowsmash.sh does), or name their folder in SSBU_LLVM_BIN")
+        return found
     roots = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
     found = []
     for root in roots:
@@ -69,9 +109,11 @@ def _find_llvm():
 
 
 LLVM = _find_llvm()
-CLANG = os.path.join(LLVM, "clang.exe")
-LLVM_AR = os.path.join(LLVM, "llvm-ar.exe")
-TARGET = ["--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT]
+CLANG = os.path.join(LLVM, "clang" + EXE)
+LLVM_AR = os.path.join(LLVM, "llvm-ar" + EXE)
+LLVM_NM = os.path.join(LLVM, "llvm-nm" + EXE)
+# (on Linux, the system's own target and headers)
+TARGET = [] if HOST_LINUX else ["--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT]
 # Guest FP semantics need IEEE-exact arithmetic: no contraction, no fast-math (as on Windows).
 # -fno-pic: the program is linked at a fixed address (non-PIE); its code is far over the size
 # where PIC's extra indirections are free.
@@ -85,7 +127,10 @@ _PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
 
 
 def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=_PRIORITY)
+    if HOST_LINUX:
+        r = subprocess.run(["nice", "-n", "10", *cmd], capture_output=True, text=True)
+    else:
+        r = subprocess.run(cmd, capture_output=True, text=True, creationflags=_PRIORITY)
     return r.returncode, r.stdout + r.stderr
 
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build the game for x86-64 Linux, on this Windows machine (the toolchain: tools/linux/toolchain.py).
+"""Build the game for x86-64 Linux: cross-compiled on Windows, or on Linux itself (the toolchain:
+tools/linux/toolchain.py).
 
 Usage: build_linux.py [--port <dir>] [--out <dir>] [--jobs N] [--runtime-only] [--link-only] [--replace]
 
@@ -10,7 +11,9 @@ build/ at its top) or a game version's folder of the same layout, e.g. v13.0.5 -
 it is built (toolchain.default_port). Files with exception landing sites (guest C++ try/catch) are
 compiled as C++ (see recomp.h). The runtime is runtime/*.c with the Linux platform layer
 (runtime/linux), and the program links against DXVK (Direct3D 11 on Vulkan), SDL2, vkd3d-shader
-(built by build_vkd3d.py), libopus and libvpx, the last three statically.
+(built by build_vkd3d.py), libopus and libvpx, the last three statically (on Linux, libopus and
+libvpx as the system has them). Built on Linux, the DXVK libraries go into <out>/lib, so the
+program runs from its own folder.
 Incremental: a file is compiled again when its source is newer than its object. <out> holds one
 tree's game (port.txt): build another tree's into another <out> (e.g. build-linux-11.0.0), or
 give --replace to start this one over."""
@@ -22,8 +25,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, LLVM, REPO, RUNTIME, SYSROOT, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC,
-                       compile_each, default_port, read_port_stamp, run, same_path, write_port_stamp)
+from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, LLVM, LLVM_NM, REPO, RUNTIME, SYSROOT, TARGET,
+                       TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each, default_port, read_port_stamp, run, same_path,
+                       write_port_stamp)
 
 
 def arg(name, default=None):
@@ -139,11 +143,20 @@ def write_if_changed(path, text):
 
 
 def overlay_font():
-    """gen/overlay_font.h: the debug overlay's glyphs, drawn by GDI here as the Windows build does."""
+    """gen/overlay_font.h: the debug overlay's glyphs, drawn by GDI here as the Windows build does
+    (on Linux, with Pillow from the system's monospace font: make_overlay_font.py)."""
     os.makedirs(GEN, exist_ok=True)
     header = os.path.join(GEN, "overlay_font.h")
-    tool_src = os.path.join(REPO, "tools", "linux", "make_overlay_font.c")
+    tool_src = os.path.join(REPO, "tools", "linux", "make_overlay_font.py" if HOST_LINUX else "make_overlay_font.c")
     if not needs(header, tool_src):
+        return True
+    if HOST_LINUX:
+        r = subprocess.run([sys.executable, tool_src, header], capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip())
+        if r.returncode:   # (only the debug overlay's text needs it: not worth stopping the build for)
+            print("could not draw the overlay font: the overlay (F1, F2) shows no text")
+            with open(header, "w", newline="\n") as f:
+                f.write("static const unsigned char overlay_font[%d] = {0};\n" % (12 * 16 * 24 * 6))
         return True
     exe = os.path.join(GEN, "make_overlay_font.exe")
     code, out = run([os.path.join(LLVM, "clang-cl.exe"), "/nologo", "/O1", "-w", "-fuse-ld=lld", tool_src, "/Fe" + exe, "/link", "gdi32.lib", "user32.lib"])
@@ -228,10 +241,9 @@ def link():
     rsp = exe + ".rsp"
     with open(rsp, "w") as f:
         f.write("\n".join('"%s"' % o.replace("\\", "/") for o in objs))
-    lib = os.path.join(SYSROOT, "usr", "lib", "x86_64-linux-gnu")
     t0 = time.time()
-    code, out = run([CLANG, "--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT, "-fuse-ld=lld", "-no-pie", "@" + rsp, "-o", exe,
-                     os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a"), os.path.join(lib, "libopus.a"), os.path.join(lib, "libvpx.a"),
+    code, out = run([CLANG, *TARGET, "-fuse-ld=lld", "-no-pie", "@" + rsp, "-o", exe,
+                     os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a"), codec_lib("opus"), codec_lib("vpx"),
                      "-L" + DXVK_LIBS, "-l:libdxvk_d3d11.so.0", "-l:libdxvk_dxgi.so.0", "-l:libSDL2-2.0.so.0",
                      "-lstdc++", "-lm", "-lpthread", "-ldl", "-lrt",
                      "-Wl,-rpath,$ORIGIN/lib", "-Wl,--allow-shlib-undefined", "-Wl,-z,noexecstack", "-Wl,--build-id",
@@ -240,11 +252,28 @@ def link():
         errors = [l for l in out.splitlines() if "error" in l.lower()] or out.splitlines()
         print("link failed\n" + "\n".join(errors)[:6000])
         return False
-    syms = subprocess.run([os.path.join(LLVM, "llvm-nm.exe"), "-n", "--defined-only", exe], capture_output=True, text=True)
+    syms = subprocess.run([LLVM_NM, "-n", "--defined-only", exe], capture_output=True, text=True)
     with open(os.path.join(OUT, "ssbu.syms"), "w", newline="\n") as f:
         f.write(syms.stdout)
+    if HOST_LINUX:   # (the program looks for them in lib/ beside it: -rpath $ORIGIN/lib)
+        for so in ("libdxvk_d3d11.so.0", "libdxvk_dxgi.so.0"):
+            src, dst = os.path.join(DXVK_LIBS, so), os.path.join(OUT, "lib", so)
+            if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
+
+
+def codec_lib(name):
+    """libopus or libvpx for the link: cross-compiling, the sysroot's static library; on Linux,
+    the system's static one if it has one (then the program needs no copy at run time), else its
+    shared one."""
+    if not HOST_LINUX:
+        return os.path.join(SYSROOT, "usr", "lib", "x86_64-linux-gnu", f"lib{name}.a")
+    r = subprocess.run([CLANG, f"-print-file-name=lib{name}.a"], capture_output=True, text=True)
+    path = r.stdout.strip()
+    return path if os.path.isabs(path) and os.path.isfile(path) else f"-l{name}"
 
 
 def dxvk_libs():

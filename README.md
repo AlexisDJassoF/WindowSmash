@@ -54,7 +54,7 @@ The game itself still comes from your files. This repository holds only the tran
 - **The game's own Online mode**, new and still being tested: Quickplay against WindowSmash's own game server.
 - **Your DLC fighters**, and a tool that unlocks the base-game roster on your own save.
 - **Any game version**, including 13.0.5 with Kazuya and Sora, and several versions side by side.
-- **An experimental Linux version**, built from the same source.
+- **An experimental Linux version**, built from the same source: `install-windowsmash.sh` sets it up on Linux in one go ([Linux](docs/LINUX.md)).
 
 ## What you need
 
@@ -244,7 +244,7 @@ Looking for people to play with? Ask on the [Discord server](https://discord.gg/
 | [DLC and unlocks](docs/DLC-AND-UNLOCKS.md) | use your DLC, or unlock every base-game fighter on your save. |
 | [Game updates](docs/UPDATES.md) | apply an update file, such as 13.0.5, as a version of its own. |
 | [Several versions](docs/VERSIONS.md) | keep more than one game version and choose one when you start. |
-| [Linux](docs/LINUX.md) | build and run the experimental Linux version. |
+| [Linux](docs/LINUX.md) | install, build and run the experimental Linux version. |
 | [Runtime packages](docs/RUNTIME-SETUP.md) | set up a ready-built runtime package with your own game data. |
 | [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
 | [Third-party notices](NOTICE.md) | see attributions and licenses. |
@@ -263,7 +263,7 @@ WindowSmash is **experimental**. Menus and matches run and Local Wireless connec
 | **Audio and movies** | Music (Opus) and movies (VP9) are decoded by libopus and libvpx, built from the sources that come with WindowSmash. |
 | **DLC** | The DLC fighters your version has: 11.0.0 has them up to Pyra/Mythra; Kazuya came with 12.0.0 and Sora with 13.0.0. |
 | **Multiplayer** | The online lobby (with direct connections) and private rooms work. Complete matches between two PCs, and the whole roster online, haven't been fully verified. |
-| **Linux** | Experimental, cross-compiled from the same source and drawn through DXVK on Vulkan. |
+| **Linux** | Experimental, built from the same source and drawn through DXVK on Vulkan: on Linux itself with `install-windowsmash.sh`, or cross-compiled on Windows. |
 
 There is no connection to Nintendo's online service, no claim of general Switch compatibility, and no verified performance target.
 

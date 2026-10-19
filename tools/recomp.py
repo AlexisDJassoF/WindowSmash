@@ -9,7 +9,7 @@ Usage:
   recomp.py build    <nso> --out <dir> [--jobs N] [--per-file INSNS]
   recomp.py compile  <dir> [--jobs N]
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
-  recomp.py all      <exefs dir> --out <build dir> [--jobs N]
+  recomp.py all      <exefs dir> --out <build dir> [--jobs N] [--generate-only]
   recomp.py check    <exefs dir>
   recomp.py wrap-sig <nso> <address>
 
@@ -24,7 +24,9 @@ build     write C for a whole module, split across many files, plus its loader t
 compile   compile a build directory to objects (incremental; reports per-file failures)
 link      compile the host runtime and link module build directories into an executable
 all       image + build + compile every module of an ExeFS, then link; a module another game
-          version tree already built (same build id) is reused, not built again (modcache.py)
+          version tree already built (same build id) is reused, not built again (modcache.py);
+          --generate-only stops before compiling (the Linux build compiles the C itself:
+          tools/linux/build_linux.py)
 check     list each module's imports that no module exports and the runtime does not implement
 wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
 
@@ -613,7 +615,7 @@ def check(exefs):
     return modcache.report_imports(mods, hle_names(), os.path.join(TREE, "build", "imports.unresolved.txt"))
 
 
-def build_all(exefs, out, jobs):
+def build_all(exefs, out, jobs, compile_c=True):
     dirs = []
     paths = module_paths(exefs)
     check(exefs)
@@ -637,11 +639,14 @@ def build_all(exefs, out, jobs):
             reused += 1
         else:
             build(nso, target, jobs, 40000)
-        if not compile_dir(target, min(jobs, 16)):
+        if compile_c and not compile_dir(target, min(jobs, 16)):
             return False
         modcache.write_stamp(target, mod.build_id, base, name, fp)
         dirs.append(target)
     print(f"{reused} of {len(paths)} modules reused without generating their C again")
+    if not compile_c:
+        print(f"the C of {len(dirs)} modules is in {out} (--generate-only: not compiled here)")
+        return True
     return link(dirs, os.path.join(out, "ssbu.exe"))
 
 
@@ -670,7 +675,7 @@ if __name__ == "__main__":
     elif cmd == "link":
         sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
-        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20"))) else 1)
+        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), "--generate-only" not in sys.argv) else 1)
     elif cmd == "check":
         check(nso)
     elif cmd == "wrap-sig":

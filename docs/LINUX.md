@@ -10,14 +10,22 @@ The same recompiled game as the Windows build, as a native x86-64 Linux program.
   cache from the Windows build comes with this folder.
 - The window, controllers and sound use **SDL2**.
 
-The game version is the one of the game tree it was built from: the main one, or a version
-folder made by `tools/update.py` (for example 13.0.5). `dump/port.txt` says which.
+There are two ways to get it:
+
+- **Install it on Linux.** `install-windowsmash.sh` sets up WindowSmash on the Linux machine and
+  builds the game there from your own files, as `Install WindowSmash.bat` does on Windows. See
+  [Installing on Linux](#installing-on-linux).
+- **Copy over a package from Windows.** A Windows PC that has built the game can make an
+  `ssbu-linux` folder to copy to a Linux machine or virtual machine. See [Setting up](#setting-up).
+
+Any game version should work; WindowSmash has been tested with 11.0.0 and 13.0.5.
 
 > [!IMPORTANT]
-> This folder holds the game's code and data. It's for your own machines, not for sharing.
+> A built game holds the game's code and data. It's for your own machines, not for sharing.
 
 ## Contents
 
+- [Installing on Linux](#installing-on-linux)
 - [What you need](#what-you-need)
 - [Setting up](#setting-up)
 - [In a VMware virtual machine](#in-a-vmware-virtual-machine)
@@ -28,7 +36,94 @@ folder made by `tools/update.py` (for example 13.0.5). `dump/port.txt` says whic
 - [If something goes wrong](#if-something-goes-wrong)
 - [Building it](#building-it)
 
+## Installing on Linux
+
+`install-windowsmash.sh` does everything in one go: it gets the newest WindowSmash, installs what
+the build needs, finds your game files, and builds the game. It needs:
+
+- **An x86-64 PC with AVX2**, a Vulkan driver, and 8 GB of RAM or more (16 GB builds faster).
+- **About 30 GB of free space**, and an internet connection.
+- **Your password for `sudo`**, to install packages. It knows the package managers of Ubuntu,
+  Debian, Linux Mint, Fedora, Arch, Manjaro and openSUSE, and the families built on them.
+- **Your own game files**: the game (its `.nca` files, or an `.nsp` or `.xci`), with its update
+  and DLC if you have them; your keys (`prod.keys` and `title.keys`); and your firmware's `.nca`
+  files. An emulator's own folders work as they are.
+
+1. **Download WindowSmash.** On the [GitHub page](https://github.com/SNO2207/WindowSmash), click
+   **Code > Download ZIP**, then unpack it in your home folder, for example as `~/WindowSmash`.
+2. **Open a terminal in that folder.** Open the folder in your file manager, right-click an empty
+   area, and choose **Open in Terminal**.
+3. **Run the installer:**
+
+   ```bash
+   bash install-windowsmash.sh
+   ```
+
+4. **Answer its questions.** It asks for three folders, and fills in yuzu's, its forks' (Eden,
+   Citron, Sudachi, Suyu) or Ryujinx's own folders when it finds them, Flatpak installs included.
+   Press <kbd>Enter</kbd> to keep a folder in [brackets], or type another:
+
+   | Folder | What's in it | For example |
+   | :--- | :--- | :--- |
+   | Keys | `prod.keys` and `title.keys` | `~/MyKeys` |
+   | Firmware | your firmware's `.nca` files | `~/MyFirmware` |
+   | Game | the game's files, with its update and DLC | `~/MyDump` |
+
+   It checks each one and says what it found, then asks for the name other players see online.
+5. **Wait for the build.** The first one compiles the whole game: from one to a few hours,
+   depending on the processor and the memory. Later ones redo only what changed. If it stops, run
+   `bash install-windowsmash.sh` again: it carries on where it stopped. Everything it says also
+   goes to `install.log`.
+6. **Play:** run `./play-ssbu.sh` in the folder, or choose **WindowSmash** in your applications
+   menu.
+
+The installer's steps:
+
+| Step | What it does |
+| :--- | :--- |
+| 1. Update | Gets the newest WindowSmash from GitHub. Your game files, settings, save and build stay. |
+| 2. This PC | Checks the processor, the memory and the free space. |
+| 3. Packages | Installs clang, lld, bison, flex, SDL2, libopus, libvpx, the Vulkan loader and zenity from your distribution. |
+| 4. Python | Makes a Python of WindowSmash's own in `deps/venv`, with the packages the tools use. |
+| 5. DXVK and vkd3d | Downloads DXVK 3.1.1, vkd3d 2.1 and their headers into `deps/linux-toolchain`, each checked against its SHA-256. |
+| 6. Your files | Asks for the three folders and the online name. |
+| 7. Launchers | Adds WindowSmash to the applications menu. |
+| 8. Build | Takes the program, fonts, data, DLC and fighters out of your files, then builds `build-linux/ssbu`. |
+
+Running it again later updates WindowSmash and builds again what the update changed. Its options:
+
+| Option | What it does |
+| :--- | :--- |
+| `--game`, `--keys`, `--firmware` | Name a folder instead of being asked. |
+| `--yes` | Take the folders found or named, without asking. |
+| `--online-name <name>` | The name other players see. |
+| `--jobs <n>` | How many files to compile at a time. The default goes by the memory: 4 under 16 GB, 8 with 16 GB, 16 with 32 GB or more. |
+| `--skip-build` | Everything but compiling the game. |
+| `--no-update` | Don't look for a newer WindowSmash. |
+| `--no-packages` | Don't install packages: for a distribution it doesn't know, install them yourself first. |
+| `--dry-run` | Say what each step would do, and do nothing. |
+
+The launchers work like the Windows ones: `play-ssbu.sh` at the top of the folder, the others in
+`launchers/`.
+
+| Launcher | On Windows | What it does |
+| :--- | :--- | :--- |
+| `play-ssbu.sh` | `Play SSBU.bat` | The game, online through the lobby in `online_server.txt` ([Multiplayer](MULTIPLAYER.md)). |
+| `launchers/play-ssbu-offline.sh` | `Play SSBU Offline.bat` | The game, offline. |
+| `launchers/host-ssbu-netplay.sh`, `launchers/join-ssbu-netplay.sh` | `Host/Join SSBU Netplay.bat` | A private room. |
+| `launchers/unlock-all-fighters.sh` | `Unlock All Fighters.bat` | The unlock tool, on this folder's save. Run it with the game closed. |
+
+The game reads its data in place from your game folder, or from the decrypted copy in
+`dump/modules` when the game had to be decrypted first. If your game folder is on a disk or shared
+folder that isn't mounted, the launchers say so. The [Controls](#controls), [Settings](#settings) and
+[If something goes wrong](#if-something-goes-wrong) sections below apply here too. The save is in
+`save/`, and the log goes to `build/play.log`.
+
+The rest of this guide is about the package from Windows, apart from those sections.
+
 ## What you need
+
+These are for the package from Windows.
 
 | | Requirement |
 | :--- | :--- |
@@ -221,7 +316,14 @@ back.
 
 ## Building it
 
-The Linux program is cross-compiled on Windows, next to the Windows build. It compiles the same
+On Linux, `install-windowsmash.sh` builds it ([Installing on Linux](#installing-on-linux)). By hand:
+`tools/build_game.py` prepares the game tree and then, on Linux, generates the game's C
+(`tools/recomp.py all --generate-only`) and runs `build_vkd3d.py` and `build_linux.py` below with
+the system's clang and lld. The third-party parts then live in `deps/linux-toolchain`, where the
+installer puts them, and the overlay's font is drawn from the system's monospace font
+(`tools/linux/make_overlay_font.py`, with Pillow).
+
+On Windows, the Linux program is cross-compiled next to the Windows build. It compiles the same
 generated C again, so build the game tree for Windows first (`tools/recomp.py`; for a version
 folder, `--tree`). You also need Visual Studio's Clang (`clang.exe` and `ld.lld.exe`, or name
 their folder in `SSBU_LLVM_BIN`) and Python 3.
