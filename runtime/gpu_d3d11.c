@@ -2449,6 +2449,86 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
     }
 }
 
+/* SSBU_GPU_TIMES=<second>: the draws of one frame from then on timed on the GPU (a timestamp
+ * before and after each), and the costliest shader pairs written to the log - what a frame asks
+ * of the graphics card, draw by draw. */
+#define GPU_TIMES_MAX 8192
+static int gpu_times_state;   /* 0: not asked for, 1: waiting for the second, 2: timing a frame, 3: done */
+static ID3D11Query *gpu_times_q[GPU_TIMES_MAX + 2], *gpu_times_disjoint;
+static u32 gpu_times_n;
+static struct { char vs[24], ps[24]; u32 w, h; } gpu_times_what[GPU_TIMES_MAX / 2];
+
+static void gpu_times_before(void) {
+    if (gpu_times_state != 2 || gpu_times_n + 2 > GPU_TIMES_MAX) return;
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)gpu_times_q[gpu_times_n]);
+}
+static void gpu_times_after(const char *vs, const char *ps, u32 w, u32 h) {
+    if (gpu_times_state != 2 || gpu_times_n + 2 > GPU_TIMES_MAX) return;
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)gpu_times_q[gpu_times_n + 1]);
+    u32 k = gpu_times_n / 2;
+    snprintf(gpu_times_what[k].vs, sizeof gpu_times_what[k].vs, "%s", vs);
+    snprintf(gpu_times_what[k].ps, sizeof gpu_times_what[k].ps, "%s", ps);
+    gpu_times_what[k].w = w; gpu_times_what[k].h = h;
+    gpu_times_n += 2;
+}
+/* (at each present) */
+static void gpu_times_frame(void) {
+    if (gpu_times_state == 0) {
+        gpu_times_state = getenv("SSBU_GPU_TIMES") ? 1 : 3;
+        if (gpu_times_state == 1) {
+            D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP, 0}, dd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            for (u32 i = 0; i < GPU_TIMES_MAX + 2; i++)
+                if (FAILED(ID3D11Device_CreateQuery(dev, &qd, &gpu_times_q[i]))) gpu_times_state = 3;
+            if (FAILED(ID3D11Device_CreateQuery(dev, &dd, &gpu_times_disjoint))) gpu_times_state = 3;
+        }
+    }
+    if (gpu_times_state == 1 && rt_now_ns() > (u64)(atof(getenv("SSBU_GPU_TIMES")) * 1e9)) {
+        ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)gpu_times_disjoint);
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)gpu_times_q[GPU_TIMES_MAX]);
+        gpu_times_n = 0;
+        gpu_times_state = 2;
+        return;
+    }
+    if (gpu_times_state != 2) return;
+    gpu_times_state = 3;
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)gpu_times_q[GPU_TIMES_MAX + 1]);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)gpu_times_disjoint);
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    while (ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)gpu_times_disjoint, &dj, sizeof dj, 0) == S_FALSE) Sleep(1);
+    if (dj.Disjoint || !dj.Frequency) { fprintf(stderr, "[gpu times] the GPU clock changed during the frame: not timed\n"); return; }
+    UINT64 *t = calloc(GPU_TIMES_MAX + 2, sizeof *t);
+    for (u32 i = 0; i < gpu_times_n; i++) ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)gpu_times_q[i], &t[i], sizeof t[i], 0);
+    for (u32 i = GPU_TIMES_MAX; i < GPU_TIMES_MAX + 2; i++) ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)gpu_times_q[i], &t[i], sizeof t[i], 0);
+    double us = 1e6 / (double)dj.Frequency, total = (double)(t[GPU_TIMES_MAX + 1] - t[GPU_TIMES_MAX]) * us, drawn = 0;
+    /* by shader pair and target size: count, time */
+    struct { u32 first, count; double us; } *g = calloc(GPU_TIMES_MAX / 2, sizeof *g);
+    u32 ng = 0;
+    for (u32 k = 0; k < gpu_times_n / 2; k++) {
+        double d = t[2 * k + 1] > t[2 * k] ? (double)(t[2 * k + 1] - t[2 * k]) * us : 0;
+        drawn += d;
+        u32 j = 0;
+        for (; j < ng; j++) {
+            u32 f = g[j].first;
+            if (!strcmp(gpu_times_what[f].vs, gpu_times_what[k].vs) && !strcmp(gpu_times_what[f].ps, gpu_times_what[k].ps) &&
+                gpu_times_what[f].w == gpu_times_what[k].w && gpu_times_what[f].h == gpu_times_what[k].h) break;
+        }
+        if (j == ng) g[ng++].first = k;
+        g[j].count++;
+        g[j].us += d;
+    }
+    fprintf(stderr, "[gpu times] one frame: %.0f us on the GPU from start to present, %u draws taking %.0f us; costliest:\n", total, gpu_times_n / 2, drawn);
+    for (u32 shown = 0; shown < 25 && shown < ng; shown++) {
+        u32 best = 0;
+        for (u32 j = 1; j < ng; j++) if (g[j].us > g[best].us) best = j;
+        u32 f = g[best].first;
+        fprintf(stderr, "[gpu times]   %8.0f us  %4u draws  %s %s  %ux%u\n", g[best].us, g[best].count, gpu_times_what[f].vs, gpu_times_what[f].ps,
+                gpu_times_what[f].w, gpu_times_what[f].h);
+        g[best].us = -1;
+    }
+    free(g);
+    free(t);
+}
+
 void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     if (!enter()) return;
     kept_flush();
@@ -2853,8 +2933,10 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
             ID3D11DeviceContext_RSSetState(ctx, cur.rs);
             ID3D11DeviceContext_OMSetDepthStencilState(ctx, cur.ds, cur.stencil_ref);
         }
+        gpu_times_before();
         if (indexed) ID3D11DeviceContext_DrawIndexed(ctx, regs[M_DRAW_INDEX_COUNT], index_first, (INT)regs[M_GLOBAL_BASE_VERTEX]);
         else ID3D11DeviceContext_Draw(ctx, regs[M_VERTEX_ARRAY_COUNT], regs[M_VERTEX_ARRAY_START]);
+        gpu_times_after(vs->name, ps ? ps->name : "-", rt_w, rt_h);
     }
     gfx_stat_drawn++;
     leave();
@@ -3683,6 +3765,7 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
     gpu_timer_frame();
+    gpu_times_frame();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
     IDXGISwapChain1_Present(swapchain, display_sync_interval(), display_present_flags());   /* (blocks while the GPU is frames behind) */

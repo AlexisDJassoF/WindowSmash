@@ -66,21 +66,31 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
     (void)unused;
     SetThreadDescription(GetCurrentThread(), L"vsync");
     timeBeginPeriod(1);
+    static u8 shown[sizeof queue.slots[0].buffer];
+    static i32 shown_crop[4];   /* (with its crop rectangle: handheld's part of the buffer) */
     for (;;) {
         display_wait_tick();   /* the next refresh (display.ini's pacing) */
         queue_lock();
         int oldest = -1;
+        u32 shown_size = 0;
         for (int i = 0; i < SLOTS; i++)
             if (queue.slots[i].state == QUEUED && (oldest < 0 || queue.slots[i].queued_at < queue.slots[oldest].queued_at)) oldest = i;
         if (oldest >= 0) {
             for (int i = 0; i < SLOTS; i++) if (queue.slots[i].state == ACQUIRED) queue.slots[i].state = FREE;
             queue.slots[oldest].state = ACQUIRED;
             queue.frames++;
-            present_frame(queue.slots[oldest].buffer, queue.slots[oldest].buffer_size, queue.slots[oldest].crop);
+            shown_size = queue.slots[oldest].buffer_size;
+            memcpy(shown, queue.slots[oldest].buffer, shown_size);
+            memcpy(shown_crop, queue.slots[oldest].crop, sizeof shown_crop);
+        }
+        queue_unlock();
+        /* Shown outside the queue's lock: a present can wait for the graphics card (frames
+         * behind), and meanwhile the game queues its next frame and goes on with the one after. */
+        if (oldest >= 0) {
+            present_frame(shown, shown_size, shown_crop);
             kernel_signal_event(queue.buffer_event);
             WakeAllConditionVariable(&queue.freed);
         }
-        queue_unlock();
         kernel_signal_event(queue.vsync_event);
     }
 }
