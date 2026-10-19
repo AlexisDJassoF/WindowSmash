@@ -16,6 +16,10 @@
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a>
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/pkgyYGf3YB"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the community on Discord"></a>
+</p>
+
 ---
 
 > [!IMPORTANT]
@@ -31,6 +35,7 @@
 - [All guides](#all-guides)
 - [Project status](#project-status)
 - [How it works](#how-it-works)
+- [Community](#community)
 - [Getting help](#getting-help)
 - [For developers](#for-developers)
 - [Legal](#legal)
@@ -139,6 +144,8 @@ Plug in a controller and press a button: each pad becomes the next free player, 
 
 Everyone needs the **same game version**, and each PC uses its own save. The [multiplayer guide](NETPLAY.md) walks through each way and what to do when a room doesn't show up.
 
+Looking for people to play with? Ask on the [Discord server](https://discord.gg/pkgyYGf3YB).
+
 ## All guides
 
 | Guide | Read it to |
@@ -188,9 +195,20 @@ The recompiler finds every function in the game's ARM64 code and writes it out a
 
 The **[technical guide](docs/TECHNICAL.md)** explains each part: the CPU model, function discovery, symbol binding, the services, the graphics path, shader compilation, the network protocol, save handling, and every tool in `tools/`.
 
+## Community
+
+<a href="https://discord.gg/pkgyYGf3YB"><img src="https://img.shields.io/badge/Discord-recomps.wtf-5865F2?logo=discord&logoColor=white" alt="Discord: recomps.wtf"></a>
+
+Join the **[recomps.wtf Discord server](https://discord.gg/pkgyYGf3YB)** to:
+
+- get help with setting up and building;
+- find people to play with online;
+- share how the game runs on your PC;
+- follow development and new releases.
+
 ## Getting help
 
-When something goes wrong, first look at [If something goes wrong](docs/BUILDING.md#if-something-goes-wrong) in the setup guide. To report a problem, open an issue and include:
+When something goes wrong, first look at [If something goes wrong](docs/BUILDING.md#if-something-goes-wrong) in the setup guide. For a quick question, ask on [Discord](https://discord.gg/pkgyYGf3YB). To report a problem, open an issue and include:
 
 - the game version, your Windows version, and your graphics card and driver version;
 - which WindowSmash you have (the date you downloaded it, or the output of `git rev-parse --short HEAD`);
