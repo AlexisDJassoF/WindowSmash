@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "gpu.h"   /* (gpu_queue_drain) */
 
 enum { R_OK = 0, R_TIMEOUT = 0xEA01, R_CANCELLED = 0xEC01, R_INVALID_HANDLE = 0xE401, R_INVALID_STATE = 0xFA01,
        R_INVALID_ADDRESS = 0xCC01, R_INVALID_ENUM = 0xF001, R_OUT_OF_MEMORY = 0xD001 };
@@ -439,6 +440,7 @@ void rt_svc(Cpu *c, u32 n) {
         for (u32 i = 0; i < 1024; i++)
             if (maps[i].size && maps[i].dst == x[0]) {
                 memcpy((void *)maps[i].src, (void *)maps[i].dst, maps[i].size);
+                gpu_queue_drain();   /* (work queued on the GPU thread may still read it) */
                 VirtualFree((void *)maps[i].dst, maps[i].size, MEM_DECOMMIT);
                 remove_region(maps[i].dst);
                 maps[i].size = 0;
@@ -539,6 +541,7 @@ void rt_svc(Cpu *c, u32 n) {
         x[0] = R_OK;
         break;
     case 0x2D:     /* UnmapPhysicalMemory(address, size) */
+        gpu_queue_drain();   /* (work queued on the GPU thread may still read it) */
         VirtualFree((void *)x[0], x[1], MEM_DECOMMIT);
         unmap_range(x[0], x[1]);
         x[0] = R_OK;

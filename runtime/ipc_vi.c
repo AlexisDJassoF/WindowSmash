@@ -15,6 +15,7 @@
 #include "ipc.h"
 #include "present.h"
 #include "display.h"
+#include "gpu.h"   /* (gpu_queue_mark / gpu_queue_wait) */
 
 #define DISPLAY_ID 1
 #define LAYER_ID 1
@@ -30,7 +31,7 @@ enum {   /* IGraphicBufferProducer transactions */
     ALLOCATE_BUFFERS = 13, SET_PREALLOCATED_BUFFER = 14, GET_BUFFER_HISTORY = 17
 };
 
-typedef struct Slot { int state, has_buffer; u8 buffer[0x400]; u32 buffer_size; u64 queued_at; } Slot;
+typedef struct Slot { int state, has_buffer; u8 buffer[0x400]; u32 buffer_size; u64 queued_at, gpu_mark; } Slot;
 static struct {
     Slot slots[SLOTS];
     u32 buffer_event, vsync_event;
@@ -86,6 +87,7 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
     SetThreadDescription(GetCurrentThread(), L"vsync");
     timeBeginPeriod(1);
     static u8 shown[sizeof queue.slots[0].buffer];
+    u64 gpu_mark = 0;
     for (;;) {
         int unlocked = display_unlocked();
         if (unlocked) wait_queued();
@@ -101,6 +103,7 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
             queue.frames++;
             shown_size = queue.slots[oldest].buffer_size;
             memcpy(shown, queue.slots[oldest].buffer, shown_size);
+            gpu_mark = queue.slots[oldest].gpu_mark;
         }
         queue_unlock();
         /* Shown outside the queue's lock: a present can wait for the graphics card (frames
@@ -108,7 +111,10 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
          * Unlocked, the game has its previous buffer back before the present, so it draws its
          * next frame meanwhile too. */
         if (unlocked) hand_back(oldest >= 0);
-        if (oldest >= 0) present_frame(shown, shown_size);
+        if (oldest >= 0) {
+            gpu_queue_wait(gpu_mark);   /* the frame drawn: what was submitted before it was queued has run */
+            present_frame(shown, shown_size);
+        }
         if (!unlocked) hand_back(oldest >= 0);
     }
 }
@@ -209,6 +215,7 @@ static void transact(u32 code, In *in, Out *out, Cpu *c) {
         if (slot < SLOTS) {
             queue.slots[slot].state = QUEUED;
             queue.slots[slot].queued_at = rt_now_ns();
+            queue.slots[slot].gpu_mark = gpu_queue_mark();
             WakeConditionVariable(&queue.queued);   /* (unlocked frame rate: shown at once) */
         }
         queue_output(out);
