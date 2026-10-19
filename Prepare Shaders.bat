@@ -6,6 +6,7 @@ rem usable). It can be stopped (close this window) and started again: what is do
 rem Needs Python and the build tools, as for building (docs\BUILDING.md).
 cd /d "%~dp0"
 setlocal
+call tools\find_python.bat || (pause & exit /b 1)
 call tools\pick_version.bat || (pause & exit /b 1)
-python tools\shader_aot.py --tree "%SSBU_TREE%"
+%PY% tools\shader_aot.py --tree "%SSBU_TREE%"
 pause

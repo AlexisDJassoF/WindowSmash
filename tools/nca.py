@@ -187,22 +187,60 @@ def is_plain_romfs(path):
     return len(head) == 8 and struct.unpack("<Q", head)[0] == 0x50
 
 
-# ---- containers: NSP (a PFS0 of NCAs, tickets and certificates) ----------------------
+# ---- containers: NSP (a PFS0 of NCAs, tickets and certificates), XCI (HFS0 partitions) ---------
+def partition_files(f, at, hfs):
+    """[(name, offset in the file, size)] of the PFS0 (0x18-byte entries) or HFS0 (0x40-byte
+    entries) partition at `at`; the data follows the header."""
+    f.seek(at)
+    head = f.read(0x10)
+    magic, esz = (b"HFS0", 0x40) if hfs else (b"PFS0", 0x18)
+    if head[:4] != magic:
+        raise SystemExit(f"{f.name}: no {magic.decode()} partition at byte {at:#x}")
+    count, strsz = struct.unpack_from("<II", head, 4)
+    table = f.read(count * esz + strsz)
+    strings = table[count * esz:]
+    base = at + 0x10 + count * esz + strsz
+    out = []
+    for i in range(count):
+        off, size, name_off = struct.unpack_from("<QQI", table, i * esz)
+        out.append((strings[name_off:strings.index(b"\0", name_off)].decode(), base + off, size))
+    return out
+
+
 def pfs0_files(path):
     """[(name, offset in the file, size)] of a PFS0 container such as an NSP."""
     with open(path, "rb") as f:
-        head = f.read(0x10)
-        if head[:4] != b"PFS0":
-            raise SystemExit(f"{path}: not a PFS0 container")
-        count, strsz = struct.unpack_from("<II", head, 4)
-        table = f.read(count * 0x18 + strsz)
-    strings = table[count * 0x18:]
-    base = 0x10 + count * 0x18 + strsz
-    out = []
-    for i in range(count):
-        off, size, name_off = struct.unpack_from("<QQI", table, i * 0x18)
-        out.append((strings[name_off:strings.index(b"\0", name_off)].decode(), base + off, size))
-    return out
+        return partition_files(f, 0, False)
+
+
+def xci_files(path):
+    """[(name, offset, size)] of an XCI's secure partition: the game's NCAs."""
+    with open(path, "rb") as f:
+        head = f.read(0x200)
+        if head[0x100:0x104] != b"HEAD":
+            raise SystemExit(f"{path}: not an XCI")
+        root = struct.unpack_from("<Q", head, 0x130)[0]
+        for name, off, _size in partition_files(f, root, True):   # (offsets count from the root header's end)
+            if name == "secure":
+                return partition_files(f, off, True)
+    raise SystemExit(f"{path}: the XCI has no secure partition")
+
+
+def container_kind(path):
+    """"nsp", "xci" or "nca" by content, not name."""
+    with open(path, "rb") as f:
+        head = f.read(0x200)
+    return "nsp" if head[:4] == b"PFS0" else "xci" if head[0x100:0x104] == b"HEAD" else "nca"
+
+
+def container_files(path):
+    """The NCAs a file holds: [(name, offset, size)] - itself when it is a bare .nca."""
+    kind = container_kind(path)
+    if kind == "nsp":
+        return [e for e in pfs0_files(path) if e[0].endswith(".nca")]
+    if kind == "xci":
+        return [e for e in xci_files(path) if e[0].endswith(".nca")]
+    return [(os.path.basename(path), 0, os.path.getsize(path))]
 
 
 # signature type -> where a ticket's body starts (the type, the signature, its padding)
@@ -210,8 +248,11 @@ TICKET_SIG = {0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x80, 0x10003: 0x240, 0x1
 
 
 def nsp_title_keys(path):
-    """rights id (hex) -> encrypted title key, from the common tickets in an NSP."""
+    """rights id (hex) -> encrypted title key, from the common tickets in an NSP (a game card's
+    NCAs need none: their keys are in their own key areas)."""
     keys = {}
+    if container_kind(path) != "nsp":
+        return keys
     with open(path, "rb") as f:
         for name, off, size in pfs0_files(path):
             if not name.endswith(".tik"):
@@ -225,10 +266,24 @@ def nsp_title_keys(path):
     return keys
 
 
-def nsp_ncas(path, keydir, suffix=".nca"):
-    """The NCAs of an NSP whose names end in `suffix`, opened in place with the NSP's own tickets."""
+def container_ncas(path, keydir, suffix=".nca"):
+    """The NCAs in an NSP or XCI (or the bare .nca itself) whose names end in `suffix`, opened in
+    place with the container's own tickets. Ones under a key we lack are skipped."""
     tks = nsp_title_keys(path)
-    return [(name, Nca(path, keydir, off, tks)) for name, off, size in pfs0_files(path) if name.endswith(suffix)]
+    out, first_error = [], None
+    for name, off, _size in container_files(path):
+        if not name.endswith(suffix):
+            continue
+        try:
+            out.append((name, Nca(path, keydir, off, tks)))
+        except SystemExit as e:   # (under a key we lack, or not an NCA at all)
+            first_error = first_error or f"{name}: {e}"
+    if not out and first_error:
+        raise SystemExit(f"{path}: no readable NCA - {first_error}")
+    return out
+
+
+nsp_ncas = container_ncas
 
 
 # ---- the RomFS as the runtime reads it: romfs.cfg -------------------------------------
@@ -397,22 +452,78 @@ def aoc_cfg(root, keydir, out, app):
     print(f"wrote {out}: {len(entries)} add-on contents")
 
 
+def decrypt_nca(nca, out, chunk=64 << 20):
+    """Write the NCA decrypted - its header and every section as plain bytes - so that it can
+    be read in place afterwards (romfs-cfg, the runtime, update.py's base). Resumes a cut-off
+    copy (<out>.partial) at the chunk it stopped in. A patch (BKTR) section is refused: an
+    update's RomFS is only meaningful applied over its base (update.py)."""
+    nca.f.seek(nca.base)
+    raw = nca.f.read(0xC00)
+    header = raw if nca.plaintext else xts_decrypt(nca.prod["header_key"], raw)
+    # the file as regions: the header, then each section where it lies, zeros in between
+    regions, at = [(header, None, 0, 0xC00)], 0xC00
+    for sec in sorted(nca.sections, key=lambda s: s.start):
+        if sec.enc_type == 4:
+            raise SystemExit(f"section {sec.index} is a patch (BKTR) over another NCA: not decryptable on its own")
+        if sec.start > at:
+            regions.append((None, None, 0, sec.start - at))
+        regions.append((None, sec, 0, sec.end - sec.start))
+        at = sec.end
+    if nca.size > at:
+        regions.append((None, None, 0, nca.size - at))
+    partial = out + ".partial"
+    done = os.path.getsize(partial) // chunk * chunk if os.path.exists(partial) else 0
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    with open(partial, "r+b" if done else "wb") as o:
+        o.seek(done)
+        o.truncate()
+        pos, shown = 0, -1
+        for data, sec, _off, length in regions:
+            if pos + length <= done:
+                pos += length
+                continue
+            skip = max(0, done - pos)
+            for rel in range(skip, length, chunk):
+                n = min(chunk, length - rel)
+                if data is not None:
+                    o.write(data[rel:rel + n])
+                elif sec is None:
+                    o.write(bytes(n))
+                else:
+                    o.write(sec.read_raw(rel, n))
+                pct = (pos + rel + n) * 100 // nca.size
+                if pct != shown:   # (once per percent: a log keeps every line)
+                    print(f"\r  decrypted {pct}%", end="", file=sys.stderr)
+                    shown = pct
+            pos += length
+    print(file=sys.stderr)
+    os.replace(partial, out)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["info", "exefs", "romfs-ls", "romfs-get", "romfs-cfg", "aoc-cfg"])
+    ap.add_argument("cmd", choices=["info", "exefs", "romfs-ls", "romfs-get", "romfs-cfg", "aoc-cfg", "decrypt"])
     ap.add_argument("nca")
     ap.add_argument("--keys")
     ap.add_argument("--out")
     ap.add_argument("--match", default="")
     ap.add_argument("--flat", action="store_true", help="romfs-get: every file straight into --out, without its folders")
     ap.add_argument("--app", type=lambda s: int(s, 16), help="aoc-cfg: the application whose add-on content to list")
+    ap.add_argument("--inner", help="the NCA of that name inside the package (an .nsp or .xci) given in place of an NCA")
     a = ap.parse_args()
 
     if a.cmd == "aoc-cfg":
         if not (a.keys and a.out):
             raise SystemExit("aoc-cfg needs --keys <dir> and --out <aoc.cfg>")
         return aoc_cfg(a.nca, a.keys, a.out, a.app)
-    if is_plain_romfs(a.nca) or a.nca.endswith(".cfg"):
+    if a.inner:   # an NCA inside an NSP or XCI, read in place (with an NSP's own tickets)
+        if not a.keys:
+            raise SystemExit("--keys <dir> is needed to read an NCA")
+        found = [n for name, n in nsp_ncas(a.nca, a.keys) if name.lower() == a.inner.lower()]
+        if not found:
+            raise SystemExit(f"{a.nca} holds no {a.inner}")
+        nca = found[0]
+    elif is_plain_romfs(a.nca) or a.nca.endswith(".cfg"):
         if a.cmd not in ("romfs-ls", "romfs-get"):
             raise SystemExit(f"{a.nca} is a RomFS image, not an NCA: only romfs-ls and romfs-get apply")
         romfs = RomfsImage(a.nca) if a.nca.endswith(".cfg") else PlainRomfs(a.nca)
@@ -444,15 +555,24 @@ def main():
         if sec.enc_type != 1 and not nca.plaintext:
             raise SystemExit("the RomFS section is encrypted; the runtime reads it in place only when it is not")
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        at = getattr(nca, "base", 0) + sec.start + sec.data_off   # (base: where the NCA starts in its package)
         with open(a.out, "w") as f:
-            f.write(f"{os.path.abspath(a.nca)}\n{sec.start + sec.data_off}\n")
-        print(f"wrote {a.out}: RomFS at byte {sec.start + sec.data_off:#x} of {a.nca}")
+            f.write(f"{os.path.abspath(a.nca)}\n{at}\n")
+        print(f"wrote {a.out}: RomFS at byte {at:#x} of {a.nca}")
     elif a.cmd == "romfs-get":
         sec = nca.section(0)
         for path, off, size in romfs_entries(sec):
             if a.match in path:
                 print(f"  {path} ({size})")
                 copy_out(sec, off, size, os.path.join(a.out, os.path.basename(path) if a.flat else path.replace("/", os.sep)))
+    elif a.cmd == "decrypt":   # the whole NCA as plain bytes: readable in place from then on
+        if not a.out:
+            raise SystemExit("decrypt needs --out <file>")
+        if nca.plaintext:
+            print(f"{a.nca} is already decrypted")
+        else:
+            decrypt_nca(nca, a.out)
+            print(f"wrote {a.out}: {nca.size} bytes")
 
 
 if __name__ == "__main__":

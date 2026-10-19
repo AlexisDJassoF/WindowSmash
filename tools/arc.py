@@ -26,7 +26,13 @@ import os
 import struct
 import sys
 import zlib
-from compression import zstd
+try:
+    from compression.zstd import decompress as zstd_decompress   # Python 3.14
+except ImportError:                                               # 3.10 to 3.13: the zstandard package
+    import zstandard
+
+    def zstd_decompress(data):
+        return zstandard.ZstdDecompressor().decompressobj().decompress(data)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nca import RomfsImage, romfs_entries  # noqa: E402
@@ -75,7 +81,7 @@ class Arc:
             raise SystemExit("data.arc: bad magic")
         self.file_section = hdr[2]
         data_start, decomp, comp, _ = struct.unpack("<4I", self.read(hdr[4], 16))
-        t = self.t = zstd.decompress(self.read(hdr[4] + data_start, comp))
+        t = self.t = zstd_decompress(self.read(hdr[4] + data_start, comp))
         if len(t) != decomp:
             raise SystemExit("data.arc: file system table did not decompress whole")
 
@@ -188,7 +194,7 @@ class Arc:
         off, stored, size, compressed = where
         data = self.read(off, stored)
         if compressed:
-            data = zstd.decompress(data)
+            data = zstd_decompress(data)
         if len(data) != size:
             raise SystemExit(f"{path}: {len(data)} bytes, the table says {size}")
         return data

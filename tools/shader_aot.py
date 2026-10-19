@@ -24,7 +24,13 @@ import struct
 import subprocess
 import sys
 import time
-from compression import zstd
+try:
+    from compression.zstd import decompress as zstd_decompress   # Python 3.14
+except ImportError:                                               # 3.10 to 3.13: the zstandard package
+    import zstandard
+
+    def zstd_decompress(data):
+        return zstandard.ZstdDecompressor().decompressobj().decompress(data)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arc as A    # noqa: E402
@@ -71,7 +77,7 @@ def find_programs(arc):
         data = arc.read(off, stored)
         if flags & 3:
             try:
-                data = zstd.decompress(data)
+                data = zstd_decompress(data)
             except Exception:
                 unread += 1
                 continue

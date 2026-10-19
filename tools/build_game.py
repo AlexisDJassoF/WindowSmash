@@ -2,23 +2,31 @@
 """Build the game from your own files in one go: what Build WindowSmash.bat runs.
 
 Usage:
-  build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir>] [--jobs N]
+  build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir>] [--jobs N] [--prepare-only]
+  build_game.py --check
 
 It does the setup guide's steps (docs/BUILDING.md) one after the other and stops at the first
 that fails, saying why. A step whose result is already there is skipped, so running it again
-carries on where it stopped.
-  1. tools     Python 3.14, and clang-cl (found by tools/cc.py) building a test program
+carries on where it stopped. --check does the first step only (the installer uses it);
+--prepare-only all but the last.
+  1. tools     Python 3.10 or newer, and clang-cl (found by tools/cc.py) building a test program
   2. packages  requirements.txt, installed with pip unless they are already
   3. folders   where the game files, keys and firmware are: asked (the answers are the defaults
                next time, in dump/build_folders.txt) unless --game, --keys, --firmware say
-  4. program   the Program NCA among the game folder's .nca files (of two, the update's: title
-               id ending in 800); its ExeFS into dump/exefs
+  4. program   the Program NCA among the game folder's files (tools/gamefiles.py: the guide's
+               folder, an emulator's installed-content folder, an update .nsp; of base and
+               update, the update's); its ExeFS into dump/exefs, and which game and version it
+               is into dump/game_source.txt - a later run with a game folder holding another
+               version stops rather than mix the two (one folder, one version: docs/VERSIONS.md)
   5. fonts     the .bfttf fonts of every firmware NCA into dump/fonts (or the six from a fonts
                folder in the game folder)
   6. data      dump/modules/romfs.cfg: the game folder's romfs.bin, checked and set by
-               tools/Configure-Game-Data.ps1; without one, the program NCA's own RomFS, which
-               must be decrypted (tools/nca.py romfs-cfg)
-  7. dlc       dump/modules/aoc.cfg from the game folder's dlc folder, if it has one
+               tools/Configure-Game-Data.ps1; without one, the program NCA's own RomFS, read in
+               place when it is decrypted (tools/nca.py romfs-cfg), else decrypted first into
+               dump/modules (tools/nca.py decrypt); an update's, which is a patch, is applied
+               over the base's next to it (tools/update.py apply: a layered romfs.cfg)
+  7. dlc       dump/modules/aoc.cfg from the game folder's dlc folder (DLC .nsp files, or
+               installed content), or from the DLC installed next to the game (an emulator's)
   8. fighters  the fighter modules in data.arc into dump/nro (tools/arc.py nro, which skips the
                ones there already)
   9. build     build/ssbu.exe (tools/recomp.py all), unless it is newer than everything it is
@@ -35,6 +43,7 @@ import sys
 import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS)
 ROOT = os.path.dirname(TOOLS)
 DUMP = os.path.join(ROOT, "dump")
 EXEFS = os.path.join(DUMP, "exefs")
@@ -42,6 +51,7 @@ FONTS = os.path.join(DUMP, "fonts")
 MODULES = os.path.join(DUMP, "modules")
 EXE = os.path.join(ROOT, "build", "ssbu.exe")
 SAVED = os.path.join(DUMP, "build_folders.txt")
+SOURCE = os.path.join(DUMP, "game_source.txt")   # which game and version dump/ was set up from
 EXEFS_FILES = ("main", "main.npdm", "rtld", "sdk", "subsdk0")
 FONT_FILES = ("nintendo_udsg-r_std_003.bfttf", "nintendo_udsg-r_org_zh-cn_003.bfttf",
               "nintendo_udsg-r_ext_zh-cn_003.bfttf", "nintendo_udjxh-db_zh-tw_003.bfttf",
@@ -67,17 +77,32 @@ def run(args, failure):
 # ---- what the steps decide by (also tested: tests/test_build_game.py) ---------------------
 def pick_program(ncas):
     """The program to build from, of [(path, content type, title id)]: the one Program NCA, or
-    of two, the update's (its title id ends in 800)."""
-    programs = [(path, title) for path, kind, title in ncas if kind == PROGRAM]
-    if len(programs) > 1:
-        updates = [p for p in programs if p[1] & 0xFFF == 0x800]
-        programs = updates if len(updates) == 1 else programs
-    if not programs:
-        raise Failed("there is no Program NCA among them")
-    if len(programs) > 1:
-        raise Failed("there are several Program NCAs: " + ", ".join(os.path.basename(p) for p, _ in programs)
-                     + ". Keep only the one of the game version to build (setup guide step 2).")
-    return programs[0][0]
+    of two, the update's (its title id ends in 800) - gamefiles.pick_program's rule."""
+    import gamefiles
+    contents = [{"path": path, "name": os.path.basename(path), "container": None, "content_id": None,
+                 "type": "program" if kind == PROGRAM else "other", "title_id": f"{title:016X}",
+                 "app": f"{gamefiles.app_of(title):016X}", "kind": gamefiles.kind_of(title), "version": None}
+                for path, kind, title in ncas]
+    try:
+        return gamefiles.pick_program(contents)["path"]
+    except gamefiles.Error as e:
+        raise Failed(str(e))
+
+
+def marker_applies(marker):
+    """Whether a requirement's environment marker holds here: the python_version comparisons
+    requirements.txt uses (`python_version < "3.14"`), joined by `and`; anything else: yes."""
+    here = tuple(sys.version_info[:2])
+    for clause in marker.split(" and "):
+        m = re.match(r'\s*python_version\s*(<=|>=|==|!=|<|>)\s*"(\d+)\.(\d+)"\s*$', clause)
+        if not m:
+            continue
+        op, want = m.group(1), (int(m.group(2)), int(m.group(3)))
+        holds = {"<": here < want, "<=": here <= want, ">": here > want, ">=": here >= want,
+                 "==": here == want, "!=": here != want}[op]
+        if not holds:
+            return False
+    return True
 
 
 def jobs_for_ram(gb):
@@ -106,6 +131,8 @@ def missing_packages(requirements):
             name = re.split(r"[\s;<>=!~\[#]", line.strip(), maxsplit=1)[0]
             if not name or name.startswith("-"):
                 continue
+            if ";" in line and not marker_applies(line.split(";", 1)[1].split("#")[0]):
+                continue
             try:
                 metadata.version(name)
             except metadata.PackageNotFoundError:
@@ -115,8 +142,8 @@ def missing_packages(requirements):
 
 # ---- the steps ------------------------------------------------------------------------------
 def check_tools():
-    if sys.version_info < (3, 14) or importlib.util.find_spec("compression.zstd") is None:
-        raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.14 (setup guide step 3).")
+    if sys.version_info < (3, 10):
+        raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.10 or newer (setup guide step 3).")
     log(f"  Python {sys.version.split()[0]}: {sys.executable}")
     import cc
     clang = cc.CLANG if os.path.isfile(cc.CLANG) else shutil.which(cc.CLANG)
@@ -200,59 +227,104 @@ def load_saved():
 
 
 def find_program(game, keys):
-    """(path, title id) of the program among the game folder's .nca files (nca.py info's type)."""
-    from nca import Nca
-    found, unread = [], []
-    for name in sorted(os.listdir(game)):
-        path = os.path.join(game, name)
-        if not name.lower().endswith(".nca") or not os.path.isfile(path):
-            continue
-        try:
-            nca = Nca(path, keys)
-        except (SystemExit, Exception) as e:   # (a cut-off file, or one under keys we lack)
-            unread.append(f"{name}: {e}")
-            continue
-        found.append((path, nca.content_type, nca.title_id))
-        nca.f.close()
+    """(path, title id, record, scan) of the program to build from, among the game folder's
+    files (tools/gamefiles.py: the guide's folder, an emulator's installed-content folder, update
+    and DLC .nsp packages)."""
+    import gamefiles
+    result = gamefiles.scan(game, keys)
+    contents, unread = result["contents"], result["unread"]
+    for line in gamefiles.summary(result):
+        log(f"  {line}")
     try:
-        program = pick_program(found)
-    except Failed as e:
-        why = [f"Looked for the game's program among the {len(found) + len(unread)} .nca files in {game}: {e}."]
+        program = gamefiles.pick_program(contents)
+    except gamefiles.Error as e:
+        why = [f"Looked for the game's program among the {len(contents) + len(unread)} game files in {game}: {e}."]
         if unread:
             why.append("These could not be read (keys missing or too old?):\n    " + "\n    ".join(unread[:8]))
-        if not found and not unread:
+        if not contents and not unread:
             why.append("Copy the game's program .nca there (setup guide step 2).")
         raise Failed("\n  ".join(why))
-    title = next(t for p, _k, t in found if p == program)
-    log(f"  program: {os.path.basename(program)} (title id {title:016X})")
-    return program, title
+    title = int(program["title_id"], 16)
+    log(f"  program: {gamefiles.where(program)} (title id {title:016X})")
+    return program["path"], title, program, result
 
 
-def extract_exefs(program, keys):
+def nca_ref(rec):
+    """nca.py's arguments naming the NCA of a scan record: its file, or its package and --inner."""
+    return [rec["path"], "--inner", rec["name"]] if rec["container"] else [rec["path"]]
+
+
+def game_identity(rec):
+    """What the build is of: the game, base or update, and the version (game_source.txt's first line)."""
+    return f"{rec['app']} {rec['kind']} {rec['version'] if rec['version'] is not None else '-'}"
+
+
+def describe_identity(line, display=None):
+    """For a person: the version as the game shows it (13.0.5) when known, else the title version."""
+    _app, kind, version = (line.split() + ["-", "-", "-"])[:3]
+    what = "the game's update" if kind == "update" else "the game"
+    if display:
+        return f"{display} ({what})"
+    return f"{what} (title version v{int(version) >> 16})" if version.isdigit() else what
+
+
+def same_game(was, now):
+    """Whether two game_identity lines name the same build source; a version unknown on either
+    side (a renamed file without its metadata) is not held against it."""
+    w, n = (was.split() + ["-", "-", "-"])[:3], (now.split() + ["-", "-", "-"])[:3]
+    return w[:2] == n[:2] and (w[2] == n[2] or "-" in (w[2], n[2]))
+
+
+def check_same_game(rec):
+    """This folder was set up from one version of the game (dump/game_source.txt); refuse to mix in
+    another: its program, data and fighters would no longer match."""
+    if not os.path.isfile(SOURCE):
+        return
+    with open(SOURCE, encoding="utf-8") as f:
+        was = f.readline().strip()
+        was_display = f.readline().split("\t")[0].strip()
+    now = game_identity(rec)
+    if was and not same_game(was, now):
+        raise Failed(f"This WindowSmash folder was set up from {describe_identity(was, was_display)}, but the game "
+                     f"folder now has {describe_identity(now, rec['display_version'])} to build from. One folder holds "
+                     "one game version: set up the new one in a new WindowSmash folder, or add it as a version of its "
+                     "own (docs/VERSIONS.md).")
+
+
+def write_game_source(rec):
+    with open(SOURCE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(game_identity(rec) + "\n")
+        f.write(f"{rec['display_version'] or ''}\t{rec['path']}\t{rec['name'] if rec['container'] else ''}\n")
+
+
+def extract_exefs(rec, keys):
+    import gamefiles
     partial = EXEFS + ".partial"
-    run([sys.executable, os.path.join("tools", "nca.py"), "exefs", program, "--keys", keys,
+    run([sys.executable, os.path.join("tools", "nca.py"), "exefs", *nca_ref(rec), "--keys", keys,
          "--out", os.path.join("dump", "exefs.partial")],
-        f"Could not copy the program out of {program} (see above).")
+        f"Could not copy the program out of {gamefiles.where(rec)} (see above).")
     missing = [n for n in EXEFS_FILES if not os.path.isfile(os.path.join(partial, n))]
     if missing:
-        raise Failed(f"{os.path.basename(program)} has no {', '.join(missing)}: it is not the game's program.")
+        raise Failed(f"{gamefiles.where(rec)} has no {', '.join(missing)}: it is not the game's program.")
     os.makedirs(EXEFS, exist_ok=True)
     for n in os.listdir(partial):
         os.replace(os.path.join(partial, n), os.path.join(EXEFS, n))
     os.rmdir(partial)
+    write_game_source(rec)
 
 
 def extract_fonts(firmware, keys):
     """What `nca.py romfs-get <nca> --match .bfttf --flat` gets from each firmware NCA, read in
     this one process; an NCA it cannot read (no RomFS, no key) has no fonts for the game."""
     from nca import Nca, copy_out, romfs_entries
+    import gamefiles
     partial = FONTS + ".partial"
-    names = sorted(n for n in os.listdir(firmware) if n.lower().endswith(".nca") and os.path.isfile(os.path.join(firmware, n)))
-    log(f"  reading the {len(names)} .nca files in {firmware}")
-    for name in names:
+    ncas, _nsps = gamefiles.list_ncas(firmware, depth=0)   # (files, or Ryujinx's <id>.nca\00)
+    log(f"  reading the {len(ncas)} .nca files in {firmware}")
+    for path, _name in ncas:
         nca = None
         try:
-            nca = Nca(os.path.join(firmware, name), keys)
+            nca = Nca(path, keys)
             sec = nca.section(0)
             for path, off, size in romfs_entries(sec) if sec else ():
                 if ".bfttf" in path:
@@ -282,13 +354,49 @@ def write_romfs_cfg(game, keys, the_program):
              "-FontsDirectory", FONTS],
             f"{romfs_bin} could not be used (see above): it must be the game's data, unencrypted and with "
             "your update applied (setup guide part 2).")
+        return
+    import gamefiles
+    path, _title, program, result = the_program()
+    cfg = os.path.join("dump", "modules", "romfs.cfg")
+    state = program["romfs"]
+    if state == "plain":   # readable in place
+        run([sys.executable, os.path.join("tools", "nca.py"), "romfs-cfg", *nca_ref(program), "--keys", keys, "--out", cfg],
+            f"The game data inside {gamefiles.where(program)} can't be read in place (see above). Put the game's data in "
+            f"{game} as romfs.bin: unencrypted, with your update applied (setup guide part 2).")
+    elif state == "encrypted":   # the game (or a release with its update merged in), as the Switch stores it
+        plain = decrypt_once(program, keys)
+        run([sys.executable, os.path.join("tools", "nca.py"), "romfs-cfg", plain, "--keys", keys, "--out", cfg],
+            f"The game data inside {os.path.basename(plain)} can't be read (see above).")
+    elif state == "patch":   # an update: its data is a patch over the game's own, applied by update.py
+        base = gamefiles.base_program(result["contents"], program)
+        if not base:
+            raise Failed(f"{gamefiles.where(program)} is the game's update, whose data is a patch over the game's own: "
+                         f"WindowSmash also needs the game itself (its program .nca, or its .nsp) in {game}, next to it.")
+        base_cfg = os.path.join("dump", "modules", "romfs_base.cfg")
+        base_ref = nca_ref(base) if base["romfs"] == "plain" else [decrypt_once(base, keys)]
+        run([sys.executable, os.path.join("tools", "nca.py"), "romfs-cfg", *base_ref, "--keys", keys, "--out", base_cfg],
+            f"The game data inside {gamefiles.where(base)} can't be read (see above).")
+        log("  applying the update over the game's data (a few minutes; every block of the result is checked)")
+        run([sys.executable, os.path.join("tools", "update.py"), "apply", path, "--base", base_cfg, "--keys", keys,
+             "--tree", ROOT],
+            "The update could not be applied over the game's data (see above).")
     else:
-        program = the_program()[0]
-        run([sys.executable, os.path.join("tools", "nca.py"), "romfs-cfg", program, "--keys", keys,
-             "--out", os.path.join("dump", "modules", "romfs.cfg")],
-            f"There is no romfs.bin in {game}, and the game data inside {os.path.basename(program)} can't be read "
-            "in place (see above). Put the game's data there as romfs.bin: unencrypted, with your update "
-            "applied (setup guide part 2).")
+        raise Failed(f"There is no romfs.bin in {game}, and {gamefiles.where(program)} holds no game data. Put the game's "
+                     "data there as romfs.bin: unencrypted, with your update applied (setup guide part 2).")
+
+
+def decrypt_once(record, keys):
+    """The NCA decrypted into dump/modules, for reading in place; kept once it is complete."""
+    import gamefiles
+    out = os.path.join(MODULES, f"{record['kind']}-{record['title_id'].lower()}.nca")
+    if os.path.isfile(out) and os.path.getsize(out) == record["size"]:
+        log(f"  {os.path.relpath(out, ROOT)}: already decrypted")
+        return out
+    log(f"  decrypting {gamefiles.where(record)} into {os.path.relpath(out, ROOT)} ({record['size'] / 2**30:.1f} GB: "
+        "some minutes; if it stops, run this again to carry on)")
+    run([sys.executable, os.path.join("tools", "nca.py"), "decrypt", *nca_ref(record), "--keys", keys, "--out", out],
+        f"Could not decrypt {gamefiles.where(record)} (see above).")
+    return out
 
 
 def build_is_current():
@@ -327,7 +435,6 @@ def in_use(path):
 
 
 def build(a):
-    sys.path.insert(0, TOOLS)
     log("[1/9] Check the tools")
     check_tools()
 
@@ -341,7 +448,8 @@ def build(a):
     os.makedirs(DUMP, exist_ok=True)
     saved = load_saved()
     game = keys = firmware = fonts_from = None
-    if not (exefs_done and romfs_done and os.path.exists(aoc)):
+    # (a game folder named on the command line is always looked at: it may hold another version now)
+    if a.game or not (exefs_done and romfs_done and os.path.exists(aoc)):
         game = ask_folder("game", a.game, saved)
     if missing_fonts(FONTS):
         fonts_from = "game" if game and not missing_fonts(os.path.join(game, "fonts")) else "firmware"
@@ -361,9 +469,11 @@ def build(a):
 
     log("\n[4/9] Copy the game's program (dump\\exefs)")
     if exefs_done:
+        if game:
+            check_same_game(the_program()[2])
         log("  already done")
     else:
-        extract_exefs(the_program()[0], keys)
+        extract_exefs(the_program()[2], keys)
 
     log("\n[5/9] Take the fonts out of your firmware (dump\\fonts)")
     if fonts_from is None:
@@ -390,15 +500,19 @@ def build(a):
         write_romfs_cfg(game, keys, the_program)
 
     log("\n[7/9] Turn on your DLC (dump\\modules\\aoc.cfg)")
-    dlc = os.path.join(game, "dlc") if game else None
     if os.path.exists(aoc):
         log("  already done")
-    elif not os.path.isdir(dlc):
-        log(f"  no dlc folder in {game}: no DLC")
     else:
-        run([sys.executable, os.path.join("tools", "nca.py"), "aoc-cfg", dlc, "--keys", keys,
-             "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{the_program()[1] & ~0xFFF:016X}"],
-            f"Could not read the DLC in {dlc} (see above).")
+        dlc = os.path.join(game, "dlc")
+        if not os.path.isdir(dlc):   # an emulator's folder: the DLC is installed next to the game
+            _path, _title, program, result = the_program()
+            dlc = game if any(c["kind"] == "dlc" and c["app"] == program["app"] for c in result["contents"]) else None
+        if not dlc:
+            log(f"  no dlc folder in {game}, and no DLC among its files: no DLC")
+        else:
+            run([sys.executable, os.path.join("tools", "nca.py"), "aoc-cfg", dlc, "--keys", keys,
+                 "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{the_program()[1] & ~0xFFF:016X}"],
+                f"Could not read the DLC in {dlc} (see above).")
 
     log("\n[8/9] Take out the fighters (dump\\nro)")
     run([sys.executable, os.path.join("tools", "arc.py"), "nro"],
@@ -406,6 +520,9 @@ def build(a):
         "the game's, with your update applied.")
 
     log("\n[9/9] Build the game (build\\ssbu.exe)")
+    if a.prepare_only:
+        log("  not now (--prepare-only): everything the build needs is ready")
+        return
     import cc
     if build_is_current():
         log("  build\\ssbu.exe is newer than everything it is built from: nothing to do (delete it to build again)")
@@ -433,9 +550,16 @@ def main():
     ap.add_argument("--keys", help=r"the folder with prod.keys and title.keys (asked; default D:\MyKeys)")
     ap.add_argument("--firmware", help=r"the folder with the firmware's .nca files (asked; default D:\MyFirmware)")
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
+    ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
+    ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")
     a = ap.parse_args()
     try:
-        build(a)
+        if a.check:
+            log("[1/9] Check the tools")
+            check_tools()
+            log("\nThe tools are ready.")
+        else:
+            build(a)
     except Failed as e:
         log(f"\nERROR: {e}")
         return 1

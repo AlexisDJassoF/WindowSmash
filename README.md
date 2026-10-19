@@ -65,35 +65,27 @@ The game itself still comes from your files. This repository holds only the tran
 | **Memory** | 16 GB recommended. |
 | **Free space** | About 60 GB on the drive WindowSmash goes on, plus room for your game files (about 17 GB). |
 | **Your game files** | Super Smash Bros. Ultimate from your own Switch, with your console's keys and firmware. Any version should work; **11.0.0** and **13.0.5** have been tested. The [setup guide](docs/BUILDING.md#part-2-gather-your-game-files) lists exactly which files. |
-| **Two free tools** | Python and Visual Studio Community. The setup guide shows how to install them. |
-| **Time** | About an hour of your own time, plus 30 minutes to a few hours of waiting while your PC builds the game. |
+| **Two free tools** | Python and the Visual Studio build tools. `Install WindowSmash.bat` installs them for you. |
+| **Time** | About 15 minutes of your own time, plus 30 minutes to a few hours of waiting while your PC builds the game. |
 
 ## Install and play
 
-**Follow the [setup guide](docs/BUILDING.md).** It goes step by step, and no programming knowledge is needed: you copy each command from the guide and paste it.
-
-The whole journey at a glance:
-
 | Step | What happens | Your time |
 | :---: | :--- | :--- |
-| **1** | **Check your PC** can run the game. | 5 minutes |
-| **2** | **Gather your game files** into three folders. | 10 minutes |
-| **3** | **Install two free tools**, Python and Visual Studio. | 30 minutes, mostly waiting |
-| **4** | **Download WindowSmash** and install its helpers. | 5 minutes |
-| **5** | **Prepare the game.** Paste a few commands that take what's needed from your files. | 15 minutes |
-| **6** | **Build the game.** Paste one command, then wait while your PC translates the game. | 30 minutes to a few hours |
-| **7** | **Play.** Double-click `Play SSBU.bat`. | |
+| **1** | **Have your game files ready.** Played the game in yuzu or Ryujinx on this PC? Then you already do. Otherwise, the [setup guide](docs/BUILDING.md#part-2-gather-your-game-files) says which files you need. | 10 minutes |
+| **2** | **Download WindowSmash** (the green **Code** button → **Download ZIP**, extract it) and double-click **`Install WindowSmash.bat`**. It checks your PC, installs the two tools if they are missing, shows the folders it found for your game files, keys and firmware, and builds the game. | 5 minutes, then waiting |
+| **3** | **Play.** Double-click `Play SSBU.bat`, or the shortcut it put on the desktop. | |
 
-Steps 5 and 6 can also run in one go: after downloading WindowSmash, double-click **`Build WindowSmash.bat`** ([how](docs/BUILDING.md#shortcut-build-windowsmashbat)).
+To update later, double-click `Install WindowSmash.bat` again: it fetches the newest WindowSmash and builds it. The [setup guide](docs/BUILDING.md) has the details, and every step by hand for those who prefer it.
 
-<p align="center"><a href="docs/BUILDING.md"><strong>Start the setup guide →</strong></a></p>
+<p align="center"><a href="docs/BUILDING.md"><strong>Open the setup guide →</strong></a></p>
 
 <details>
 <summary><strong>Already know your way around? The short version</strong></summary>
 
 <br>
 
-You need Windows 10/11 x64, Python 3.14 as `python`, and Visual Studio 2022 or newer with **Desktop development with C++** and **C++ Clang tools for Windows**. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`.
+You need Windows 10/11 x64, Python 3.10 or newer as `python`, and Visual Studio 2022 or newer (or its Build Tools) with **Desktop development with C++** and **C++ Clang tools for Windows**. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`. Music and movie codecs are built from `third_party/` as part of the build.
 
 ```powershell
 git clone https://github.com/SNO2207/WindowSmash.git
@@ -172,7 +164,7 @@ WindowSmash is **experimental**. Menus and matches run and Local Wireless connec
 | **Graphics** | Direct3D 11. Shaders compile the first time each is used, so a new effect can hitch once. `Prepare Shaders.bat` can compile them ahead of time. |
 | **Controllers** | Up to eight players on most pads, plus the keyboard. Testing with real pads has been limited so far. |
 | **Display** | Windowed, borderless or full screen, kept 16:9, with pacing for fixed-refresh and variable-refresh monitors. |
-| **Audio and movies** | Music needs libopus and movies need libvpx, both optional when building. |
+| **Audio and movies** | Music (Opus) and movies (VP9) are decoded by libopus and libvpx, built from the sources that come with WindowSmash. |
 | **DLC** | The DLC fighters your version has: 11.0.0 has them up to Pyra/Mythra; Kazuya came with 12.0.0 and Sora with 13.0.0. |
 | **Multiplayer** | The online lobby (with direct connections) and private rooms work. Complete matches between two PCs, and the whole roster online, haven't been fully verified. |
 | **Linux** | Experimental, cross-compiled from the same source and drawn through DXVK on Vulkan. |
@@ -234,7 +226,7 @@ The game-backed instruction and function tests are in the [technical guide](docs
 | `runtime/` | The native runtime: services, graphics, input, audio, networking. |
 | `tools/` | The recompiler, game-file readers, launch helpers and diagnostic tools. |
 | `tests/` | Source-only tests. |
-| `third_party/` | License texts of third-party code. |
+| `third_party/` | The sources of libopus and libvpx's VP9 decoder, built during the build, with their license texts. |
 | `docs/` | These guides. |
 
 Everything generated or personal stays out of Git: `build/`, `dump/`, `deps/`, `save/`, version folders such as `v13.0.5/`, caches, captures, reports and local bundles.
