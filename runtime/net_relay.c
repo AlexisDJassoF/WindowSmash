@@ -349,10 +349,10 @@ static void write_share_file(void) {
     if (upnp_state == 1) fprintf(f, "Give your friends this address to join: %s:%u\n", public_ip[0] ? public_ip : "(your public IP)", port);
     else if (upnp_state == 4) fprintf(f, "Your router opened the port, but its own internet address (%s) is not reachable from outside:\n"
                                          "it is behind another router or your provider's NAT. Friends on the same network can join %s:%u.\n"
-                                         "For friends elsewhere, use a VPN or tools/ssbu_relay.py on a reachable machine (see NETPLAY.md).\n",
+                                         "For friends elsewhere, use a VPN or tools/ssbu_relay.py on a reachable machine (see docs/MULTIPLAYER.md).\n",
                                       public_ip, lan_ip, port);
     else fprintf(f, "Your router did not open the port (UPnP %s).\nFriends on the same network can join %s:%u.\n"
-                    "For friends elsewhere, run tools/ssbu_relay.py on a reachable machine (see NETPLAY.md).\n",
+                    "For friends elsewhere, run tools/ssbu_relay.py on a reachable machine (see docs/MULTIPLAYER.md).\n",
                  upnp_state == 2 ? "not available" : "refused", lan_ip, port);
     fprintf(f, "Room: %s\n", room);
     fclose(f);

@@ -326,7 +326,7 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
         out(": %s address %s", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
             rt_describe(e->ExceptionRecord->ExceptionInformation[1], name, sizeof name));
     out("\n");
-    /* where on the host: the faulting instruction's module and offset (symbolize with tools/hostsym.py) */
+    /* where on the host: the faulting instruction's module and offset (symbolize with tools/dev/hostsym.py) */
     HMODULE mod = NULL;
     char modname[MAX_PATH] = "?";
     u64 pc = (u64)e->ExceptionRecord->ExceptionAddress;

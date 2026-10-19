@@ -41,7 +41,7 @@ The first time, the new version gets a **copy** of your main save, which the gam
 
 - **Multiplayer needs the same version on every PC.** A 13.0.5 player can't play with an 11.0.0 one.
 - **The unlock tool** knows the save layouts of 11.0.0 and 13.0.5, which are the same, and refuses other versions. The game unlocks Kazuya and Sora itself when you have their DLC ([DLC and unlocks](DLC-AND-UNLOCKS.md)).
-- **The local bundler** (`tools/bundle_ssbu.py`) only understands a plain `romfs.cfg`, so it refuses an update's folder rather than make a broken bundle. The [Linux packager](../README-LINUX.md) handles both.
+- **The local bundler** (`tools/bundle_ssbu.py`) only understands a plain `romfs.cfg`, so it refuses an update's folder rather than make a broken bundle. The [Linux packager](LINUX.md) handles both.
 - **What has been checked on 13.0.5:** the game data (every block, see [below](#how-the-update-is-applied)), a build of `main` and all 98 fighter modules, and scripted runs through the menus. The title screen reads *Ver. 13.0.5*, the unlock sequence for the new content plays, and character select shows the full roster, Kazuya and Sora included. Matches haven't been checked thoroughly.
 - **Managing several versions** (folders, choosing at start, sharing, disk space) is in [Several versions](VERSIONS.md).
 
@@ -77,7 +77,7 @@ To start that version without a launcher:
 v13.0.5\build\ssbu.exe v13.0.5\dump\modules --status 30 > v13.0.5\build\play.log 2>&1
 ```
 
-`SSBU_TREE=v13.0.5 tools/menurun.sh <out dir>` runs the scripted menu test on that version.
+`SSBU_TREE=v13.0.5 tools/dev/menurun.sh <out dir>` runs the scripted menu test on that version.
 
 ## How the update is applied
 

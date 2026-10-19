@@ -1,12 +1,12 @@
 # DLC and unlocks
 
-[← README](../README.md) · [Setup guide](BUILDING.md) · [Game updates](UPDATES.md) · [Multiplayer](../NETPLAY.md)
+[← README](../README.md) · [Setup guide](BUILDING.md) · [Game updates](UPDATES.md) · [Multiplayer](MULTIPLAYER.md)
 
 Three separate things are involved:
 
 1. **Telling the game which DLC you own**, with a small list file called `aoc.cfg`.
 2. **Building the DLC fighters' code**, which the normal build does by itself.
-3. **Unlocking the base-game fighters** on your save, with `Unlock All Fighters.bat`.
+3. **Unlocking the base-game fighters** on your save, with `launchers\Unlock All Fighters.bat`.
 
 ## Contents
 
@@ -55,15 +55,15 @@ The next time the game starts, it may announce new fighters, stages, music or co
 
 **For a version folder** such as `v13.0.5`, write its own list with `--out v13.0.5/dump/modules/aoc.cfg`, or give `tools/install_version.py` the `--dlc` option, which does it for you ([game updates](UPDATES.md)).
 
-**With a runtime package**, give `Configure Game Data.bat` an `aoc.cfg` you already have when it asks. Packages never include anyone's DLC list.
+**With a runtime package**, give `launchers\Configure Game Data.bat` an `aoc.cfg` you already have when it asks. Packages never include anyone's DLC list.
 
 ## Unlock every base-game fighter
 
-The game starts with only the original eight fighters unlocked. `Unlock All Fighters.bat` unlocks the rest of the base-game roster on your own save.
+The game starts with only the original eight fighters unlocked. `launchers\Unlock All Fighters.bat` unlocks the rest of the base-game roster on your own save.
 
 1. Start the game once and wait for the main menu, so it creates a save. Then close it.
 2. **Make sure every game window is closed.** The game keeps its save in memory and would overwrite the change.
-3. Double-click **`Unlock All Fighters.bat`** in the WindowSmash folder. With [several versions](VERSIONS.md) built, it asks which one.
+3. Double-click **`launchers\Unlock All Fighters.bat`** in the WindowSmash folder. With [several versions](VERSIONS.md) built, it asks which one.
 4. Read what it says. It makes a dated backup of your save in `save_backups\` first: keep it.
 5. Start the game again. Unlock notices appear for the new fighters: skip each with the **X** button (<kbd>C</kbd> on the keyboard).
 

@@ -38,7 +38,7 @@ These are external dependencies, not bundled implementations. Their own licenses
 | SDL3 | Controllers other than Xbox pads | Optional, the official Windows development package. |
 | PyCryptodome (`pycryptodomex`) | Reading game packages | `requirements.txt`. |
 | zstandard | Reading `data.arc` on Pythons older than 3.14 | `requirements.txt` (Python 3.14 has `compression.zstd` built in). |
-| Capstone, Unicorn | Disassembly and differential tests | `requirements-dev.txt`, optional. |
+| Capstone, Unicorn | Disassembly and differential tests | `tests/requirements-dev.txt`, optional. |
 
 A developer can link their own libopus or libvpx builds instead of the included sources (`SSBU_OPUS_LIBS`, `SSBU_VPX_DIR`: [`tools/cc.py`](tools/cc.py)). No binaries of any library are checked into this repository.
 

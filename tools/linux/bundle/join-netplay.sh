@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts the game as a netplay player joining a host's relay (or a standalone relay,
-# tools/ssbu_relay.py). No port forwarding needed here. See NETPLAY.md. The log goes to build/play.log.
+# tools/ssbu_relay.py). No port forwarding needed here. See docs/MULTIPLAYER.md. The log goes to build/play.log.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 . ./scripts/common.sh
 find_game_data || exit 1

@@ -24,7 +24,8 @@ FONTS = (
     'nintendo_udsg-r_ext_zh-cn_003.bfttf', 'nintendo_udjxh-db_zh-tw_003.bfttf',
     'nintendo_udsg-r_ko_003.bfttf', 'nintendo_ext_003.bfttf',
 )
-LAUNCHERS = ('Play SSBU.bat', 'Play SSBU Offline.bat', 'Host SSBU Netplay.bat', 'Join SSBU Netplay.bat')
+LAUNCHERS = ('Play SSBU.bat', 'launchers/Play SSBU Offline.bat', 'launchers/Host SSBU Netplay.bat',
+             'launchers/Join SSBU Netplay.bat')   # (the ones in launchers/ expect to be one folder down)
 START_HERE = r'''SSBU PORTABLE - WINDOWS
 
 Extract the ENTIRE ZIP to a writable local folder. Do not play inside the ZIP.
@@ -32,7 +33,8 @@ Use NTFS or exFAT, not FAT32. Allow at least 22 GB for extraction plus space for
 saves and caches. Keeping both the ZIP and game takes roughly 40 GB.
 
 Run Play SSBU.bat to play. It goes online (below) and plays offline by itself
-if the online lobby does not answer; Play SSBU Offline.bat never goes online.
+if the online lobby does not answer; launchers\Play SSBU Offline.bat never goes
+online.
 No compiler, Python, or separate emulator installation is needed to play this
 build. Windows 10/11 x64, an AVX2/FMA/F16C CPU, and a Direct3D 11-capable GPU
 are required.
@@ -47,12 +49,12 @@ Allow the game through Windows Firewall if asked. The overlay (F1) shows
 "Online: N players, M rooms" when connected.
 
 PRIVATE ROOM - ONE PLAYER PER PC
-Host: run Host SSBU Netplay.bat. Choose your player name and a room name.
+Host: run launchers\Host SSBU Netplay.bat. Choose your player name and a room name.
 Allow the game through Windows Firewall if asked. Give your friend the address
 shown by the launcher, netplay_address.txt, or the game's overlay (F2).
 Open Local Wireless in the main-menu sidebar, then Create a Room.
 
-Friend: run Join SSBU Netplay.bat. Enter the host's address, your player name,
+Friend: run launchers\Join SSBU Netplay.bat. Enter the host's address, your player name,
 and the SAME room name. Open Local Wireless and select the host's room.
 The host accepts the challenger. Both PCs must use the same build.
 
@@ -74,7 +76,7 @@ the window (windowed, borderless, fullscreen), its size, and the pacing:
 pacing = vrr is best on G-Sync / FreeSync monitors.
 
 Each install starts with a fresh save and generates its own netplay identity.
-If Unlock All Fighters.bat is included, first start the game, reach the main menu,
+If launchers\Unlock All Fighters.bat is included, first start the game, reach the main menu,
 and close it. Run that button to back up and unlock your own save; no Python is
 needed. DLC is enabled by the included aoc.cfg when present. This 11.0.0 build
 has DLC through Pyra/Mythra; Kazuya and Sora require a newer game version.
@@ -161,7 +163,7 @@ def build_plan(source: Path, shader_cache: bool = True) -> list[Payload]:
     if server.is_file():
         payload.append(text_payload('online_server.txt', server.read_text(encoding='utf-8-sig')))
     # (every launcher picks the game version through tools/pick_version.bat)
-    for name in ('tools/pick_version.bat', 'tools/unlock_all.py', 'tools/Unlock-All-Fighters.ps1', 'Unlock All Fighters.bat'):
+    for name in ('tools/pick_version.bat', 'tools/unlock_all.py', 'tools/Unlock-All-Fighters.ps1', 'launchers/Unlock All Fighters.bat'):
         path = source / name
         if path.is_file():
             payload.append(file_payload(name, path))

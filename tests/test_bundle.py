@@ -40,7 +40,7 @@ class BundleTests(unittest.TestCase):
             'tools/ssbu_relay.py': b'# optional relay',
             'tools/unlock_all.py': b'# optional unlock tool',
             'tools/Unlock-All-Fighters.ps1': b'# optional no-Python unlock tool',
-            'Unlock All Fighters.bat': b'@echo off\n',
+            'launchers/Unlock All Fighters.bat': b'@echo off\n',
             'save/private.dat': b'PRIVATE',
             'prod.keys': b'PRIVATE',
             'netplay_id.txt': b'PRIVATE',
@@ -57,6 +57,7 @@ class BundleTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'font')
         for name in bundler.LAUNCHERS:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text('@echo off\ncd /d "%~dp0"\nrem current launcher\n')
 
     def package(self):
@@ -77,7 +78,7 @@ class BundleTests(unittest.TestCase):
             self.assertIn('SSBU-Portable/dump/modules/aoc.cfg', names)
             self.assertIn('SSBU-Portable/tools/unlock_all.py', names)
             self.assertIn('SSBU-Portable/tools/Unlock-All-Fighters.ps1', names)
-            self.assertIn('SSBU-Portable/Unlock All Fighters.bat', names)
+            self.assertIn('SSBU-Portable/launchers/Unlock All Fighters.bat', names)
             for launcher in bundler.LAUNCHERS:
                 text = archive.read('SSBU-Portable/' + launcher).decode()
                 self.assertIn('set "SSBU_NET_HOST="', text)
