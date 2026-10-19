@@ -148,47 +148,59 @@ static void beside_exe(char *out, size_t n, const char *name) {
     }
 }
 
+/* Read once, by whichever thread asks first (the hitch log's reads it in the background at
+ * start: names show up once it is done); the others wait. The symbols are published last. */
+static volatile LONG symbols_state;   /* 0 not read, 1 being read, 2 read (or there is no map) */
+static int symbols_found;
 static int load_symbols(void) {
-    if (sym_va) return 1;
+    if (InterlockedCompareExchange(&symbols_state, 1, 0) != 0) {
+        while (symbols_state == 1) Sleep(10);
+        return symbols_found;
+    }
     char path[MAX_PATH];
     beside_exe(path, sizeof path, ".map");
     FILE *map = fopen(path, "r");
-    if (!map) return 0;
-    U32 cap = 1 << 18;
+    if (!map) { symbols_state = 2; return 0; }
+    U32 cap = 1 << 18, n = 0;
     size_t pool_used = 0, pool_cap = 1 << 22;
-    sym_va = malloc(sizeof *sym_va * cap);
-    sym_name = malloc(sizeof *sym_name * cap);
-    sym_pool = malloc(pool_cap);
+    U64 *va_of = malloc(sizeof *va_of * cap);
+    U32 *name_of = malloc(sizeof *name_of * cap);
+    char *pool = malloc(pool_cap);
     char line[512];
     while (fgets(line, sizeof line, map)) {   /* " 0001:00001234  f_7100000570  0000000140002234 f  g0000.obj" */
         unsigned sect, off;
         char name[256];
         U64 va;
         if (strncmp(line, " 0001:", 6) || sscanf(line, " %x:%x %255s %llx", &sect, &off, name, &va) != 4) continue;
-        if (nsyms && va < sym_va[nsyms - 1]) continue;
-        if (nsyms == cap) {
+        if (n && va < va_of[n - 1]) continue;
+        if (n == cap) {
             cap *= 2;
-            sym_va = realloc(sym_va, sizeof *sym_va * cap);
-            sym_name = realloc(sym_name, sizeof *sym_name * cap);
+            va_of = realloc(va_of, sizeof *va_of * cap);
+            name_of = realloc(name_of, sizeof *name_of * cap);
         }
         size_t len = strlen(name) + 1;
-        if (pool_used + len > pool_cap) { pool_cap *= 2; sym_pool = realloc(sym_pool, pool_cap); }
-        memcpy(sym_pool + pool_used, name, len);
-        sym_va[nsyms] = va;
-        sym_name[nsyms++] = (U32)pool_used;
+        if (pool_used + len > pool_cap) { pool_cap *= 2; pool = realloc(pool, pool_cap); }
+        memcpy(pool + pool_used, name, len);
+        va_of[n] = va;
+        name_of[n++] = (U32)pool_used;
         pool_used += len;
     }
     fclose(map);
+    sym_va = va_of; sym_name = name_of; sym_pool = pool;
+    __atomic_store_n(&nsyms, n, __ATOMIC_RELEASE);
+    symbols_found = 1;
+    symbols_state = 2;
     return 1;
 }
 
 /* The program's function at rip: an offset into sym_pool + 1, or 0. */
 static U32 symbol_of(U64 rip) {
     U64 base = modules[exe_module].base;
-    if (!nsyms || rip < base || rip >= base + modules[exe_module].size) return 0;
+    U32 count = __atomic_load_n(&nsyms, __ATOMIC_ACQUIRE);
+    if (!count || rip < base || rip >= base + modules[exe_module].size) return 0;
     U64 va = rip - base + 0x140000000ull;   /* (the map's addresses are at the preferred base) */
     if (va < sym_va[0]) return 0;
-    U32 lo = 0, hi = nsyms;
+    U32 lo = 0, hi = count;
     while (hi - lo > 1) {
         U32 mid = (lo + hi) / 2;
         if (sym_va[mid] <= va) lo = mid; else hi = mid;
@@ -508,7 +520,7 @@ const char *rt_describe_host(unsigned long long pc, char *buf, size_t n);   /* h
 static U64 filetime(FILETIME t) { return (U64)t.dwHighDateTime << 32 | t.dwLowDateTime; }
 
 /* A code address for a report: the guest function of recompiled code, else the program's own
- * function (when F6 has loaded the map) or module + offset (tools/hostsym.py names those). */
+ * function (once the map is read: by F6, or the hitch log at start) or module + offset. */
 static void describe_pc(U64 pc, char *buf, size_t n) {
     char guest[96];
     U32 sym = symbol_of(pc);
@@ -576,13 +588,13 @@ DWORD gfx_last_enter_thread(void);   /* gpu_d3d11.c */
 
 enum { ROLE_MAIN, ROLE_VSYNC, ROLE_RENDER, ROLES };
 static const char *const ROLE_NAMES[ROLES] = {"main", "vsync", "renderer"};
-typedef struct HitchSample { U64 key; unsigned char role, waiting; } HitchSample;
+typedef struct HitchSample { U64 key, via; unsigned char role, waiting; } HitchSample;   /* via: see hitch_sample */
 #define HITCH_RING 8192
 static HitchSample hitch_ring[HITCH_RING];
 static U32 hitch_head, hitch_frame_start;
 static SRWLOCK hitch_lock = SRWLOCK_INIT;
 static int hitch_ms = -1;
-typedef struct HitchCause { U64 key; U32 role, frames; double ms; } HitchCause;
+typedef struct HitchCause { U64 key, via; U32 role, frames; double ms; } HitchCause;
 static HitchCause hitch_causes[512];
 static U32 nhitch_causes, hitch_count;
 
@@ -590,7 +602,9 @@ static int is_system_module(int m) {
     return is_wait_module(m) || (m >= 0 && (!_stricmp(modules[m].name, "KERNELBASE.dll") || !_stricmp(modules[m].name, "KERNEL32.DLL")));
 }
 
-/* The sample's key: the function (its start) of the innermost frame outside system code. */
+/* The sample's key: the function (its start) of the innermost frame outside system code; and
+ * when that is a driver's or library's (a wait in the graphics driver), via: the program's own
+ * function that called into it. */
 static void hitch_sample(HANDLE h, int role) {
     if (SuspendThread(h) == (DWORD)-1) return;
     CONTEXT ctx;
@@ -599,14 +613,22 @@ static void hitch_sample(HANDLE h, int role) {
     U32 depth = GetThreadContext(h, &ctx) ? walk(&ctx, pc) : 0;
     ResumeThread(h);
     if (!depth) return;
-    HitchSample s = {0, (unsigned char)role, (unsigned char)is_wait_module(module_of(pc[0]))};
-    for (U32 i = 0; i < depth; i++) {
+    HitchSample s = {0, 0, (unsigned char)role, (unsigned char)is_wait_module(module_of(pc[0]))};
+    U32 i = 0;
+    for (; i < depth; i++) {
         int m = module_of(pc[i]);
         if (is_system_module(m)) continue;
         RUNTIME_FUNCTION *rf = function_entry(m, pc[i]);
         s.key = rf ? modules[m].base + rf->BeginAddress : pc[i];
         break;
     }
+    if (i < depth && module_of(pc[i]) != (int)exe_module)
+        for (U32 j = i + 1; j < depth; j++)
+            if (module_of(pc[j]) == (int)exe_module) {
+                RUNTIME_FUNCTION *rf = function_entry((int)exe_module, pc[j]);
+                s.via = rf ? modules[exe_module].base + rf->BeginAddress : pc[j];
+                break;
+            }
     AcquireSRWLockExclusive(&hitch_lock);
     hitch_ring[hitch_head++ % HITCH_RING] = s;
     ReleaseSRWLockExclusive(&hitch_lock);
@@ -653,10 +675,29 @@ static DWORD WINAPI hitch_sampler(void *unused) {
     }
 }
 
-static void hitch_add_cause(U64 key, U32 role, double ms) {
+static void hitch_add_cause(U64 key, U64 via, U32 role, double ms) {
     for (U32 i = 0; i < nhitch_causes; i++)
-        if (hitch_causes[i].key == key && hitch_causes[i].role == role) { hitch_causes[i].frames++; hitch_causes[i].ms += ms; return; }
-    if (nhitch_causes < 512) hitch_causes[nhitch_causes++] = (HitchCause){key, role, 1, ms};
+        if (hitch_causes[i].key == key && hitch_causes[i].via == via && hitch_causes[i].role == role) { hitch_causes[i].frames++; hitch_causes[i].ms += ms; return; }
+    if (nhitch_causes < 512) hitch_causes[nhitch_causes++] = (HitchCause){key, via, role, 1, ms};
+}
+
+/* "function", or "driver function via the program's function" */
+static void describe_hitch(U64 key, U64 via, char *buf, size_t n) {
+    describe_pc(key, buf, n);
+    if (via) {
+        size_t len = strlen(buf);
+        if (len + 6 < n) { memcpy(buf + len, " via ", 5); describe_pc(via, buf + len + 5, n - len - 5); }
+    }
+}
+
+/* The map read in the background (seconds for a big one), so the log names the program's functions. */
+static DWORD WINAPI symbols_main(void *unused) {
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    ULONGLONG t0 = GetTickCount64();
+    if (!load_symbols()) fprintf(stderr, "[hitch] the exe's .map not found: the program's functions unnamed\n");
+    else fprintf(stderr, "[hitch] the program's functions named from here on (the map took %.1f s to read)\n", (GetTickCount64() - t0) / 1000.0);
+    return 0;
 }
 
 static int by_cause_ms(const void *a, const void *b) {
@@ -671,6 +712,7 @@ void hitch_present(void) {
         hitch_ms = v ? atoi(v) : 0;
         if (hitch_ms > 0) {
             fprintf(stderr, "[hitch] logging frames over %d ms\n", hitch_ms);
+            CloseHandle(CreateThread(NULL, 0, symbols_main, NULL, 0, NULL));
             CloseHandle(CreateThread(NULL, 0, hitch_sampler, NULL, 0, NULL));
         }
     }
@@ -694,18 +736,21 @@ void hitch_present(void) {
     if (ms > hitch_ms && to - from > 0) {
         if (to - from > HITCH_RING) from = to - HITCH_RING;
         /* per role, the most sampled functions of the frame */
-        struct { U64 key; U32 n, waiting; } top[ROLES][64];
+        struct { U64 key, via; U32 n, waiting; } top[ROLES][64];
         U32 ntop[ROLES] = {0}, total_role[ROLES] = {0};
         for (U32 i = from; i != to; i++) {
             const HitchSample *s = &hitch_ring[i % HITCH_RING];
             total_role[s->role]++;
             U32 j = 0;
-            for (; j < ntop[s->role] && top[s->role][j].key != s->key; j++) {}
-            if (j == ntop[s->role]) { if (j == 64) continue; top[s->role][j].key = s->key; top[s->role][j].n = top[s->role][j].waiting = 0; ntop[s->role]++; }
+            for (; j < ntop[s->role] && (top[s->role][j].key != s->key || top[s->role][j].via != s->via); j++) {}
+            if (j == ntop[s->role]) {
+                if (j == 64) continue;
+                top[s->role][j].key = s->key; top[s->role][j].via = s->via; top[s->role][j].n = top[s->role][j].waiting = 0; ntop[s->role]++;
+            }
             top[s->role][j].n++;
             top[s->role][j].waiting += s->waiting;
         }
-        char text[1400], where[160];
+        char text[2400], where[320];
         int len = snprintf(text, sizeof text, "[hitch] frame %llu: %.1f ms; page faults +%llu; system CPU %.0f%%", frame, ms,
                            faults - last_faults, total > last_total ? 100.0 * (1.0 - (double)(idle - last_idle) / (double)(total - last_total)) : 0.0);
 
@@ -716,10 +761,10 @@ void hitch_present(void) {
                 U32 best = 0, bn = 0;
                 for (U32 j = 0; j < ntop[r]; j++) if (top[r][j].n > bn) { bn = top[r][j].n; best = j; }
                 if (!bn) break;
-                describe_pc(top[r][best].key, where, sizeof where);
+                describe_hitch(top[r][best].key, top[r][best].via, where, sizeof where);
                 double est = ms * bn / total_role[r];   /* the role's samples cover the frame */
                 len += snprintf(text + len, sizeof text - len, " %.1f ms %s%s;", est, where, top[r][best].waiting * 2 > top[r][best].n ? " (waiting)" : "");
-                if (k == 0) hitch_add_cause(top[r][best].key, (U32)r, est);
+                if (k == 0) hitch_add_cause(top[r][best].key, top[r][best].via, (U32)r, est);
                 top[r][best].n = 0;
             }
         }
@@ -732,9 +777,9 @@ void hitch_present(void) {
         last_table = frame;
         qsort(hitch_causes, nhitch_causes, sizeof *hitch_causes, by_cause_ms);
         fprintf(stderr, "[hitch] %u frames over %d ms so far; the largest part of each, by total time:\n", hitch_count, hitch_ms);
-        char where[160];
+        char where[320];
         for (U32 i = 0; i < nhitch_causes && i < 10; i++) {
-            describe_pc(hitch_causes[i].key, where, sizeof where);
+            describe_hitch(hitch_causes[i].key, hitch_causes[i].via, where, sizeof where);
             fprintf(stderr, "[hitch]   %7.1f ms in %4u frames  %s: %s\n", hitch_causes[i].ms, hitch_causes[i].frames, ROLE_NAMES[hitch_causes[i].role], where);
         }
     }
