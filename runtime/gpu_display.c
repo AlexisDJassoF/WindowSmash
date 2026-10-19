@@ -16,7 +16,12 @@
  *   display  the monitor's own refreshes (every 1st/2nd/4th at 60/120/240 Hz): every frame is
  *            on screen equally long, but the game then runs at the monitor's real rate (59.94
  *            frames a second on a 59.94 Hz monitor). Falls back to the clock on other rates.
- * SSBU_WINDOW, SSBU_WINDOW_SIZE (WxH) and SSBU_PACING override the file (test runs).
+ *   unlocked no pacing at all (a performance test): the vsync thread shows every frame the
+ *            moment the game queues it, tearing where the system allows it. The game's speed
+ *            follows its frame rate. This build starts unlocked whatever the file says; F7
+ *            switches to the file's pacing and back.
+ * SSBU_WINDOW, SSBU_WINDOW_SIZE (WxH) and SSBU_PACING override the file (test runs);
+ * SSBU_PACING=clock|vrr|display starts with the frame rate capped.
  *
  * Linux: the window is SDL's, made and run by linux/window.c with this file's settings
  * (display_window_mode ...); borderless and fullscreen are both SDL's desktop full screen.
@@ -39,6 +44,7 @@ static struct {
     Pacing pacing;
     int loaded;
 } cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0};
+static volatile LONG unlocked = 1;   /* (F7 switches it while playing) */
 
 static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
@@ -63,7 +69,9 @@ static const char DEFAULT_INI[] =
     "width = 1280\n"
     "height = 720\n"
     "\n"
-    "; pacing = clock | vrr | display\n"
+    "; pacing = clock | vrr | display | unlocked\n"
+    ";   unlocked: no frame rate limit (a performance test). The game's speed follows its frame rate.\n"
+    ";            This build always starts unlocked; F7 switches to the pacing below and back.\n"
 #ifdef _WIN32
     ";   clock:   a steady 60 frames a second; each is shown at the monitor's next refresh.\n"
     ";   vrr:     for G-Sync / FreeSync monitors: each frame is shown the moment it is ready, so every\n"
@@ -95,7 +103,11 @@ static void parse_pacing(const char *v) {
     if (!_stricmp(v, "clock")) cfg.pacing = PACING_CLOCK;
     else if (!_stricmp(v, "vrr")) cfg.pacing = PACING_VRR;
     else if (!_stricmp(v, "display")) cfg.pacing = PACING_DISPLAY;
-    else fprintf(stderr, "[display] pacing is clock, vrr or display, not '%s'\n", v);
+    else if (_stricmp(v, "unlocked")) fprintf(stderr, "[display] pacing is clock, vrr, display or unlocked, not '%s'\n", v);
+}
+
+static const char *pacing_name(void) {
+    return cfg.pacing == PACING_VRR ? "vrr" : cfg.pacing == PACING_DISPLAY ? "display" : "clock";
 }
 
 static char *trim(char *s) {
@@ -131,7 +143,11 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     }
     if (f) fclose(f);
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
-    if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
+    if ((env = getenv("SSBU_PACING")) && *env) {
+        parse_pacing(env);
+        unlocked = !_stricmp(env, "unlocked");
+    }
+    if (unlocked) fprintf(stderr, "[display] frame rate unlocked: no pacing, the game runs as fast as it can (F7: %s pacing)\n", pacing_name());
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
     if (cfg.width < 320) cfg.width = 320;
     if (cfg.height < 180) cfg.height = 180;
@@ -148,6 +164,16 @@ static void load(void) {
 
 int display_latency(void) { load(); return cfg.latency; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
+int display_unlocked(void) { load(); return unlocked != 0; }
+
+void display_toggle_unlocked(void) {
+    load();
+    LONG now = !unlocked;   /* (only the presenting thread switches it) */
+    InterlockedExchange(&unlocked, now);
+    double at = rt_now_ns() / 1e9;
+    if (now) fprintf(stderr, "[display] frame rate unlocked (F7 at %.1f s)\n", at);
+    else fprintf(stderr, "[display] frame rate capped: %s pacing (F7 at %.1f s)\n", pacing_name(), at);
+}
 
 #ifdef _WIN32
 void display_dpi_aware(void) {
@@ -361,7 +387,7 @@ void display_set_tearing(int supported) { tearing = supported; }
 
 unsigned display_present_flags(void) {
     load();
-    return cfg.pacing == PACING_VRR && tearing ? 0x200u /* DXGI_PRESENT_ALLOW_TEARING */ : 0;
+    return (unlocked || cfg.pacing == PACING_VRR) && tearing ? 0x200u /* DXGI_PRESENT_ALLOW_TEARING */ : 0;
 }
 
 void *gfx_display_output(void);   /* gpu_d3d11.c: the swap chain's output (IDXGIOutput, referenced), or NULL */
@@ -431,8 +457,7 @@ void display_wait_tick(void) {
     if (!logged && gfx_window_handle()) {
         logged = 1;
         int hz = monitor_hz();
-        fprintf(stderr, "[display] %d Hz monitor, %s pacing%s\n", hz,
-                cfg.pacing == PACING_VRR ? "vrr" : cfg.pacing == PACING_DISPLAY ? "display" : "clock",
+        fprintf(stderr, "[display] %d Hz monitor, %s pacing%s\n", hz, pacing_name(),
                 cfg.pacing == PACING_VRR && !tearing ? " (no tearing support: as clock)" : "");
     }
     if (cfg.pacing == PACING_DISPLAY && vblank_tick()) {   /* the clock restarts from here if it is needed later */

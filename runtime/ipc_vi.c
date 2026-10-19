@@ -6,7 +6,8 @@
  * window through Android's IGraphicBufferProducer protocol, sent as binder transactions to
  * the relay service (IHOSBinderDriver). The queue's consumer is a native vsync thread: 60
  * times a second it presents the oldest queued buffer and returns the previous one, which
- * paces the game exactly as the console's compositor does. */
+ * paces the game exactly as the console's compositor does. With the frame rate unlocked
+ * (display_unlocked) it does so the moment each buffer is queued instead. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <string.h>
@@ -33,7 +34,7 @@ typedef struct Slot { int state, has_buffer; u8 buffer[0x400]; u32 buffer_size; 
 static struct {
     Slot slots[SLOTS];
     u32 buffer_event, vsync_event;
-    CONDITION_VARIABLE freed;
+    CONDITION_VARIABLE freed, queued;
     SRWLOCK lock;
     int started;
     u64 frames;
@@ -56,13 +57,39 @@ static void queue_unlock(void) {
 DWORD present_queue_holder(u64 *since_ms) { DWORD t = queue_holder; *since_ms = queue_held_since; return t; }
 
 /* ---- the consumer: vsync -------------------------------------------------------- */
+/* Unlocked frame rate: no clock. Returns the moment the game queues a frame, or after a
+ * millisecond without one (loading screens: the game may wait for the vsync event alone). */
+static void wait_queued(void) {
+    queue_lock();
+    int any = 0;
+    for (int i = 0; i < SLOTS && !any; i++) any = queue.slots[i].state == QUEUED;
+    if (!any) {
+        queue_holder = 0;   /* (not held while asleep) */
+        SleepConditionVariableSRW(&queue.queued, &queue.lock, 1, 0);
+        queue_held_since = GetTickCount64();
+        queue_holder = GetCurrentThreadId();
+    }
+    queue_unlock();
+}
+
+/* The previous buffer back to the game (when a new one is shown), and the vsync. */
+static void hand_back(int shown) {
+    if (shown) {
+        kernel_signal_event(queue.buffer_event);
+        WakeAllConditionVariable(&queue.freed);
+    }
+    kernel_signal_event(queue.vsync_event);
+}
+
 static DWORD WINAPI vsync_thread(LPVOID unused) {
     (void)unused;
     SetThreadDescription(GetCurrentThread(), L"vsync");
     timeBeginPeriod(1);
     static u8 shown[sizeof queue.slots[0].buffer];
     for (;;) {
-        display_wait_tick();   /* the next refresh (display.ini's pacing) */
+        int unlocked = display_unlocked();
+        if (unlocked) wait_queued();
+        else display_wait_tick();   /* the next refresh (display.ini's pacing) */
         queue_lock();
         int oldest = -1;
         u32 shown_size = 0;
@@ -77,13 +104,12 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
         }
         queue_unlock();
         /* Shown outside the queue's lock: a present can wait for the graphics card (frames
-         * behind), and meanwhile the game queues its next frame and goes on with the one after. */
-        if (oldest >= 0) {
-            present_frame(shown, shown_size);
-            kernel_signal_event(queue.buffer_event);
-            WakeAllConditionVariable(&queue.freed);
-        }
-        kernel_signal_event(queue.vsync_event);
+         * behind), and meanwhile the game queues its next frame and goes on with the one after.
+         * Unlocked, the game has its previous buffer back before the present, so it draws its
+         * next frame meanwhile too. */
+        if (unlocked) hand_back(oldest >= 0);
+        if (oldest >= 0) present_frame(shown, shown_size);
+        if (!unlocked) hand_back(oldest >= 0);
     }
 }
 
@@ -91,6 +117,7 @@ static void start(void) {
     if (queue.started) return;
     queue.started = 1;
     InitializeConditionVariable(&queue.freed);
+    InitializeConditionVariable(&queue.queued);
     queue.buffer_event = kernel_create_event();
     queue.vsync_event = kernel_create_event();
     CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
@@ -182,6 +209,7 @@ static void transact(u32 code, In *in, Out *out, Cpu *c) {
         if (slot < SLOTS) {
             queue.slots[slot].state = QUEUED;
             queue.slots[slot].queued_at = rt_now_ns();
+            WakeConditionVariable(&queue.queued);   /* (unlocked frame rate: shown at once) */
         }
         queue_output(out);
         w32(out, 0);

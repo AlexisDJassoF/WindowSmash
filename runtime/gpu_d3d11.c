@@ -271,7 +271,7 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
 /* ---- window and device ------------------------------------------------------------ */
 /* Debug keys, taken at the next present: F1 the overlay, F2 its details, F3 a screenshot,
  * F4 a log of the next frame's draws and its render targets, F5 depth sampling on/off, F6 a
- * 10-second sampling profile. */
+ * 10-second sampling profile, F7 the frame rate unlocked or capped (gpu_display.c). */
 static volatile LONG hotkeys;
 
 #ifdef _WIN32
@@ -279,7 +279,7 @@ static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     LRESULT result;
     if (display_message(h, msg, w, l, &result)) return result;   /* size, full screen, pointer (gpu_display.c) */
     if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); ExitProcess(0); }
-    if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F6 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
+    if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F7 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
     return DefWindowProcW(h, msg, w, l);
 }
 
@@ -3515,6 +3515,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     if (profile_at == -1) profile_at = getenv("SSBU_PROFILE_AT") ? atof(getenv("SSBU_PROFILE_AT")) : -2;
     if (profile_at >= 0 && rt_now_ns() > (u64)(profile_at * 1e9)) { profile_at = -2; keys |= 32; }
     if (keys & 32) profile_start(10.0);   /* F6 */
+    if (keys & 64) display_toggle_unlocked();   /* F7 */
     static char detail[1800], hint[640];
     static u64 last_ns, last_presented, last_drawn, last_dispatched, last_skipped, last_watch, last_busy, last_upload, last_waits, last_composed, last_reused, last_kind[4];
     u64 now = rt_now_ns();
@@ -3534,7 +3535,8 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  "shaders %llu (%ld compiling, prewarm %ld/%ld)  textures %u  surfaces %u\n"
                  "GPU-resident buffers %u  write watch %.1f ms/s  depth sampling %s\n"
                  "F1 overlay  F2 details  F3 screenshot  F4 log a frame\n"
-                 "F5 depth sampling on/off  F6 profile 10 s%s",
+                 "F5 depth sampling on/off  F6 profile 10 s%s\n"
+                 "F7 frame rate cap on/off (now %s)",
                  gpu_frames ? (double)(gfx_stat_inflight - last_inflight) / gpu_frames : 0.0,
                  (gfx_stat_present_ticks - last_present_ticks) * 1000.0 / (double)freq.QuadPart / frames,
                  (gfx_stat_busy_ticks - last_busy) * 1000.0 / (double)freq.QuadPart / frames,
@@ -3545,11 +3547,11 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  (gfx_stat_drawn - last_drawn) / frames, (gfx_stat_dispatched - last_dispatched) / frames, gfx_stat_gpu_waits - last_waits,
                  (gfx_stat_skipped - last_skipped) / secs, gfx_stat_shaders, (long)compiles_pending, (long)prewarm_ready, (long)prewarm_total, ntextures, nsurfaces, nresidents,
                  (gfx_stat_watch_us - last_watch) / 1000.0 / secs, depth_sampling != 0 ? "on" : "off",
-                 profile_running() ? "  (profiling...)" : "");
+                 profile_running() ? "  (profiling...)" : "", display_unlocked() ? "unlocked" : "capped");
         char net[512];
         net_status(net, sizeof net);
-        snprintf(hint, sizeof hint, "F2 details%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
-                 profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
+        snprintf(hint, sizeof hint, "F2 details%s%s%s%s%s", display_unlocked() ? "  frame rate UNLOCKED (F7)" : "",
+                 depth_sampling == 0 ? "  depth sampling OFF" : "", profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
         if (net[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", net); }
         char pads[256];
         pad_describe(pads, sizeof pads);

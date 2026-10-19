@@ -4,7 +4,7 @@
  * with GetAsyncKeyState. Here the main thread creates an SDL window at start-up (DXVK presents
  * into it: its HWND is the SDL_Window) and then runs the event loop for good, keeping what the
  * rest of the runtime asks for up to date: the keyboard (behind GetAsyncKeyState), focus, the
- * debug keys F1-F6 and the window's close button. Game controllers are hle_pad.c's: its input
+ * debug keys F1-F7 and the window's close button. Game controllers are hle_pad.c's: its input
  * thread reads them (SDL starts them here, with their events off).
  *
  * display.ini (gpu_display.c) sizes the window and picks its mode: windowed, or SDL's desktop
@@ -160,7 +160,7 @@ void rt_window_loop(int every, void (*status)(void)) {
                 break;
             case SDL_KEYDOWN:
                 if (e.key.repeat) break;
-                if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F6)
+                if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F7)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 ||
                     (e.key.keysym.scancode == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT))) {

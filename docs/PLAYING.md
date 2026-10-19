@@ -64,6 +64,7 @@ The keyboard plays as player 1, together with player 1's pad if there is one:
 | <kbd>F4</kbd> | Writes one frame's drawing commands to the log. |
 | <kbd>F5</kbd> | Turns depth sampling on or off. |
 | <kbd>F6</kbd> | Records a 10-second profile into `build\profile_*.txt`. |
+| <kbd>F7</kbd> | Switches the frame rate between unlocked and `display.ini`'s `pacing` (see [Window and display](#window-and-display)). |
 
 </details>
 
@@ -119,11 +120,16 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 | :--- | :--- | :--- |
 | `window` | `windowed`: a window that keeps 16:9 as you resize it. `borderless`: covers its whole monitor. `fullscreen`: borderless and always on top; the monitor keeps its resolution. | `windowed` |
 | `width`, `height` | The window's inside size at 100% display scaling. | `1280`, `720` |
-| `pacing` | `clock`: a steady 60 frames a second. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. | `clock` |
+| `pacing` | `clock`: a steady 60 frames a second. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. `unlocked`: no limit at all, see below. | `clock` |
 | `latency` | How many frames the graphics card may work ahead, 1–3. Lower is more responsive. | `3` |
 | `hide_cursor` | `1` hides the mouse pointer after two seconds without movement. | `1` |
 
 `controllers.ini` and `display.ini` apply to every game version started from the same folder.
+
+> [!WARNING]
+> **This is the unlocked-frame-rate test build.** It always starts with the frame rate unlocked, whatever `pacing` says, to measure how fast the port can run. The game counts time in frames, so it plays faster than normal: at 240 frames a second, about four times as fast. <kbd>F7</kbd> switches to the `pacing` in `display.ini` (normal speed) and back. <kbd>F1</kbd> shows the frame rate. To start at normal speed, set `SSBU_PACING=clock` (or `vrr`, `display`) in the environment.
+>
+> Frames are presented without waiting for the monitor, so expect tearing. A graphics driver setting that forces vertical sync or caps the frame rate (NVIDIA Control Panel's *Vertical sync* or *Max Frame Rate*, AMD's *Wait for Vertical Refresh* or *Frame Rate Target Control*) still applies; turn it off for this build to see the full rate.
 
 ## Shaders and first-time stutter
 

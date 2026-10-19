@@ -31,3 +31,8 @@ void display_set_tearing(int supported);
 unsigned display_present_flags(void);
 /* The vsync thread: returns when the next refresh the game sees is due. */
 void display_wait_tick(void);
+/* Unlocked frame rate (this build starts with it, whatever the pacing; F7 switches): no pacing,
+ * the vsync thread shows each frame the moment the game queues it, so the game runs as fast as
+ * it can - and its speed with it, a frame being one tick of the game. */
+int display_unlocked(void);
+void display_toggle_unlocked(void);
