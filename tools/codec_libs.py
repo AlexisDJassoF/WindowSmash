@@ -28,6 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS)   # (for cc, also when this runs on its own under a Python that does not add it: recomp.py)
 ROOT = os.path.dirname(TOOLS)
 THIRD_PARTY = os.path.join(ROOT, "third_party")
 OPUS = os.path.join(THIRD_PARTY, "opus")
