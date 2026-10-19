@@ -556,13 +556,13 @@ DWORD gfx_last_enter_thread(void);   /* gpu_d3d11.c */
 
 enum { ROLE_MAIN, ROLE_VSYNC, ROLE_RENDER, ROLES };
 static const char *const ROLE_NAMES[ROLES] = {"main", "vsync", "renderer"};
-typedef struct HitchSample { U64 key; unsigned char role, waiting; } HitchSample;
+typedef struct HitchSample { U64 key, via; unsigned char role, waiting; } HitchSample;   /* via: see hitch_sample */
 #define HITCH_RING 8192
 static HitchSample hitch_ring[HITCH_RING];
 static U32 hitch_head, hitch_frame_start;
 static pthread_mutex_t hitch_lock = PTHREAD_MUTEX_INITIALIZER;
 static int hitch_ms = -1;
-typedef struct HitchCause { U64 key; U32 role, frames; double ms; } HitchCause;
+typedef struct HitchCause { U64 key, via; U32 role, frames; double ms; } HitchCause;
 static HitchCause hitch_causes[512];
 static U32 nhitch_causes, hitch_count;
 
@@ -580,19 +580,29 @@ static U64 symbol_start(U64 pc) {   /* the start of the program's function at pc
     return sym_va[lo];
 }
 
-/* The sample's key: the function (its start) of the innermost frame outside the C library. */
+/* The sample's key: the function (its start) of the innermost frame outside the C library; and
+ * when that is a driver's or library's (a wait in DXVK or the Vulkan driver), via: the program's
+ * own function that called into it (as debug_profile.c's). */
 static void hitch_sample(pid_t tid, int role) {
     Shot s;
     if (!shoot(tid, 1, &s)) return;
     U64 pc[STACK_DEPTH + 8];
     int depth = shot_stack(&s, pc, STACK_DEPTH + 8);
-    HitchSample h = {0, (unsigned char)role, (unsigned char)s.waiting};
-    for (int i = 0; i < depth; i++) {
+    HitchSample h = {0, 0, (unsigned char)role, (unsigned char)s.waiting};
+    int i = 0;
+    for (; i < depth; i++) {
         if (is_system_module(module_of(pc[i]))) continue;
         U64 start = symbol_start(pc[i]);
         h.key = start ? start : pc[i];
         break;
     }
+    if (i < depth && module_of(pc[i]) != (int)exe_module)
+        for (int j = i + 1; j < depth; j++)
+            if (module_of(pc[j]) == (int)exe_module) {
+                U64 start = symbol_start(pc[j]);
+                h.via = start ? start : pc[j];
+                break;
+            }
     pthread_mutex_lock(&hitch_lock);
     hitch_ring[hitch_head++ % HITCH_RING] = h;
     pthread_mutex_unlock(&hitch_lock);
@@ -627,10 +637,19 @@ static DWORD WINAPI hitch_sampler(void *unused) {
     }
 }
 
-static void hitch_add_cause(U64 key, U32 role, double ms) {
+static void hitch_add_cause(U64 key, U64 via, U32 role, double ms) {
     for (U32 i = 0; i < nhitch_causes; i++)
-        if (hitch_causes[i].key == key && hitch_causes[i].role == role) { hitch_causes[i].frames++; hitch_causes[i].ms += ms; return; }
-    if (nhitch_causes < 512) hitch_causes[nhitch_causes++] = (HitchCause){key, role, 1, ms};
+        if (hitch_causes[i].key == key && hitch_causes[i].via == via && hitch_causes[i].role == role) { hitch_causes[i].frames++; hitch_causes[i].ms += ms; return; }
+    if (nhitch_causes < 512) hitch_causes[nhitch_causes++] = (HitchCause){key, via, role, 1, ms};
+}
+
+/* "function", or "library function via the program's function" */
+static void describe_hitch(U64 key, U64 via, char *buf, size_t n) {
+    describe_pc(key, buf, n);
+    if (via) {
+        size_t len = strlen(buf);
+        if (len + 6 < n) { memcpy(buf + len, " via ", 5); describe_pc(via, buf + len + 5, n - len - 5); }
+    }
 }
 
 static int by_cause_ms(const void *a, const void *b) {
@@ -678,18 +697,21 @@ void hitch_present(void) {
     if (ms > hitch_ms && to - from > 0) {
         if (to - from > HITCH_RING) from = to - HITCH_RING;
         /* per role, the most sampled functions of the frame */
-        struct { U64 key; U32 n, waiting; } top[ROLES][64];
+        struct { U64 key, via; U32 n, waiting; } top[ROLES][64];
         U32 ntop[ROLES] = {0}, total_role[ROLES] = {0};
         for (U32 i = from; i != to; i++) {
             const HitchSample *s = &hitch_ring[i % HITCH_RING];
             total_role[s->role]++;
             U32 j = 0;
-            for (; j < ntop[s->role] && top[s->role][j].key != s->key; j++) {}
-            if (j == ntop[s->role]) { if (j == 64) continue; top[s->role][j].key = s->key; top[s->role][j].n = top[s->role][j].waiting = 0; ntop[s->role]++; }
+            for (; j < ntop[s->role] && (top[s->role][j].key != s->key || top[s->role][j].via != s->via); j++) {}
+            if (j == ntop[s->role]) {
+                if (j == 64) continue;
+                top[s->role][j].key = s->key; top[s->role][j].via = s->via; top[s->role][j].n = top[s->role][j].waiting = 0; ntop[s->role]++;
+            }
             top[s->role][j].n++;
             top[s->role][j].waiting += s->waiting;
         }
-        char text[1400], where[160];
+        char text[2400], where[320];
         int len = snprintf(text, sizeof text, "[hitch] frame %llu: %.1f ms; page faults +%llu; system CPU %.0f%%", frame, ms,
                            faults - last_faults, total > last_total ? 100.0 * (1.0 - (double)(idle - last_idle) / (double)(total - last_total)) : 0.0);
         for (int r = 0; r < ROLES; r++) {
@@ -699,10 +721,10 @@ void hitch_present(void) {
                 U32 best = 0, bn = 0;
                 for (U32 j = 0; j < ntop[r]; j++) if (top[r][j].n > bn) { bn = top[r][j].n; best = j; }
                 if (!bn) break;
-                describe_pc(top[r][best].key, where, sizeof where);
+                describe_hitch(top[r][best].key, top[r][best].via, where, sizeof where);
                 double est = ms * bn / total_role[r];   /* the role's samples cover the frame */
                 len += snprintf(text + len, sizeof text - len, " %.1f ms %s%s;", est, where, top[r][best].waiting * 2 > top[r][best].n ? " (waiting)" : "");
-                if (k == 0) hitch_add_cause(top[r][best].key, (U32)r, est);
+                if (k == 0) hitch_add_cause(top[r][best].key, top[r][best].via, (U32)r, est);
                 top[r][best].n = 0;
             }
         }
@@ -715,9 +737,9 @@ void hitch_present(void) {
         last_table = frame;
         qsort(hitch_causes, nhitch_causes, sizeof *hitch_causes, by_cause_ms);
         fprintf(stderr, "[hitch] %u frames over %d ms so far; the largest part of each, by total time:\n", hitch_count, hitch_ms);
-        char where[160];
+        char where[320];
         for (U32 i = 0; i < nhitch_causes && i < 10; i++) {
-            describe_pc(hitch_causes[i].key, where, sizeof where);
+            describe_hitch(hitch_causes[i].key, hitch_causes[i].via, where, sizeof where);
             fprintf(stderr, "[hitch]   %7.1f ms in %4u frames  %s: %s\n", hitch_causes[i].ms, hitch_causes[i].frames, ROLE_NAMES[hitch_causes[i].role], where);
         }
     }
