@@ -106,6 +106,8 @@ If your base RomFS is the original release, unpacked, those places are right. `u
 
 With 13.0.5 over a merged 11.0.0 base, **1,074,269 of 1,074,277 blocks matched the update's hashes**. The other 8 blocks (128 KB) are inside a few models' material, texture and helper-bone files whose original-release bytes no longer exist in a merged base. They keep the best guess and are listed in `romfs.unverified.txt`. None of them is in a fighter module. With the original release's RomFS as the base, the patch applies exactly.
 
+Some updates don't carry every hash. For a block that is unchanged since the original release, they reuse that release's hash, which isn't in the update. 13.0.5 carries all of its own. Such blocks are checked through the level of the hash tree above: one hash covers the hashes of 512 blocks, and the tree goes up to a single hash in the update's header. Over a merged base, a group of 512 that doesn't match has its pieces tried other ways until it does. A group that still doesn't match is listed in `romfs.unverified.txt` as all 512 blocks, even if only one or two of them are wrong.
+
 ### Reading it
 
 The runtime reads the result in place (`runtime/hle_fs.c`). `romfs.cfg` starts with the word `layered`, then names the layer map and its sources: your base file and `romfs_patch.bin`. Nothing else is extracted, and the plain `romfs.cfg` format still works.
