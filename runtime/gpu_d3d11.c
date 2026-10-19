@@ -346,10 +346,72 @@ static int on_dxvk(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* ---- the graphics driver's threads: big stacks --------------------------------------------
+ * NVIDIA's driver starts its worker threads (which compile shaders to GPU code, among their
+ * work) with 64 KB stacks, and its compiler (nvgpucomp64.dll) recurses over a program's blocks:
+ * some of the game's programs run that out, and the stack overflow ends the game the moment the
+ * driver compiles one - players saw it when an effect first showed (the Daybreak item,
+ * Sephiroth's specials). The compile device below does not cover every compile the rendering
+ * device makes. So every thread a driver DLL (one from the system's DriverStore) starts gets a
+ * 16 MB stack reservation: as each DLL loads, its CreateThread import is pointed here.
+ * SSBU_DRIVER_STACKS=0: the driver's own sizes. */
+#define DRIVER_STACK (16ull << 20)
+
+static HANDLE WINAPI driver_create_thread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags,
+                                          LPDWORD id) {
+    if (stack < DRIVER_STACK) {
+        stack = DRIVER_STACK;
+        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+    }
+    return CreateThread(sa, stack, fn, arg, flags, id);
+}
+
+static void driver_imports(BYTE *base) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++) {
+        if (!d->OriginalFirstThunk) continue;
+        IMAGE_THUNK_DATA *name = (IMAGE_THUNK_DATA *)(base + d->OriginalFirstThunk), *slot = (IMAGE_THUNK_DATA *)(base + d->FirstThunk);
+        for (; name->u1.AddressOfData; name++, slot++) {
+            if (IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal) || strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(base + name->u1.AddressOfData))->Name, "CreateThread"))
+                continue;
+            DWORD old;
+            if (!VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, PAGE_READWRITE, &old)) continue;
+            slot->u1.Function = (ULONG_PTR)driver_create_thread;
+            VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, old, &old);
+        }
+    }
+}
+
+typedef struct { USHORT length, max; WCHAR *text; } NtString;
+typedef struct { ULONG flags; const NtString *path, *name; void *base; ULONG size; } DllLoaded;
+
+static void CALLBACK on_dll_loaded(ULONG reason, const DllLoaded *dll, void *unused) {
+    (void)unused;
+    if (reason != 1) return;   /* (LDR_DLL_NOTIFICATION_REASON_LOADED) */
+    static const WCHAR store[] = L"\\DriverStore\\";
+    const size_t n = sizeof store / sizeof *store - 1, len = dll->path->length / sizeof(WCHAR);
+    for (size_t i = 0; i + n <= len; i++)
+        if (!_wcsnicmp(dll->path->text + i, store, n)) { driver_imports(dll->base); return; }
+}
+
+static void driver_stacks(void) {
+    static void *cookie;
+    if (getenv("SSBU_DRIVER_STACKS") && !atoi(getenv("SSBU_DRIVER_STACKS"))) return;
+    LONG (NTAPI *reg)(ULONG, void (CALLBACK *)(ULONG, const DllLoaded *, void *), void *, void **) =
+        (LONG (NTAPI *)(ULONG, void (CALLBACK *)(ULONG, const DllLoaded *, void *), void *, void **))(void *)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    if (!reg || reg(0, on_dll_loaded, NULL, &cookie) < 0) fprintf(stderr, "[gfx] note: the driver's threads keep their own stack size\n");
+}
+#endif
+
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&lock);
 #ifdef _WIN32
+    driver_stacks();   /* (before Direct3D loads the driver) */
     HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, window_thread, done, 0, NULL);
     WaitForSingleObject(done, INFINITE);
@@ -563,9 +625,9 @@ static void dump_shaders(const u32 *regs) {
 /* Translated at their first draw (on the submitting thread, well under a millisecond), then
  * made ready by compiler threads of our own: from the DXBC an earlier run kept on disk, else
  * from fxc's (seconds on large programs, minutes on some dispatch loops) - cache loads first.
- * Left to itself NVIDIA's driver compiles to GPU code after Create*Shader returns, on threads
- * with 64 KB stacks (which one of our programs overflowed), and the first draw with the shader
- * waits for that (the hitch when a move is first used). So a second device, with the driver's
+ * Left to itself NVIDIA's driver compiles to GPU code after Create*Shader returns, on threads of
+ * its own (see driver_stacks), and the first draw with the shader waits for that (the hitch when
+ * a move is first used). So a second device, with the driver's
  * threading off, compiles each one first - inside Create*Shader, on our thread, with our stack;
  * the rendering device keeps its threading (without it the renderer took twice as long a
  * frame). A draw whose
