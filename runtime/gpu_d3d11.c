@@ -450,10 +450,11 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     return TRUE;
 }
 
-/* Time spent in the renderer (the outermost enter to its leave), for the overlay. */
+/* Time spent in the renderer (the outermost enter to its leave), for the overlay - from
+ * rt_clock_ns, as this is twice a draw (clock.h: the system timer can be slow). */
 static u32 enter_depth;
-static LARGE_INTEGER enter_t0;
-u64 gfx_stat_busy_ticks, gfx_stat_upload_bytes, gfx_stat_gpu_waits, gfx_stat_composed, gfx_stat_upload_kind[4];
+static u64 enter_t0;
+u64 gfx_stat_busy_ns, gfx_stat_upload_bytes, gfx_stat_gpu_waits, gfx_stat_composed, gfx_stat_upload_kind[4];
 static struct { u32 size, bank, extent; char shader[24]; } gfx_stat_biggest_cb;
 
 static volatile DWORD last_enter_thread;
@@ -465,16 +466,12 @@ static int enter(void) {
     if (!ready) return 0;
     EnterCriticalSection(&lock);
     last_enter_thread = GetCurrentThreadId();
-    if (!enter_depth++) QueryPerformanceCounter(&enter_t0);
+    if (!enter_depth++) enter_t0 = rt_clock_ns();
     return 1;
 }
 
 static void leave(void) {
-    if (!--enter_depth) {
-        LARGE_INTEGER t;
-        QueryPerformanceCounter(&t);
-        gfx_stat_busy_ticks += (u64)(t.QuadPart - enter_t0.QuadPart);
-    }
+    if (!--enter_depth) gfx_stat_busy_ns += rt_clock_ns() - enter_t0;
     LeaveCriticalSection(&lock);
 }
 
@@ -3455,7 +3452,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  "F5 depth sampling on/off  F6 profile 10 s%s",
                  gpu_frames ? (double)(gfx_stat_inflight - last_inflight) / gpu_frames : 0.0,
                  (gfx_stat_present_ticks - last_present_ticks) * 1000.0 / (double)freq.QuadPart / frames,
-                 (gfx_stat_busy_ticks - last_busy) * 1000.0 / (double)freq.QuadPart / frames,
+                 (gfx_stat_busy_ns - last_busy) / 1e6 / frames,
                  (gfx_stat_upload_bytes - last_upload) / 1048576.0 / frames, (gfx_stat_composed - last_composed) / frames,
                  (gfx_stat_reused - last_reused) / frames,
                  (gfx_stat_upload_kind[0] - last_kind[0]) / 1048576.0 / frames, (gfx_stat_upload_kind[1] - last_kind[1]) / 1048576.0 / frames,
@@ -3489,7 +3486,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         last_ns = now; last_presented = gfx_stat_presented; last_drawn = gfx_stat_drawn;
         last_dispatched = gfx_stat_dispatched; last_skipped = gfx_stat_skipped; last_watch = gfx_stat_watch_us;
         memcpy(last_kind, gfx_stat_upload_kind, sizeof last_kind);
-        last_busy = gfx_stat_busy_ticks; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed; last_reused = gfx_stat_reused;
+        last_busy = gfx_stat_busy_ns; last_upload = gfx_stat_upload_bytes; last_waits = gfx_stat_gpu_waits; last_composed = gfx_stat_composed; last_reused = gfx_stat_reused;
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
     overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
