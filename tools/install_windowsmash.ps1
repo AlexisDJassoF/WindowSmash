@@ -97,6 +97,11 @@ $NeedDiskGb = 60
 $MinRamGb = 8
 $FirewallRuleName = 'WindowSmash (ssbu.exe)'
 $UserAgent = 'WindowSmash-installer'
+# Python code that exits 0 when tools\arc.py has a zstd: the zstandard package (any Python), or
+# compression.zstd (3.14 and newer). zstandard is asked first: before 3.14, asking for
+# compression.zstd raises an error instead of answering no (there is no compression package).
+# (No double quotes in it: Windows PowerShell hands them to programs unescaped.)
+$ZstdCheck = 'import sys, importlib.util as u; sys.exit(0 if u.find_spec(''zstandard'') or (sys.version_info >= (3, 14) and u.find_spec(''compression.zstd'')) else 1)'
 # where updates come from: this repository's branch
 $RepoOwner = 'SNO2207'
 $RepoName = 'WindowSmash'
@@ -657,7 +662,7 @@ function Test-PythonPackages {
     <# Whether the chosen Python has what the tools import (pycryptodomex, and a zstd). #>
     $r = Get-PythonOutput @('-c', 'import Cryptodome')
     if ($r.Code -ne 0) { return $false }
-    $r = Get-PythonOutput @('-c', 'import importlib.util as u, sys; sys.exit(0 if u.find_spec(''compression.zstd'') or u.find_spec(''zstandard'') else 1)')
+    $r = Get-PythonOutput @('-c', $ZstdCheck)
     return ($r.Code -eq 0)
 }
 
