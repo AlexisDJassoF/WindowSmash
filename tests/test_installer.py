@@ -5,11 +5,20 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 PS = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
 SCRIPT = ROOT / 'tools/install_windowsmash.ps1'
+
+
+def ps_text(script):
+    """What PowerShell prints running `script` with the installer's functions loaded (its host output)."""
+    command = f". '{SCRIPT}'; {script}"
+    r = subprocess.run([str(PS), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                       capture_output=True, text=True)
+    return r.stdout + r.stderr
 
 
 def ps(expression):
@@ -174,6 +183,28 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertEqual(got['a'], ['-DryRun', '-Game', 'D:\\My Dump', '-Jobs', '4', '-NoUpdate'])
         self.assertEqual(got['b'], ['-NoUpdate'])
         self.assertEqual(got['c'], ['-NoUpdate'])
+
+    def test_compiler_step_without_clang(self):
+        # (the first run on a PC without the compiler: no Visual Studio, one edition, two editions, no winget)
+        with tempfile.TemporaryDirectory(prefix='installer-test-') as tmp:
+            Path(tmp, 'setup.exe').write_bytes(b'')
+            mocks = (f"$DryRun = $true; $VsInstallerDir = '{tmp}'; "
+                     "function Test-Compiler { @{ Ok = $false; Output = 'ERROR: clang-cl.exe was not found' } }; ")
+            winget = "function Get-Command { [pscustomobject]@{ Source = 'C:\\winget.exe' } }; "
+            one = "@{ Path = 'C:\\VS\\BuildTools'; Product = 'Microsoft.VisualStudio.Product.BuildTools' }"
+            two = one + "; @{ Path = 'C:\\VS\\Community'; Product = 'Microsoft.VisualStudio.Product.Community' }"
+            cases = {
+                'none': (winget + "function Get-VsInstances { return @() }; ", 'would run: winget install --id Microsoft.VisualStudio.BuildTools'),
+                'one': (winget + f"function Get-VsInstances {{ {one} }}; ", 'Visual Studio in C:\\VS\\BuildTools: setup.exe modify'),
+                'two': (winget + f"function Get-VsInstances {{ {two} }}; ", 'Visual Studio in C:\\VS\\BuildTools: setup.exe modify'),
+                'no winget': ("function Get-Command { $null }; function Get-VsInstances { }; ", 'visual-cpp-build-tools'),
+            }
+            for name, (setup, want) in cases.items():
+                out = ps_text(mocks + setup + "try { Step-Compiler } catch { 'STOPPED: ' + $_.Exception.Message }")
+                self.assertIn(want, out, name)
+                self.assertNotIn("property 'Count' cannot be found", out, name)
+                if name != 'no winget':
+                    self.assertNotIn('STOPPED', out, name)
 
     def test_small_decisions(self):
         got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\WindowSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "

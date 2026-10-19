@@ -619,18 +619,24 @@ function Step-CheckPc {
     if ($ramGb -lt 16) { Write-Warn "$ramGb GB of RAM: enough, but the build will be slow (16 GB is comfortable)" } else { Write-Info "$ramGb GB of RAM" }
 
     $drive = [IO.Path]::GetPathRoot($Root)
-    $free = (Get-PSDrive -Name $drive.Substring(0, 1)).Free / 1GB
-    $already = 0
-    foreach ($d in @('dump', 'build')) {
-        $p = Join-Path $Root $d
-        if (Test-Path -LiteralPath $p) { $already += (Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB }
+    $psDrive = $null
+    if ($drive -match '^[A-Za-z]:') { $psDrive = Get-PSDrive -Name $drive.Substring(0, 1) -ErrorAction SilentlyContinue }
+    if ($psDrive -and $null -ne $psDrive.Free) {
+        $free = $psDrive.Free / 1GB
+        $already = 0
+        foreach ($d in @('dump', 'build')) {
+            $p = Join-Path $Root $d
+            if (Test-Path -LiteralPath $p) { $already += [double](Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB }
+        }
+        $need = Get-DiskNeedGb $NeedDiskGb $already
+        Write-Info ("{0:N0} GB free on {1}, {2:N0} GB still needed for the build" -f $free, $drive, $need)
+        if ($free -lt $need) {
+            throw ("Only {0:N0} GB are free on {1}; the build needs about {2:N0} GB more. Free some space, or move WindowSmash to a drive with room." -f $free, $drive, $need)
+        }
+    } else {
+        Write-Warn "the free space on $drive could not be read; the build needs about $NeedDiskGb GB"
     }
-    $need = Get-DiskNeedGb $NeedDiskGb $already
-    Write-Info ("{0:N0} GB free on {1}, {2:N0} GB still needed for the build" -f $free, $drive, $need)
-    if ($free -lt $need) {
-        throw ("Only {0:N0} GB are free on {1}; the build needs about {2:N0} GB more. Free some space, or move WindowSmash to a drive with room." -f $free, $drive, $need)
-    }
-    $gpu = (Get-CimInstance Win32_VideoController | Select-Object -First 1).Name
+    $gpu = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) | Select-Object -First 1
     if ($gpu) { Write-Info "graphics: $gpu (needs DirectX 11 and an up-to-date driver)" }
 }
 
@@ -740,7 +746,8 @@ function Step-Compiler {
         return
     }
     Write-Info ($check.Output -split "`n" | Where-Object { $_ -match 'ERROR' } | Select-Object -First 1)
-    $instances = Get-VsInstances
+    # @(): a function's list comes back as nothing when empty and as the one item when alone
+    $instances = @(Get-VsInstances)
     $setup = Join-Path $VsInstallerDir 'setup.exe'
     if ($instances.Count -gt 0 -and (Test-Path -LiteralPath $setup)) {
         $inst = $instances[0]
@@ -762,7 +769,7 @@ function Step-Compiler {
         & $winget.Source @install
         $code = $LASTEXITCODE
         if ($code -eq -1978335189) {   # already installed, but without what we need: add it
-            $instances = Get-VsInstances
+            $instances = @(Get-VsInstances)
             if ($instances.Count -eq 0 -or -not (Test-Path -LiteralPath $setup)) { throw "winget says the Build Tools are installed, but they could not be found. Open Visual Studio Installer, click Modify, tick 'Desktop development with C++' and 'C++ Clang tools for Windows', then run this again." }
             $inst = $instances[0]
             $p = Start-Process -FilePath $setup -ArgumentList (Get-VsModifyArguments $inst.Path $inst.Product) -Wait -PassThru
