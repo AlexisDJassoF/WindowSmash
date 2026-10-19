@@ -28,6 +28,9 @@ void gfx_resident_flush(u64 va, u64 bytes);
 void gfx_resident_written(u64 va, u64 bytes);
 /* The command stream itself wrote guest memory (constant buffer loads, inline-to-memory). */
 void gfx_stream_wrote(u64 va, u64 bytes);
+/* Other writes of the GPU to guest memory (semaphores, copies into block-linear surfaces;
+ * bytes 0: somewhere unknown). */
+void gfx_guest_wrote(u64 va, u64 bytes);
 void gfx_stream_end(void);   /* (after each submission) */
 int gfx_draw_logging(void);   /* a frame's draws are being logged (debugging) */
 void *gfx_window_handle(void);   /* the game's window (an HWND), to own dialogs */

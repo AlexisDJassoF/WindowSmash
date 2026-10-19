@@ -978,7 +978,16 @@ static u64 table_hash(const ShaderInfo *info, CbufSource *src) {
 /* Programs by where they are: finding a shader by its contents means decoding the program for
  * its length and hashing all of it - per draw, per stage, far too slow - so each address
  * remembers the shader it last held, recognised again by a few of its words. */
-typedef struct ShaderSlot { u64 g, key, print; u32 size; Shader *s; } ShaderSlot;
+typedef struct ShaderSlot { u64 g, key, print; u32 size; Shader *s; u64 tables_at; } ShaderSlot;
+
+/* Where a program's jump tables were read from, if they are all its compiler constants (bank 1,
+ * which lie after its code and do not change): found there before, they are the same tables -
+ * not read and hashed again for every draw. 0: anywhere else. */
+static u64 tables_place(const ShaderInfo *info, const CbBinding *cb) {
+    if (!info->ntables) return 0;
+    for (u32 t = 0; t < info->ntables; t++) if (info->table[t].bank != 1) return 0;
+    return cb[1].address ? cb[1].address ^ (u64)cb[1].size << 48 : 0;
+}
 #define SHADER_SLOTS 16384
 static ShaderSlot shader_slots[SHADER_SLOTS];
 
@@ -1001,8 +1010,11 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     ShaderSlot *slot = &shader_slots[((g >> 4) * 0x9E3779B97F4A7C15ull ^ key) >> 50 & (SHADER_SLOTS - 1)];
     if (slot->s && slot->g == g && slot->key == key && slot->print == fingerprint(stage, p, slot->size)) {
         Shader *s = slot->s;
+        if (!s->info.ntables) return s;
+        u64 place = tables_place(&s->info, stage_cb);
+        if (place && slot->tables_at == place) return s;
         CbufSource src = {stage_cb};
-        if (!s->info.ntables || s->table_hash == table_hash(&s->info, &src)) return s;
+        if (s->table_hash == table_hash(&s->info, &src)) { slot->tables_at = place; return s; }
     }
     u32 size = shader_size(p, 0x40000), skip = stage == SHADER_COMPUTE ? 0x50 : 0;
     u64 h = shader_program_hash(p + skip, size - skip);
@@ -1181,9 +1193,42 @@ static void read_gpu(u64 va, u32 size, void *dst);
  * work on the calling thread (AMD's, Intel's) pay for every map and bind there, in the game's
  * frame. */
 #define REUSE_MAX 65536
-typedef struct LastUpload { u64 va; u32 size, cls, gen, cap; ID3D11ShaderResourceView *srv; u8 *copy; } LastUpload;
+typedef struct LastUpload { u64 va; u32 size, cls, gen, cap; ID3D11ShaderResourceView *srv; u8 *copy; u64 batch, seq; } LastUpload;
 static LastUpload last_upload[3][128];
-u64 gfx_stat_reused;
+u64 gfx_stat_reused, gfx_stat_reuse_compared;
+
+/* What the GPU's own commands wrote to guest memory (constant buffer loads, inline writes,
+ * copies, semaphores, compute results brought back), by guest address. Within one submission
+ * nothing else changes what its draws read - the game may not touch it, as the console's GPU
+ * reads it later - so bytes compared once in a submission need no comparing again unless one of
+ * these writes touched them since: a results screen draws ~6,000 times a frame, with ~14 uploads
+ * a draw that are nearly all the same as before. (The lock held: writes come through kept_flush,
+ * gfx_resident_written/flush and gfx_guest_wrote.) */
+#define WROTE_LOG 1024
+extern u64 gpu_stat_batches;   /* (gpu.c: submissions so far) */
+typedef struct Wrote { u64 lo, hi; } Wrote;
+static Wrote wrote_log[WROTE_LOG];
+static u64 wrote_seq;   /* writes logged so far (an entry is never changed once there: a check
+                         * that has seen it must not miss what is added) */
+
+static void guest_wrote(u64 va, u64 bytes) {   /* bytes == 0: anywhere */
+    u64 lo = 0, hi = ~0ull, g = bytes ? gpu_va_to_guest(va) : 0;
+    if (g && gpu_va_to_guest(va + bytes - 1) == g + bytes - 1) { lo = g; hi = g + bytes; }
+    wrote_log[wrote_seq % WROTE_LOG] = (Wrote){lo, hi};
+    wrote_seq++;
+}
+void gfx_guest_wrote(u64 va, u64 bytes) {
+    if (!enter()) return;
+    guest_wrote(va, bytes);
+    leave();
+}
+/* Guest memory [g, g + size) as it was when write `since` was the next to come, in this submission? */
+static int untouched_since(u64 batch, u64 since, u64 g, u64 size) {
+    if (batch != gpu_stat_batches || wrote_seq - since > WROTE_LOG) return 0;
+    for (u64 i = since; i < wrote_seq; i++)
+        if (wrote_log[i % WROTE_LOG].lo < g + size && g < wrote_log[i % WROTE_LOG].hi) return 0;
+    return 1;
+}
 
 /* Guest GPU memory [va, va + size) uploaded for a stage's slot: straight from guest memory into
  * a ring chunk when it fits one (else through a copy). */
@@ -1194,10 +1239,18 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
     LastUpload *lu = &last_upload[stage][slot];
     u64 g = size && size <= REUSE_MAX ? gpu_va_to_guest(va) : 0;
     const u8 *src = g && gpu_va_to_guest(va + size - 1) == g + size - 1 ? P(const u8, g) : NULL;   /* (one mapping) */
-    if (src && lu->srv && lu->va == va && lu->size == size &&
-        lu->gen == (lu->cls < RING_CLASSES ? rings[lu->cls].gen : 0) && !memcmp(src, lu->copy, size)) {
-        gfx_stat_reused++;
-        return lu->srv;
+    if (src && lu->srv && lu->va == va && lu->size == size && lu->gen == (lu->cls < RING_CLASSES ? rings[lu->cls].gen : 0)) {
+        if (untouched_since(lu->batch, lu->seq, g, size)) {   /* compared already in this submission, and not written since */
+            gfx_stat_reused++;
+            return lu->srv;
+        }
+        gfx_stat_reuse_compared += size;
+        if (!memcmp(src, lu->copy, size)) {
+            lu->batch = gpu_stat_batches;
+            lu->seq = wrote_seq;
+            gfx_stat_reused++;
+            return lu->srv;
+        }
     }
     if (src) {   /* (the copy, taken now: what is compared next time) */
         if (lu->cap < size) {
@@ -1218,7 +1271,7 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
         ring_done(c);
         gfx_stat_upload_bytes += padded;
         gfx_stat_upload_kind[slot < 18 ? 0 : slot < 96 ? 1 : 2] += padded;
-        *lu = (LastUpload){va, size, c, rings[c].gen, lu->cap, src ? v : NULL, lu->copy};
+        *lu = (LastUpload){va, size, c, rings[c].gen, lu->cap, src ? v : NULL, lu->copy, gpu_stat_batches, wrote_seq};
         return v;
     }
     static u8 *tmp;
@@ -1228,7 +1281,7 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
     else read_gpu(va, size, tmp);
     if (padded > size) memset(tmp + size, 0, padded - size);
     v = upload_raw(stage, slot, tmp, size);   /* (the slot's own buffer, unless a ring took it) */
-    if (src && v && v == uploads[stage][slot].srv) *lu = (LastUpload){va, size, RING_CLASSES, 0, lu->cap, v, lu->copy};
+    if (src && v && v == uploads[stage][slot].srv) *lu = (LastUpload){va, size, RING_CLASSES, 0, lu->cap, v, lu->copy, gpu_stat_batches, wrote_seq};
     return v;
 }
 
@@ -1644,6 +1697,7 @@ int gfx_copy_resident(u64 dst_va, u64 src_va, u64 bytes) {
 /* Bring the GPU's data for [va, va + bytes) back to guest memory (waits for the GPU). */
 void gfx_resident_flush(u64 va, u64 bytes) {
     if (!enter()) return;
+    guest_wrote(va, bytes);
     for (u32 i = 0; i < nresidents; i++) {
         Resident *r = &residents[i];
         u64 lo = va > r->va ? va : r->va, hi = va + bytes < r->va + r->size ? va + bytes : r->va + r->size;
@@ -1676,7 +1730,9 @@ static void kept_flush(void);
 
 /* Guest memory in [va, va + bytes) changed under a resident region: update the GPU's copy. */
 void gfx_resident_written(u64 va, u64 bytes) {
-    if (!bytes || bytes > (256u << 20) || !enter()) return;
+    if (!bytes || !enter()) return;
+    guest_wrote(va, bytes > (256u << 20) ? 0 : bytes);
+    if (bytes > (256u << 20)) { leave(); return; }
     kept_flush();
     kept_apply(va, va + bytes);   /* (constant buffers kept on the GPU too) */
     for (u32 i = 0; i < nresidents; i++) {
@@ -1906,8 +1962,18 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     return t->srv;
 }
 
+/* Samplers by their 32-byte descriptors (TSC), and state objects by their descriptions (below):
+ * in hash tables, as draws look them up thousands of times a frame among hundreds kept. */
+#define STATE_SLOTS 4096   /* (Direct3D's own limit of objects of a kind) */
+static u32 desc_hash(const void *d, size_t size) {
+    const u8 *p = d;
+    u64 h = 1469598103934665603ull;
+    for (size_t i = 0; i + 4 <= size; i += 4) { u32 w; memcpy(&w, p + i, 4); h = (h ^ w) * 0x100000001B3ull; }
+    return (u32)(h >> 32 ^ h);
+}
+
 typedef struct Sampler { u32 tsc[8]; ID3D11SamplerState *state; } Sampler;
-static Sampler samplers[1024];
+static Sampler samplers[STATE_SLOTS];
 static u32 nsamplers;
 
 static D3D11_TEXTURE_ADDRESS_MODE wrap_mode(u32 m) {
@@ -1921,7 +1987,9 @@ static D3D11_TEXTURE_ADDRESS_MODE wrap_mode(u32 m) {
 }
 
 static ID3D11SamplerState *get_sampler(const u32 *tsc) {
-    for (u32 i = 0; i < nsamplers; i++) if (!memcmp(samplers[i].tsc, tsc, 32)) return samplers[i].state;
+    u32 k = desc_hash(tsc, 32) & (STATE_SLOTS - 1);
+    for (u32 n = 0; n < STATE_SLOTS && samplers[k].state; n++, k = (k + 1) & (STATE_SLOTS - 1))
+        if (!memcmp(samplers[k].tsc, tsc, 32)) return samplers[k].state;
     D3D11_SAMPLER_DESC sd;
     memset(&sd, 0, sizeof sd);
     u32 mag = tsc[1] & 3, min = (tsc[1] >> 4) & 3, mip = (tsc[1] >> 6) & 3, aniso = (tsc[0] >> 20) & 7, cmp = (tsc[0] >> 9) & 1;
@@ -1938,7 +2006,11 @@ static ID3D11SamplerState *get_sampler(const u32 *tsc) {
     memcpy(sd.BorderColor, &tsc[4], 16);
     ID3D11SamplerState *state = NULL;
     ID3D11Device_CreateSamplerState(dev, &sd, &state);
-    if (nsamplers < 1024) { memcpy(samplers[nsamplers].tsc, tsc, 32); samplers[nsamplers++].state = state; }
+    if (state && nsamplers < STATE_SLOTS * 3 / 4) {   /* (k: the free slot the search ended at) */
+        memcpy(samplers[k].tsc, tsc, 32);
+        samplers[k].state = state;
+        nsamplers++;
+    }
     return state;
 }
 
@@ -2008,16 +2080,24 @@ static D3D11_BLEND_OP blend_op(u32 op) {
     return D3D11_BLEND_OP_ADD;
 }
 
-/* State objects are cached by their descriptions. */
-#define STATE_CACHE(Name, Desc, Iface, Create)                                                   \
-    static struct { Desc desc; Iface *obj; } Name##_cache[512];                                    \
+/* State objects are cached by their descriptions (in hash tables, as the samplers above): a
+ * session makes hundreds of each kind, a match many more than the menus, and every draw looks up
+ * three - searched one by one, the results screen after a match spent most of its frame
+ * comparing descriptions. */
+#define STATE_CACHE(Name, Desc, Iface, Create)                                                 \
+    static struct { Desc desc; Iface *obj; } Name##_cache[STATE_SLOTS];                            \
     static u32 Name##_count;                                                                      \
     static Iface *Name(const Desc *d) {                                                           \
-        for (u32 i = 0; i < Name##_count; i++)                                                    \
-            if (!memcmp(&Name##_cache[i].desc, d, sizeof *d)) return Name##_cache[i].obj;         \
+        u32 k = desc_hash(d, sizeof *d) & (STATE_SLOTS - 1);                                       \
+        for (u32 n = 0; n < STATE_SLOTS && Name##_cache[k].obj; n++, k = (k + 1) & (STATE_SLOTS - 1)) \
+            if (!memcmp(&Name##_cache[k].desc, d, sizeof *d)) return Name##_cache[k].obj;          \
         Iface *o = NULL;                                                                          \
         Create(dev, d, &o);                                                                       \
-        if (Name##_count < 512) { Name##_cache[Name##_count].desc = *d; Name##_cache[Name##_count++].obj = o; } \
+        if (o && Name##_count < STATE_SLOTS * 3 / 4) {   /* (k: the free slot the search ended at) */ \
+            Name##_cache[k].desc = *d;                                                            \
+            Name##_cache[k].obj = o;                                                              \
+            Name##_count++;                                                                       \
+        }                                                                                         \
         return o;                                                                                 \
     }
 STATE_CACHE(raster_state, D3D11_RASTERIZER_DESC, ID3D11RasterizerState, ID3D11Device_CreateRasterizerState)
@@ -2098,6 +2178,7 @@ static void kept_flush(void) {
     if (!pending_hi) return;
     u64 lo = pending_lo, hi = pending_hi;
     pending_hi = 0;
+    guest_wrote(lo, hi - lo);
     kept_apply(lo, hi);
 }
 
@@ -2768,12 +2849,13 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         u32 bytes = n * (isz == 1 ? 2 : isz);
         /* the same indices from the same place as the last indexed draw's, which the ring still
          * holds (not discarded since): used where they are */
-        static struct { u64 va; u32 bytes, isz, first, gen; int ok; u8 copy[65536]; } last_ix;
+        static struct { u64 va; u32 bytes, isz, first, gen; int ok; u64 batch, seq; u8 copy[65536]; } last_ix;
         static u32 index_gen;
         u64 ig = isz != 1 && bytes <= sizeof last_ix.copy ? gpu_va_to_guest(va) : 0;
         const u8 *isrc = ig && gpu_va_to_guest(va + bytes - 1) == ig + bytes - 1 ? P(const u8, ig) : NULL;
         int again = isrc && last_ix.ok && last_ix.va == va && last_ix.bytes == bytes && last_ix.isz == isz && last_ix.gen == index_gen &&
-                    !memcmp(isrc, last_ix.copy, bytes);
+                    (untouched_since(last_ix.batch, last_ix.seq, ig, bytes) || !memcmp(isrc, last_ix.copy, bytes));
+        if (again) { last_ix.batch = gpu_stat_batches; last_ix.seq = wrote_seq; }
         if (again) { index_first = last_ix.first; gfx_stat_reused++; }
         if (!again && bytes > index_cap) {
             if (index_buffer) bury(index_buffer);
@@ -2799,6 +2881,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
                 memcpy(last_ix.copy, isrc, bytes);
                 memcpy(m.pData, last_ix.copy, bytes);
                 last_ix.va = va; last_ix.bytes = bytes; last_ix.isz = isz; last_ix.first = index_first; last_ix.gen = index_gen; last_ix.ok = 1;
+                last_ix.batch = gpu_stat_batches; last_ix.seq = wrote_seq;
             } else if (isz == 1) {   /* 8-bit indices widen to 16 */
                 static u8 tmp8[1 << 16];
                 u32 left = n, done = 0;
@@ -3567,6 +3650,12 @@ void gfx_present(u64 guest, u32 width, u32 height) {
             for (u32 i = 0; i < KEPT_SETS * KEPT_WAYS; i++) nk += kept[i].srv != NULL;
             fprintf(stderr, "[stats] kept constant buffers: %u; so far %llu made, %llu updated by the command stream, %llu taken again after CPU writes, %llu mismatches\n",
                     nk, gfx_stat_kept_made, gfx_stat_kept_applied, gfx_stat_kept_reloaded, gfx_stat_kept_mismatches);
+            static u64 last_compared, compared_frames0;
+            fprintf(stderr, "[stats] state objects: %u rasterizer, %u depth/stencil, %u blend, %u samplers; reuse checks compared %.2f MB/frame\n",
+                    raster_state_count, depth_state_count, blend_state_count, nsamplers,
+                    (gfx_stat_reuse_compared - last_compared) / 1048576.0 / (double)(gfx_stat_presented - compared_frames0 ? gfx_stat_presented - compared_frames0 : 1));
+            last_compared = gfx_stat_reuse_compared;
+            compared_frames0 = gfx_stat_presented;
         }
         last_ns = now; last_presented = gfx_stat_presented; last_drawn = gfx_stat_drawn;
         last_dispatched = gfx_stat_dispatched; last_skipped = gfx_stat_skipped; last_watch = gfx_stat_watch_us;

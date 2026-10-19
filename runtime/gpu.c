@@ -51,6 +51,7 @@ static void release(u64 va, u32 payload, int four_words) {
         write32(va, payload);
         write32(va + 4, 0);
     } else write32(va, payload);
+    gfx_guest_wrote(va, four_words ? 16 : 4);
 }
 
 static void syncpoint_increment(u32 id) {
@@ -198,6 +199,7 @@ static void dma_launch(Engine *e, u32 arg) {
                 }
         }
         if (dst_span && !(src.pitch_linear && identity)) gfx_resident_written(dst.base, dst_span);   /* (the plain case did it per line) */
+        if (!dst.pitch_linear) gfx_guest_wrote(0, 0);   /* (into a block-linear surface: where, exactly, is not worked out) */
     }
     u32 semaphore = (arg >> 3) & 3;
     if (semaphore) release((u64)e->regs[0x90] << 32 | e->regs[0x91], e->regs[0x92], semaphore == 2);
