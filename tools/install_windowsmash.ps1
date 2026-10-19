@@ -32,7 +32,7 @@ Steps, each skipped when it is already done, so running it again carries on wher
                build\ssbu.exe (asks for administrator rights once).
   9. build     tools\build_game.py with those folders: the game's program, fonts, data, DLC,
                fighters, then the build itself (30 minutes to a few hours; minutes after an update).
- 10. shaders   if ticked, Prepare Shaders.bat in a window of its own, at low priority.
+ 10. shaders   if ticked, launchers\Prepare Shaders.bat in a window of its own, at low priority.
 Everything is written to install.log next to this folder's launchers.
 
 Why the embeddable Python and not `winget install Python.Python.3.14`: the embeddable zip goes
@@ -1244,10 +1244,10 @@ function Step-Build {
 function Step-Shaders {
     param([hashtable]$Answers, [bool]$Built)
     Write-Step '[10/10] Shaders'
-    if (-not $Answers.Shaders) { Write-Info 'not wanted (Prepare Shaders.bat does it any time)'; return }
-    if ($DryRun -or -not $Built) { Write-Would 'start Prepare Shaders.bat in a window of its own'; return }
-    Start-Process -FilePath (Join-Path $Root 'Prepare Shaders.bat') -WorkingDirectory $Root
-    Write-Info 'Prepare Shaders.bat runs in its own window at low priority; you can play meanwhile, and close it any time'
+    if (-not $Answers.Shaders) { Write-Info 'not wanted (launchers\Prepare Shaders.bat does it any time)'; return }
+    if ($DryRun -or -not $Built) { Write-Would 'start launchers\Prepare Shaders.bat in a window of its own'; return }
+    Start-Process -FilePath (Join-Path $Root 'launchers\Prepare Shaders.bat') -WorkingDirectory $Root
+    Write-Info 'launchers\Prepare Shaders.bat runs in its own window at low priority; you can play meanwhile, and close it any time'
 }
 
 function Main {

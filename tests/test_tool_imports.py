@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / 'tools'
 CALLERS = [TOOLS / 'build_game.py', TOOLS / 'install_windowsmash.ps1', TOOLS / 'install_version.py',
-           *ROOT.glob('*.bat'), *TOOLS.glob('*.bat')]
+           *ROOT.glob('*.bat'), *(ROOT / 'launchers').glob('*.bat'), *TOOLS.glob('*.bat')]
 NAMED = re.compile(r'''tools[\\/]+(\w+)\.py|["']tools["'],\s*["'](\w+)\.py|TOOLS,\s*["'](\w+)\.py''')
 # loads the script as a module (its imports, not its main); with "folder", also says whether its
 # folder is then on sys.path (for the imports it makes later, inside functions)

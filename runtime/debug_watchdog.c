@@ -6,7 +6,7 @@
  * A report: how long, the owners of the locks presenting depends on (the renderer's, the
  * present queue's, the kernel's, the GPU channel's), the shader compiles in flight, the guest
  * threads' states, and every thread's stack (guest functions named by their place in the game's
- * modules; the runtime's as ssbu.exe+offset, which tools/hostsym.py names).
+ * modules; the runtime's as ssbu.exe+offset, which tools/dev/hostsym.py names).
  * SSBU_WATCHDOG=0: no watchdog. SSBU_FREEZE_TEST=<seconds>: then the vsync thread stops for
  * 7 s once (to try it). */
 #define _CRT_SECURE_NO_WARNINGS

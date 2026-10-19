@@ -1,5 +1,5 @@
 /* Check vkd3d-shader (the Linux build's HLSL compiler) on this machine: translate every dumped
- * program in a directory (as tools/shadertest.c does), compile the HLSL with vkd3d-shader and
+ * program in a directory (as tools/dev/shadertest.c does), compile the HLSL with vkd3d-shader and
  * with fxc, and have a Direct3D 11 device create a shader from vkd3d's bytecode.
  *
  * Usage: hlsltest <dir> [name filter] [-v] [-list <file of names>] [-nofxc]

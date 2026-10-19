@@ -1,6 +1,6 @@
 # Setup guide
 
-[← README](../README.md) · [Playing](PLAYING.md) · [Multiplayer](../NETPLAY.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md) · [Game updates](UPDATES.md)
+[← README](../README.md) · [Playing](PLAYING.md) · [Multiplayer](MULTIPLAYER.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md) · [Game updates](UPDATES.md)
 
 This guide takes you from a fresh download to playing. No programming knowledge is needed.
 
@@ -31,7 +31,7 @@ Each step is skipped when it is already done, so running it again never repeats 
 - **SDL3** for PlayStation, Switch Pro and other controllers, into `deps\SDL3`, from SDL's own releases, checked against the SHA-256 the release lists.
 - **Music and movies:** nothing to download. The codecs (libopus and libvpx) are built from the sources in `third_party` as part of the game build.
 - **Your folders:** suggests yuzu's and Ryujinx's (keys, firmware and installed games), shows what it finds, and remembers your answers. The game's program, data and DLC are taken from there, even when they are still encrypted as the Switch stores them, or when an update sits next to the game.
-- **Afterwards:** writes `online_name.txt`, puts a shortcut on the desktop, adds a Windows Firewall rule for the game if you leave that ticked (it asks for administrator rights once), runs the build ([`Build WindowSmash.bat`](#shortcut-build-windowsmashbat)'s steps), and if ticked starts `Prepare Shaders.bat` in a window of its own.
+- **Afterwards:** writes `online_name.txt`, puts a shortcut on the desktop, adds a Windows Firewall rule for the game if you leave that ticked (it asks for administrator rights once), runs the build ([`launchers\Build WindowSmash.bat`](#shortcut-build-windowsmashbat)'s steps), and if ticked starts `launchers\Prepare Shaders.bat` in a window of its own.
 - Everything it prints also goes to `install.log` in the WindowSmash folder.
 
 Options for a PowerShell window: `tools\install_windowsmash.ps1 -DryRun` says what each step would do without doing it; `-NoWizard` asks in the window instead; `-Game`, `-Keys` and `-Firmware` give the folders; `-NoUpdate` skips the update check.
@@ -47,7 +47,7 @@ Prefer to do it yourself, or want to know what each step does? The rest of this 
 
 **How long it takes:** about an hour, plus 30 minutes to a few hours while your PC builds the game. You copy each command from this page and paste it into PowerShell.
 
-**Want it done for you?** After step 5, [`Build WindowSmash.bat`](#shortcut-build-windowsmashbat) does steps 7–14 in one go. **Comfortable with a command line?** Skip to the [quick version](#quick-version).
+**Want it done for you?** After step 5, [`launchers\Build WindowSmash.bat`](#shortcut-build-windowsmashbat) does steps 7–14 in one go. **Comfortable with a command line?** Skip to the [quick version](#quick-version).
 
 ## Contents
 
@@ -95,7 +95,7 @@ You need these files from your own Switch:
 > **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. The program and the data must be the same version. To keep more than one version, set up one with this guide and [add the others](#add-another-version) afterwards.
 
 > [!TIP]
-> **With `Install WindowSmash.bat` or `Build WindowSmash.bat` you don't need `romfs.bin`.** Put the game (a game card dump `.xci`, an `.nsp`, or its `.nca` files; or point at the folder yuzu or Ryujinx installed it in), your update's `.nsp` if you have one, and your DLC `.nsp` files (loose, or in a `dlc` folder) into one folder. They find the program, decrypt what needs it, and apply the update over the game themselves. Decrypting the game needs about 15 GB more space and the update about 4 GB; both take a few minutes. The game as first released (version 1.0.0) is the best base for an update: it applies exactly.
+> **With `Install WindowSmash.bat` or `launchers\Build WindowSmash.bat` you don't need `romfs.bin`.** Put the game (a game card dump `.xci`, an `.nsp`, or its `.nca` files; or point at the folder yuzu or Ryujinx installed it in), your update's `.nsp` if you have one, and your DLC `.nsp` files (loose, or in a `dlc` folder) into one folder. They find the program, decrypt what needs it, and apply the update over the game themselves. Decrypting the game needs about 15 GB more space and the update about 4 GB; both take a few minutes. The game as first released (version 1.0.0) is the best base for an update: it applies exactly.
 
 <details>
 <summary><strong>What do "update applied" and "unencrypted" mean?</strong></summary>
@@ -191,10 +191,10 @@ git clone https://github.com/SNO2207/WindowSmash.git C:\WindowSmash
 
 ### Shortcut: Build WindowSmash.bat
 
-Once steps 1–5 are done, **`Build WindowSmash.bat`** can do steps 7 to 14 for you in one go:
+Once steps 1–5 are done, **`launchers\Build WindowSmash.bat`** can do steps 7 to 14 for you in one go:
 
 1. If you want PlayStation, Switch Pro and other controllers, do [step 12](#step-12-optional-support-more-kinds-of-controllers) first.
-2. Double-click **`Build WindowSmash.bat`** in `C:\WindowSmash`.
+2. Double-click **`launchers\Build WindowSmash.bat`** in `C:\WindowSmash`.
 3. It asks for the folders with your game files, keys and firmware. Press <kbd>Enter</kbd> to accept `D:\MyDump`, `D:\MyKeys` and `D:\MyFirmware`, or type your own. It remembers the answers for next time.
 4. It finds the program file by itself (no need to rename it), copies the fonts, connects your `romfs.bin` (or a decrypted program `.nca`), turns on your DLC if `D:\MyDump\dlc` exists, takes out the fighters, and builds with a `--jobs` number that fits your RAM.
 5. If it stops with a message, fix that ([If something goes wrong](#if-something-goes-wrong) can help) and run it again: it skips whatever is already done.
@@ -260,7 +260,7 @@ nintendo_ext_003.bfttf
 
 ### Step 10: Connect your game data
 
-Double-click **`Configure Game Data.bat`** in `C:\WindowSmash`. (If **Windows protected your PC** appears, click **More info**, then **Run anyway**.) Answer its questions:
+Double-click **`launchers\Configure Game Data.bat`** in `C:\WindowSmash`. (If **Windows protected your PC** appears, click **More info**, then **Run anyway**.) Answer its questions:
 
 | It asks for | Answer |
 | :--- | :--- |
@@ -278,7 +278,7 @@ If it says `No unencrypted RomFS header at this offset`, your `romfs.bin` is sti
 
 <br>
 
-Skip `Configure Game Data.bat` and run these two commands instead. The first points WindowSmash at the data inside your program file; the second copies the fonts.
+Skip `launchers\Configure Game Data.bat` and run these two commands instead. The first points WindowSmash at the data inside your program file; the second copies the fonts.
 
 ```powershell
 python tools/nca.py romfs-cfg "D:\MyDump\program.nca" --keys "D:\MyKeys" --out dump/modules/romfs.cfg
@@ -369,13 +369,13 @@ Double-click **`Play SSBU.bat`** in `C:\WindowSmash`.
 
 **What next?**
 
-- Controls and settings: the [playing guide](PLAYING.md). `Play SSBU Offline.bat` starts the game without going online.
-- Playing with friends: the [multiplayer guide](../NETPLAY.md).
+- Controls and settings: the [playing guide](PLAYING.md). `launchers\Play SSBU Offline.bat` starts the game without going online.
+- Playing with friends: the [multiplayer guide](MULTIPLAYER.md).
 - Unlocking every fighter on your save: [DLC and unlocks](DLC-AND-UNLOCKS.md#unlock-every-base-game-fighter).
 
 ### Step 16: (Optional) Prepare the shaders
 
-The game's graphics programs (*shaders*) are prepared the first time each one is needed, which is why a new effect can stutter once. To prepare them all in advance, double-click **`Prepare Shaders.bat`**. It runs at low priority, so you can keep using the PC, and shows a progress bar with the time left: about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; it keeps what it has done.
+The game's graphics programs (*shaders*) are prepared the first time each one is needed, which is why a new effect can stutter once. To prepare them all in advance, double-click **`launchers\Prepare Shaders.bat`**. It runs at low priority, so you can keep using the PC, and shows a progress bar with the time left: about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; it keeps what it has done.
 
 </details>
 
@@ -400,7 +400,7 @@ From then on, `Play SSBU.bat` asks which version to start. Every player in a mul
 
 Double-click **`Install WindowSmash.bat`** again. It downloads the newest WindowSmash from GitHub if there is one, replaces the files that changed, and builds again, which takes minutes rather than hours. Your game files, settings, save and a lobby code in `online_server.txt` stay as they are.
 
-By hand: download the ZIP again, unblock it as in [step 5](#step-5-download-windowsmash), and copy the contents of its `WindowSmash-main` folder over `C:\WindowSmash`, replacing the files. Then build again ([step 14](#step-14-build-the-game), or double-click `Build WindowSmash.bat`). With Git, run `git pull` instead of downloading.
+By hand: download the ZIP again, unblock it as in [step 5](#step-5-download-windowsmash), and copy the contents of its `WindowSmash-main` folder over `C:\WindowSmash`, replacing the files. Then build again ([step 14](#step-14-build-the-game), or double-click `launchers\Build WindowSmash.bat`). With Git, run `git pull` instead of downloading.
 
 ### If something goes wrong
 
@@ -429,7 +429,7 @@ By hand: download the ZIP again, unblock it as in [step 5](#step-5-download-wind
 
 ### Quick version
 
-The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`; `python` must be 3.10 or newer. (`Build WindowSmash.bat` does the same from `python -m pip` on, and takes an emulator's installed-content folder as the game folder.)
+The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`; `python` must be 3.10 or newer. (`launchers\Build WindowSmash.bat` does the same from `python -m pip` on, and takes an emulator's installed-content folder as the game folder.)
 
 ```powershell
 git clone https://github.com/SNO2207/WindowSmash.git
@@ -437,7 +437,7 @@ cd WindowSmash
 python -m pip install -r requirements.txt
 python tools/nca.py exefs "D:\MyDump\program.nca" --keys "D:\MyKeys" --out dump/exefs
 Get-ChildItem D:\MyFirmware\*.nca | ForEach-Object { python tools/nca.py romfs-get $_.FullName --keys D:\MyKeys --match .bfttf --flat --out D:\MyDump\fonts 2>$null }
-& ".\Configure Game Data.bat"    # your patched, unencrypted romfs.bin and D:\MyDump\fonts
+& ".\launchers\Configure Game Data.bat"    # your patched, unencrypted romfs.bin and D:\MyDump\fonts
 python tools/nca.py aoc-cfg "D:\MyDump\dlc" --keys "D:\MyKeys" --out dump/modules/aoc.cfg    # optional: DLC
 python tools/arc.py nro
 python tools/recomp.py all dump/exefs --out build --jobs 16
@@ -472,8 +472,12 @@ python -m pip install -r requirements.txt
 
 ```text
 WindowSmash/
+  Install WindowSmash.bat     sets everything up and builds the game
+  Play SSBU.bat               starts the game
+  launchers/                  the other launchers: offline play, private rooms, shaders, unlocks, building
+  docs/                       these guides
   runtime/                    the Windows runtime (source)
-  tools/                      the recompiler and helper tools (source)
+  tools/                      the recompiler and helper tools (source); tools/dev/ holds the developers' diagnostics
   dump/
     exefs/                    main, sdk, subsdk0, rtld, main.npdm (step 8)
     modules/
@@ -503,7 +507,7 @@ D:\MyDump\romfs.bin
 0
 ```
 
-- **A plain RomFS image** (`romfs.bin`) starts at 0. `Configure Game Data.bat` checks its header before writing the file.
+- **A plain RomFS image** (`romfs.bin`) starts at 0. `launchers\Configure Game Data.bat` checks its header before writing the file.
 - **A decrypted NCA** has its RomFS further in. `python tools/nca.py romfs-cfg <nca> --keys <dir> --out dump/modules/romfs.cfg` finds the offset and writes the file. It refuses an NCA whose RomFS section is encrypted.
 - **An update over a base** uses a layered RomFS made by `tools/update.py`: see [game updates](UPDATES.md).
 
@@ -559,6 +563,6 @@ If the log says the runtime *harvested* a fighter module at run time, the module
 
 ### Tests and local packaging
 
-`requirements-dev.txt` adds the optional test tools. The [technical guide](TECHNICAL.md#verification-and-debugging) covers the source-only tests and the game-backed differential checks.
+`tests/requirements-dev.txt` adds the optional test tools. The [technical guide](TECHNICAL.md#verification-and-debugging) covers the source-only tests and the game-backed differential checks.
 
-`Bundle Latest SSBU.bat` packs your own installation into a portable ZIP; `--dry-run` checks its inputs without making the archive. That bundle contains game-derived files, so it's for your own machines only and stays out of Git.
+`launchers\Bundle Latest SSBU.bat` packs your own installation into a portable ZIP; `--dry-run` checks its inputs without making the archive. That bundle contains game-derived files, so it's for your own machines only and stays out of Git.

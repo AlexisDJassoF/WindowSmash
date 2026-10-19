@@ -1,7 +1,7 @@
 """Cross toolchain for the Linux build: the Visual Studio clang, targeting x86_64-linux-gnu.
 
 Everything third-party lives outside the repository, in linux-toolchain/ next to this checkout
-(SSBU_LINUX_TOOLCHAIN overrides; README-LINUX.md says where each part comes from):
+(SSBU_LINUX_TOOLCHAIN overrides; docs/LINUX.md says where each part comes from):
   sysroot/        Ubuntu 22.04 packages (glibc 2.35, libgcc, libstdc++, SDL2, libopus, libvpx)
   dxvk-native/    DXVK's native Linux libraries (Direct3D 11 on Vulkan)
   dxvk-headers/   their headers (DXVK's include/native and mingw-directx-headers)

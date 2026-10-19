@@ -37,7 +37,7 @@ try {
         throw 'Close every SSBU game window before unlocking fighters, then run this again.'
     }
     if (-not (Test-Path -LiteralPath $SavePath -PathType Leaf)) {
-        throw 'No save found. Start the updated game once, reach the main menu, close it, then run Unlock All Fighters.bat again.'
+        throw 'No save found. Start the updated game once, reach the main menu, close it, then run launchers\Unlock All Fighters.bat again.'
     }
     $SavePath = (Resolve-Path -LiteralPath $SavePath).Path
     $originalInfo = Get-Item -LiteralPath $SavePath

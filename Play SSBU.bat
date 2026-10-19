@@ -9,8 +9,8 @@ set "SSBU_NET_ROOM="
 set "SSBU_NET_NAME="
 @echo off
 rem Starts the native Super Smash Bros. Ultimate, online: the game joins the lobby named in
-rem online_server.txt, where Local Wireless lists everyone's rooms (see NETPLAY.md). If the lobby
-rem does not answer, the game plays offline (Play SSBU Offline.bat never goes online). The word off
+rem online_server.txt, where Local Wireless lists everyone's rooms (see docs\MULTIPLAYER.md). If the lobby
+rem does not answer, the game plays offline (launchers\Play SSBU Offline.bat never goes online). The word off
 rem in online_direct.txt keeps all of a room's traffic going through the lobby (no direct
 rem connections, so the players in your rooms don't learn your internet address). Every game
 rem version built here has a folder of its own with its own save (the port's folder: build\, save\;

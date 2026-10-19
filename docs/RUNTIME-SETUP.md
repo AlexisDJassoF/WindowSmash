@@ -1,6 +1,6 @@
 # Runtime packages
 
-[← README](../README.md) · [Setup guide](BUILDING.md) · [Playing](PLAYING.md) · [Multiplayer](../NETPLAY.md)
+[← README](../README.md) · [Setup guide](BUILDING.md) · [Playing](PLAYING.md) · [Multiplayer](MULTIPLAYER.md)
 
 A **runtime package** is a ZIP with a ready-built `ssbu.exe`, the module images it needs, the launchers, and the setup and unlock helpers. With one, you don't need Python or Visual Studio to play.
 
@@ -60,7 +60,7 @@ The package contains no `romfs.cfg`, fonts, save or multiplayer identity, so you
 ## After setup
 
 - **Controls, controllers and the window:** the [playing guide](PLAYING.md). Pads other than Xbox controllers need `SDL3.dll` next to `build\ssbu.exe`; a package that includes it also includes its license, `SDL3-LICENSE.txt`.
-- **Multiplayer:** every player needs the same package release and the same game version. See the [multiplayer guide](../NETPLAY.md).
+- **Multiplayer:** every player needs the same package release and the same game version. See the [multiplayer guide](MULTIPLAYER.md).
 - **Unlocking fighters:** after the first start, close the game and double-click `Unlock All Fighters.bat` ([DLC and unlocks](DLC-AND-UNLOCKS.md#unlock-every-base-game-fighter)).
 - **Shaders:** shaders are prepared as you play, so a new effect can stutter once. `Prepare Shaders.bat` needs Python and Visual Studio, as for [building](BUILDING.md#step-16-optional-prepare-the-shaders).
 - **Problems:** the log is `build\play.log`, and crashes or freezes write a report into `reports\` ([problem reports](PLAYING.md#problem-reports)).
