@@ -24,6 +24,7 @@ This guide takes you from a fresh download to playing. No programming knowledge 
 
 Each step is skipped when it is already done, so running it again never repeats work:
 
+- **Updates WindowSmash first:** it asks GitHub whether a newer WindowSmash is out than the one in your folder, and if so downloads it and replaces the files that changed, then carries on with the new version. Your game files, settings, save and builds stay as they are, and so does a lobby code you added to `online_server.txt`. A folder made with Git is updated with `git pull` instead, when it is on the `main` branch with no changes of its own.
 - **Checks the PC:** 64-bit Windows 10 or 11, a processor with AVX2, the installed RAM, and the free space on the drive. A failed check stops with a message saying what is missing.
 - **Python:** uses the Python you have if it is 3.10 or newer, otherwise puts a copy of Python 3.14 into `deps\python`. Nothing else on the PC changes: no PATH, no file associations.
 - **The compiler:** if Visual Studio's Clang tools aren't there, installs the free Visual Studio Build Tools with the C++ workload and Clang through winget, which is part of Windows. That download is a few GB; a progress window shows it. Without winget, it prints the link and the two boxes to tick.
@@ -33,7 +34,7 @@ Each step is skipped when it is already done, so running it again never repeats 
 - **Afterwards:** writes `online_name.txt`, puts a shortcut on the desktop, adds a Windows Firewall rule for the game if you leave that ticked (it asks for administrator rights once), runs the build ([`Build WindowSmash.bat`](#shortcut-build-windowsmashbat)'s steps), and if ticked starts `Prepare Shaders.bat` in a window of its own.
 - Everything it prints also goes to `install.log` in the WindowSmash folder.
 
-Options for a PowerShell window: `tools\install_windowsmash.ps1 -DryRun` says what each step would do without doing it; `-NoWizard` asks in the window instead; `-Game`, `-Keys` and `-Firmware` give the folders.
+Options for a PowerShell window: `tools\install_windowsmash.ps1 -DryRun` says what each step would do without doing it; `-NoWizard` asks in the window instead; `-Game`, `-Keys` and `-Firmware` give the folders; `-NoUpdate` skips the update check.
 
 </details>
 
@@ -394,9 +395,9 @@ From then on, `Play SSBU.bat` asks which version to start. Every player in a mul
 
 ### Update WindowSmash
 
-When a newer WindowSmash comes out, download the ZIP again, unblock it as in [step 5](#step-5-download-windowsmash), and copy the contents of its `WindowSmash-main` folder over `C:\WindowSmash`, replacing the files. Then build again ([step 14](#step-14-build-the-game), or double-click `Build WindowSmash.bat`), which is much quicker than the first time. With Git, run `git pull` instead of downloading.
+Double-click **`Install WindowSmash.bat`** again. It downloads the newest WindowSmash from GitHub if there is one, replaces the files that changed, and builds again, which takes minutes rather than hours. Your game files, settings, save and a lobby code in `online_server.txt` stay as they are.
 
-Your game files, settings and save are in folders the ZIP doesn't contain, so they stay as they are.
+By hand: download the ZIP again, unblock it as in [step 5](#step-5-download-windowsmash), and copy the contents of its `WindowSmash-main` folder over `C:\WindowSmash`, replacing the files. Then build again ([step 14](#step-14-build-the-game), or double-click `Build WindowSmash.bat`). With Git, run `git pull` instead of downloading.
 
 ### If something goes wrong
 

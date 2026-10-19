@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import subprocess
+import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +113,67 @@ class InstallerDecisionTests(unittest.TestCase):
         got = ps('@{ ' + names + ' }')
         for name, want in cases.items():
             self.assertEqual(got[name], want, name)
+
+    def test_source_version(self):
+        sha = '9fdc8fd21b3fde86c3e58a1e634a7e76a87220c7'
+        got = ps(f"@{{ zip = (Read-SourceVersion '{sha.upper()} 2026-10-19'); git = (Read-SourceVersion '$Format:%H %cs$'); "
+                 f"none = (Read-SourceVersion ''); long = (Read-SourceVersion '{sha}0') }}")
+        self.assertEqual(got['zip'], sha)
+        self.assertIsNone(got['git'])     # a git checkout: the placeholder
+        self.assertIsNone(got['none'])
+        self.assertIsNone(got['long'])    # 41 hex digits are not a commit
+
+    def test_source_version_filled_in_by_downloads(self):
+        attributes = (ROOT / '.gitattributes').read_text()
+        self.assertIn('tools/source_version.txt export-subst', attributes.splitlines())
+        self.assertIn('$Format:%H', (ROOT / 'tools/source_version.txt').read_text())
+
+    def test_update_decision(self):
+        got = ps("@{ a = (Get-UpdateDecision 'ahead'); i = (Get-UpdateDecision 'identical'); b = (Get-UpdateDecision 'behind'); "
+                 "d = (Get-UpdateDecision 'diverged'); x = (Get-UpdateDecision 'something') }")
+        self.assertEqual(got, {'a': 'update', 'i': 'current', 'b': 'newer', 'd': 'diverged', 'x': 'unknown'})
+
+    def test_removed_paths(self):
+        got = ps("@{ r = (Get-RemovedPaths @('tools/a.py', 'tools/old.py', 'README.md', 'docs/Gone.md', '../evil.txt', 'x/../../y', 'C:/z') "
+                 "@('tools/a.py', 'readme.md', 'tools/new.py')); none = (Get-RemovedPaths @('a') @('A')) }")
+        self.assertEqual(got['r'], ['tools/old.py', 'docs/Gone.md'])   # case-only renames kept, escapes refused
+        self.assertEqual(got['none'], [])
+
+    def test_online_server_merge(self):
+        head = '# The online lobby\n# host:port, then an optional lobby code\n'
+        old, new = head + 'lobby.example:39420\n', head + 'lobby.example:39421\n'
+        cases = {
+            'untouched': (old, old, new, new),
+            'code added': (head + 'lobby.example:39420 FRIENDS\n', old, new, head + 'lobby.example:39421 FRIENDS\n'),
+            'code, CRLF': ((head + 'lobby.example:39420   FRIENDS\n').replace('\n', '\r\n'), old, new, head + 'lobby.example:39421 FRIENDS\n'),
+            'own lobby': (head + 'my.server:5000\n', old, new, head + 'my.server:5000\n'),
+            'off': (head + 'off\n', old, new, head + 'off\n'),
+            'comment only': ('# mine\n' + head + 'lobby.example:39420\n', old, new, new),
+            'old unknown': (head + 'lobby.example:39420 FRIENDS\n', None, new, head + 'lobby.example:39420 FRIENDS\n'),
+            'no file': (None, old, new, new),
+            'same as new': (new, old, new, new),
+        }
+        def lit(s):
+            return '$null' if s is None else "'" + s.replace("'", "''") + "'"
+        expr = '@{ ' + '; '.join(f"'{k}' = (Merge-OnlineServer {lit(l)} {lit(o)} {lit(n)})" for k, (l, o, n, _) in cases.items()) + ' }'
+        got = ps(expr)
+        for k, (_l, _o, _n, want) in cases.items():
+            self.assertEqual(got[k].replace('\r\n', '\n'), want, k)
+
+    def test_command_line_round_trip(self):
+        args = ['plain', 'with space', 'quote"inside', 'trailing\\', 'back\\"quote', 'C:\\My Dump\\', '']
+        lit = ', '.join("'" + a.replace("'", "''") + "'" for a in args)
+        line = ps(f"@{{ line = (Join-CommandLine @({lit})) }}")['line']
+        r = subprocess.run(f'"{sys.executable}" -c "import sys, json; print(json.dumps(sys.argv[1:]))" {line}',
+                           capture_output=True, text=True)
+        self.assertEqual(json.loads(r.stdout), args, line)
+
+    def test_restart_arguments(self):
+        got = ps("@{ a = (Get-RestartArguments @{ DryRun = [switch]$true; SkipBuild = [switch]$false; Game = 'D:\\My Dump'; Jobs = 4 }); "
+                 "b = (Get-RestartArguments @{ NoUpdate = [switch]$true }); c = (Get-RestartArguments @{}) }")
+        self.assertEqual(got['a'], ['-DryRun', '-Game', 'D:\\My Dump', '-Jobs', '4', '-NoUpdate'])
+        self.assertEqual(got['b'], ['-NoUpdate'])
+        self.assertEqual(got['c'], ['-NoUpdate'])
 
     def test_small_decisions(self):
         got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\WindowSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "

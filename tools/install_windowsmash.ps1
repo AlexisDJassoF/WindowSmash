@@ -4,27 +4,35 @@ Sets WindowSmash up on this PC in one go: what "Install WindowSmash.bat" runs.
 
 .DESCRIPTION
 Steps, each skipped when it is already done, so running it again carries on where it stopped:
-  1. check     64-bit Windows 10 or 11, a processor with AVX2, the installed RAM, the free space
+  1. update    this folder brought to the newest commit of GitHub's main branch, then the updated
+               installer run in its place. A copy from GitHub's ZIP knows its commit (tools\
+               source_version.txt, filled in by the download: export-subst); GitHub says whether
+               main is ahead of it; if so the new ZIP's files replace the changed ones (with fresh
+               file times, so the build redoes what changed), files the new version dropped are
+               removed, and online_server.txt keeps a lobby code or address you set. A git checkout
+               of main with no changes of its own is fast-forwarded with git pull. Anything else
+               (another branch, a commit GitHub does not have, no internet) is left as it is.
+  2. check     64-bit Windows 10 or 11, a processor with AVX2, the installed RAM, the free space
                on this drive (about 60 GB for the build). A failed check stops with a plain message.
-  2. python    a Python 3.10 or newer with the packages (deps\python, then python on the PATH, then
+  3. python    a Python 3.10 or newer with the packages (deps\python, then python on the PATH, then
                the py launcher); otherwise python.org's embeddable Python 3.14 into deps\python, with
                pip and requirements.txt. Every later Python call uses the one found.
-  3. compiler  clang-cl, found and tried by tools\build_game.py --check; otherwise the Visual Studio
+  4. compiler  clang-cl, found and tried by tools\build_game.py --check; otherwise the Visual Studio
                Build Tools with the C++ workload and the Clang component, through winget (a few GB),
                or the missing components added to a Visual Studio already there; without winget, the
                manual step and its link.
-  4. sdl3      deps\SDL3 from the newest SDL3-devel-<version>-VC.zip on GitHub, checked against the
+  5. sdl3      deps\SDL3 from the newest SDL3-devel-<version>-VC.zip on GitHub, checked against the
                SHA-256 the release lists (controllers other than Xbox pads).
-  5. codecs    nothing to fetch: the music and movie codecs are built from third_party\ during the
+  6. codecs    nothing to fetch: the music and movie codecs are built from third_party\ during the
                game build (tools\codec_libs.py).
-  6. files     a window asking where your game files, keys and firmware are, filled in from yuzu's
+  7. files     a window asking where your game files, keys and firmware are, filled in from yuzu's
                or Ryujinx's folders when they have them, showing what was found, and your online
                name (online_name.txt), so the first start asks nothing.
-  7. extras    a desktop shortcut to Play SSBU.bat and, if ticked, a Windows Firewall rule for
+  8. extras    a desktop shortcut to Play SSBU.bat and, if ticked, a Windows Firewall rule for
                build\ssbu.exe (asks for administrator rights once).
-  8. build     tools\build_game.py with those folders: the game's program, fonts, data, DLC,
-               fighters, then the build itself (30 minutes to a few hours).
-  9. shaders   if ticked, Prepare Shaders.bat in a window of its own, at low priority.
+  9. build     tools\build_game.py with those folders: the game's program, fonts, data, DLC,
+               fighters, then the build itself (30 minutes to a few hours; minutes after an update).
+ 10. shaders   if ticked, Prepare Shaders.bat in a window of its own, at low priority.
 Everything is written to install.log next to this folder's launchers.
 
 Why the embeddable Python and not `winget install Python.Python.3.14`: the embeddable zip goes
@@ -47,6 +55,8 @@ Ask in this window instead of opening the wizard.
 Stop after the setup steps, before building the game.
 .PARAMETER Jobs
 Passed to the build: how many files to compile at a time (default: by the installed RAM).
+.PARAMETER NoUpdate
+Do not look for a newer WindowSmash (the updated installer is started with it).
 #>
 [CmdletBinding()]
 param(
@@ -57,12 +67,14 @@ param(
     [string]$OnlineName,
     [switch]$NoWizard,
     [switch]$SkipBuild,
-    [int]$Jobs
+    [int]$Jobs,
+    [switch]$NoUpdate
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$ScriptBound = $PSBoundParameters   # (this script's own arguments, to start the updated copy with)
 $Root = Split-Path -Parent $PSScriptRoot
 $Script:Python = $null            # the Python command: @(exe) or @('py', '-3')
 $Script:WizardSnapshot = $null    # set to a .png path to have the wizard save a picture of itself and accept (tests)
@@ -85,8 +97,122 @@ $NeedDiskGb = 60
 $MinRamGb = 8
 $FirewallRuleName = 'WindowSmash (ssbu.exe)'
 $UserAgent = 'WindowSmash-installer'
+# where updates come from: this repository's branch
+$RepoOwner = 'SNO2207'
+$RepoName = 'WindowSmash'
+$UpdateBranch = 'main'
+$RepoApi = "https://api.github.com/repos/$RepoOwner/$RepoName"
+$SourceVersionFile = 'tools\source_version.txt'   # "<commit> <date>": GitHub's ZIP download fills it in
 
 # ---- pure functions: what the steps decide by (tested in tests/test_installer.py) --------------
+function Read-SourceVersion {
+    <# The commit a source_version.txt names, in lower case, or $null: a ZIP from GitHub has it filled
+       in (git archive's export-subst), a git checkout has the $Format placeholder instead. #>
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $m = [regex]::Match($Text, '(?<![0-9a-fA-F])([0-9a-fA-F]{40})(?![0-9a-fA-F])')
+    if ($m.Success) { return $m.Groups[1].Value.ToLower() }
+    return $null
+}
+
+function Get-UpdateDecision {
+    <# What to do, from GitHub's comparison of this copy's commit (the base) with the branch (the head). #>
+    param([string]$Status)
+    switch ($Status) {
+        'identical' { return 'current' }
+        'ahead' { return 'update' }       # the branch has commits this copy lacks, and none the other way
+        'behind' { return 'newer' }       # this copy has commits the branch lacks
+        'diverged' { return 'diverged' }  # both: a copy of another branch
+        default { return 'unknown' }
+    }
+}
+
+function Get-RemovedPaths {
+    <# The old version's files that the new one no longer has ('/' separators; names compared without
+       case, as Windows does). A path that could reach outside the folder is never returned. #>
+    param([string[]]$Old, [string[]]$New)
+    $keep = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $New) { [void]$keep.Add($p) }
+    $out = @()
+    foreach ($p in $Old) {
+        if ($keep.Contains($p)) { continue }
+        if ($p -match '(^|[/\\])\.\.([/\\]|$)' -or $p -match '^[/\\]' -or $p.Contains(':')) { continue }
+        $out += $p
+    }
+    return , $out
+}
+
+function Get-LobbyLine {
+    <# The line of an online_server.txt that Play SSBU.bat reads (the first that is not empty or a
+       comment): @{Address; Code; Index}, or $null. #>
+    param([string[]]$Lines)
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $t = $Lines[$i].Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        $parts = @($t -split '\s+')
+        $code = $null
+        if ($parts.Count -gt 1) { $code = $parts[1] }
+        return @{ Address = $parts[0]; Code = $code; Index = $i }
+    }
+    return $null
+}
+
+function Merge-OnlineServer {
+    <# online_server.txt after an update. Unchanged by you: the new version's. You only added a lobby
+       code to the address the old version had: the new version's address with your code. Another
+       address, or "off": yours, as it is. With no old version to compare against: yours. #>
+    param([AllowNull()][string]$Local, [AllowNull()][string]$Old, [string]$New)
+    if (-not $Local) { return $New }
+    $l = ($Local -replace "`r`n", "`n")
+    $n = ($New -replace "`r`n", "`n")
+    if ($l.TrimEnd() -eq $n.TrimEnd()) { return $New }
+    if (-not $Old) { return $Local }
+    $o = ($Old -replace "`r`n", "`n")
+    if ($l.TrimEnd() -eq $o.TrimEnd()) { return $New }
+    $mine = Get-LobbyLine ($l -split "`n")
+    $was = Get-LobbyLine ($o -split "`n")
+    $newLines = @($n -split "`n")
+    $now = Get-LobbyLine $newLines
+    if ($mine -and $was -and $now -and $mine.Address -eq $was.Address -and $mine.Address -ne 'off') {
+        if (-not $mine.Code) { return $New }
+        $newLines[$now.Index] = "$($now.Address) $($mine.Code)"
+        return ($newLines -join "`n")
+    }
+    return $Local
+}
+
+function Join-CommandLine {
+    <# One Windows command line of these arguments (Start-Process takes a string: Windows PowerShell
+       does not quote the elements of an array), quoted by CommandLineToArgvW's rules. #>
+    param([string[]]$Arguments)
+    $quoted = foreach ($a in $Arguments) {
+        if ($a -eq '') { '""' }
+        elseif ($a -notmatch '[\s"]') { $a }
+        else {
+            $s = [regex]::Replace($a, '(\\*)"', { param($m) ($m.Groups[1].Value * 2) + '\"' })
+            $s = [regex]::Replace($s, '(\\+)$', { param($m) $m.Groups[1].Value * 2 })
+            '"' + $s + '"'
+        }
+    }
+    return ($quoted -join ' ')
+}
+
+function Get-RestartArguments {
+    <# The installer's own arguments again, for starting the updated copy, with -NoUpdate added. #>
+    param([System.Collections.IDictionary]$Bound)
+    $out = @()
+    foreach ($k in @($Bound.Keys | Sort-Object)) {
+        $v = $Bound[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter] -or $v -is [bool]) {
+            if ([bool]$v) { $out += "-$k" }
+        } else {
+            $out += @("-$k", "$v")
+        }
+    }
+    if ($out -notcontains '-NoUpdate') { $out += '-NoUpdate' }
+    return , $out
+}
+
 function Get-PythonEmbedUrl {
     <# The newest 3.<minor>.x on python.org's listing (its "3.14.8/" links), or the fallback. #>
     param([string]$Listing, [string]$Minor, [string]$Fallback, [string]$Base = $PythonFtp)
@@ -289,9 +415,162 @@ function Test-PythonCommand {
     }
 }
 
-# ---- step 1: the PC ---------------------------------------------------------------------------------
+# ---- step 1: the newest WindowSmash -----------------------------------------------------------------
+function Invoke-Api {
+    <# GitHub's API: @{Ok; Data} or @{Ok = $false; NotFound; Error}. #>
+    param([string]$Url)
+    try {
+        return @{ Ok = $true; Data = (Get-Json $Url) }
+    } catch {
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        return @{ Ok = $false; NotFound = ($code -eq 404); Error = $_.Exception.Message }
+    }
+}
+
+function Get-LocalCommit {
+    $file = Join-Path $Root $SourceVersionFile
+    if (-not (Test-Path -LiteralPath $file)) { return $null }
+    return Read-SourceVersion ([IO.File]::ReadAllText($file))
+}
+
+function Update-GitCheckout {
+    <# A git checkout of the branch, with no changes of its own: git pull --ff-only. #>
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) { Write-Warn 'this folder is a git checkout, but git is not installed: not updating'; return $false }
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $branch = (& git -C $Root rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
+        $head = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
+        if ($branch -ne $UpdateBranch) { Write-Info "this is a git checkout of the branch $($branch), not $($UpdateBranch): not updating (update it with git)"; return $false }
+        $dirty = (& git -C $Root status --porcelain --untracked-files=no 2>$null | Out-String).Trim()
+        if ($dirty) { Write-Info 'this git checkout has changes of its own: not updating (update it with git)'; return $false }
+        $remote = (((& git -C $Root ls-remote origin "refs/heads/$UpdateBranch" 2>$null | Out-String).Trim()) -split '\s+')[0]
+        if (-not $remote) { Write-Warn 'could not reach the git remote: going on with this version'; return $false }
+        if ($remote -eq $head) { Write-Info "up to date ($($head.Substring(0, 7)), git checkout)"; return $false }
+        if ($DryRun) { Write-Would "run git pull --ff-only ($($head.Substring(0, 7)) to $($remote.Substring(0, 7)))"; return $false }
+        & git -C $Root pull --ff-only origin $UpdateBranch | Out-Host
+        $after = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
+        if ($after -eq $head) { Write-Warn 'git pull changed nothing (see above): going on with this version'; return $false }
+        Write-Info "updated with git: $($head.Substring(0, 7)) to $($after.Substring(0, 7))"
+        return $true
+    } finally {
+        $ErrorActionPreference = $old
+    }
+}
+
+function Update-FromZip {
+    <# Replaces this folder's WindowSmash files with those of commit $New (GitHub's ZIP of it).
+       Only files whose content changed are written; they get the current time, so the build redoes
+       what they feed. Files of commit $Old that $New dropped are removed. Nothing else is touched:
+       dump\, build\, save\, deps\, settings and the like are not in the ZIP. #>
+    param([string]$Old, [string]$New, [string]$NewDate)
+    $work = Join-Path $Root 'deps\update'
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $zip = Join-Path $work "WindowSmash-$New.zip"
+    Invoke-Download "https://codeload.github.com/$RepoOwner/$RepoName/zip/$New" $zip "WindowSmash $($New.Substring(0, 7))"
+    $extract = Join-Path $work 'extract'
+    Expand-Archive -LiteralPath $zip -DestinationPath $extract
+    $top = @(Get-ChildItem -LiteralPath $extract -Directory)
+    if ($top.Count -ne 1 -or -not (Test-Path -LiteralPath (Join-Path $top[0].FullName 'tools\recomp.py'))) {
+        throw 'The downloaded WindowSmash does not look complete; nothing was changed. Run this again.'
+    }
+    $src = $top[0].FullName
+    $newFiles = @(Get-ChildItem -LiteralPath $src -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($src.Length + 1).Replace('\', '/') })
+    $removed = @()
+    $tree = Invoke-Api "$RepoApi/git/trees/$($Old)?recursive=1"
+    if ($tree.Ok -and -not $tree.Data.truncated) {
+        $oldFiles = @($tree.Data.tree | Where-Object { $_.type -eq 'blob' } | ForEach-Object { $_.path })
+        $removed = Get-RemovedPaths $oldFiles $newFiles
+    } else {
+        Write-Warn "the old version's file list could not be read: files the new version dropped stay"
+    }
+    $oldLobby = $null
+    try { $oldLobby = [string](Get-Text "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Old/online_server.txt") } catch { }
+
+    $changed = 0
+    $now = Get-Date
+    foreach ($rel in $newFiles) {
+        $from = Join-Path $src $rel
+        $to = Join-Path $Root $rel
+        try {
+            if ($rel -ieq 'online_server.txt' -and (Test-Path -LiteralPath $to)) {
+                $mine = [IO.File]::ReadAllText($to)
+                $theirs = [IO.File]::ReadAllText($from)
+                $merged = Merge-OnlineServer $mine $oldLobby $theirs
+                if ($merged -ne $theirs) { Write-Info 'online_server.txt: kept your lobby settings' }
+                if ($merged -ne $mine) { [IO.File]::WriteAllText($to, $merged); $changed++ }
+                continue
+            }
+            if ((Test-Path -LiteralPath $to -PathType Leaf) -and (Get-FileHash -LiteralPath $to).Hash -eq (Get-FileHash -LiteralPath $from).Hash) { continue }
+            $dir = Split-Path -Parent $to
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            Copy-Item -LiteralPath $from -Destination $to -Force
+            (Get-Item -LiteralPath $to).LastWriteTime = $now
+            $changed++
+        } catch {
+            throw "Could not replace $rel ($($_.Exception.Message)). Close the game and any window using this folder, then run this again."
+        }
+    }
+    $gone = 0
+    foreach ($rel in $removed) {
+        $p = Join-Path $Root $rel
+        if (Test-Path -LiteralPath $p -PathType Leaf) { Remove-Item -LiteralPath $p -Force; $gone++ }
+    }
+    # last: until this is written, a stopped update is simply done again next time
+    [IO.File]::WriteAllText((Join-Path $Root $SourceVersionFile), "$New $NewDate`n")
+    Remove-Item -LiteralPath $work -Recurse -Force
+    Write-Info "updated: $changed file(s) replaced, $gone removed; your game files, settings, save and builds are as they were"
+    return $true
+}
+
+function Step-Update {
+    <# Brings this folder to the newest commit of GitHub's branch. $true when files changed. #>
+    Write-Step '[1/10] Get the newest WindowSmash'
+    if ($NoUpdate) { Write-Info 'not checking (-NoUpdate)'; return $false }
+    if (Test-Path -LiteralPath (Join-Path $Root '.git')) { return (Update-GitCheckout) }
+    $local = Get-LocalCommit
+    if (-not $local) {
+        Write-Warn "this folder does not say which version it is ($SourceVersionFile names no commit): not updating."
+        Write-Warn "To get the newest, download the ZIP again from https://github.com/$RepoOwner/$RepoName"
+        return $false
+    }
+    $short = $local.Substring(0, 7)
+    $head = Invoke-Api "$RepoApi/commits/$UpdateBranch"
+    if (-not $head.Ok) { Write-Warn "could not ask GitHub for a newer version ($($head.Error)); going on with this one"; return $false }
+    $headSha = [string]$head.Data.sha
+    $headDate = ([string]$head.Data.commit.committer.date).Substring(0, 10)
+    if ($headSha -eq $local) { Write-Info "up to date ($short, $headDate)"; return $false }
+    $cmp = Invoke-Api "$RepoApi/compare/$($local)...$($headSha)"
+    if (-not $cmp.Ok) {
+        if ($cmp.NotFound) { Write-Info "this copy ($short) is not on GitHub (made on this PC, or from a branch since deleted): not updating" }
+        else { Write-Warn "could not ask GitHub for a newer version ($($cmp.Error)); going on with this one" }
+        return $false
+    }
+    switch (Get-UpdateDecision $cmp.Data.status) {
+        'current' { Write-Info "up to date ($short)"; return $false }
+        'newer' { Write-Info "this copy ($short) is newer than GitHub's $($UpdateBranch): not updating"; return $false }
+        'diverged' { Write-Info "this copy ($short) comes from another branch than $($UpdateBranch): not updating"; return $false }
+        'update' { }
+        default { Write-Warn "GitHub's answer ($($cmp.Data.status)) was not understood: not updating"; return $false }
+    }
+    $n = [int]$cmp.Data.ahead_by
+    $plural = ''
+    if ($n -ne 1) { $plural = 's' }
+    Write-Info "a newer WindowSmash is on GitHub: $n new commit$plural ($short to $($headSha.Substring(0, 7)), $headDate)"
+    $titles = @($cmp.Data.commits | ForEach-Object { ([string]$_.commit.message -split "`n")[0] } | Where-Object { $_ -notmatch '^Merge (pull request|branch) ' })
+    [array]::Reverse($titles)
+    foreach ($t in ($titles | Select-Object -First 8)) { Write-Info "  - $t" }
+    if ($titles.Count -gt 8) { Write-Info "  ... and $($titles.Count - 8) more" }
+    if ($DryRun) { Write-Would "download it and replace this folder's WindowSmash files (your game files, settings, save and builds stay)"; return $false }
+    return (Update-FromZip $local $headSha $headDate)
+}
+
+# ---- step 2: the PC ---------------------------------------------------------------------------------
 function Step-CheckPc {
-    Write-Step '[1/9] Check this PC'
+    Write-Step '[2/10] Check this PC'
     $os = Get-CimInstance Win32_OperatingSystem
     $build = [int]$os.BuildNumber
     Write-Info "$($os.Caption) ($($os.Version), $($os.OSArchitecture))"
@@ -332,7 +611,7 @@ function Step-CheckPc {
     if ($gpu) { Write-Info "graphics: $gpu (needs DirectX 11 and an up-to-date driver)" }
 }
 
-# ---- step 2: Python -----------------------------------------------------------------------------------
+# ---- step 3: Python -----------------------------------------------------------------------------------
 function Find-Python {
     <# The first Python 3.10+ that runs: deps\python, python on the PATH, the py launcher. #>
     $own = Join-Path $Root 'deps\python\python.exe'
@@ -354,7 +633,7 @@ function Test-PythonPackages {
 }
 
 function Step-Python {
-    Write-Step '[2/9] Python'
+    Write-Step '[3/10] Python'
     $found = Find-Python
     if ($found) {
         $Script:Python = $found.Command
@@ -410,7 +689,7 @@ function Step-Python {
     }
 }
 
-# ---- step 3: the compiler ---------------------------------------------------------------------------
+# ---- step 4: the compiler ---------------------------------------------------------------------------
 function Test-Compiler {
     $r = Get-PythonOutput @((Join-Path $Root 'tools\build_game.py'), '--check')
     return @{ Ok = ($r.Code -eq 0); Output = $r.Output }
@@ -431,7 +710,7 @@ function Get-VsInstances {
 }
 
 function Step-Compiler {
-    Write-Step '[3/9] The compiler (Visual Studio Build Tools with Clang)'
+    Write-Step '[4/10] The compiler (Visual Studio Build Tools with Clang)'
     $check = Test-Compiler
     if ($check.Ok) {
         foreach ($line in ($check.Output -split "`n")) { if ($line -match 'clang-cl|Python') { Write-Info $line.Trim() } }
@@ -477,9 +756,9 @@ function Step-Compiler {
     foreach ($line in ($check.Output -split "`n")) { if ($line -match 'clang-cl') { Write-Info $line.Trim() } }
 }
 
-# ---- step 4: SDL3 ----------------------------------------------------------------------------------------
+# ---- step 5: SDL3 ----------------------------------------------------------------------------------------
 function Step-Sdl3 {
-    Write-Step '[4/9] SDL3 (controllers other than Xbox pads)'
+    Write-Step '[5/10] SDL3 (controllers other than Xbox pads)'
     $dir = Join-Path $Root 'deps\SDL3'
     if ((Test-Path -LiteralPath (Join-Path $dir 'include\SDL3\SDL_gamepad.h')) -and (Test-Path -LiteralPath (Join-Path $dir 'lib\x64\SDL3.dll'))) {
         $v = ''
@@ -516,9 +795,9 @@ function Step-Sdl3 {
     Write-Info "deps\SDL3: SDL3 $($asset.Version)"
 }
 
-# ---- step 5: codecs ---------------------------------------------------------------------------------------
+# ---- step 6: codecs ---------------------------------------------------------------------------------------
 function Step-Codecs {
-    Write-Step '[5/9] Music and movie codecs'
+    Write-Step '[6/10] Music and movie codecs'
     $opus = Join-Path $Root 'third_party\opus\src\opus_decoder.c'
     $vpx = Join-Path $Root 'third_party\libvpx\vp9\vp9_dx_iface.c'
     if ((Test-Path -LiteralPath $opus) -and (Test-Path -LiteralPath $vpx)) {
@@ -528,7 +807,7 @@ function Step-Codecs {
     }
 }
 
-# ---- step 6: the game files ------------------------------------------------------------------------------
+# ---- step 7: the game files ------------------------------------------------------------------------------
 function Get-SavedFolders {
     <# Last time's answers (dump\build_folders.txt, written by build_game.py). #>
     $saved = @{}
@@ -783,7 +1062,7 @@ function Read-Answers {
 }
 
 function Step-GameFiles {
-    Write-Step '[6/9] Your game files'
+    Write-Step '[7/10] Your game files'
     $detected = Get-DetectedFolders
     if ($Game) { $detected.Game = $Game }
     if ($Keys) { $detected.Keys = $Keys }
@@ -813,14 +1092,24 @@ function Step-GameFiles {
     return $answers
 }
 
-# ---- step 7: shortcut and firewall -----------------------------------------------------------------------
+# ---- step 8: shortcut and firewall -----------------------------------------------------------------------
 function Get-DesktopFolder {
     return [Environment]::GetFolderPath('Desktop')
 }
 
+function Test-FirewallRule {
+    <# Whether the rule is there for this folder's ssbu.exe (another WindowSmash folder has its own). #>
+    param([string]$Exe)
+    foreach ($r in @(Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue)) {
+        $f = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+        if ($f -and $f.Program -ieq $Exe) { return $true }
+    }
+    return $false
+}
+
 function Step-Extras {
     param([hashtable]$Answers)
-    Write-Step '[7/9] Shortcut and firewall'
+    Write-Step '[8/10] Shortcut and firewall'
     $lnk = Join-Path (Get-DesktopFolder) 'Play SSBU.lnk'
     if (-not $Answers.Shortcut) {
         Write-Info 'shortcut: not wanted'
@@ -841,7 +1130,7 @@ function Step-Extras {
     $exe = Join-Path $Root 'build\ssbu.exe'
     if (-not $Answers.Firewall) {
         Write-Info 'firewall rule: not wanted (Windows will ask the first time the game goes online)'
-    } elseif (Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue) {
+    } elseif (Test-FirewallRule $exe) {
         Write-Info "firewall rule: already there ($FirewallRuleName)"
     } elseif ($DryRun) {
         Write-Would "add the firewall rule '$FirewallRuleName' for $exe, with administrator rights"
@@ -857,10 +1146,10 @@ function Step-Extras {
     }
 }
 
-# ---- step 8: the build ---------------------------------------------------------------------------------------
+# ---- step 9: the build ---------------------------------------------------------------------------------------
 function Step-Build {
     param([hashtable]$Answers)
-    Write-Step '[8/9] Build the game'
+    Write-Step '[9/10] Build the game'
     $build = @((Join-Path $Root 'tools\build_game.py'), '--game', $Answers.Game, '--keys', $Answers.Keys, '--firmware', $Answers.Firmware)
     if ($Jobs) { $build += @('--jobs', "$Jobs") }
     if ($SkipBuild) { Write-Info '-SkipBuild: not building'; return $false }
@@ -870,10 +1159,10 @@ function Step-Build {
     return $true
 }
 
-# ---- step 9: shaders --------------------------------------------------------------------------------------------
+# ---- step 10: shaders --------------------------------------------------------------------------------------------
 function Step-Shaders {
     param([hashtable]$Answers, [bool]$Built)
-    Write-Step '[9/9] Shaders'
+    Write-Step '[10/10] Shaders'
     if (-not $Answers.Shaders) { Write-Info 'not wanted (Prepare Shaders.bat does it any time)'; return }
     if ($DryRun -or -not $Built) { Write-Would 'start Prepare Shaders.bat in a window of its own'; return }
     Start-Process -FilePath (Join-Path $Root 'Prepare Shaders.bat') -WorkingDirectory $Root
@@ -888,6 +1177,15 @@ function Main {
         Write-Host "  $Root"
         if ($DryRun) { Write-Host '  dry run: saying what each step would do, doing nothing' -ForegroundColor DarkGray }
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        if (Step-Update) {
+            # the rest is the new version's to do: start its installer in this window, as this one was
+            Write-Host ''
+            Write-Host 'Starting the updated installer' -ForegroundColor Cyan
+            try { Stop-Transcript | Out-Null } catch { }
+            $line = Join-CommandLine (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'tools\install_windowsmash.ps1')) + (Get-RestartArguments $ScriptBound))
+            $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $line -NoNewWindow -Wait -PassThru
+            return $p.ExitCode
+        }
         Step-CheckPc
         Step-Python
         if (-not $Script:Python) { Write-Host ''; Write-Host '(dry run) the later steps need Python; stopping here' -ForegroundColor DarkGray; return 0 }

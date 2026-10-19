@@ -76,7 +76,7 @@ The game itself still comes from your files. This repository holds only the tran
 | **2** | **Download WindowSmash** (the green **Code** button → **Download ZIP**, extract it) and double-click **`Install WindowSmash.bat`**. It checks your PC, installs the two tools if they are missing, shows the folders it found for your game files, keys and firmware, and builds the game. | 5 minutes, then waiting |
 | **3** | **Play.** Double-click `Play SSBU.bat`, or the shortcut it put on the desktop. | |
 
-The [setup guide](docs/BUILDING.md) has the details, and every step by hand for those who prefer it.
+To update later, double-click `Install WindowSmash.bat` again: it fetches the newest WindowSmash and builds it. The [setup guide](docs/BUILDING.md) has the details, and every step by hand for those who prefer it.
 
 <p align="center"><a href="docs/BUILDING.md"><strong>Open the setup guide →</strong></a></p>
 
