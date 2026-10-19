@@ -105,6 +105,15 @@ def marker_applies(marker):
     return True
 
 
+def dlc_folder(game, rec, contents):
+    """Where the DLC is: the game folder's dlc folder; else the game folder itself, when DLC of
+    this game is next to the game (an emulator's installed content, loose .nsp files); else None."""
+    dlc = os.path.join(game, "dlc")
+    if os.path.isdir(dlc):
+        return dlc
+    return game if any(c["kind"] == "dlc" and c["app"] == rec["app"] for c in contents) else None
+
+
 def jobs_for_ram(gb):
     """recomp.py's --jobs for this much installed RAM, as the setup guide's build step says."""
     return 16 if gb >= 32 else 8 if gb >= 16 else 4
@@ -460,12 +469,12 @@ def build(a):
     if not keys:
         log("  none needed: the steps that read them are done")
 
-    program = None
+    found = None   # (find_program's answer, once asked; the steps below read it, never set it)
 
     def the_program():
-        nonlocal program
-        program = program or find_program(game, keys)
-        return program
+        nonlocal found
+        found = found or find_program(game, keys)
+        return found
 
     log("\n[4/9] Copy the game's program (dump\\exefs)")
     if exefs_done:
@@ -503,15 +512,13 @@ def build(a):
     if os.path.exists(aoc):
         log("  already done")
     else:
-        dlc = os.path.join(game, "dlc")
-        if not os.path.isdir(dlc):   # an emulator's folder: the DLC is installed next to the game
-            _path, _title, program, result = the_program()
-            dlc = game if any(c["kind"] == "dlc" and c["app"] == program["app"] for c in result["contents"]) else None
+        _path, title, rec, result = the_program()
+        dlc = dlc_folder(game, rec, result["contents"])
         if not dlc:
             log(f"  no dlc folder in {game}, and no DLC among its files: no DLC")
         else:
             run([sys.executable, os.path.join("tools", "nca.py"), "aoc-cfg", dlc, "--keys", keys,
-                 "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{the_program()[1] & ~0xFFF:016X}"],
+                 "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{title & ~0xFFF:016X}"],
                 f"Could not read the DLC in {dlc} (see above).")
 
     log("\n[8/9] Take out the fighters (dump\\nro)")

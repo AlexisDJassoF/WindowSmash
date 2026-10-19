@@ -2,6 +2,7 @@ from pathlib import Path
 import runpy
 import sys
 import tempfile
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +50,67 @@ class GameSourceTests(unittest.TestCase):
         self.assertEqual(describe(identity(update)), "the game's update (title version v31)")
         self.assertEqual(describe(identity(update), '13.0.5'), "13.0.5 (the game's update)")
         self.assertEqual(describe('01006A800016E000 base -'), 'the game')
+
+
+class BuildStepsTests(unittest.TestCase):
+    """build() from the folders to the fighters, with what reads game files stubbed: which tools it
+    runs, and with what."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='build-steps-test-')
+        self.addCleanup(self.temp.cleanup)
+        top = Path(self.temp.name)
+        self.game, keys, firmware = top / 'game', top / 'keys', top / 'firmware'
+        for d in (self.game, keys, firmware):
+            d.mkdir()
+        dump = top / 'port' / 'dump'
+        exefs = dump / 'exefs'
+        exefs.mkdir(parents=True)
+        (dump / 'modules').mkdir()
+        for n in ('main', 'main.npdm', 'rtld', 'sdk', 'subsdk0'):   # (the program is copied out already)
+            (exefs / n).write_bytes(b'')
+        self.program = {'path': str(self.game / 'update.nsp'), 'name': 'prog.nca', 'container': 'update.nsp',
+                        'app': '01006A800016E000', 'kind': 'update', 'version': 2031616, 'title_id': '01006A800016E000'}
+        self.contents = [self.program]
+        self.calls = []
+        # (the module's own globals, which build() reads: run_path returns a copy of them)
+        self.ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_steps')['build'].__globals__
+        folders = {'game': str(self.game), 'keys': str(keys), 'firmware': str(firmware)}
+        self.ns.update(
+            DUMP=str(dump), EXEFS=str(exefs), FONTS=str(dump / 'fonts'), MODULES=str(dump / 'modules'),
+            SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'),
+            log=lambda msg='': None, check_tools=lambda: None, install_packages=lambda: None,
+            ask_folder=lambda key, given, saved: folders[key],
+            find_program=lambda game, keys: (self.program['path'], BASE, self.program, {'contents': self.contents}),
+            romfs_cfg_ok=lambda cfg: True, missing_fonts=lambda folder: [], check_same_game=lambda rec: None,
+            run=lambda args, failure: self.calls.append([str(a) for a in args]))
+        self.args = types.SimpleNamespace(game=str(self.game), keys=str(keys), firmware=str(firmware), jobs=None,
+                                          prepare_only=True)
+
+    def aoc_call(self):
+        calls = [c for c in self.calls if 'aoc-cfg' in c]
+        return calls[0] if calls else None
+
+    def test_dlc_next_to_the_game(self):
+        # an emulator's folder, or loose DLC .nsp files: no dlc folder (this raised KeyError: 1)
+        self.contents.append({'kind': 'dlc', 'app': '01006A800016E000'})
+        self.ns['build'](self.args)
+        call = self.aoc_call()
+        self.assertEqual(call[call.index('aoc-cfg') + 1], str(self.game))
+        self.assertEqual(call[call.index('--app') + 1], '01006A800016E000')
+        self.assertTrue(any('arc.py' in ' '.join(c) for c in self.calls))   # and on to the fighters
+
+    def test_dlc_folder(self):
+        (self.game / 'dlc').mkdir()
+        self.ns['build'](self.args)
+        call = self.aoc_call()
+        self.assertEqual(call[call.index('aoc-cfg') + 1], str(self.game / 'dlc'))
+
+    def test_no_dlc(self):
+        self.contents.append({'kind': 'dlc', 'app': '0100000000010000'})   # another game's
+        self.ns['build'](self.args)
+        self.assertIsNone(self.aoc_call())
+        self.assertTrue(any('arc.py' in ' '.join(c) for c in self.calls))
 
 
 class MarkerTests(unittest.TestCase):
