@@ -451,13 +451,21 @@ def main():
     ap.add_argument("--match", default="")
     ap.add_argument("--flat", action="store_true", help="romfs-get: every file straight into --out, without its folders")
     ap.add_argument("--app", type=lambda s: int(s, 16), help="aoc-cfg: the application whose add-on content to list")
+    ap.add_argument("--inner", help="the NCA of that name inside the package (an .nsp) given in place of an NCA")
     a = ap.parse_args()
 
     if a.cmd == "aoc-cfg":
         if not (a.keys and a.out):
             raise SystemExit("aoc-cfg needs --keys <dir> and --out <aoc.cfg>")
         return aoc_cfg(a.nca, a.keys, a.out, a.app)
-    if is_plain_romfs(a.nca) or a.nca.endswith(".cfg"):
+    if a.inner:   # an NCA inside an NSP, read in place with the package's own tickets
+        if not a.keys:
+            raise SystemExit("--keys <dir> is needed to read an NCA")
+        found = [n for name, n in nsp_ncas(a.nca, a.keys) if name.lower() == a.inner.lower()]
+        if not found:
+            raise SystemExit(f"{a.nca} holds no {a.inner}")
+        nca = found[0]
+    elif is_plain_romfs(a.nca) or a.nca.endswith(".cfg"):
         if a.cmd not in ("romfs-ls", "romfs-get"):
             raise SystemExit(f"{a.nca} is a RomFS image, not an NCA: only romfs-ls and romfs-get apply")
         romfs = RomfsImage(a.nca) if a.nca.endswith(".cfg") else PlainRomfs(a.nca)
@@ -489,9 +497,10 @@ def main():
         if sec.enc_type != 1 and not nca.plaintext:
             raise SystemExit("the RomFS section is encrypted; the runtime reads it in place only when it is not")
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        at = getattr(nca, "base", 0) + sec.start + sec.data_off   # (base: where the NCA starts in its package)
         with open(a.out, "w") as f:
-            f.write(f"{os.path.abspath(a.nca)}\n{sec.start + sec.data_off}\n")
-        print(f"wrote {a.out}: RomFS at byte {sec.start + sec.data_off:#x} of {a.nca}")
+            f.write(f"{os.path.abspath(a.nca)}\n{at}\n")
+        print(f"wrote {a.out}: RomFS at byte {at:#x} of {a.nca}")
     elif a.cmd == "romfs-get":
         sec = nca.section(0)
         for path, off, size in romfs_entries(sec):

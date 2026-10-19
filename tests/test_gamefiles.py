@@ -66,16 +66,51 @@ class PickProgramTests(unittest.TestCase):
         with self.assertRaises(gamefiles.Error):
             gamefiles.pick_program([record('x.nca', 'base', app=OTHER), record('y.nca', 'base', app=OTHER + 0x1000000)])
 
-    def test_packaged_program_does_not_count(self):
-        with self.assertRaises(gamefiles.Error):
-            gamefiles.pick_program([record('update.nca', 'update', container='update.nsp'), record('meta.nca', 'base', type='meta')])
+    def test_update_in_a_package(self):
+        got = gamefiles.pick_program([record('base.nca', 'base'), record('prog.nca', 'update', container='update.nsp', version=2031616),
+                                      record('meta.nca', 'base', type='meta')])
+        self.assertEqual((got['name'], got['container']), ('prog.nca', 'update.nsp'))
+        self.assertEqual(gamefiles.where(got), 'prog.nca in update.nsp')
         with self.assertRaises(gamefiles.Error):
             gamefiles.pick_program([])
+
+    def test_the_same_program_twice(self):
+        loose, packed = record('prog.nca', 'update', version=5), record('prog.nca', 'update', container='u.nsp', version=5)
+        self.assertIs(gamefiles.pick_program([packed, loose]), loose)          # one known version: the file of its own
+        a, b = dict(loose, content_id='ab' * 16), dict(packed, content_id='ab' * 16, version=None)
+        self.assertIs(gamefiles.pick_program([b, a]), a)                      # one content id
+        with self.assertRaises(gamefiles.Error):
+            gamefiles.pick_program([record('x.nca', 'base'), record('y.nca', 'base')])   # two bases, versions unknown
 
     def test_base_for_an_update(self):
         contents = [record('base.nca', 'base'), record('update.nca', 'update'), record('other.nca', 'base', app=OTHER)]
         self.assertEqual(gamefiles.base_program(contents, contents[1])['name'], 'base.nca')
         self.assertIsNone(gamefiles.base_program([contents[1], contents[2]], contents[1]))
+        packed = record('packed.nca', 'base', container='game.nsp')
+        self.assertEqual(gamefiles.base_program([packed, contents[0], contents[1]], contents[1])['name'], 'base.nca')
+        self.assertEqual(gamefiles.base_program([packed, contents[1]], contents[1])['name'], 'packed.nca')
+
+
+class MetadataTests(unittest.TestCase):
+    def test_kinds_and_versions_from_the_metadata(self):
+        # an update's program and control data carry the game's own title id; only its .cnmt lists them
+        prog = dict(record('aa' * 16 + '.nca', 'base', container='update.nsp'), content_id='aa' * 16)
+        ctrl = dict(record('bb' * 16 + '.nca', 'base', type='control', container='update.nsp'), content_id='bb' * 16,
+                    display_version='13.0.5', game='Super Smash Bros. Ultimate')
+        base = dict(record('cc' * 16 + '.nca', 'base'), content_id='cc' * 16)
+        base_ctrl = dict(record('dd' * 16 + '.nca', 'base', type='control'), content_id='dd' * 16, display_version='11.0.0')
+        renamed = record('program.nca', 'base')
+        metas = [(APP + 0x800, 2031616, 0x81, ['aa' * 16, 'bb' * 16]), (APP, 0, 0x80, ['cc' * 16, 'dd' * 16])]
+        gamefiles.apply_metadata([prog, ctrl, base, base_ctrl, renamed], metas)
+        self.assertEqual((prog['kind'], prog['version'], prog['display_version']), ('update', 2031616, '13.0.5'))
+        self.assertEqual(ctrl['kind'], 'update')
+        self.assertEqual((base['kind'], base['version'], base['display_version']), ('base', 0, '11.0.0'))
+        self.assertEqual((renamed['kind'], renamed['version']), ('base', 0))   # by its title's metadata
+
+    def test_a_patch_is_an_update_without_metadata(self):
+        nca = types.SimpleNamespace(content_type=0, title_id=APP, size=1, plaintext=False,
+                                    section=lambda fs_type: types.SimpleNamespace(enc_type=4))
+        self.assertEqual(gamefiles.describe_nca(nca, 'u.nca', 'u.nca')['kind'], 'update')
 
 
 class SummaryTests(unittest.TestCase):

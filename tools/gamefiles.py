@@ -10,12 +10,15 @@ emulator's installed-content folder - yuzu's nand\\user\\Contents\\registered, R
 bis\\user\\Contents\\registered - where every content is <content id>.nca, as a file or as a
 folder holding the file as 00, next to other games' contents, which are ignored. Folders one
 level down are read too (the guide's dlc\\, the emulators' numbered folders), and .nsp packages
-in them, whose contents count as DLC or as an update but never as the program to build from:
-the build reads the program from a file of its own.
+anywhere in them: the game's update and DLC as dumped (an update .nsp holds the update's
+program; tools/build_game.py reads it in place with nca.py --inner, and tools/update.py applies
+its data over the base's).
 
 Title ids: an application's ends in 000, its update's in 800, and its add-on contents' are the
 application's + 0x1000 + the DLC's index (Super Smash Bros. Ultimate: 01006A800016E000,
-01006A800016E800, 01006A800016F001 and so on).
+01006A800016E800, 01006A800016F001 and so on). Those are the metadata's (.cnmt); the NCAs of an
+update carry the application's title id in their own headers, so what an NCA is for comes from
+the metadata that lists it (apply_metadata), or from its data being a patch.
 """
 import argparse
 import json
@@ -124,7 +127,42 @@ def describe_nca(nca, path, name, container=None):
     if nca.content_type == 0:
         sec = nca.section(0)
         rec["romfs"] = None if sec is None else "plain" if nca.plaintext else ROMFS_STATES.get(sec.enc_type, "encrypted")
+        if rec["romfs"] == "patch":   # (an update's program carries the game's own title id: its data says what it is)
+            rec["kind"] = "update"
     return rec
+
+
+META_KINDS = {0x80: "base", 0x81: "update", 0x82: "dlc"}   # a .cnmt's content meta type
+
+
+def apply_metadata(contents, metas):
+    """What the metadata (.cnmt) says about each content, onto the records: its kind and version.
+    `metas` are (title id, version, meta type, [content ids]). An NCA's own header is not enough:
+    an update's program and control data carry the game's title id, not the update's; only the
+    update's metadata lists them. A record without a content id (a renamed file) keeps what its
+    header says, its version then from the metadata of its title. Then each program gets the
+    display version of the control data of the same game and kind."""
+    by_id, by_title = {}, {}
+    for title, version, mtype, ids in metas:
+        for cid in ids:
+            by_id[cid] = (version, META_KINDS.get(mtype))
+        by_title[title] = max(by_title.get(title, 0), version)
+    for rec in contents:
+        known = by_id.get(rec["content_id"]) if rec["content_id"] else None
+        if known:
+            rec["version"] = known[0] if rec["version"] is None else rec["version"]
+            if known[1] and rec["type"] != "meta":
+                rec["kind"] = known[1]
+        elif rec["version"] is None and rec["kind"] != "update":
+            rec["version"] = by_title.get(int(rec["title_id"], 16))
+    controls = {}
+    for rec in contents:
+        if rec["type"] == "control" and rec["display_version"]:
+            controls.setdefault((rec["app"], rec["kind"]), (rec["game"], rec["display_version"]))
+    for rec in contents:
+        if rec["type"] != "control" and rec["display_version"] is None and (rec["app"], rec["kind"]) in controls:
+            rec["game"], rec["display_version"] = controls[(rec["app"], rec["kind"])]
+    return contents
 
 
 def scan(folder, keys, depth=1):
@@ -145,48 +183,37 @@ def scan(folder, keys, depth=1):
                 opened.append((nca, path, inner, name))
         except (SystemExit, OSError, ValueError, struct.error) as e:
             unread.append(f"{name}: {e}")
-    metas, controls = [], {}
+    metas = []
     for nca, path, name, container in opened:
         try:
             rec = describe_nca(nca, path, name, container)
             if nca.content_type == 1:
                 info = cnmt_info(nca)
                 if info:
-                    title, version, kind, ids = info
+                    title, version, mtype, ids = info
                     rec["version"] = version
-                    metas.append((title, version, ids))
+                    rec["kind"] = META_KINDS.get(mtype, rec["kind"])
+                    metas.append((title, version, mtype, ids))
             elif nca.content_type == 2:
                 info = nacp_info(nca)
                 if info:
                     rec["game"], rec["display_version"] = info
-                    controls.setdefault(nca.title_id, info)
             contents.append(rec)
         except (SystemExit, OSError, ValueError, struct.error) as e:
             unread.append(f"{name}: {e}")
         finally:
             nca.f.close()
-    # what the metadata says about each content: its version (by content id, else by title)
-    by_id = {cid: version for _title, version, ids in metas for cid in ids}
-    by_title = {}
-    for title, version, _ids in metas:
-        by_title[title] = max(by_title.get(title, 0), version)
-    for rec in contents:
-        if rec["version"] is None:
-            rec["version"] = by_id.get(rec["content_id"]) if rec["content_id"] else None
-            if rec["version"] is None:
-                rec["version"] = by_title.get(int(rec["title_id"], 16))
-        if rec["display_version"] is None and int(rec["title_id"], 16) in controls:
-            rec["game"], rec["display_version"] = controls[int(rec["title_id"], 16)]
+    apply_metadata(contents, metas)
     return {"folder": os.path.abspath(folder), "contents": contents, "unread": unread}
 
 
 # ---- pure: what to build from -------------------------------------------------------------------
 def pick_program(contents, app=APP_ID):
-    """The program record to build from, among a scan's contents: a Program NCA in a file of its
-    own (not inside a package); of the game's (`app`) when the folder holds several games'; the
-    update's rather than the base's; of several updates, the newest the metadata knows; else the
-    choice must be made by hand."""
-    programs = [c for c in contents if c["type"] == "program" and not c["container"]]
+    """The program record to build from, among a scan's contents: a Program NCA, as a file of its
+    own or inside a package (.nsp); of the game's (`app`) when the folder holds several games';
+    the update's rather than the base's; of several updates, the newest the metadata knows; of
+    the same program twice, the file of its own; else the choice must be made by hand."""
+    programs = [c for c in contents if c["type"] == "program"]
     if not programs:
         raise Error("there is no Program NCA among them")
     ours = [c for c in programs if int(c["app"], 16) == app]
@@ -201,18 +228,27 @@ def pick_program(contents, app=APP_ID):
         if len(updates) > 1 and all(c["version"] is not None for c in updates):
             newest = max(c["version"] for c in updates)
             programs = [c for c in updates if c["version"] == newest]
+    if len(programs) > 1:   # the same program twice: one content id, or one known version
+        ids = {c["content_id"] for c in programs}
+        versions = {(c["kind"], c["version"]) for c in programs}
+        if (len(ids) == 1 and None not in ids) or (len(versions) == 1 and programs[0]["version"] is not None):
+            programs = sorted(programs, key=lambda c: c["container"] is not None)[:1]
     if len(programs) > 1:
-        raise Error("there are several Program NCAs: " + ", ".join(c["name"] for c in programs)
+        raise Error("there are several Program NCAs: " + ", ".join(where(c) for c in programs)
                     + ". Keep only the one of the game version to build (setup guide step 2).")
     return programs[0]
 
 
+def where(rec):
+    """A record's file, for a person: the NCA's name, and the package it is in."""
+    return f"{rec['name']} in {rec['container']}" if rec["container"] else rec["name"]
+
+
 def base_program(contents, program):
-    """The base's Program NCA (a file of its own) for an update's, or None."""
-    for c in contents:
-        if c["type"] == "program" and not c["container"] and c["kind"] == "base" and c["app"] == program["app"]:
-            return c
-    return None
+    """The base's Program NCA for an update's (a file of its own rather than one in a package), or None."""
+    bases = [c for c in contents if c["type"] == "program" and c["kind"] == "base" and c["app"] == program["app"]]
+    bases.sort(key=lambda c: c["container"] is not None)
+    return bases[0] if bases else None
 
 
 def summary(result, app=APP_ID):

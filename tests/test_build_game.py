@@ -34,6 +34,23 @@ class PickProgramTests(unittest.TestCase):
             pick_program([('a.nca', PROGRAM, UPDATE), ('b.nca', PROGRAM, UPDATE)])
 
 
+class GameSourceTests(unittest.TestCase):
+    def test_same_game(self):
+        same_game, describe = BUILD['same_game'], BUILD['describe_identity']
+        identity = BUILD['game_identity']
+        update = {'app': '01006A800016E000', 'kind': 'update', 'version': 2031616}
+        base = {'app': '01006A800016E000', 'kind': 'base', 'version': 0}
+        self.assertEqual(identity(update), '01006A800016E000 update 2031616')
+        self.assertEqual(identity(dict(base, version=None)), '01006A800016E000 base -')
+        self.assertTrue(same_game(identity(update), identity(update)))
+        self.assertFalse(same_game(identity(base), identity(update)))              # 11.0.0 folder, 13.0.5 files
+        self.assertFalse(same_game(identity(update), identity(dict(update, version=1966080))))
+        self.assertTrue(same_game(identity(base), identity(dict(base, version=None))))   # unknown: not held against it
+        self.assertEqual(describe(identity(update)), "the game's update (title version v31)")
+        self.assertEqual(describe(identity(update), '13.0.5'), "13.0.5 (the game's update)")
+        self.assertEqual(describe('01006A800016E000 base -'), 'the game')
+
+
 class MarkerTests(unittest.TestCase):
     def test_python_version_markers(self):
         marker_applies = BUILD['marker_applies']

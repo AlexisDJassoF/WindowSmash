@@ -52,7 +52,7 @@ The online name to write into online_name.txt.
 .PARAMETER NoWizard
 Ask in this window instead of opening the wizard.
 .PARAMETER SkipBuild
-Stop after the setup steps, before building the game.
+Prepare the game files (program, fonts, data, DLC, fighters) but stop before the build itself.
 .PARAMETER Jobs
 Passed to the build: how many files to compile at a time (default: by the installed RAM).
 .PARAMETER NoUpdate
@@ -416,16 +416,38 @@ function Test-PythonCommand {
 }
 
 # ---- step 1: the newest WindowSmash -----------------------------------------------------------------
+function Invoke-Http {
+    <# A GET that answers with its status instead of throwing (a 404 is an answer here, and a thrown
+       one would land in install.log as an error): @{Code; Body; Error}. #>
+    param([string]$Url, [string]$Accept = '*/*')
+    $client = $null
+    try {
+        Add-Type -AssemblyName System.Net.Http
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds(60)
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', $UserAgent)
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept', $Accept)
+        $resp = $client.GetAsync($Url).GetAwaiter().GetResult()
+        return @{ Code = [int]$resp.StatusCode; Body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult(); Error = $null }
+    } catch {
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        return @{ Code = 0; Body = $null; Error = $e.Message }
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+}
+
 function Invoke-Api {
     <# GitHub's API: @{Ok; Data} or @{Ok = $false; NotFound; Error}. #>
     param([string]$Url)
-    try {
-        return @{ Ok = $true; Data = (Get-Json $Url) }
-    } catch {
-        $code = 0
-        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
-        return @{ Ok = $false; NotFound = ($code -eq 404); Error = $_.Exception.Message }
+    $r = Invoke-Http $Url 'application/vnd.github+json'
+    if ($r.Code -ge 200 -and $r.Code -lt 300) {
+        try { return @{ Ok = $true; Data = ($r.Body | ConvertFrom-Json) } } catch { return @{ Ok = $false; NotFound = $false; Error = 'an answer that is not JSON' } }
     }
+    $why = $r.Error
+    if (-not $why) { $why = "HTTP $($r.Code)" }
+    return @{ Ok = $false; NotFound = ($r.Code -eq 404); Error = $why }
 }
 
 function Get-LocalCommit {
@@ -488,7 +510,8 @@ function Update-FromZip {
         Write-Warn "the old version's file list could not be read: files the new version dropped stay"
     }
     $oldLobby = $null
-    try { $oldLobby = [string](Get-Text "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Old/online_server.txt") } catch { }
+    $was = Invoke-Http "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Old/online_server.txt"
+    if ($was.Code -eq 200) { $oldLobby = [string]$was.Body }
 
     $changed = 0
     $now = Get-Date
@@ -898,7 +921,7 @@ function Show-Wizard {
     $rows = @{}
     $y = 58
     foreach ($spec in @(
-        @{ Key = 'Game'; Title = 'Game files'; Hint = "The game's .nca files (from yuzu, Ryujinx, or your own dump folder), with romfs.bin if you have one" },
+        @{ Key = 'Game'; Title = 'Game files'; Hint = "yuzu's or Ryujinx's game folder, or yours: the game, its update .nsp, DLC .nsp files" },
         @{ Key = 'Keys'; Title = 'Keys'; Hint = "The folder with prod.keys and title.keys" },
         @{ Key = 'Firmware'; Title = 'Firmware'; Hint = "The folder with your Switch firmware's .nca files (for the fonts)" }
     )) {
@@ -1152,10 +1175,12 @@ function Step-Build {
     Write-Step '[9/10] Build the game'
     $build = @((Join-Path $Root 'tools\build_game.py'), '--game', $Answers.Game, '--keys', $Answers.Keys, '--firmware', $Answers.Firmware)
     if ($Jobs) { $build += @('--jobs', "$Jobs") }
-    if ($SkipBuild) { Write-Info '-SkipBuild: not building'; return $false }
+    if ($SkipBuild) { $build += '--prepare-only' }
     if ($DryRun) { Write-Would ('run: ' + ($Script:Python -join ' ') + ' ' + ($build -join ' ')); return $false }
-    Write-Info 'the program, fonts, data, DLC and fighters, then the build: 30 minutes to a few hours'
+    if ($SkipBuild) { Write-Info 'the program, fonts, data, DLC and fighters; not the build itself (-SkipBuild)' }
+    else { Write-Info 'the program, fonts, data, DLC and fighters, then the build: 30 minutes to a few hours' }
     if ((Invoke-Python $build) -ne 0) { throw 'The build stopped (the message above says why). Fix that, then run Install WindowSmash.bat again: it carries on where it stopped.' }
+    if ($SkipBuild) { return $false }
     return $true
 }
 

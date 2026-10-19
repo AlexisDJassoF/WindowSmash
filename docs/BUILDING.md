@@ -9,7 +9,7 @@ This guide takes you from a fresh download to playing. No programming knowledge 
 
 ## Install in one go
 
-**What you need:** a Windows 10 or 11 PC (64-bit, a processor with AVX2, 16 GB of RAM is comfortable, about 60 GB free) and your own game files: the game as dumped from your Switch, with its update if you have one, your console's keys (`prod.keys` and `title.keys`) and its firmware. If you have played the game in **yuzu or Ryujinx on this PC, you already have all three**, and the installer finds them by itself. Otherwise, [Part 2](#part-2-gather-your-game-files) below says what the files are and where to put them.
+**What you need:** a Windows 10 or 11 PC (64-bit, a processor with AVX2, 16 GB of RAM is comfortable, about 60 GB free) and your own game files: the game as dumped from your Switch, with its update if you have one, your console's keys (`prod.keys` and `title.keys`) and its firmware. If you have played the game in **yuzu or Ryujinx on this PC, you already have all three**, and the installer finds them by itself. Otherwise, put the game, its update `.nsp` and your DLC `.nsp` files in one folder; [Part 2](#part-2-gather-your-game-files) below says what the files are.
 
 1. On **<https://github.com/SNO2207/WindowSmash>**, click the green **Code** button, then **Download ZIP**. Extract the ZIP somewhere with room, for example to `C:\WindowSmash`. Keep it out of the Desktop and Documents folders: OneDrive may try to upload them, and the finished build is around 30 GB.
 2. Double-click **`Install WindowSmash.bat`** in that folder. Windows asks whether to run it (**The publisher could not be verified**): click **Run**. On some PCs a blue **Windows protected your PC** box comes instead: click **More info**, then **Run anyway**. Windows asks this about anything downloaded that isn't signed; the installer takes that mark off WindowSmash's other files, so it asks only this once.
@@ -93,6 +93,9 @@ You need these files from your own Switch:
 
 > [!NOTE]
 > **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. The program and the data must be the same version. To keep more than one version, set up one with this guide and [add the others](#add-another-version) afterwards.
+
+> [!TIP]
+> **With `Install WindowSmash.bat` or `Build WindowSmash.bat` you don't need `romfs.bin`.** Put the game's `.nca` files (or point at the folder yuzu or Ryujinx installed the game in), your update's `.nsp` if you have one, and your DLC `.nsp` files (loose, or in a `dlc` folder) into one folder. They find the program, decrypt what needs it, and apply the update over the game themselves. The update takes a few minutes and about 4 GB more space.
 
 <details>
 <summary><strong>What do "update applied" and "unencrypted" mean?</strong></summary>
