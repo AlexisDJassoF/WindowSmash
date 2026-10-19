@@ -1,6 +1,6 @@
 # Playing
 
-[← README](../README.md) · [Setup guide](BUILDING.md) · [Multiplayer](../NETPLAY.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md)
+[← README](../README.md) · [Setup guide](BUILDING.md) · [Multiplayer](MULTIPLAYER.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md)
 
 Everything about playing once the game is built: how to start it, the controls, the settings files, and where WindowSmash keeps your save, screenshots and problem reports.
 
@@ -17,19 +17,19 @@ Everything about playing once the game is built: how to start it, the controls, 
 
 ## Starting the game
 
-Everything starts from a launcher in the WindowSmash folder. Double-click the one you want:
+Everything starts from a launcher. `Play SSBU.bat` and `Install WindowSmash.bat` are in the WindowSmash folder; the others are in its `launchers` folder. Double-click the one you want:
 
 | Launcher | What it does |
 | :--- | :--- |
 | **`Play SSBU.bat`** | Starts the game and joins the online lobby, so Local Wireless shows everyone's rooms. If the lobby doesn't answer, the game plays offline. |
-| **`Play SSBU Offline.bat`** | Starts the game without going online. |
-| **`Host SSBU Netplay.bat`** | Starts the game as the host of a private room ([multiplayer guide](../NETPLAY.md#private-room)). |
-| **`Join SSBU Netplay.bat`** | Starts the game and joins someone's private room. |
-| **`Unlock All Fighters.bat`** | Unlocks every base-game fighter on your save. Close the game first ([DLC and unlocks](DLC-AND-UNLOCKS.md#unlock-every-base-game-fighter)). |
-| **`Prepare Shaders.bat`** | Prepares all of the game's shaders ahead of time ([below](#shaders-and-first-time-stutter)). |
+| **`launchers\Play SSBU Offline.bat`** | Starts the game without going online. |
+| **`launchers\Host SSBU Netplay.bat`** | Starts the game as the host of a private room ([multiplayer guide](MULTIPLAYER.md#private-room)). |
+| **`launchers\Join SSBU Netplay.bat`** | Starts the game and joins someone's private room. |
+| **`launchers\Unlock All Fighters.bat`** | Unlocks every base-game fighter on your save. Close the game first ([DLC and unlocks](DLC-AND-UNLOCKS.md#unlock-every-base-game-fighter)). |
+| **`launchers\Prepare Shaders.bat`** | Prepares all of the game's shaders ahead of time ([below](#shaders-and-first-time-stutter)). |
 | **`Install WindowSmash.bat`** | Sets everything up and builds the game ([setup guide](BUILDING.md#install-in-one-go)). Run it again to get the newest WindowSmash and build it. |
-| **`Build WindowSmash.bat`** | Builds the game from your files, when the tools are already installed ([setup guide](BUILDING.md#shortcut-build-windowsmashbat)). |
-| **`Configure Game Data.bat`** | Points WindowSmash at your game data and fonts ([setup guide, step 10](BUILDING.md#step-10-connect-your-game-data)). |
+| **`launchers\Build WindowSmash.bat`** | Builds the game from your files, when the tools are already installed ([setup guide](BUILDING.md#shortcut-build-windowsmashbat)). |
+| **`launchers\Configure Game Data.bat`** | Points WindowSmash at your game data and fonts ([setup guide, step 10](BUILDING.md#step-10-connect-your-game-data)). |
 
 With [more than one game version](VERSIONS.md) built, the launchers ask which one to start. The last one you picked is the default.
 
@@ -130,7 +130,7 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 
 The game's graphics programs (*shaders*) are prepared the first time each one is used, so a new effect can show a moment late, or stutter, the first time you see it. WindowSmash keeps every prepared shader in `dump\shadercache\` and loads them in the background each time the game starts, so each stutter happens only once.
 
-To prepare them all before playing, double-click **`Prepare Shaders.bat`**. It runs once per game version, at low priority so the PC stays usable, and shows a progress bar with the time left. A first run compiles about 40,000 shaders (for 13.0.5): about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; what's done stays done, so a later run takes minutes. It needs Python and Visual Studio, as for [building](BUILDING.md).
+To prepare them all before playing, double-click **`launchers\Prepare Shaders.bat`**. It runs once per game version, at low priority so the PC stays usable, and shows a progress bar with the time left. A first run compiles about 40,000 shaders (for 13.0.5): about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; what's done stays done, so a later run takes minutes. It needs Python and Visual Studio, as for [building](BUILDING.md).
 
 ## Low frame rate
 

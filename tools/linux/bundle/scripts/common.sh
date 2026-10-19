@@ -116,7 +116,7 @@ vulkan_installed() {
     return 1
 }
 
-# Online play (see NETPLAY.md): the lobby is the first line of online_server.txt that is not a
+# Online play (see docs/MULTIPLAYER.md): the lobby is the first line of online_server.txt that is not a
 # comment - host:port, then an optional lobby code (only players with the same code see each
 # other's rooms) - or "off". SSBU_NET_RELAY (and SSBU_NET_ROOM) set beforehand name a lobby
 # outright. The name the other players see is kept in online_name.txt, asked for the first time.

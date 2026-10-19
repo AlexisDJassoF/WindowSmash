@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the game from your own files in one go: what Build WindowSmash.bat runs.
+"""Build the game from your own files in one go: what launchers\\Build WindowSmash.bat runs.
 
 Usage:
   build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir>] [--jobs N] [--prepare-only]
@@ -571,12 +571,12 @@ def build(a):
         run([sys.executable, os.path.join("tools", "recomp.py"), "all", os.path.join("dump", "exefs"),
              "--out", "build", "--jobs", str(jobs)],
             "The build failed (see above). If the PC ran out of memory, build with fewer jobs at a time: open "
-            "PowerShell in this folder and run  & \".\\Build WindowSmash.bat\" --jobs 4")
+            "PowerShell in this folder and run  & \".\\launchers\\Build WindowSmash.bat\" --jobs 4")
     log("\nDone: build\\ssbu.exe is ready. Start the game with Play SSBU.bat.")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build the game from your own files (Build WindowSmash.bat).")
+    ap = argparse.ArgumentParser(description="Build the game from your own files (launchers\\Build WindowSmash.bat).")
     ap.add_argument("--game", help=r"the folder with the game's files (asked; default D:\MyDump)")
     ap.add_argument("--keys", help=r"the folder with prod.keys and title.keys (asked; default D:\MyKeys)")
     ap.add_argument("--firmware", help=r"the folder with the firmware's .nca files (asked; default D:\MyFirmware)")

@@ -18,8 +18,8 @@ One WindowSmash folder can hold several versions of the game side by side, each 
 ## Choosing a version when you start
 
 - **`Play SSBU.bat`** lists the versions that are built and asks which one to start. The one you picked last is the default (remembered in `last_version.txt`). With only one built, it starts that one straight away.
-- **`Host SSBU Netplay.bat`** and **`Join SSBU Netplay.bat`** ask the same way. **Every player needs the same version.**
-- **`Unlock All Fighters.bat`** asks too, and only changes a version whose save layout it knows ([DLC and unlocks](DLC-AND-UNLOCKS.md)).
+- **`launchers\Host SSBU Netplay.bat`** and **`launchers\Join SSBU Netplay.bat`** ask the same way. **Every player needs the same version.**
+- **`launchers\Unlock All Fighters.bat`** asks too, and only changes a version whose save layout it knows ([DLC and unlocks](DLC-AND-UNLOCKS.md)).
 
 To skip the question, set `SSBU_TREE` to a version's folder before starting a launcher.
 

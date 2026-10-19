@@ -8,7 +8,7 @@ lobby, so nobody needs port forwarding; the lobby's machine needs its UDP port o
 the same room whose games can do it are also introduced to each other, so their games can send the
 room's traffic straight to each other (UDP hole punching) and use the lobby only when that fails.
 The protocol is runtime/net_relay.c's (version 2); the host player's game can run a smaller relay
-of its own for a private room (Host SSBU Netplay.bat).
+of its own for a private room (launchers\\Host SSBU Netplay.bat).
 
     python3 ssbu_relay.py [--port 39420] [--bind 0.0.0.0] [--verbose] [--banlist FILE]
     python3 ssbu_relay.py --probe HOST[:PORT] [--room CODE] [--build ID]   (is a lobby there?)

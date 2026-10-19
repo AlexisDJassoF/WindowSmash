@@ -1,4 +1,4 @@
-/* The clock behind host.c's rt_clock_ns (included there once; tools/clocktest.c checks it).
+/* The clock behind host.c's rt_clock_ns (included there once; tools/dev/clocktest.c checks it).
  *
  * What tells time asks it: the game's system tick, the kernel's timeouts, rt_now_ns and the
  * renderer's own timing (twice a draw) - tens of thousands of times a second. That is

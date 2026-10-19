@@ -520,7 +520,8 @@ const char *rt_describe_host(unsigned long long pc, char *buf, size_t n);   /* h
 static U64 filetime(FILETIME t) { return (U64)t.dwHighDateTime << 32 | t.dwLowDateTime; }
 
 /* A code address for a report: the guest function of recompiled code, else the program's own
- * function (once the map is read: by F6, or the hitch log at start) or module + offset. */
+ * function (once the map is read: by F6, or the hitch log at start) or module + offset
+ * (tools/dev/hostsym.py names those). */
 static void describe_pc(U64 pc, char *buf, size_t n) {
     char guest[96];
     U32 sym = symbol_of(pc);

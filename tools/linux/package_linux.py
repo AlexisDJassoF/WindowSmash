@@ -171,10 +171,12 @@ def main():
             text = text.replace("@ROMFS_KIND@", kind).replace("@ROMFS_OFFSET@", nca_offset).replace("@ROMFS_FILES@", files_text)
             with open(dst, "w", encoding="utf-8", newline="\n") as out:
                 out.write(text)
-    # (online_server.txt: the online lobby run.sh joins)
-    for doc in ("README-LINUX.md", "NETPLAY.md", "DLC_AND_UNLOCKS.md", "UPDATE_13.0.5.md", "online_server.txt"):
-        if os.path.exists(os.path.join(REPO, doc)):
-            copy(os.path.join(REPO, doc), os.path.join(BUNDLE, doc))
+    # the guides, laid out as in the repository (the launchers' messages point at docs/...), and
+    # online_server.txt: the online lobby run.sh joins
+    for doc in ("LINUX.md", "MULTIPLAYER.md", "DLC-AND-UNLOCKS.md", "UPDATES.md", "VERSIONS.md"):
+        copy(os.path.join(REPO, "docs", doc), os.path.join(BUNDLE, "docs", doc))
+    if os.path.exists(os.path.join(REPO, "online_server.txt")):
+        copy(os.path.join(REPO, "online_server.txt"), os.path.join(BUNDLE, "online_server.txt"))
     for tool in ("unlock_all.py", "ssbu_relay.py"):
         copy(os.path.join(REPO, "tools", tool), os.path.join(BUNDLE, "tools", tool))
     total = sum(os.path.getsize(os.path.join(r, f)) for r, _d, fs in os.walk(BUNDLE) for f in fs)

@@ -9,10 +9,10 @@
 <p align="center">
   <a href="docs/BUILDING.md"><strong>Setup guide</strong></a> ·
   <a href="docs/PLAYING.md"><strong>Playing</strong></a> ·
-  <a href="NETPLAY.md"><strong>Multiplayer</strong></a> ·
+  <a href="docs/MULTIPLAYER.md"><strong>Multiplayer</strong></a> ·
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
   <a href="docs/UPDATES.md"><strong>Game updates</strong></a> ·
-  <a href="README-LINUX.md"><strong>Linux</strong></a> ·
+  <a href="docs/LINUX.md"><strong>Linux</strong></a> ·
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a>
 </p>
 
@@ -228,9 +228,9 @@ Plug in a controller and press a button: each pad becomes the next free player, 
 | :--- | :--- | :--- |
 | **Online lobby** (the default) | Anyone, anywhere | Double-click `Play SSBU.bat`, open **Local Wireless** in the game, then create a room or pick one from **Rooms List**. |
 | **Lobby code** | Friends only, through the online lobby | Everyone adds the same code to `online_server.txt`. Only players with that code see your rooms. |
-| **Private room** | A group with one host | The host runs `Host SSBU Netplay.bat`; the others run `Join SSBU Netplay.bat` and type the host's address. |
+| **Private room** | A group with one host | The host runs `launchers\Host SSBU Netplay.bat`; the others run `launchers\Join SSBU Netplay.bat` and type the host's address. |
 
-Everyone needs the **same game version**, and each PC uses its own save. The [multiplayer guide](NETPLAY.md) walks through each way and what to do when a room doesn't show up.
+Everyone needs the **same game version**, and each PC uses its own save. The [multiplayer guide](docs/MULTIPLAYER.md) walks through each way and what to do when a room doesn't show up.
 
 Looking for people to play with? Ask on the [Discord server](https://discord.gg/pkgyYGf3YB).
 
@@ -240,11 +240,11 @@ Looking for people to play with? Ask on the [Discord server](https://discord.gg/
 | :--- | :--- |
 | [Setup guide](docs/BUILDING.md) | install WindowSmash and build the game, step by step. |
 | [Playing](docs/PLAYING.md) | change the controls or the window, and find saves, screenshots and problem reports. |
-| [Multiplayer](NETPLAY.md) | play with other people online or in a private room. |
+| [Multiplayer](docs/MULTIPLAYER.md) | play with other people online or in a private room. |
 | [DLC and unlocks](docs/DLC-AND-UNLOCKS.md) | use your DLC, or unlock every base-game fighter on your save. |
 | [Game updates](docs/UPDATES.md) | apply an update file, such as 13.0.5, as a version of its own. |
 | [Several versions](docs/VERSIONS.md) | keep more than one game version and choose one when you start. |
-| [Linux](README-LINUX.md) | build and run the experimental Linux version. |
+| [Linux](docs/LINUX.md) | build and run the experimental Linux version. |
 | [Runtime packages](docs/RUNTIME-SETUP.md) | set up a ready-built runtime package with your own game data. |
 | [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
 | [Third-party notices](NOTICE.md) | see attributions and licenses. |
@@ -257,7 +257,7 @@ WindowSmash is **experimental**. Menus and matches run and Local Wireless connec
 | :--- | :--- |
 | **Game versions** | Any version should work. **11.0.0** is the most tested. **13.0.5** has been checked through its menus and full roster, its matches less so. Other versions haven't been tried. |
 | **CPU and loading** | The game's code is translated to C ahead of time; fighter modules are compiled too and loaded when the game asks for them. |
-| **Graphics** | Direct3D 11. Shaders compile the first time each is used, so a new effect can hitch once. `Prepare Shaders.bat` can compile them ahead of time. |
+| **Graphics** | Direct3D 11. Shaders compile the first time each is used, so a new effect can hitch once. `launchers\Prepare Shaders.bat` can compile them ahead of time. |
 | **Controllers** | Up to eight players on most pads, plus the keyboard. Testing with real pads has been limited so far. |
 | **Display** | Windowed, borderless or full screen, kept 16:9, with pacing for fixed-refresh and variable-refresh monitors. |
 | **Audio and movies** | Music (Opus) and movies (VP9) are decoded by libopus and libvpx, built from the sources that come with WindowSmash. |
@@ -311,7 +311,7 @@ When something goes wrong, first look at [If something goes wrong](docs/BUILDING
 Run the source-only tests. They use made-up data, need no game files, and don't start the game:
 
 ```powershell
-python -m pip install -r requirements-dev.txt
+python -m pip install -r tests/requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
@@ -319,8 +319,9 @@ The game-backed instruction and function tests are in the [technical guide](docs
 
 | Folder | Contents |
 | :--- | :--- |
+| `launchers/` | The other launchers: offline play, private rooms, shader preparation, the unlock tool, building without the installer. |
 | `runtime/` | The native runtime: services, graphics, input, audio, networking. |
-| `tools/` | The recompiler, game-file readers, launch helpers and diagnostic tools. |
+| `tools/` | The recompiler, game-file readers and launch helpers; `tools/dev/` holds the developers' analysis and test tools, `tools/linux/` the Linux build. |
 | `tests/` | Source-only tests. |
 | `third_party/` | The sources of libopus and libvpx's VP9 decoder, built during the build, with their license texts. |
 | `docs/` | These guides. |

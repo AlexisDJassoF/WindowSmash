@@ -1,4 +1,4 @@
-"""The port's clock (runtime/clock.h) through tools/clocktest.c: built with the game's compiler and
+"""The port's clock (runtime/clock.h) through tools/dev/clocktest.c: built with the game's compiler and
 run as is, with a system timer slowed to a microsecond a read (as on a PC timed by the HPET), and
 with the CPU's counter asked for. Skipped where there is no clang-cl (it builds nothing else)."""
 from pathlib import Path
@@ -24,7 +24,7 @@ class ClockTests(unittest.TestCase):
         cls.exe = {}
         for name, extra in (('plain', []), ('slow', ['/DSLOW_QPC'])):
             exe = os.path.join(cls.dir, 'clocktest_%s.exe' % name)
-            r = subprocess.run([cc.CLANG, '/nologo', '/O2', *cc.BASE_CFLAGS, *extra, str(ROOT / 'tools' / 'clocktest.c'),
+            r = subprocess.run([cc.CLANG, '/nologo', '/O2', *cc.BASE_CFLAGS, *extra, str(ROOT / 'tools' / 'dev' / 'clocktest.c'),
                                 '/Fe' + exe, '/Fo' + os.path.join(cls.dir, name + '.obj')], capture_output=True, text=True)
             if r.returncode:
                 raise AssertionError('clocktest.c did not build:\n' + r.stdout + r.stderr)

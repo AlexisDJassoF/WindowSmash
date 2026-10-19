@@ -1,6 +1,6 @@
 # How WindowSmash works
 
-[← README](../README.md) · [Setup guide](BUILDING.md) · [Multiplayer](../NETPLAY.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md) · [Several versions](VERSIONS.md)
+[← README](../README.md) · [Setup guide](BUILDING.md) · [Multiplayer](MULTIPLAYER.md) · [DLC and unlocks](DLC-AND-UNLOCKS.md) · [Several versions](VERSIONS.md)
 
 WindowSmash is a static recompiler plus a Windows compatibility runtime, specialized for this game. CPU code is translated before launch. GPU programs are translated when encountered. Selected operating-system and SDK entry points are implemented natively, while the remaining game and SDK code executes as compiled guest functions.
 
@@ -158,7 +158,7 @@ Direct connections keep protocol version 2 and are negotiated: a lobby that intr
 
 The game's Online mode logs in to a NEX game server of WindowSmash's own, [`tools/nex`](../tools/nex/) (standard-library Python), which [`ssbu_online_lobby.py`](../tools/ssbu_online_lobby.py) runs inside the lobby at the lobby's virtual address, `10.13.0.1`. With netplay configured, [`hle_env.c`](../runtime/hle_env.c) gives the user a network service account: an id derived from `netplay_id.txt`, and an id token with that id and the player name, which only this server reads. Hooks in [`hle_online.c`](../runtime/hle_online.c) give NEX a direct server address, with which it opens its WebSocket without TLS, and resolve Nintendo's server names (the game server, Pia's NAT check servers) to the lobby; nothing goes to Nintendo. NEX's stream socket travels over a TCP connection to the lobby's port, and the game server answers login, matchmaking (MatchmakeExtension, MatchMaking, NAT traversal), ranked ratings and the Online menu's other calls. Matched players' Pia traffic then crosses the virtual LAN as Local Wireless's does, relayed by the lobby only between players the game server put in one match. The server lets a connection act only for the player it logged in as and on gatherings that player belongs to, and bounds connections, buffers and stored state. `python -m nex.selftest`, run in `tools`, tests it without a game.
 
-Lobby codes and room names are routing identifiers, not passwords. The protocol is not encrypted or an authenticated public service. Use it with trusted players and a reachable relay. A virtual LAN can simplify connectivity when the host cannot accept inbound UDP directly. Follow the [multiplayer setup guide](../NETPLAY.md).
+Lobby codes and room names are routing identifiers, not passwords. The protocol is not encrypted or an authenticated public service. Use it with trusted players and a reachable relay. A virtual LAN can simplify connectivity when the host cannot accept inbound UDP directly. Follow the [multiplayer setup guide](MULTIPLAYER.md).
 
 ## 6. DLC and fighter unlocks
 
@@ -168,16 +168,16 @@ The unlock tools edit the known save layout of 11.0.0, which 13.0.5 shares; they
 
 ## 7. Tool reference
 
-Paths below are relative to the repository root. Diagnostic tools may require `requirements-dev.txt` and locally prepared game inputs. Several modules are libraries imported by the driver rather than general user commands.
+Paths below are relative to the repository root. `tools/` holds what the installer, the build and the launchers run; `tools/dev/` holds the developers' analysis, verification and automation tools, which may require `tests/requirements-dev.txt` and locally prepared game inputs; `tools/linux/` is the Linux build ([Linux](LINUX.md)). Several modules are libraries imported by the driver rather than general user commands.
 
-### Build and content preparation
+### Build and content preparation (`tools/`)
 
 | Tool | Role |
 | :--- | :--- |
 | [`nca.py`](../tools/nca.py) | Inspect packages; extract ExeFS/RomFS files; generate `romfs.cfg` and installed-content `aoc.cfg`. |
 | [`arc.py`](../tools/arc.py) | Inspect `data.arc`, extract named paths, and collect known embedded NRO modules. Uses Python 3.14's `compression.zstd`, or the `zstandard` package on older Pythons. |
 | [`gamefiles.py`](../tools/gamefiles.py) | Say what a folder of game files holds (the guide's folder or an emulator's installed-content folder): the program to build from, base or update, DLC, versions. |
-| [`build_game.py`](../tools/build_game.py) | The one-command build behind `Build WindowSmash.bat`: tools check, packages, program, fonts, data (decrypting or applying an update when needed), DLC, fighters, build. |
+| [`build_game.py`](../tools/build_game.py) | The one-command build behind `launchers\Build WindowSmash.bat`: tools check, packages, program, fonts, data (decrypting or applying an update when needed), DLC, fighters, build. |
 | [`codec_libs.py`](../tools/codec_libs.py) | Build libopus and libvpx's VP9 decoder from `third_party/` into static libraries, when they are missing or stale ([third-party sources](../third_party/README.md)). |
 | [`install_windowsmash.ps1`](../tools/install_windowsmash.ps1) | What `Install WindowSmash.bat` runs: PC checks, Python, the compiler, SDL3, the folder wizard, then `build_game.py`. |
 | [`update.py`](../tools/update.py) | Apply an update package as a layered RomFS in a version folder, checking every block against the update's hashes ([later versions](UPDATES.md)). |
@@ -191,39 +191,45 @@ Paths below are relative to the repository root. Diagnostic tools may require `r
 | [`a64.py`](../tools/a64.py) | Shared instruction-emission helpers, register expressions, types, and unsupported-operation handling. |
 | [`cc.py`](../tools/cc.py) | Find `clang-cl`, construct compile options, compile incrementally, and link Windows executables. |
 
-### Analysis and diagnostics
+### Analysis and diagnostics (`tools/dev/`)
 
 | Tool | Role |
 | :--- | :--- |
-| [`disasm.py`](../tools/disasm.py) | Disassemble an address range, optionally beside lifted C output. |
-| [`calls.py`](../tools/calls.py) | List a function's direct calls and name imported callees. |
-| [`census.py`](../tools/census.py) | Summarize imported/exported SDK boundaries and dynamically requested NVN entry points. |
-| [`insn_census.py`](../tools/insn_census.py) | Count decoded instruction forms in a module's text. |
-| [`ipc_reach.py`](../tools/ipc_reach.py) | Trace direct-call reachability to service IPC boundaries; indirect calls make its result a lower bound. |
+| [`disasm.py`](../tools/dev/disasm.py) | Disassemble an address range, optionally beside lifted C output. |
+| [`calls.py`](../tools/dev/calls.py) | List a function's direct calls and name imported callees. |
+| [`census.py`](../tools/dev/census.py) | Summarize imported/exported SDK boundaries and dynamically requested NVN entry points. |
+| [`insn_census.py`](../tools/dev/insn_census.py) | Count decoded instruction forms in a module's text. |
+| [`ipc_reach.py`](../tools/dev/ipc_reach.py) | Trace direct-call reachability to service IPC boundaries; indirect calls make its result a lower bound. |
 | [`eh.py`](../tools/eh.py) | Inspect exception-frame information and C++ landing-pad tables. |
-| [`find_crc.py`](../tools/find_crc.py) | Find the CRC-32 table and code references to it. |
-| [`strrefs.py`](../tools/strrefs.py) | Report strings referenced by instructions in a range. |
-| [`sym.py`](../tools/sym.py) | Resolve module-relative offsets to nearby exported function symbols. |
-| [`hostsym.py`](../tools/hostsym.py) | Resolve host executable offsets using a locally generated linker map. |
-| [`sass.py`](../tools/sass.py) | List or count Maxwell shader instructions in dumped shader binaries. |
-| [`hlslc.py`](../tools/hlslc.py) | Compile an HLSL file through Windows D3DCompiler and report diagnostics. |
-| [`shot.py`](../tools/shot.py) | Convert captured BMP frames to PNG and summarize colors. |
+| [`find_crc.py`](../tools/dev/find_crc.py) | Find the CRC-32 table and code references to it. |
+| [`strrefs.py`](../tools/dev/strrefs.py) | Report strings referenced by instructions in a range. |
+| [`sym.py`](../tools/dev/sym.py) | Resolve module-relative offsets to nearby exported function symbols. |
+| [`hostsym.py`](../tools/dev/hostsym.py) | Resolve host executable offsets using a locally generated linker map. |
+| [`sass.py`](../tools/dev/sass.py) | List or count Maxwell shader instructions in dumped shader binaries. |
+| [`hlslc.py`](../tools/dev/hlslc.py) | Compile an HLSL file through Windows D3DCompiler and report diagnostics. |
+| [`shot.py`](../tools/dev/shot.py) | Convert captured BMP frames to PNG and summarize colors. |
 
-### Verification, automation, and player utilities
+### Verification and automation (`tools/dev/`)
 
 | Tool | Role |
 | :--- | :--- |
-| [`difftest.py`](../tools/difftest.py) | Compare lifted single-instruction behavior against Unicorn across sampled CPU states. |
-| [`functest.py`](../tools/functest.py) | Compare selected whole leaf functions against Unicorn, including registers and memory writes. |
-| [`shadertest.c`](../tools/shadertest.c) | Translate dumped guest shaders and compile their HLSL with D3DCompiler. |
-| [`shader_aot.py`](../tools/shader_aot.py), [`shaderaot.c`](../tools/shaderaot.c) | Find the game's shader programs in `data.arc` and compile them ahead of time into a version's disk cache, as the renderer would (`Prepare Shaders.bat`). |
-| [`padtest.c`](../tools/padtest.c) | Check the controller layer offline: configuration, button mapping, sticks, player slots, and rumble pacing. |
-| [`clocktest.c`](../tools/clocktest.c) | Check the clock offline: the timer it picks (also with a system timer slowed to a microsecond a read), that it never goes back across threads, and its rate and cost (`tests/test_clock.py` builds and runs it). |
-| [`vp9test.c`](../tools/vp9test.c) | Replay recorded NVDEC jobs through the VP9 path and libvpx. |
-| [`vp9rt.c`](../tools/vp9rt.c) | Exercise VP9 header reconstruction with an independently parsed synthetic clip. |
-| [`menurun.sh`](../tools/menurun.sh) | Script menu navigation, captures, and logging using a copied test save. |
-| [`autobattle.sh`](../tools/autobattle.sh) | Drive a timed menu-to-battle input sequence for local diagnostics. |
-| [`netpair.sh`](../tools/netpair.sh) | Run two local instances through loopback relay transport with separate copied test data. |
+| [`difftest.py`](../tools/dev/difftest.py) | Compare lifted single-instruction behavior against Unicorn across sampled CPU states. |
+| [`functest.py`](../tools/dev/functest.py) | Compare selected whole leaf functions against Unicorn, including registers and memory writes. |
+| [`shadertest.c`](../tools/dev/shadertest.c) | Translate dumped guest shaders and compile their HLSL with D3DCompiler. |
+| [`padtest.c`](../tools/dev/padtest.c) | Check the controller layer offline: configuration, button mapping, sticks, player slots, and rumble pacing. |
+| [`clocktest.c`](../tools/dev/clocktest.c) | Check the clock offline: the timer it picks (also with a system timer slowed to a microsecond a read), that it never goes back across threads, and its rate and cost (`tests/test_clock.py` builds and runs it). |
+| [`vp9test.c`](../tools/dev/vp9test.c) | Replay recorded NVDEC jobs through the VP9 path and libvpx. |
+| [`vp9rt.c`](../tools/dev/vp9rt.c) | Exercise VP9 header reconstruction with an independently parsed synthetic clip. |
+| [`menurun.sh`](../tools/dev/menurun.sh) | Script menu navigation, captures, and logging using a copied test save. |
+| [`autobattle.sh`](../tools/dev/autobattle.sh) | Drive a timed menu-to-battle input sequence for local diagnostics. |
+| [`netpair.sh`](../tools/dev/netpair.sh) | Run two local instances through loopback relay transport with separate copied test data. |
+| [`smoke.ps1`](../tools/dev/smoke.ps1) | Compile and execute a small known game-function smoke harness against prepared local inputs. |
+
+### Play, package and serve (`tools/`)
+
+| Tool | Role |
+| :--- | :--- |
+| [`shader_aot.py`](../tools/shader_aot.py), [`shaderaot.c`](../tools/shaderaot.c) | Find the game's shader programs in `data.arc` and compile them ahead of time into a version's disk cache, as the renderer would (`launchers\Prepare Shaders.bat`). |
 | [`ssbu_relay.py`](../tools/ssbu_relay.py) | Run a standalone UDP relay without the game, native runtime, or game files. |
 | [`ssbu_online_lobby.py`](../tools/ssbu_online_lobby.py), [`nex/`](../tools/nex/) | Run the online lobby with the game server for Online mode (UDP and TCP on one port); `python -m nex.selftest` tests the server. |
 | [`bundle_ssbu.py`](../tools/bundle_ssbu.py) | Stream a local build into a portable ZIP64, rewrite the RomFS location, and verify CRC/SHA-256. |
@@ -231,7 +237,6 @@ Paths below are relative to the repository root. Diagnostic tools may require `r
 | [`Unlock-All-Fighters.ps1`](../tools/Unlock-All-Fighters.ps1) | Equivalent Windows save-unlock helper, with a running-game guard and atomic backup/replacement. |
 | [`Configure-Game-Data.ps1`](../tools/Configure-Game-Data.ps1) | Configure a runtime release using a separately supplied RomFS, fonts, and optional installed-content config. |
 | [`pick_version.bat`](../tools/pick_version.bat) | Let the launchers list the built game versions and ask which to start. |
-| [`smoke.ps1`](../smoke.ps1) | Compile and execute a small known game-function smoke harness against prepared local inputs. |
 
 The `.sh` helpers expect a Unix-like shell/tool environment that can run the Windows executable. They recreate their named output/test directories; use disposable capture paths. They are developer scripts, not required player launchers.
 
@@ -247,8 +252,8 @@ Game-backed checks after preparing local modules:
 
 ```powershell
 python tools/recomp.py coverage dump/exefs/main --jobs 8
-python tools/difftest.py dump/exefs/main --jobs 8
-python tools/functest.py dump/exefs/main --jobs 8
+python tools/dev/difftest.py dump/exefs/main --jobs 8
+python tools/dev/functest.py dump/exefs/main --jobs 8
 ```
 
 Differential results apply to the sampled encodings, states, and functions. Whole-function tests deliberately skip reference runs that cannot complete in isolation; neither test is proof that every game path works.
@@ -257,7 +262,7 @@ The overlay exposes frame/rendering counters. F1 toggles the overlay, F2 shows d
 
 A host exception writes `reports/crash_<time>.txt` with a minidump, and a runtime stop writes `reports/stopped_<time>.txt`. The minidump is written by a second process (the same executable started with `--write-dump`), because a process that dumps itself can deadlock on a lock held by one of its suspended threads. A watchdog ([`debug_watchdog.c`](../runtime/debug_watchdog.c)) writes `reports/freeze_<time>.txt` and a minidump when no frame has been presented for 5 s (again at 30 s and 120 s): the owners of the renderer's, present queue's, kernel's, and GPU channel's locks, the shader compiles in flight, the guest threads' states, and every thread's stack, with guest functions named by module offset. `SSBU_WATCHDOG=0` turns the watchdog off; `SSBU_MINIDUMP=0` writes no minidumps and `SSBU_MINIDUMP=full` writes all memory. `SSBU_HITCH=<ms>` logs every frame longer than that with what the main, vsync, and renderer threads spent it on: the program's functions by name once its map has been read (a few seconds after start), and for a wait inside a driver or library, the program's function that called into it (`... via <function>`). Locally generated linker maps are useful to `hostsym.py` and profiling tools, but are not required to run a release build.
 
-Useful environment variables include `SSBU_DATA_ROOT`, `SSBU_SHADER_CACHE`, `SSBU_SHADER_PREWARM`, `SSBU_COMPILE_THREADS`, `SSBU_DUMP_SHADERS`, `SSBU_DUMP_HLSL`, `SSBU_INPUT`, `SSBU_CAPTURE`, `SSBU_CONTROLLERS` (another `controllers.ini`), `SSBU_PAD_BACKEND=xinput`, `SSBU_DISPLAY` (another `display.ini`), `SSBU_WINDOW`, `SSBU_WINDOW_SIZE`, `SSBU_PACING`, `SSBU_WATCHDOG`, `SSBU_MINIDUMP`, `SSBU_HITCH`, `SSBU_CLOCK`, and the [network variables](../NETPLAY.md#reference-environment-variables). Several other `SSBU_*` switches are implementation-level debugging controls; consult their use sites before enabling them.
+Useful environment variables include `SSBU_DATA_ROOT`, `SSBU_SHADER_CACHE`, `SSBU_SHADER_PREWARM`, `SSBU_COMPILE_THREADS`, `SSBU_DUMP_SHADERS`, `SSBU_DUMP_HLSL`, `SSBU_INPUT`, `SSBU_CAPTURE`, `SSBU_CONTROLLERS` (another `controllers.ini`), `SSBU_PAD_BACKEND=xinput`, `SSBU_DISPLAY` (another `display.ini`), `SSBU_WINDOW`, `SSBU_WINDOW_SIZE`, `SSBU_PACING`, `SSBU_WATCHDOG`, `SSBU_MINIDUMP`, `SSBU_HITCH`, `SSBU_CLOCK`, and the [network variables](MULTIPLAYER.md#reference-environment-variables). Several other `SSBU_*` switches are implementation-level debugging controls; consult their use sites before enabling them.
 
 ## Build boundaries
 
