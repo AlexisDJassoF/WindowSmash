@@ -206,6 +206,26 @@ class InstallerDecisionTests(unittest.TestCase):
                 if name != 'no winget':
                     self.assertNotIn('STOPPED', out, name)
 
+    def test_zstd_check_before_python_314(self):
+        # Python 3.13 and older have no compression package: asking for compression.zstd raised
+        # there, so a Python with zstandard installed was taken for one without it
+        check = ps("@{ code = $ZstdCheck }")['code']
+        self.assertNotIn('"', check)
+        older = ("import sys, types, importlib.machinery; sys.modules['compression'] = None; "
+                 "sys.version_info = (3, 13, 7, 'final', 0); ")
+        fake_zstandard = ("m = types.ModuleType('zstandard'); m.__spec__ = importlib.machinery.ModuleSpec('zstandard', None); "
+                          "sys.modules['zstandard'] = m; ")
+        no_zstandard = "import sys; sys.modules['zstandard'] = None; "
+        def run(prefix):
+            return subprocess.run([sys.executable, '-c', prefix + f'exec({check!r})'], capture_output=True, text=True)
+        r = run(older + fake_zstandard)
+        self.assertEqual(r.returncode, 0, r.stderr)                 # 3.13 with zstandard: there
+        r = run(older + no_zstandard)
+        self.assertEqual((r.returncode, r.stderr), (1, ''))         # 3.13 without: a plain no, no error
+        if sys.version_info >= (3, 14):
+            r = run(no_zstandard)
+            self.assertEqual(r.returncode, 0, r.stderr)             # 3.14: compression.zstd
+
     def test_small_decisions(self):
         got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\WindowSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "
                  "v1 = (Test-PythonVersionText 'Python 3.14.6'); v2 = (Test-PythonVersionText '3.10.0'); "
