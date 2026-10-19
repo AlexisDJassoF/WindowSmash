@@ -19,8 +19,8 @@ Steps, each skipped when it is already done, so running it again carries on wher
                pip and requirements.txt. Every later Python call uses the one found.
   4. compiler  clang-cl, found and tried by tools\build_game.py --check; otherwise the Visual Studio
                Build Tools with the C++ workload and the Clang component, through winget (a few GB),
-               or the missing components added to a Visual Studio already there; without winget, the
-               manual step and its link.
+               or the missing components added to a Visual Studio already there (asks for
+               administrator rights); without winget, the manual step and its link.
   5. sdl3      deps\SDL3 from the newest SDL3-devel-<version>-VC.zip on GitHub, checked against the
                SHA-256 the release lists (controllers other than Xbox pads).
   6. codecs    nothing to fetch: the music and movie codecs are built from third_party\ during the
@@ -287,7 +287,7 @@ function Get-VsExitMessage {
         1602 { return 'it was cancelled' }
         5004 { return 'it was cancelled' }
         1618 { return 'another installation is running, so wait for it to finish' }
-        5007 { return "this PC doesn't meet its requirements" }
+        5007 { return "it was blocked: it needs administrator rights, or this PC doesn't meet its requirements" }
         87 { return 'it did not accept its options' }
         -1073720687 { return "it couldn't connect to the internet" }
         default { return 'it stopped' }
@@ -767,11 +767,19 @@ function Get-VsInstances {
 }
 
 function Invoke-VsModify {
-    <# Runs the Visual Studio Installer's modify command and waits for it; stops with what its exit
-       code means when it fails. Its arguments go as one quoted command line: given a list,
-       Start-Process joins it unquoted and the installation path breaks at its spaces (code 87). #>
+    <# Runs the Visual Studio Installer's modify command with administrator rights and waits for it;
+       stops with what its exit code means when it fails. Its arguments go as one quoted command
+       line: given a list, Start-Process joins it unquoted and the installation path breaks at its
+       spaces (code 87). The rights are asked for here (-Verb RunAs): setup.exe runs with those of
+       whoever starts it, and with --passive it will not ask for them itself ("Commands with
+       --quiet or --passive should be run elevated from the beginning", code 5007). #>
     param([string]$Setup, [string[]]$Arguments)
-    $p = Start-Process -FilePath $Setup -ArgumentList (Join-CommandLine $Arguments) -Wait -PassThru
+    try {
+        $p = Start-Process -FilePath $Setup -ArgumentList (Join-CommandLine $Arguments) -Verb RunAs -Wait -PassThru
+    } catch {
+        throw ("The Visual Studio Installer needs administrator rights to add the C++ tools, and it did not get them " +
+               "($($_.Exception.Message)). Run this again and click Yes when Windows asks.")
+    }
     $why = Get-VsExitMessage $p.ExitCode
     if ($why) {
         throw ("The Visual Studio Installer could not add the C++ tools: $why (code $($p.ExitCode)). Run this again; if it keeps " +
@@ -795,7 +803,8 @@ function Step-Compiler {
         $inst = $instances[0]
         $modify = Get-VsModifyArguments $inst.Path $inst.Product
         if ($DryRun) { Write-Would "add the C++ workload and Clang to the Visual Studio in $($inst.Path): setup.exe $($modify -join ' ')"; return }
-        Write-Info "adding the C++ workload and Clang to the Visual Studio in $($inst.Path) (a progress window opens; this downloads up to a few GB)"
+        Write-Info "adding the C++ workload and Clang to the Visual Studio in $($inst.Path)"
+        Write-Info 'Windows now asks for administrator rights; then a progress window opens (this downloads up to a few GB)'
         Invoke-VsModify $setup $modify
     } else {
         $winget = Get-Command winget -ErrorAction SilentlyContinue
