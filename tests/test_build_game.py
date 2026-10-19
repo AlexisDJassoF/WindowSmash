@@ -1,9 +1,13 @@
 from pathlib import Path
+import os
 import runpy
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_reference')
@@ -154,6 +158,58 @@ class RomfsCfgTests(unittest.TestCase):
         self.assertFalse(romfs_cfg_ok(self.cfg))
         (self.folder / 'patch.bin').write_bytes(b'patch')
         self.assertTrue(romfs_cfg_ok(self.cfg))
+
+
+class VersionFileTests(unittest.TestCase):
+    """version.txt, by which the launchers name the game version (tools/pick_version.bat): without
+    one, the port's own folder showed as "Game version .  - build\\, save\\"."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='version-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.top = Path(self.temp.name)
+        self.logged = []
+        self.ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_version')['build'].__globals__
+        self.ns.update(ROOT=str(self.top), MODULES=str(self.top / 'dump' / 'modules'), EXEFS=str(self.top / 'dump' / 'exefs'),
+                       log=self.logged.append)
+        self.arc = types.ModuleType('arc')
+        self.arc.Arc = lambda cfg: types.SimpleNamespace(version=0x0D0005)   # (data.arc 13.0.5)
+        nso = types.ModuleType('nso')
+        nso.Module = lambda path: types.SimpleNamespace(build_id='ABCD')
+        patcher = mock.patch.dict(sys.modules, {'arc': self.arc, 'nso': nso})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_written_once(self):
+        self.ns['write_version']()
+        text = (self.top / 'version.txt').read_text()
+        self.assertEqual(text.splitlines()[0], '13.0.5')
+        self.assertTrue(text.endswith('main ABCD\ndata.arc 13.0.5\n'))
+        (self.top / 'version.txt').write_text('13.0.5 (mine)\n')
+        self.ns['write_version']()   # (one folder, one version: a version.txt there is kept)
+        self.assertEqual((self.top / 'version.txt').read_text(), '13.0.5 (mine)\n')
+
+    def test_unreadable_does_not_stop_the_build(self):
+        def broken(cfg):
+            raise OSError('no game data')
+        self.arc.Arc = broken
+        self.ns['write_version']()
+        self.assertFalse((self.top / 'version.txt').exists())
+        self.assertIn('could not be read', self.logged[-1])
+
+    @unittest.skipUnless(os.name == 'nt', 'a batch file')
+    def test_the_launchers_name_it(self):
+        (self.top / 'tools').mkdir()
+        shutil.copy(ROOT / 'tools' / 'pick_version.bat', self.top / 'tools' / 'pick_version.bat')
+        (self.top / 'build').mkdir()
+        (self.top / 'build' / 'ssbu.exe').write_bytes(b'')
+
+        def picked():
+            r = subprocess.run(['cmd', '/d', '/c', r'call tools\pick_version.bat'], cwd=self.top, capture_output=True, text=True)
+            return r.stdout.strip()
+        self.assertEqual(picked(), 'Game version .  - build\\, save\\')   # (what users saw)
+        self.ns['write_version']()
+        self.assertEqual(picked(), 'Game version 13.0.5  - build\\, save\\')
 
 
 if __name__ == '__main__':
