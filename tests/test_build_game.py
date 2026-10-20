@@ -110,6 +110,19 @@ class BuildStepsTests(unittest.TestCase):
         self.assertEqual(call[call.index('--app') + 1], '01006A800016E000')
         self.assertTrue(any('arc.py' in ' '.join(c) for c in self.calls))   # and on to the fighters
 
+    def test_compiler_downloaded_while_the_game_files_are_prepared(self):
+        # no compiler: step 1 hands back the download, started once the packages are in (step 2),
+        # running through the game-file steps, waited for at step 9 (also with --prepare-only)
+        download = types.SimpleNamespace(start=lambda: self.calls.append(['compiler start']),
+                                         finish=lambda: self.calls.append(['compiler finish']))
+        self.ns.update(check_tools=lambda: download, install_packages=lambda: self.calls.append(['packages']))
+        self.ns['build'](self.args)
+        order = [' '.join(c) for c in self.calls]
+        start, finish = order.index('compiler start'), order.index('compiler finish')
+        self.assertEqual(order.index('packages'), start - 1)
+        self.assertTrue(any('arc.py' in c for c in order[start + 1:finish]))   # the fighters (step 8) in between
+        self.assertEqual(finish, len(order) - 1)
+
     def test_dlc_folder(self):
         (self.game / 'dlc').mkdir()
         self.ns['build'](self.args)
@@ -162,6 +175,91 @@ class BuildStepsTests(unittest.TestCase):
             self.ns['build'](self.args)
         self.assertIn('zstd file table, v1 layout', str(e.exception))
         self.assertFalse(any('decrypt' in c for c in self.calls))
+
+
+class CompilerDownloadTests(unittest.TestCase):
+    """Step 1 with no working compiler (Windows): the build gets one without Visual Studio (a made-up
+    msvc_deps here: no downloads)."""
+
+    def setUp(self):
+        self.ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_compiler')['build'].__globals__
+        self.logged = []
+        self.deps = types.ModuleType('msvc_deps')
+        self.deps.Failed = type('Failed', (Exception,), {})
+        self.deps.log = print
+        self.deps.answer, self.deps.result, self.deps.removed = (True, {'license': 'https://x/license'}), 0, False
+        self.deps.agree = lambda: self.deps.answer
+        self.deps.remove = lambda: setattr(self.deps, 'removed', True)
+
+        def install(agreed):
+            self.deps.log('  deps\\llvm: LLVM 23.1.3, 326 files, 226 MB')
+            self.deps.log('    LLVM: 50% of 276 MB')
+            if isinstance(self.deps.result, Exception):
+                raise self.deps.result
+            return self.deps.result
+        self.deps.install = install
+        self.problems = []
+        self.ns.update(LINUX=False, MACOS=False, log=lambda msg='': self.logged.append(msg),
+                       windows_compiler_problem=lambda cc: self.problems.pop(0) if self.problems else None)
+        patcher = mock.patch.dict(sys.modules, {'msvc_deps': self.deps})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_check_only_says_so(self):
+        self.problems = ['No compiler (clang-cl.exe) was found.']
+        with self.assertRaisesRegex(self.ns['Failed'], 'No compiler'):
+            self.ns['check_tools'](fetch=False)   # (--check: the installer decides what to get)
+        self.assertIsNone(self.ns['check_tools'](fetch=False))   # a compiler that works: nothing to do
+
+    def test_downloaded(self):
+        self.problems = ['No compiler (clang-cl.exe) was found.']
+        import cc
+        with mock.patch.object(cc, 'WINSYSROOT', None):   # (this PC's own choice aside: no deps\msvc)
+            download = self.ns['check_tools']()
+        self.assertIsNotNone(download)
+        self.assertFalse(self.deps.removed)
+        self.assertTrue(any('about 570 MB' in m for m in self.logged))
+        download.start()
+        download.finish()
+        shown = '\n'.join(self.logged)
+        self.assertIn('deps\\llvm: LLVM 23.1.3', shown)
+        self.assertNotIn('50% of', shown)   # (progress only while it is waited for)
+        self.assertIs(self.deps.log, print)   # its own log again
+
+    def test_broken_deps_set_up_afresh(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('SSBU_CLANG', None)
+            self.problems = ['the test program does not run.']
+            with mock.patch.object(self.ns['CompilerDownload'], 'ask', classmethod(lambda cls, broken=False: broken)):
+                import cc
+                with mock.patch.object(cc, 'WINSYSROOT', 'C:\\x\\deps\\msvc'):
+                    self.assertIs(self.ns['check_tools'](), True)   # (asked with broken=True)
+
+    def test_declined_or_offline(self):
+        self.deps.answer = (False, {'license': 'https://x/license'})
+        with self.assertRaisesRegex(self.ns['Failed'], "Microsoft's license terms were not accepted"):
+            self.ns['CompilerDownload'].ask()
+
+        def offline():
+            raise self.deps.Failed("Microsoft's Visual Studio channel list could not be read: no network.")
+        self.deps.agree = offline
+        with self.assertRaisesRegex(self.ns['Failed'], 'Check the internet connection'):
+            self.ns['CompilerDownload'].ask()
+
+    def test_download_failed(self):
+        for result in (1, OSError('disk full')):
+            self.deps.result = result
+            download = self.ns['CompilerDownload'].ask()
+            download.start()
+            with self.assertRaisesRegex(self.ns['Failed'], 'could not be downloaded'):
+                download.finish()
+            self.assertIs(self.deps.log, print)
+
+    def test_ssbu_clang_is_not_replaced(self):
+        self.problems = ['SSBU_CLANG\'s compiler could not build a test program.']
+        with mock.patch.dict(os.environ, {'SSBU_CLANG': 'C:\\mine\\clang-cl.exe'}):
+            with self.assertRaisesRegex(self.ns['Failed'], 'could not build'):
+                self.ns['check_tools']()
 
 
 class MarkerTests(unittest.TestCase):

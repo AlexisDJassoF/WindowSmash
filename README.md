@@ -68,8 +68,8 @@ The game itself still comes from your files. This repository holds only the tran
 | **Memory** | 16 GB recommended. |
 | **Free space** | About 60 GB on the drive WindowSmash goes on, plus room for your game files (about 17 GB). |
 | **Your game files** | Super Smash Bros. Ultimate from your own Switch (a game card dump, an `.nsp`, or the game installed in yuzu or Ryujinx), with your console's keys and firmware. Any version should work; **11.0.0** and **13.0.5** have been tested. [Step 2](#step-2-have-your-game-files-ready) below says where to put them. |
-| **Two free tools** | Python and the Visual Studio build tools. `Install WindowSmash.bat` installs them for you. |
-| **Time** | About 15 minutes of your own time, plus up to half an hour while the tools install and 30 minutes to a few hours while your PC builds the game. |
+| **Two free tools** | Python and a compiler. `Install WindowSmash.bat` installs them for you. |
+| **Time** | About 15 minutes of your own time, plus a few minutes while the tools download and 30 minutes to a few hours while your PC builds the game. |
 
 ## Install and play
 
@@ -83,7 +83,7 @@ The whole journey at a glance:
 | **2** | **Have your game files ready**: the game, its update and DLC, your keys and firmware. | 10 minutes |
 | **3** | **Download WindowSmash** and extract it. | 5 minutes |
 | **4** | **Start the installer**: double-click `Install WindowSmash.bat`. | 1 minute |
-| **5** | **Let it install the tools** it needs: Python, the Visual Studio build tools and SDL3, if they are missing. | 10–30 minutes, mostly waiting |
+| **5** | **Let it install the tools** it needs: Python, a compiler and SDL3, if they are missing. | A few minutes, mostly waiting |
 | **6** | **Choose your folders** and your online name in its setup window. | 5 minutes |
 | **7** | **Wait while it builds the game.** | 30 minutes to a few hours |
 | **8** | **Play.** Double-click the **Play SSBU** shortcut on your desktop. | |
@@ -128,7 +128,7 @@ A window opens and shows each step as it goes. First it fetches the newest Windo
 The installer installs only what your PC is missing:
 
 - **Python**, which runs WindowSmash's helper programs. If your PC has none, the installer puts a copy in the WindowSmash folder; nothing else on your PC changes.
-- **The Visual Studio Build Tools**, Microsoft's free tools that build the game. They download several gigabytes, and a progress window shows how far it is. Windows asks whether to allow the changes: click **Yes**. If it asks you to restart, do so, then double-click `Install WindowSmash.bat` again.
+- **A compiler**, which builds the game: LLVM's clang with Microsoft's C runtime and Windows SDK, downloaded into the WindowSmash folder (about 570 MB). Microsoft's parts come under Microsoft's license terms: the installer shows where to read them and asks whether you accept them; type `yes` and press <kbd>Enter</kbd>. If that download doesn't work, it installs the Visual Studio Build Tools instead, Microsoft's free tools: several gigabytes, with a progress window. Windows asks whether to allow the changes: click **Yes**. If it asks you to restart, do so, then double-click `Install WindowSmash.bat` again.
 - **SDL3**, for PlayStation, Switch Pro and most other controllers.
 
 Music and movies need nothing extra: their decoders come with WindowSmash and are built with the game.
@@ -183,7 +183,7 @@ The installer stops with a message saying what went wrong and what to do; `insta
 
 <br>
 
-You need Windows 10/11 x64. `Install WindowSmash.bat` installs Python 3.10 or newer and the Visual Studio Build Tools with **C++ Clang tools for Windows** when they are missing. `-NoWizard` asks its questions in the console instead of the setup window, with the folders you give as the answers to accept. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`.
+You need Windows 10/11 x64. `Install WindowSmash.bat` installs Python 3.10 or newer and a compiler when they are missing: LLVM's clang-cl with Microsoft's C runtime and Windows SDK in `deps` (`tools\msvc_deps.py`, after you accept Microsoft's license terms), or the Visual Studio Build Tools with **C++ Clang tools for Windows** if that fails (`-BuildTools` goes straight to them). `-NoWizard` asks its questions in the console instead of the setup window, with the folders you give as the answers to accept. The example paths are your game files in `D:\MyDump`, your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`.
 
 ```powershell
 git clone https://github.com/SNO2207/WindowSmash.git
