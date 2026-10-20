@@ -1855,6 +1855,9 @@ static View resident_view(Resident *r, u64 va, u32 bytes) {
 }
 
 u64 gfx_stat_residents_given_up;
+/* (Direct3D's renderer also gives up regions idle for a second that hold only what the CPU has
+ * written since, counted here; this one keeps them until the table is full: none yet) */
+u64 gfx_stat_residents_retired;
 
 static Resident *resident_create(u64 va, u32 size) {
     if (nresidents == 512) {
