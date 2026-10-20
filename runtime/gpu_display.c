@@ -42,18 +42,19 @@
 #include <dxgi.h>
 #endif
 
-enum { MODE_WINDOWED, MODE_BORDERLESS, MODE_FULLSCREEN };
+enum { MODE_WINDOWED = DISPLAY_WINDOWED, MODE_BORDERLESS = DISPLAY_BORDERLESS, MODE_FULLSCREEN = DISPLAY_FULLSCREEN };
 
 static struct {
-    int mode, width, height, latency, hide_cursor;
+    int mode, width, height, latency, hide_cursor, overlay;
     Pacing pacing;
     int loaded;
     char gpu[64];
     float render_scale;   /* 0: auto */
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, "auto", 1.0f};
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, PACING_CLOCK, 0, "auto", 1.0f};
 
 static const char DEFAULT_INI[] =
-    "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
+    "; display.ini: the game's window and the pacing of its frames. Read when the game starts; the\n"
+    "; settings menu (Esc in the game) changes it too.\n"
     "; Delete this file to get it written again with the defaults. A line starting with ';' is a comment.\n"
     "\n"
     "; window = windowed | borderless | fullscreen\n"
@@ -112,15 +113,21 @@ static const char DEFAULT_INI[] =
     "latency = 3\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
     "hide_cursor = 1\n"
-#ifndef __APPLE__   /* (the Metal renderer draws at the game's own size) */
+    "; overlay = 1: show the frame rate in the corner from the start (F1 shows or hides it while playing).\n"
+    "overlay = 1\n"
     "\n"
     "; render_scale = 1 | auto | a number from 0.5 to 4\n"
     ";   The game draws its pictures at 1920x1080. render_scale draws them this many times as wide and\n"
     ";   as tall: sharper on a bigger screen, more work for the graphics card (2 = four times the pixels).\n"
+#ifdef __APPLE__
+    ";   auto: as many pixels as the picture has in the window when the game starts, at least 1: 1.33 for\n"
+    ";   a 1280x720 window on a Retina display (2 x 2 pixels a point); in full screen, the screen's. A\n"
+    ";   bigger picture than the window is shrunk to fit.\n"
+#else
     ";   auto: as many pixels as the picture has in the window when the game starts (1.33 on a 2560x1440\n"
     ";   monitor with window = borderless), at least 1. A bigger picture than the window is shrunk to fit.\n"
-    "render_scale = 1\n"
 #endif
+    "render_scale = 1\n"
 #ifdef _WIN32
     "\n"
     "; gpu = auto, or part of a graphics card's name (e.g. nvidia, radeon, intel)\n"
@@ -160,9 +167,14 @@ static char *trim(char *s) {
     return s;
 }
 
+const char *display_ini_path(void) {
+    const char *env = getenv("SSBU_DISPLAY");
+    return env && *env ? env : "display.ini";
+}
+
 static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     (void)once; (void)param; (void)ctx;
-    const char *env = getenv("SSBU_DISPLAY"), *path = env && *env ? env : "display.ini";
+    const char *env = getenv("SSBU_DISPLAY"), *path = display_ini_path();
     FILE *f = fopen(path, "r");
     if (!f && !(env && *env)) {
         FILE *w = fopen(path, "w");
@@ -182,6 +194,7 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "pacing")) parse_pacing(value);
         else if (!_stricmp(key, "latency")) cfg.latency = atoi(value);
         else if (!_stricmp(key, "hide_cursor")) cfg.hide_cursor = atoi(value) != 0;
+        else if (!_stricmp(key, "overlay")) cfg.overlay = atoi(value) != 0;
         else if (!_stricmp(key, "gpu")) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", value);
         else if (!_stricmp(key, "render_scale")) parse_render_scale(value);
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
@@ -209,6 +222,33 @@ int display_latency(void) { load(); return cfg.latency; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
 const char *display_gpu(void) { load(); return cfg.gpu; }
 float display_render_scale(void) { load(); return cfg.render_scale; }
+
+/* (the settings menu) the render scale it saved: shown from now on, the renderer's own counts
+ * only at the next start */
+static float saved_render_scale;
+static int render_scale_saved;
+void display_set_render_scale(float scale) { saved_render_scale = scale; render_scale_saved = 1; }
+int display_overlay(void) { load(); return cfg.overlay; }
+
+/* ---- the settings menu's changes ------------------------------------------------------- */
+static volatile LONG asked_mode = -1, asked_latency;
+
+void display_settings(DisplaySettings *out) {
+    load();
+    *out = (DisplaySettings){cfg.mode, cfg.width, cfg.height, cfg.latency, cfg.hide_cursor, cfg.overlay, cfg.pacing, "", render_scale_saved ? saved_render_scale : cfg.render_scale};
+    snprintf(out->gpu, sizeof out->gpu, "%s", cfg.gpu);
+}
+
+void display_set_pacing(Pacing pacing) { load(); cfg.pacing = pacing; }
+void display_set_hide_cursor(int on) { load(); cfg.hide_cursor = on != 0; }
+void display_set_latency(int frames) {
+    load();
+    cfg.latency = frames < 1 ? 1 : frames > 3 ? 3 : frames;
+    InterlockedExchange(&asked_latency, cfg.latency);
+}
+int display_take_latency(void) { return (int)InterlockedExchange(&asked_latency, 0); }
+int display_take_mode(void) { return (int)InterlockedExchange(&asked_mode, -1); }
+void *gfx_window_handle(void);
 
 #ifdef _WIN32
 void display_dpi_aware(void) {
@@ -283,6 +323,16 @@ static void set_mode(HWND h, int mode) {
     fprintf(stderr, "[display] %s\n", mode == MODE_WINDOWED ? "windowed" : mode == MODE_BORDERLESS ? "borderless" : "fullscreen");
 }
 
+/* (the window thread) the menu's choice: the window's mode now, and F11's full-screen form */
+#define WM_DISPLAY_MODE (WM_APP + 1)
+
+void display_set_mode(int mode) {
+    load();
+    if (mode != MODE_WINDOWED) cfg.mode = mode;
+    HWND h = (HWND)gfx_window_handle();
+    if (h) PostMessageW(h, WM_DISPLAY_MODE, (WPARAM)mode, 0);
+}
+
 HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *title) {
     load();
     /* made at the system DPI first, then sized for its own monitor's */
@@ -327,6 +377,10 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
         if (w != VK_RETURN || !(l & (1 << 29))) return 0;
         if (!(l & (1 << 30)))
             set_mode(h, current_mode == MODE_WINDOWED ? (cfg.mode == MODE_FULLSCREEN ? MODE_FULLSCREEN : MODE_BORDERLESS) : MODE_WINDOWED);
+        *result = 0;
+        return 1;
+    case WM_DISPLAY_MODE:
+        set_mode(h, (int)w);
         *result = 0;
         return 1;
     case WM_MENUCHAR:     /* (no "ding" for Alt+key) */
@@ -408,6 +462,11 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
 static volatile LONG refresh_hz;
 
 int display_window_mode(void) { load(); return cfg.mode; }
+void display_set_mode(int mode) {   /* (the window's loop takes it: display_take_mode) */
+    load();
+    if (mode != MODE_WINDOWED) cfg.mode = mode;
+    InterlockedExchange(&asked_mode, mode);
+}
 void display_window_size(int *width, int *height) { load(); *width = cfg.width; *height = cfg.height; }
 int display_hide_cursor(void) { load(); return cfg.hide_cursor; }
 void display_note_size(unsigned w, unsigned h) {
@@ -427,7 +486,6 @@ unsigned display_present_flags(void) {
 }
 
 void *gfx_display_output(void);   /* gpu_d3d11.c: the swap chain's output (IDXGIOutput, referenced), or NULL */
-void *gfx_window_handle(void);
 
 /* The refresh rate of the window's monitor, in Hz (0 unknown). */
 #ifdef _WIN32

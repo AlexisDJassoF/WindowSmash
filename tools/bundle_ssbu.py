@@ -40,11 +40,12 @@ build. Windows 10/11 x64, an AVX2/FMA/F16C CPU, and a Direct3D 11-capable GPU
 are required.
 
 PLAY ONLINE - ONE PLAYER PER PC
-Run Play SSBU.bat and choose the name other players see (kept in
-online_name.txt). Open Local Wireless in the main-menu sidebar: Create a Room
+Run Play SSBU.bat. The first time, the game picks the name other players see;
+press Esc in the game for the settings (your name, a lobby code, controllers,
+display). Open Local Wireless in the main-menu sidebar: Create a Room
 to host, or pick anyone's room from the Rooms List. Rooms are public to players
-of the same game version. For friends only, add the same lobby code after the
-address in online_server.txt (for example: lobby.example.net:39420 ourcode).
+of the same game version. For friends only, everyone sets the same lobby code
+(settings, Online page; or after the address in online_server.txt).
 Allow the game through Windows Firewall if asked. The overlay (F1) shows
 "Online: N players, M rooms" when connected.
 
