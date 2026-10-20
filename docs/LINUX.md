@@ -44,7 +44,16 @@ the build needs, finds your game files, and builds the game. It needs:
 - **An x86-64 PC with AVX2**, a Vulkan driver, and 8 GB of RAM or more (16 GB builds faster).
 - **About 30 GB of free space**, and an internet connection.
 - **Your password for `sudo`**, to install packages. It knows the package managers of Ubuntu,
-  Debian, Linux Mint, Fedora, Arch, Manjaro and openSUSE, and the families built on them.
+  Debian, Linux Mint, Fedora, Arch, Manjaro and openSUSE, and the families built on them. On an
+  image-based Fedora (Silverblue, Kinoite, Bazzite, Bluefin, Aurora and the like), whose system
+  folders are read-only, it adds them with `rpm-ostree`, to the running system where it can. If
+  they can only come with the next start, it says so: restart the PC and run the installer again.
+  On SteamOS (a Steam Deck), make the system folders writable first with
+  `sudo steamos-readonly disable`, and give the `deck` user a password with `passwd` if it has
+  none. If pacman then says its keyring isn't set up, run `sudo pacman-key --init` and
+  `sudo pacman-key --populate archlinux holo`. SteamOS leaves every package's header files out;
+  the installer puts back the ones the build needs. A SteamOS update puts the system back as it
+  was, so if something is missing after one, run the installer again.
 - **Your own game files**: the game (its `.nca` files, or an `.nsp` or `.xci`), with its update
   and DLC if you have them; your keys (`prod.keys` and `title.keys`); and your firmware's `.nca`
   files. An emulator's own folders work as they are.
@@ -73,7 +82,9 @@ the build needs, finds your game files, and builds the game. It needs:
 5. **Wait for the build.** The first one compiles the whole game: from one to a few hours,
    depending on the processor and the memory. Later ones redo only what changed. If it stops, run
    `bash install-windowsmash.sh` again: it carries on where it stopped. Everything it says also
-   goes to `install.log`.
+   goes to `install.log`. While it writes the game's code as C, then while it compiles it, a line
+   now and then shows how far it has got and the time left. The time left appears once the first
+   files are compiled. Most terminals also show it in the window's title.
 6. **Play:** run `./play-ssbu.sh` in the folder, or choose **WindowSmash** in your applications
    menu.
 
@@ -112,12 +123,36 @@ The launchers work like the Windows ones: `play-ssbu.sh` at the top of the folde
 | `launchers/play-ssbu-offline.sh` | `Play SSBU Offline.bat` | The game, offline. |
 | `launchers/host-ssbu-netplay.sh`, `launchers/join-ssbu-netplay.sh` | `Host/Join SSBU Netplay.bat` | A private room. |
 | `launchers/unlock-all-fighters.sh` | `Unlock All Fighters.bat` | The unlock tool, on this folder's save. Run it with the game closed. |
+| `launchers/prepare-shaders.sh` | `Prepare Shaders.bat` | Compiles all of the game's shaders in advance ([below](#shaders-and-first-time-stutter)). |
 
 The game reads its data in place from your game folder, or from the decrypted copy in
 `dump/modules` when the game had to be decrypted first. If your game folder is on a disk or shared
 folder that isn't mounted, the launchers say so. The [Controls](#controls), [Settings](#settings) and
 [If something goes wrong](#if-something-goes-wrong) sections below apply here too. The save is in
 `save/`, and the log goes to `build/play.log`.
+
+### Updating
+
+Run `bash install-windowsmash.sh` again whenever you want the newest WindowSmash. It looks at
+what changed and builds only that: your game files aren't asked for again (they are read once,
+into `dump/`), and the game's code is compiled again only when the update changes it. An update
+of the program's own parts (the graphics, the audio, the kernel: the files in `runtime/`) compiles
+those files and links the program again, which takes minutes. An update that changes how the
+game's code is translated (a performance change to the translator, say) compiles the game's code
+again, once: about as long as the first build. To build from other
+game files, name them: `bash install-windowsmash.sh --game <folder>`.
+
+### Shaders and first-time stutter
+
+The game's graphics programs (*shaders*) are made the first time each one is needed, which is why
+a new effect can show a moment late once. To make them all in advance, run
+`bash launchers/prepare-shaders.sh` from a terminal (on a Steam Deck: in Desktop Mode). It shows a
+progress bar with the time left, runs at low priority, and keeps the PC awake meanwhile. A first run
+makes about 40,000 shaders (for 13.0.5): half an hour on a fast desktop, and probably an hour or two on
+a Steam Deck. You can stop it with Ctrl+C and start it again later; what is done stays done. It
+needs the game built first, and the game files where they were. It prepares the first step, the
+shader programs themselves; DXVK and the graphics driver still make their own GPU code from them
+as each shader is first used, and keep it for next time.
 
 The rest of this guide is about the package from Windows, apart from those sections.
 
@@ -307,6 +342,7 @@ back.
 | What you see | What to do |
 | :--- | :--- |
 | *Some libraries the game needs are not installed* | Run `bash install-deps.sh`. |
+| *`SDL.h` file not found*, or another `.h` file, while building | The package is installed without its header files (SteamOS does this). Run `bash install-windowsmash.sh` again: it puts them back. |
 | A black window, or `cannot create the window` / DXVK errors in the log | Run `vulkaninfo --summary`. If it lists no device, install `mesa-vulkan-drivers`. |
 | No sound | SDL uses PulseAudio or PipeWire. Check the log for `[audio]` lines. |
 | A crash | It writes `reports/crash_<date>_<time>.txt`: the guest function and host frames (`*** host exception`), also at the end of the log. Send it with `build/play.log`. When the port stops the game itself (something it can't do yet), it writes `reports/stopped_*.txt`. |

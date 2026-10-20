@@ -23,7 +23,10 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <ctype.h>
+#include <dxgi1_6.h>
+#else
 #include <errno.h>
 #include <sys/uio.h>   /* process_vm_readv */
 #include <unistd.h>
@@ -40,7 +43,7 @@ static ID3D11RenderTargetView *final_rtv;
 static ID3D11ShaderResourceView *final_srv;
 enum { FINAL_W = 1920, FINAL_H = 1080 };
 static ID3D11VertexShader *blit_vs;
-static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps;
+static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps, *decode_ps;
 static ID3D11SamplerState *linear_sampler;
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -324,6 +327,12 @@ static const char BLIT_HLSL[] =
     "cbuffer R : register(b1) { float4 src0_step; float4 dst0_inv; };\n"
     "float4 ps2d(V i) : SV_Target { return t.Sample(s, (src0_step.xy + (i.pos.xy - dst0_inv.xy) * src0_step.zw) * dst0_inv.zw); }\n";
 
+/* (get_texture) one level of a block-compressed texture, texel by texel, into its exact-size copy */
+static const char DECODE_HLSL[] =
+    "Texture2DArray<float4> src : register(t0);\n"
+    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float4 main(V i) : SV_Target { return src.Load(int4(int2(i.pos.xy), 0, 0)); }\n";
+
 static void start_compilers(void);                 /* (see "shaders") */
 static DWORD WINAPI prewarm_main(void *unused);
 
@@ -340,10 +349,169 @@ static int on_dxvk(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* ---- the graphics driver's threads: big stacks --------------------------------------------
+ * NVIDIA's driver starts its worker threads (which compile shaders to GPU code, among their
+ * work) with 64 KB stacks, and its compiler (nvgpucomp64.dll) recurses over a program's blocks:
+ * some of the game's programs run that out, and the stack overflow ends the game the moment the
+ * driver compiles one - players saw it when an effect first showed (the Daybreak item,
+ * Sephiroth's specials). The compile device below does not cover every compile the rendering
+ * device makes. So every thread a driver DLL (one from the system's DriverStore) starts gets a
+ * 16 MB stack reservation: as each DLL loads, its CreateThread import is pointed here.
+ * SSBU_DRIVER_STACKS=0: the driver's own sizes. */
+#define DRIVER_STACK (16ull << 20)
+
+static HANDLE WINAPI driver_create_thread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags,
+                                          LPDWORD id) {
+    if (stack < DRIVER_STACK) {
+        stack = DRIVER_STACK;
+        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+    }
+    return CreateThread(sa, stack, fn, arg, flags, id);
+}
+
+static void driver_imports(BYTE *base) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++) {
+        if (!d->OriginalFirstThunk) continue;
+        IMAGE_THUNK_DATA *name = (IMAGE_THUNK_DATA *)(base + d->OriginalFirstThunk), *slot = (IMAGE_THUNK_DATA *)(base + d->FirstThunk);
+        for (; name->u1.AddressOfData; name++, slot++) {
+            if (IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal) || strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(base + name->u1.AddressOfData))->Name, "CreateThread"))
+                continue;
+            DWORD old;
+            if (!VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, PAGE_READWRITE, &old)) continue;
+            slot->u1.Function = (ULONG_PTR)driver_create_thread;
+            VirtualProtect(&slot->u1.Function, sizeof slot->u1.Function, old, &old);
+        }
+    }
+}
+
+typedef struct { USHORT length, max; WCHAR *text; } NtString;
+typedef struct { ULONG flags; const NtString *path, *name; void *base; ULONG size; } DllLoaded;
+
+static void CALLBACK on_dll_loaded(ULONG reason, const DllLoaded *dll, void *unused) {
+    (void)unused;
+    if (reason != 1) return;   /* (LDR_DLL_NOTIFICATION_REASON_LOADED) */
+    static const WCHAR store[] = L"\\DriverStore\\";
+    const size_t n = sizeof store / sizeof *store - 1, len = dll->path->length / sizeof(WCHAR);
+    for (size_t i = 0; i + n <= len; i++)
+        if (!_wcsnicmp(dll->path->text + i, store, n)) { driver_imports(dll->base); return; }
+}
+
+static void driver_stacks(void) {
+    static void *cookie;
+    if (getenv("SSBU_DRIVER_STACKS") && !atoi(getenv("SSBU_DRIVER_STACKS"))) return;
+    LONG (NTAPI *reg)(ULONG, void (CALLBACK *)(ULONG, const DllLoaded *, void *), void *, void **) =
+        (LONG (NTAPI *)(ULONG, void (CALLBACK *)(ULONG, const DllLoaded *, void *), void *, void **))(void *)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    if (!reg || reg(0, on_dll_loaded, NULL, &cookie) < 0) fprintf(stderr, "[gfx] note: the driver's threads keep their own stack size\n");
+}
+
+/* ---- the graphics card ---------------------------------------------------------------------
+ * Laptops with two graphics chips make the processor's own (Intel's) the system's default, and
+ * the game used to draw with that. display.ini's gpu: "auto" takes the card Windows calls
+ * high-performance (the NVIDIA or AMD chip beside it; on a PC with one card, that card), any
+ * other text the first card whose name contains it ("intel", "radeon", "4060"), "warp" Windows'
+ * software renderer (slow: for tests). The two exports ask the NVIDIA and AMD drivers of such
+ * laptops for their chip too, for whatever else would take the default. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
+static void adapter_name(const DXGI_ADAPTER_DESC1 *d, char *out, size_t size) {
+    size_t i = 0;
+    for (; i + 1 < size && d->Description[i]; i++) out[i] = d->Description[i] < 128 ? (char)d->Description[i] : '?';
+    out[i] = 0;
+}
+
+/* The adapter to create the device on (referenced), or NULL for the system's default; *warp:
+ * the software renderer was asked for. */
+static IDXGIAdapter1 *pick_adapter(int *warp) {
+    const char *want = display_gpu();
+    *warp = !_stricmp(want, "warp");
+    if (*warp) return NULL;
+    int any = !*want || !_stricmp(want, "auto");
+    IDXGIFactory1 *f1;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return NULL;
+    IDXGIFactory6 *f6 = NULL;
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;   /* (before Windows 10 1803: the system's order) */
+    char w[64];
+    size_t k = 0;
+    for (; k + 1 < sizeof w && want[k]; k++) w[k] = (char)tolower((unsigned char)want[k]);
+    w[k] = 0;
+    IDXGIAdapter1 *fastest = NULL, *named = NULL;   /* (fastest first) */
+    char list[1024] = "";
+    DXGI_ADAPTER_DESC1 seen[8];
+    UINT nseen = 0;
+    for (UINT i = 0;; i++) {
+        IDXGIAdapter1 *a = NULL;
+        HRESULT hr = f6 ? IDXGIFactory6_EnumAdapterByGpuPreference(f6, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_IDXGIAdapter1, (void **)&a)
+                        : IDXGIFactory1_EnumAdapters1(f1, i, &a);
+        if (FAILED(hr)) break;
+        DXGI_ADAPTER_DESC1 d;
+        if (FAILED(IDXGIAdapter1_GetDesc1(a, &d))) { IDXGIAdapter1_Release(a); continue; }
+        int again = 0;   /* (a card can be listed twice, e.g. once more for a virtual display) */
+        for (UINT j = 0; j < nseen; j++)
+            again |= seen[j].VendorId == d.VendorId && seen[j].DeviceId == d.DeviceId && seen[j].SubSysId == d.SubSysId &&
+                     seen[j].DedicatedVideoMemory == d.DedicatedVideoMemory && !wcscmp(seen[j].Description, d.Description);
+        if (again) { IDXGIAdapter1_Release(a); continue; }
+        if (nseen < 8) seen[nseen++] = d;
+        char name[128], lower[128];
+        adapter_name(&d, name, sizeof name);
+        for (k = 0; k < sizeof lower; k++) lower[k] = (char)tolower((unsigned char)name[k]);
+        int software = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        size_t l = strlen(list);
+        snprintf(list + l, sizeof list - l, "%s%s (vendor %#x, %.1f GB%s)", l ? "; " : "", name, d.VendorId,
+                 (double)d.DedicatedVideoMemory / (1 << 30), software ? ", software" : "");
+        if (!software && !any && !named && strstr(lower, w)) { named = a; IDXGIAdapter1_AddRef(a); }
+        if (!software && !fastest) fastest = a;
+        else IDXGIAdapter1_Release(a);
+    }
+    if (f6) IDXGIFactory6_Release(f6);
+    IDXGIFactory1_Release(f1);
+    fprintf(stderr, "[gfx] graphics cards: %s\n", list[0] ? list : "none listed");
+    if (any) return fastest;
+    if (!named) { fprintf(stderr, "[gfx] display.ini: no graphics card's name contains '%s': using the fastest\n", want); return fastest; }
+    if (fastest) IDXGIAdapter1_Release(fastest);
+    return named;
+}
+
+/* SSBU_D3D_DEBUG=1: Direct3D's debug layer (Windows' optional "Graphics Tools" feature) checks
+ * every call; its complaints go to the log at each present - each kind the first 3 times, then
+ * every 1000th - as uses of the API one driver forgives and another does not. */
+static ID3D11InfoQueue *debug_queue;
+
+static void debug_messages(void) {
+    if (!debug_queue) return;
+    static struct { D3D11_MESSAGE_ID id; u32 count; } seen[512];
+    UINT64 n = ID3D11InfoQueue_GetNumStoredMessages(debug_queue);
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        if (FAILED(ID3D11InfoQueue_GetMessage(debug_queue, i, NULL, &len)) || !len) continue;
+        D3D11_MESSAGE *m = malloc(len);
+        if (m && SUCCEEDED(ID3D11InfoQueue_GetMessage(debug_queue, i, m, &len))) {
+            u32 h = (u32)m->ID % 512, probe = 0;
+            while (seen[h].count && seen[h].id != m->ID && probe++ < 512) h = (h + 1) % 512;
+            seen[h].id = m->ID;
+            u32 c = ++seen[h].count;
+            if (c <= 3 || c % 1000 == 0)
+                fprintf(stderr, "[d3d debug] %s #%d (%u so far): %.*s\n", m->Severity <= D3D11_MESSAGE_SEVERITY_ERROR ? "ERROR" : "warning",
+                        (int)m->ID, c, (int)m->DescriptionByteLength, m->pDescription);
+        }
+        free(m);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(debug_queue);
+}
+#else
+static void debug_messages(void) {}
+#endif
+
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&lock);
 #ifdef _WIN32
+    driver_stacks();   /* (before Direct3D loads the driver) */
     HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, window_thread, done, 0, NULL);
     WaitForSingleObject(done, INFINITE);
@@ -359,10 +527,32 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      * and Intel's mostly do) - for measuring what the renderer costs such a driver */
     UINT render_flags = getenv("SSBU_D3D_DRIVER_THREADS") && !atoi(getenv("SSBU_D3D_DRIVER_THREADS"))
                         ? D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS : 0;
-    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx))) {
-        fprintf(stderr, "[gfx] cannot create a Direct3D 11 device\n");
+    IDXGIAdapter1 *chosen = NULL;
+    int warp = 0;
+#ifdef _WIN32
+    chosen = pick_adapter(&warp);
+#endif
+    HRESULT made = D3D11CreateDevice((IDXGIAdapter *)chosen, chosen ? D3D_DRIVER_TYPE_UNKNOWN : warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+                                     NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+    if (chosen) IDXGIAdapter1_Release(chosen);
+    if (FAILED(made) && (chosen || warp))   /* (then the system's default) */
+        made = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+    if (FAILED(made)) {
+        fprintf(stderr, "[gfx] cannot create a Direct3D 11 device (%#lx)%s\n", (unsigned long)made,
+                flags & D3D11_CREATE_DEVICE_DEBUG ? ": SSBU_D3D_DEBUG needs Windows' optional Graphics Tools feature" : "");
         return TRUE;
     }
+#ifdef _WIN32
+    if ((flags & D3D11_CREATE_DEVICE_DEBUG) && SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D11InfoQueue, (void **)&debug_queue))) {
+        D3D11_MESSAGE_SEVERITY quiet[] = {D3D11_MESSAGE_SEVERITY_INFO, D3D11_MESSAGE_SEVERITY_MESSAGE};
+        D3D11_INFO_QUEUE_FILTER filter;
+        memset(&filter, 0, sizeof filter);
+        filter.DenyList.NumSeverities = 2;
+        filter.DenyList.pSeverityList = quiet;
+        ID3D11InfoQueue_AddStorageFilterEntries(debug_queue, &filter);
+        ID3D11InfoQueue_SetMessageCountLimit(debug_queue, 4096);
+    }
+#endif
     IDXGIDevice *dxgi_dev; IDXGIAdapter *adapter; IDXGIFactory2 *factory;
     ID3D11Device_QueryInterface(dev, &IID_IDXGIDevice, (void **)&dxgi_dev);
     IDXGIDevice_GetAdapter(dxgi_dev, &adapter);
@@ -370,13 +560,30 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     /* NVIDIA's: a second device, with the driver's internal threading off, that compiles each
      * shader first on our compiler threads (see "shaders"). SSBU_COMPILE_DEVICE=0/1 overrides. */
     DXGI_ADAPTER_DESC ad;
+    memset(&ad, 0, sizeof ad);
     int nvidia = SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)) && ad.VendorId == 0x10DE;
-#ifndef _WIN32
-    {   /* (DXVK: which Vulkan device it chose) */
-        char name[128];
+    char name[128];
+    {
         size_t i = 0;
         for (; i < 127 && ad.Description[i]; i++) name[i] = ad.Description[i] < 128 ? (char)ad.Description[i] : '?';
         name[i] = 0;
+    }
+#ifdef _WIN32
+    {   /* (and what its driver says it can do: for reports from other cards) */
+        LARGE_INTEGER umd;
+        D3D11_FEATURE_DATA_THREADING th;
+        memset(&umd, 0, sizeof umd);
+        memset(&th, 0, sizeof th);
+        ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_THREADING, &th, sizeof th);
+        IDXGIAdapter_CheckInterfaceSupport(adapter, &IID_IDXGIDevice, &umd);
+        unsigned fl = (unsigned)ID3D11Device_GetFeatureLevel(dev);
+        fprintf(stderr, "[gfx] drawing with %s (vendor %#x, driver %u.%u.%u.%u, feature level %u.%u, concurrent creates %s, command lists %s)\n",
+                name, ad.VendorId, (unsigned)(umd.HighPart >> 16), (unsigned)(umd.HighPart & 0xFFFF), (unsigned)((u32)umd.LowPart >> 16),
+                (unsigned)(umd.LowPart & 0xFFFF), fl >> 12 & 15, fl >> 8 & 15, th.DriverConcurrentCreates ? "yes" : "no",
+                th.DriverCommandLists ? "yes" : "no");
+    }
+#else
+    {   /* (DXVK: which Vulkan device it chose) */
         fprintf(stderr, "[gfx] Direct3D 11 through DXVK on %s (vendor %#x)\n", name, ad.VendorId);
         if (ad.VendorId == 0x10005 || strstr(name, "llvmpipe") || strstr(name, "lavapipe"))
             fprintf(stderr, "[gfx] note: this is a software renderer (no Vulkan GPU driver found): expect a low frame rate\n");
@@ -425,6 +632,10 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
         ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &blit2d_ps);
         ID3D10Blob_Release(ps);
     }
+    if ((ps = compile_hlsl(DECODE_HLSL, "main", "ps_5_0"))) {
+        ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &decode_ps);
+        ID3D10Blob_Release(ps);
+    }
     D3D11_SAMPLER_DESC smp = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
                               D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, {0}, 0, D3D11_FLOAT32_MAX};
     ID3D11Device_CreateSamplerState(dev, &smp, &linear_sampler);
@@ -470,7 +681,14 @@ static int enter(void) {
     return 1;
 }
 
+/* GPU addresses and guest memory taken away, whose cached data is not dropped yet ([lo, hi);
+ * hi 0: none). Dropped as the outermost entry point leaves (below: forget_unmapped). */
+typedef struct Span { u64 lo, hi; } Span;
+static Span unmapped_va, unmapped_guest;
+static void forget_unmapped(void);
+
 static void leave(void) {
+    if (enter_depth == 1 && (unmapped_va.hi || unmapped_guest.hi)) forget_unmapped();
     if (!--enter_depth) gfx_stat_busy_ns += rt_clock_ns() - enter_t0;
     LeaveCriticalSection(&lock);
 }
@@ -553,9 +771,9 @@ static void dump_shaders(const u32 *regs) {
 /* Translated at their first draw (on the submitting thread, well under a millisecond), then
  * made ready by compiler threads of our own: from the DXBC an earlier run kept on disk, else
  * from fxc's (seconds on large programs, minutes on some dispatch loops) - cache loads first.
- * Left to itself NVIDIA's driver compiles to GPU code after Create*Shader returns, on threads
- * with 64 KB stacks (which one of our programs overflowed), and the first draw with the shader
- * waits for that (the hitch when a move is first used). So a second device, with the driver's
+ * Left to itself NVIDIA's driver compiles to GPU code after Create*Shader returns, on threads of
+ * its own (see driver_stacks), and the first draw with the shader waits for that (the hitch when
+ * a move is first used). So a second device, with the driver's
  * threading off, compiles each one first - inside Create*Shader, on our thread, with our stack;
  * the rendering device keeps its threading (without it the renderer took twice as long a
  * frame). A draw whose
@@ -999,11 +1217,13 @@ static u64 fingerprint(int stage, const u8 *p, u32 size) {   /* 32 words spread 
     return h;
 }
 
-/* The shader for the program at guest address g, ready (state 1) or not. */
-static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
+/* The shader for the program at guest address g, ready (state 1) or not. alpha_tested: a pixel
+ * shader's variant that does the fixed-function alpha test (its own hash, so its own cache file). */
+static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared, int alpha_tested) {
     /* a compute program has no header: it is translated as if it had one (never read) */
     const u8 *p = stage == SHADER_COMPUTE ? P(u8, g) - 0x50 : P(u8, g);
-    u64 key = (u64)stage | (u64)vs_outputs << 4 | (stage == SHADER_COMPUTE ? ((u64)local[0] ^ (u64)local[1] << 11 ^ (u64)local[2] << 22 ^ (u64)shared << 33) << 36 : 0);
+    u64 key = (u64)stage | (u64)vs_outputs << 4 | (stage == SHADER_COMPUTE ? ((u64)local[0] ^ (u64)local[1] << 11 ^ (u64)local[2] << 22 ^ (u64)shared << 33) << 36 : 0)
+            | (u64)(alpha_tested != 0) << 63;
     ShaderSlot *slot = &shader_slots[((g >> 4) * 0x9E3779B97F4A7C15ull ^ key) >> 50 & (SHADER_SLOTS - 1)];
     if (slot->s && slot->g == g && slot->key == key && slot->print == fingerprint(stage, p, slot->size)) {
         Shader *s = slot->s;
@@ -1016,6 +1236,9 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     u32 size = shader_size(p, 0x40000), skip = stage == SHADER_COMPUTE ? 0x50 : 0;
     u64 h = shader_program_hash(p + skip, size - skip);
     if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
+    u64 program_hash = h;
+    /* (the salt changes with the alpha test's code, so cache files of an older form are not used) */
+    if (alpha_tested) h = (h ^ 0x616C706861743032ull) * 1099511628211ull;
     CbufSource src = {stage_cb};
     for (u32 i = 0; i < shader_count; i++) {
         Shader *s = shader_cache[i];
@@ -1029,8 +1252,10 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     shader_cache[shader_count++] = s;
     s->hash = h; s->stage = stage; s->vs_outputs = vs_outputs;
     *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s};
-    snprintf(s->name, sizeof s->name, "%s_%016llx", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", h);
+    snprintf(s->name, sizeof s->name, "%s_%016llx%s", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", program_hash,
+             alpha_tested ? "_alphatest" : "");
     s->hlsl = stage == SHADER_COMPUTE ? shader_hlsl_cs(p, size, local, shared, &s->info, read_cbuf_word, &src)
+            : alpha_tested            ? shader_hlsl_alpha_tested(p, size, vs_outputs, &s->info, read_cbuf_word, &src)
                                       : shader_hlsl_ex(p, size, stage, vs_outputs, &s->info, read_cbuf_word, &src);
     const char *cdump = getenv("SSBU_DUMP_SHADERS");
     if (cdump && stage == SHADER_COMPUTE) {   /* C_<hash>_<local x>x<y>x<z>_<shared>.bin, behind 0x50 zero bytes */
@@ -1095,7 +1320,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
 
 /* The ready shader for the program at guest address g, or NULL while it compiles. */
 static Shader *get_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
-    Shader *s = find_shader_ex(g, stage, vs_outputs, stage_cb, local, shared);
+    Shader *s = find_shader_ex(g, stage, vs_outputs, stage_cb, local, shared, 0);
     return s && s->state == 1 ? s : NULL;
 }
 
@@ -1386,12 +1611,73 @@ typedef struct Resident {
     u8 *edge;
     u32 head, tail;
     u64 checked;   /* the submission it was last checked against the write watch in */
+    u64 seen;      /* (the write watch's clock then: watch_written) */
 } Resident;
 static Resident residents[512];
 static u32 nresidents;
 u64 gfx_stat_residents, gfx_stat_resident_pages;
 extern u64 gpu_stat_batches;
 static int watched(u64 g, u64 size);
+
+/* The write watch keeps one bit a page of the alias area, and a query that resets it takes the
+ * news from everyone else watching that page. Textures, kept constant buffers, compute inputs
+ * and resident regions share pages - memory a scene gives up is handed out again for something
+ * else - and whoever asked first kept the news for good: the No Contest screen skinned the
+ * fighters' arms from inputs never taken again (stretched over the screen). So every question
+ * goes through here: pages found written get the next stamp, kept per page, and each user keeps
+ * the clock as it was when it last asked ("seen"): its data is current unless one of its pages
+ * has a newer stamp. */
+#define WATCH_CHUNK 512   /* pages a chunk: 2 MB */
+typedef struct WatchChunk { u64 newest, page[WATCH_CHUNK]; } WatchChunk;
+static WatchChunk *watch_chunks[ALIAS_SIZE / (WATCH_CHUNK * 0x1000ull)];
+static u64 watch_clock;   /* stamps given so far */
+
+/* Take the write watch's news for guest pages [lo, hi) (page aligned, watched): resetting the
+ * bits as they are read, so a write after this is news next time. */
+static void watch_take(u64 lo, u64 hi) {
+    static void *pages[65536];   /* (256 MB: the largest range asked about, in one call) */
+    void *first;
+    ULONG_PTR count = 1;
+    ULONG granularity;
+    /* (asking is cheap, resetting is not - even where nothing was written: so ask first) */
+    if (GetWriteWatch(0, (void *)lo, hi - lo, &first, &count, &granularity) != 0 || !count) return;
+    for (u64 at = (u64)first; at < hi;) {
+        count = 65536;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)at, hi - at, pages, &count, &granularity) != 0 || !count) return;
+        u64 stamp = ++watch_clock;
+        for (ULONG_PTR k = 0; k < count; k++) {
+            u64 p = ((u64)pages[k] - ALIAS_BASE) >> 12;
+            WatchChunk **c = &watch_chunks[p / WATCH_CHUNK];
+            if (!*c && !(*c = calloc(1, sizeof **c))) continue;
+            (*c)->page[p % WATCH_CHUNK] = (*c)->newest = stamp;
+        }
+        if (count < 65536) return;
+        at = (u64)pages[count - 1] + 0x1000;
+    }
+}
+
+/* The first page in [p, hi) stamped after `seen` (hi if none). */
+static u64 watch_next(u64 p, u64 hi, u64 seen) {
+    while (p < hi) {
+        u64 i = (p - ALIAS_BASE) >> 12, end = (i / WATCH_CHUNK + 1) * WATCH_CHUNK;
+        const WatchChunk *c = watch_chunks[i / WATCH_CHUNK];
+        if (c && c->newest > seen)
+            for (; i < end && ALIAS_BASE + (i << 12) < hi; i++)
+                if (c->page[i % WATCH_CHUNK] > seen) return ALIAS_BASE + (i << 12);
+        p = ALIAS_BASE + (end << 12);
+    }
+    return hi;
+}
+
+/* Has guest memory [g, g + size) been written since *seen? (*seen moves on to now.) Ask before
+ * reading the memory, so that a write meanwhile is news next time. */
+static int watch_written(u64 g, u64 size, u64 *seen) {
+    u64 lo = g & ~0xFFFull, hi = (g + size + 0xFFF) & ~0xFFFull;
+    watch_take(lo, hi);
+    int written = watch_next(lo, hi, *seen) < hi;
+    *seen = watch_clock;
+    return written;
+}
 
 /* Views and buffers given up during a frame may still be in this frame's bindings (or the
  * arrays they are being collected in): they are released after the present. */
@@ -1416,6 +1702,8 @@ static void resident_drop(Resident *r) {
     memset(&residents[nresidents], 0, sizeof *residents);
 }
 
+static int read_guarded(void *dst, u64 g, u32 n);
+
 static void resident_snapshot(Resident *r) {
     u32 head = (u32)(0x1000 - (r->guest & 0xFFF)) & 0xFFF;   /* up to the first page boundary */
     if (head > r->size) head = r->size;
@@ -1424,12 +1712,15 @@ static void resident_snapshot(Resident *r) {
     r->head = head;
     r->tail = tail;
     r->edge = realloc(r->edge, head + tail + 1);
-    memcpy(r->edge, P(void, r->guest), head);
-    memcpy(r->edge + head, P(void, r->guest + r->size - tail), tail);
+    /* (zeros where the memory is gone - a region made over older ones may reach memory the
+     * guest has unmapped since: resident_sync finds it gone too, and leaves it alone) */
+    if (!read_guarded(r->edge, r->guest, head)) memset(r->edge, 0, head);
+    if (!read_guarded(r->edge + head, r->guest + r->size - tail, tail)) memset(r->edge + head, 0, tail);
 }
 
 /* n bytes of guest memory at g, or 0 if they are not there any more: the guest can unmap the
- * memory under a resident region (svc UnmapPhysicalMemory) and the renderer does not hear of it. */
+ * memory under a resident region (svc UnmapPhysicalMemory). The renderer hears of that and drops
+ * the region (gfx_guest_unmapped), but only if the memory held an nvmap allocation when it went. */
 #ifdef _WIN32
 extern __declspec(thread) int rt_probing;   /* host.c: the crash handler leaves a fault to us */
 static __declspec(noinline) void copy_guest(void *dst, const void *src, u32 n) { memcpy(dst, src, n); }
@@ -1470,10 +1761,11 @@ static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
 }
 
 /* The write watch over the region's whole pages starts over (after its GPU copy took guest
- * memory). Not over its partial pages: their bits belong to whatever shares them as well. */
+ * memory). Not over its partial pages: they are compared by content instead. */
 static void resident_watch_reset(Resident *r) {
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;
-    if (lo < hi) ResetWriteWatch((void *)lo, hi - lo);
+    if (lo < hi) watch_take(lo, hi);
+    r->seen = watch_clock;
 }
 
 /* Has the CPU written guest memory inside the region since its GPU copy last took it? Pages
@@ -1485,9 +1777,13 @@ static void resident_watch_reset(Resident *r) {
  * pack several to a page in the effect ring (GPU particle output among the CPU's per-draw
  * attributes); the first one checked took the bit and its neighbours kept stale data for good,
  * which drew effect meshes at a stale size over the whole screen (the white-outs). Checked
- * when a draw or dispatch uses the region (once a submission) and once a frame for all. */
+ * when a draw or dispatch uses the region (once a submission) and once a frame for all.
+ * Whole pages go to the GPU copy through a copy of their own too, never straight from guest
+ * memory: the driver reads what it is given unguarded. A region is dropped when the guest
+ * unmaps the memory under it (gfx_guest_unmapped), but before it was, regions outlived that
+ * memory and players' games crashed in the graphics driver on the vsync thread after 20-40
+ * minutes; the guarded copy stays for memory taken away without notice. */
 static void resident_sync(Resident *r, int every_frame) {
-    static void *pages[16384];
     static int no_pages = -1;   /* debug: leave resident regions alone */
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
     if (no_pages || (!every_frame && r->checked == gpu_stat_batches) || !r->edge || !watched(r->guest, r->size)) return;
@@ -1496,14 +1792,14 @@ static void resident_sync(Resident *r, int every_frame) {
         return;   /* (its memory is gone: left alone; once mapped again its bytes differ, and are taken) */
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;   /* the whole pages */
     if (lo >= hi) return;
-    ULONG_PTR count = 16384;
-    ULONG granularity;
-    if (GetWriteWatch(0, (void *)lo, hi - lo, pages, &count, &granularity) != 0 || !count) return;
-    ResetWriteWatch((void *)lo, hi - lo);   /* (before taking them: what the CPU writes meanwhile is seen next time) */
-    for (ULONG_PTR k = 0; k < count; k++) {
-        u64 pg = (u64)pages[k];
-        D3D11_BOX box = {(UINT)(pg - r->guest), 0, 0, (UINT)(pg + granularity - r->guest), 1, 1};
-        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, P(void, pg), 0, 0);
+    u64 seen = r->seen;
+    watch_take(lo, hi);   /* (before taking them: what the CPU writes meanwhile is news next time) */
+    r->seen = watch_clock;
+    for (u64 pg = watch_next(lo, hi, seen); pg < hi; pg = watch_next(pg + 0x1000, hi, seen)) {
+        u8 now[0x1000];
+        if (!read_guarded(now, pg, 0x1000)) continue;   /* (gone: left as it is) */
+        D3D11_BOX box = {(UINT)(pg - r->guest), 0, 0, (UINT)(pg + 0x1000 - r->guest), 1, 1};
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, now, 0, 0);
         gfx_stat_resident_pages++;
     }
 }
@@ -1782,6 +2078,7 @@ typedef struct Texture {
     u32 tic[8];
     u64 sample_hash;
     int watched, stale;    /* in the write-watched alias area; written since it was read */
+    u64 seen;              /* (the write watch's clock when it was read: watch_written) */
     ID3D11ShaderResourceView *srv;
     ID3D11Texture2D *tex;
     u64 used, asked;       /* (asked: the frame the write watch was last asked about it, gfx_stat_presented) */
@@ -1789,6 +2086,7 @@ typedef struct Texture {
 static Texture textures[4096];
 static u32 ntextures;
 u64 gfx_stat_textures, gfx_stat_watch_us;
+u64 gfx_stat_unpacked;   /* block-compressed textures copied to their exact size (unpack_texture) */
 
 static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
     static u64 rest;
@@ -1798,30 +2096,19 @@ static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
 }
 
 /* Which textures has the CPU (or a copy) written since they were read? The alias area is
- * reserved with MEM_WRITE_WATCH, so Windows tracks the pages written. A texture's range is
- * asked about the first time a frame draws with it - not every texture every frame: the
- * system's cost goes by the pages asked about, and a match keeps thousands of textures from
- * earlier screens it never draws (a player's 8-fighter match: about 4,000, some 0.7 ms a
- * frame). Pages found written start over at once (before the texture is read again, so what
- * the CPU writes meanwhile is seen next time), and as one bit a page belongs to every texture
- * on it, each of those is taken again at its next use. */
+ * reserved with MEM_WRITE_WATCH, so Windows tracks the pages written (watch_written). A
+ * texture's range is asked about the first time a frame draws with it - not every texture
+ * every frame: the system's cost goes by the pages asked about, and a match keeps thousands of
+ * textures from earlier screens it never draws (a player's 8-fighter match: about 4,000, some
+ * 0.7 ms a frame). A write is news to every texture on its pages, each taken again at its
+ * next use. */
 static int watched(u64 g, u64 size) { return g >= ALIAS_BASE && g + size <= ALIAS_BASE + ALIAS_SIZE; }
 
 static void texture_ask(Texture *t) {
     if (!t->watched || t->stale || t->asked == gfx_stat_presented) return;
     t->asked = gfx_stat_presented;
     u64 t0 = rt_clock_ns();
-    void *page;
-    ULONG_PTR count = 1;
-    ULONG granularity;
-    if (GetWriteWatch(0, (void *)t->guest, t->size, &page, &count, &granularity) == 0 && count) {
-        ResetWriteWatch((void *)t->guest, t->size);
-        u64 lo = t->guest & ~0xFFFull, hi = (t->guest + t->size + 0xFFF) & ~0xFFFull;
-        for (u32 i = 0; i < ntextures; i++) {   /* (t among them) */
-            Texture *o = &textures[i];
-            if (o->srv && o->watched && (o->guest & ~0xFFFull) < hi && ((o->guest + o->size + 0xFFF) & ~0xFFFull) > lo) o->stale = 1;
-        }
-    }
+    if (watch_written(t->guest, t->size, &t->seen)) t->stale = 1;
     watch_time(rt_clock_ns() - t0);
 }
 
@@ -1889,6 +2176,75 @@ static void texture_index_add(Texture *t) {
 
 static int depth_sampling = -1;   /* depth buffers as textures (shadow maps, ...); SSBU_NO_DEPTH_SAMPLING or F5: off */
 
+/* Block-compressed textures whose size is not a multiple of the 4x4 block: Direct3D 11 makes
+ * level 0 whole blocks, and a texture a few texels bigger is sampled wrongly at its right and
+ * bottom edges - coordinates are scaled by size / padded size, and clamping repeats the padding
+ * (ui2d's window frames stretch their last column across the middle of a button: the Spirits
+ * menu's selected button showed grey bars there). Such a texture is made padded as a source,
+ * then copied level by level, texel by texel, into an uncompressed texture of its exact size.
+ * Formats: the source's (typeless), how it is read, the copy's, its render target view. */
+typedef struct { DXGI_FORMAT bc, read, tex, rtv; } Unpacked;
+static int unpacked_formats(DXGI_FORMAT f, Unpacked *u) {
+    switch (f) {
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM}; break;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC2_TYPELESS, DXGI_FORMAT_BC2_UNORM}; break;
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC3_UNORM}; break;
+    case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB: *u = (Unpacked){DXGI_FORMAT_BC7_TYPELESS, DXGI_FORMAT_BC7_UNORM}; break;
+    case DXGI_FORMAT_BC4_UNORM: *u = (Unpacked){DXGI_FORMAT_BC4_TYPELESS, f, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_UNORM}; return 1;
+    case DXGI_FORMAT_BC4_SNORM: *u = (Unpacked){DXGI_FORMAT_BC4_TYPELESS, f, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_SNORM}; return 1;
+    case DXGI_FORMAT_BC5_UNORM: *u = (Unpacked){DXGI_FORMAT_BC5_TYPELESS, f, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_UNORM}; return 1;
+    case DXGI_FORMAT_BC5_SNORM: *u = (Unpacked){DXGI_FORMAT_BC5_TYPELESS, f, DXGI_FORMAT_R16G16_SNORM, DXGI_FORMAT_R16G16_SNORM}; return 1;
+    case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+        *u = (Unpacked){DXGI_FORMAT_BC6H_TYPELESS, f, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT}; return 1;
+    default: return 0;
+    }
+    u->tex = DXGI_FORMAT_R8G8B8A8_TYPELESS;   /* (an sRGB one read as UNORM and viewed as sRGB: the bytes unchanged) */
+    u->rtv = DXGI_FORMAT_R8G8B8A8_UNORM;
+    return 1;
+}
+
+static ID3D11DeviceContext *unpack_ctx;   /* deferred: the copy runs with the immediate context's state kept (mid-draw) */
+static u32 gfx_debug(void);
+
+static ID3D11Texture2D *unpack_texture(ID3D11Texture2D *bc, const TextureDesc *d, u32 levels, u32 layers, UINT misc, const Unpacked *u) {
+    if (!decode_ps || (!unpack_ctx && FAILED(ID3D11Device_CreateDeferredContext(dev, 0, &unpack_ctx)))) return NULL;
+    D3D11_TEXTURE2D_DESC td = {d->width, d->height, levels, layers, u->tex, {1, 0}, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, misc};
+    ID3D11Texture2D *out;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &out))) return NULL;
+    ID3D11DeviceContext *c = unpack_ctx;
+    ID3D11DeviceContext_VSSetShader(c, blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, decode_ps, NULL, 0);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    int ok = 1;
+    for (u32 layer = 0; layer < layers && ok; layer++)
+        for (u32 l = 0; l < levels && ok; l++) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {u->read, D3D11_SRV_DIMENSION_TEXTURE2DARRAY};
+            sd.Texture2DArray = (D3D11_TEX2D_ARRAY_SRV){l, 1, layer, 1};
+            D3D11_RENDER_TARGET_VIEW_DESC rd = {u->rtv, D3D11_RTV_DIMENSION_TEXTURE2DARRAY};
+            rd.Texture2DArray = (D3D11_TEX2D_ARRAY_RTV){l, layer, 1};
+            ID3D11ShaderResourceView *srv = NULL;
+            ID3D11RenderTargetView *rtv = NULL;
+            ok = SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)bc, &sd, &srv)) &&
+                 SUCCEEDED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)out, &rd, &rtv));
+            if (ok) {
+                D3D11_VIEWPORT vp = {0, 0, (float)(d->width >> l ? d->width >> l : 1), (float)(d->height >> l ? d->height >> l : 1), 0, 1};
+                ID3D11DeviceContext_OMSetRenderTargets(c, 1, &rtv, NULL);
+                ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+                ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &srv);
+                ID3D11DeviceContext_Draw(c, 3, 0);
+            }
+            if (srv) ID3D11ShaderResourceView_Release(srv);
+            if (rtv) ID3D11RenderTargetView_Release(rtv);
+        }
+    ID3D11CommandList *list = NULL;
+    if (FAILED(ID3D11DeviceContext_FinishCommandList(c, FALSE, &list))) ok = 0;
+    if (ok) ID3D11DeviceContext_ExecuteCommandList(ctx, list, TRUE);
+    if (list) ID3D11CommandList_Release(list);
+    if (!ok) { ID3D11Texture2D_Release(out); return NULL; }
+    return out;
+}
+
 static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     TextureDesc d;
     int ok = tic_decode(tic, &d);
@@ -1929,6 +2285,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     if (!t) t = ntextures < 4096 ? &textures[ntextures++] : lru;
     if (t->srv) { ID3D11ShaderResourceView_Release(t->srv); ID3D11Texture2D_Release(t->tex); t->srv = NULL; }
     if (t != hit) { t->guest = g; memcpy(t->tic, tic, 32); texture_index_add(t); }
+    if (watch) watch_written(g, size, &t->seen);   /* (before reading: a write meanwhile is news next frame) */
     if (d.type == TIC_3D) {   /* level 0 only, which is all a lookup table has */
         D3D11_TEXTURE3D_DESC td = {d.width, d.height, d.depth, 1, d.dxgi, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
         u32 rowb = DIV_UP_(d.width, d.bw) * d.bytes, rows = DIV_UP_(d.height, d.bh);
@@ -1959,8 +2316,11 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     D3D11_TEXTURE2D_DESC td = {d.width, d.height, levels, layers, d.dxgi, {1, 0}, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0,
                                layers == 6 || (d.type == TIC_CUBE_ARRAY) ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0};
     if (d.type != TIC_CUBE && d.type != TIC_CUBE_ARRAY) td.MiscFlags = 0;
+    Unpacked unpacked;
+    int unpack = 0;
     if (d.bw > 1 && ((d.width % 4) || (d.height % 4))) {   /* block-compressed sizes must be multiples of 4 at level 0 */
         td.Width = (d.width + 3) & ~3u; td.Height = (d.height + 3) & ~3u;
+        if (!(gfx_debug() & 128) && (unpack = unpacked_formats(d.dxgi, &unpacked))) td.Format = unpacked.bc;
     }
     D3D11_SUBRESOURCE_DATA *init = calloc(levels * layers, sizeof *init);
     u8 **mem = calloc(levels * layers, sizeof *mem);
@@ -1968,11 +2328,19 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
         for (u32 l = 0; l < levels; l++) {
             u32 w = (d.width >> l) ? d.width >> l : 1, h = (d.height >> l) ? d.height >> l : 1;
             u32 bw = (w + d.bw - 1) / d.bw, bh = (h + d.bh - 1) / d.bh;
-            u8 *buf = malloc((size_t)bw * bh * d.bytes + 64);
+            /* a padded texture's level can be a block wider or taller than the image's (9 wide: 12, level 1 6) */
+            u32 pw = (td.Width >> l) ? td.Width >> l : 1, ph = (td.Height >> l) ? td.Height >> l : 1;
+            u32 pbw = (pw + d.bw - 1) / d.bw, pbh = (ph + d.bh - 1) / d.bh;
+            if (pbw < bw) pbw = bw;
+            if (pbh < bh) pbh = bh;
+            u8 *buf = pbw > bw || pbh > bh ? calloc(1, (size_t)pbw * pbh * d.bytes + 64) : malloc((size_t)bw * bh * d.bytes + 64);
             texture_read(&d, g, layer, l, buf);
+            for (u32 y = bh; pbw > bw && y-- > 0;)   /* rows spread out to the wider pitch, from the last */
+                memmove(buf + (size_t)y * pbw * d.bytes, buf + (size_t)y * bw * d.bytes, (size_t)bw * d.bytes);
+            for (u32 y = 0; pbw > bw && y < bh; y++) memset(buf + ((size_t)y * pbw + bw) * d.bytes, 0, (size_t)(pbw - bw) * d.bytes);
             gfx_stat_upload_bytes += (u64)bw * bh * d.bytes;
             gfx_stat_upload_kind[3] += (u64)bw * bh * d.bytes;
-            init[layer * levels + l] = (D3D11_SUBRESOURCE_DATA){buf, bw * d.bytes, bw * bh * d.bytes};
+            init[layer * levels + l] = (D3D11_SUBRESOURCE_DATA){buf, pbw * d.bytes, pbw * pbh * d.bytes};
             mem[layer * levels + l] = buf;
         }
     HRESULT hr = ID3D11Device_CreateTexture2D(dev, &td, init, &t->tex);
@@ -1983,6 +2351,14 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     D3D11_SHADER_RESOURCE_VIEW_DESC sd;
     memset(&sd, 0, sizeof sd);
     sd.Format = d.dxgi == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : d.dxgi;
+    ID3D11Texture2D *exact = unpack ? unpack_texture(t->tex, &d, levels, layers, td.MiscFlags, &unpacked) : NULL;
+    if (exact) {   /* (else the padded one, as before) */
+        ID3D11Texture2D_Release(t->tex);
+        t->tex = exact;
+        sd.Format = unpacked.tex != DXGI_FORMAT_R8G8B8A8_TYPELESS ? unpacked.tex
+                  : unpacked.read != d.dxgi ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        gfx_stat_unpacked++;
+    }
     switch (shader_type) {
     case TEX_ARRAY_2D: sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY; sd.Texture2DArray.MipLevels = levels; sd.Texture2DArray.ArraySize = layers; break;
     case TEX_CUBE: sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; sd.TextureCube.MipLevels = levels; break;
@@ -2145,7 +2521,8 @@ STATE_CACHE(blend_state, D3D11_BLEND_DESC, ID3D11BlendState, ID3D11Device_Create
 /* ---- draws ------------------------------------------------------------------------- */
 u64 gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target;
 /* SSBU_GFX_DEBUG bits: 1 all colour channels written, 2 no depth/stencil test, 4 no culling,
- * 8 no blending, 16 log every draw of one frame (after SSBU_GFX_LOG_AT seconds) */
+ * 8 no blending, 16 log every draw of one frame (after SSBU_GFX_LOG_AT seconds), 64 no alpha test,
+ * 128 block-compressed textures left padded (no exact-size copies) */
 static u32 gfx_debug(void) {
     static int checked;
     static u32 v;
@@ -2176,7 +2553,7 @@ static D3D11_PRIMITIVE_TOPOLOGY topology(u32 t) {
  * and copy-engine writes - the HUD's positions change between draws that way) are applied to
  * them in order, and what the CPU wrote is found by the write watch, asked at a buffer's first
  * use in each submission; memory outside the watched area is never kept. */
-typedef struct KeptCb { u64 va, guest, used, checked; u32 size, mapped; int stale; ID3D11Buffer *buf; ID3D11ShaderResourceView *srv; u8 *shadow; } KeptCb;
+typedef struct KeptCb { u64 va, guest, used, checked, seen; u32 size, mapped; int stale; ID3D11Buffer *buf; ID3D11ShaderResourceView *srv; u8 *shadow; } KeptCb;
 extern u64 gpu_stat_batches;   /* (gpu.c: submissions so far) */
 #define KEPT_SETS 256
 #define KEPT_WAYS 4
@@ -2194,6 +2571,14 @@ static void kept_blocks_add(const KeptCb *e, int d) {
     for (u64 b = e->va >> 16; b <= (e->va + e->size - 1) >> 16; b++) kept_blocks[KEPT_BLOCK(b)] += (u16)d;
 }
 
+static void kept_drop(KeptCb *e) {
+    if (e->srv) kept_blocks_add(e, -1);
+    bury(e->srv);   /* (may be bound still) */
+    bury(e->buf);
+    free(e->shadow);
+    memset(e, 0, sizeof *e);
+}
+
 /* The command stream wrote [lo, hi) of GPU VA (guest memory has it already). */
 static void kept_apply(u64 lo, u64 hi) {
     int any = 0;
@@ -2203,6 +2588,11 @@ static void kept_apply(u64 lo, u64 hi) {
         KeptCb *e = &kept[i];
         if (!e->srv || e->stale || hi <= e->va || lo >= e->va + e->mapped) continue;
         u64 a = (lo > e->va ? lo : e->va) & ~3ull, z = (hi < e->va + e->mapped ? hi : e->va + e->mapped) + 3 & ~3ull;
+        /* Only from the memory it was made from, still mapped there: the guest may have mapped
+         * other memory at these addresses since (and unmapped the old: the driver would fault
+         * reading it). Otherwise it is taken again, or made again, at its next use. */
+        u64 g = gpu_va_to_guest(a);
+        if (g != e->guest + (a - e->va) || gpu_va_to_guest(z - 1) != g + (z - 1 - a)) { e->stale = 1; continue; }
         D3D11_BOX box = {(UINT)(a - e->va), 0, 0, (UINT)(z - e->va), 1, 1};
         ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)e->buf, 0, &box, P(void, e->guest + (a - e->va)), 0, 0);
         if (e->shadow) memcpy(e->shadow + (a - e->va), P(void, e->guest + (a - e->va)), (size_t)(z - a));
@@ -2235,6 +2625,13 @@ void gfx_stream_end(void) {
     if (pending_hi && enter()) { kept_flush(); leave(); }
 }
 
+/* How much of [va, va + size) maps to guest memory in one piece from g (at va). */
+static u32 kept_mapped(u64 va, u64 g, u32 size) {
+    u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
+    while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
+    return mapped > size ? size : mapped;
+}
+
 static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
     KeptCb *set = &kept[((va >> 4) * 0x9E3779B97F4A7C15ull >> 56) * KEPT_WAYS], *e = NULL, *lru = &set[0];
     for (u32 w = 0; w < KEPT_WAYS && !e; w++) {
@@ -2242,15 +2639,12 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
         else if (set[w].used < lru->used) lru = &set[w];
     }
     u64 g = gpu_va_to_guest(va);
-    if (e && e->guest == g) {
+    /* (still mapped as when it was made, asked at its first use in a submission and before it
+     * is taken again: a 64 KB binding reaches past the program's constants, into memory the
+     * guest may have unmapped since - the driver would fault reading it) */
+    if (e && e->guest == g && ((e->checked == gpu_stat_batches && !e->stale) || kept_mapped(va, g, size) == e->mapped)) {
         if (e->checked != gpu_stat_batches) {   /* first use in this submission: has the CPU written it since? */
-            void *page;
-            ULONG_PTR count = 1;
-            ULONG granularity;
-            if (GetWriteWatch(0, (void *)g, e->mapped, &page, &count, &granularity) == 0 && count) {
-                e->stale = 1;
-                ResetWriteWatch((void *)g, e->mapped);
-            }
+            if (watch_written(g, e->mapped, &e->seen)) e->stale = 1;
             e->checked = gpu_stat_batches;
         }
         if (e->stale) {   /* take it all again */
@@ -2273,20 +2667,15 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
         return e->srv;
     }
     if (!g || size < 0x1000) return NULL;
-    u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
-    while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
-    if (mapped > size) mapped = size;
+    u32 mapped = kept_mapped(va, g, size);
     if (!watched(g, mapped)) return NULL;
     if (!e) e = lru;
-    if (e->srv) kept_blocks_add(e, -1);
-    bury(e->srv);   /* (may be bound still) */
-    bury(e->buf);
-    free(e->shadow);
-    memset(e, 0, sizeof *e);
+    kept_drop(e);
     if (kept_verify < 0) kept_verify = getenv("SSBU_KEPT_VERIFY") != NULL;
     u32 cap = (size + 15) & ~15u;
     D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
     u8 *init = calloc(1, cap);
+    watch_written(g, mapped, &e->seen);   /* (before reading: a write meanwhile is news next submission) */
     memcpy(init, P(void, g), mapped);
     D3D11_SUBRESOURCE_DATA sd = {init, 0, 0};
     HRESULT hr = ID3D11Device_CreateBuffer(dev, &bd, &sd, &e->buf);
@@ -2591,9 +2980,16 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     u64 ps_g = regs[M_PIPELINE(5)] & 1 ? gpu_va_to_guest(region + regs[M_PIPELINE(5) + 1]) : 0;
     /* the pixel shader is asked for once the vertex shader is translated (its outputs are the
      * pixel shader's inputs), not once it is compiled: both compile at the same time */
-    Shader *vs_e = vs_g ? find_shader_ex(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], NULL, 0) : NULL;
-    Shader *ps_e = vs_e && vs_e->state != 2 && ps_g ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0) : NULL;
-    Shader *vs = vs_e && vs_e->state == 1 ? vs_e : NULL, *ps = ps_e && ps_e->state == 1 ? ps_e : NULL;
+    Shader *vs_e = vs_g ? find_shader_ex(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], NULL, 0, 0) : NULL;
+    Shader *ps_e = vs_e && vs_e->state != 2 && ps_g ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 0) : NULL;
+    /* The fixed-function alpha test (ui2d's alpha compare: the main menu's stencil masks are cut
+     * from a texture's alpha this way) needs the pixel shader's variant that discards; while that
+     * compiles, the plain one draws as before. */
+    D3D11_COMPARISON_FUNC alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : D3D11_COMPARISON_ALWAYS;
+    Shader *pa_e = alpha_func != D3D11_COMPARISON_ALWAYS && ps_e && ps_e->state != 2 && (ps_e->info.color_mask & 1)
+                 ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 1) : NULL;
+    Shader *vs = vs_e && vs_e->state == 1 ? vs_e : NULL;
+    Shader *ps = pa_e && pa_e->state == 1 ? pa_e : ps_e && ps_e->state == 1 ? ps_e : NULL;
     /* no fragment stage (depth only: shadow maps, depth pre-passes) draws with no pixel shader */
     if (!vs || (ps_g && !ps) || topo == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) {
         gfx_stat_skipped++;
@@ -2653,6 +3049,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.fix[3] = minus_one ? 0.5f : 0.0f;
     params.frag[0] = lower_left ? 1.0f : 0.0f;
     params.frag[1] = (float)rt_h;
+    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * D3D judges the winding as seen on the target, which after the fix-up above is the window
@@ -2758,13 +3155,13 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         u32 sh = regs[M_SCISSOR(0) + 1], sv = regs[M_SCISSOR(0) + 2];
         fprintf(stderr, "[draw]   scissor %s x %u-%u y %u-%u | stencil %d func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
                 "two-sided %u: back func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
-                "blend src %d dst %d op %d, alpha src %d dst %d op %d\n",
+                "blend src %d dst %d op %d, alpha src %d dst %d op %d | alpha test %u func %#x ref %g\n",
                 regs[M_SCISSOR(0)] & 1 ? "on" : "off", sh & 0xFFFF, sh >> 16, sv & 0xFFFF, sv >> 16, dd.StencilEnable, regs[M_STENCIL_FUNC],
                 regs[M_STENCIL_REF] & 0xFF, regs[M_STENCIL_FUNC_MASK] & 0xFF, regs[M_STENCIL_MASK] & 0xFF, regs[M_STENCIL_OP_FAIL],
                 regs[M_STENCIL_OP_ZFAIL], regs[M_STENCIL_OP_ZPASS], regs[M_TWO_SIDED_STENCIL] & 1, regs[M_BACK_STENCIL_FUNC],
                 regs[M_BACK_STENCIL_REF] & 0xFF, regs[M_BACK_STENCIL_FUNC_MASK] & 0xFF, regs[M_BACK_STENCIL_MASK] & 0xFF,
                 regs[M_BACK_STENCIL_OP_FAIL], regs[M_BACK_STENCIL_OP_ZFAIL], regs[M_BACK_STENCIL_OP_ZPASS], t->SrcBlend, t->DestBlend, t->BlendOp,
-                t->SrcBlendAlpha, t->DestBlendAlpha, t->BlendOpAlpha);
+                t->SrcBlendAlpha, t->DestBlendAlpha, t->BlendOpAlpha, regs[M_ALPHA_TEST] & 1, regs[M_ALPHA_FUNC], f32_of(regs[M_ALPHA_REF]));
     }
 
     /* vertex streams: each attribute the shader reads gets its stream's data at t18 + n */
@@ -3173,11 +3570,20 @@ static RwBuf *rw_upload(u32 k, const u8 *data, u32 size) {
 /* Storage buffers a compute program only reads (the fighters' bind pose and skin weights,
  * the whole model's for every part skinned): kept on the GPU for as long as guest memory under
  * them goes unwritten (the write watch says), instead of uploaded in full for every dispatch. */
-typedef struct InputBuf { u64 va, guest; u32 size; ID3D11Buffer *buf; ID3D11UnorderedAccessView *uav; u64 used; } InputBuf;
+typedef struct InputBuf { u64 va, guest; u32 size; ID3D11Buffer *buf; ID3D11UnorderedAccessView *uav; u64 used, seen; u8 *shadow; } InputBuf;
 static InputBuf inputs[128];
 static u64 input_clock;
 
+static void input_drop(InputBuf *b) {
+    bury(b->uav);   /* (may be bound still) */
+    bury(b->buf);
+    free(b->shadow);
+    memset(b, 0, sizeof *b);
+}
+
 static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
+    static int verify = -1;   /* SSBU_INPUT_VERIFY (debugging): keep a copy of what each holds, and report uses that find memory different */
+    if (verify < 0) verify = getenv("SSBU_INPUT_VERIFY") != NULL;
     u64 g = gpu_va_to_guest(va);
     if (!g || !size || !watched(g, size) || gpu_va_to_guest(va + size - 1) != g + size - 1) return NULL;   /* one watched piece only */
     InputBuf *b = NULL, *lru = &inputs[0];
@@ -3187,25 +3593,30 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     }
     u32 cap = (size + 15) & ~15u;
     if (b) {
-        void *page;
-        ULONG_PTR count = 1;
-        ULONG granularity;
-        if (GetWriteWatch(0, (void *)g, size, &page, &count, &granularity) == 0 && count) {   /* written since: take it again */
+        if (watch_written(g, size, &b->seen)) {   /* written since: take it again */
             D3D11_BOX box = {0, 0, 0, size, 1, 1};
             ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)b->buf, 0, &box, P(void, g), 0, 0);
             gfx_stat_upload_bytes += size;
-            ResetWriteWatch((void *)g, size);
+            if (b->shadow) memcpy(b->shadow, P(void, g), size);
+        } else if (b->shadow && memcmp(b->shadow, P(void, g), size)) {
+            static int reported;
+            u32 o = 0;
+            while (o < size && b->shadow[o] == P(u8, g)[o]) o++;
+            if (reported++ < 200)
+                fprintf(stderr, "[input] va %#llx (%#x bytes) +%#x: kept %02x, memory %02x (submission %llu)\n", va, size, o, b->shadow[o], P(u8, g)[o],
+                        gpu_stat_batches);
+            memcpy(b->shadow, P(void, g), size);
         }
         b->used = ++input_clock;
         return b->uav;
     }
     b = lru;
-    bury(b->uav);   /* (may be bound still) */
-    bury(b->buf);
-    memset(b, 0, sizeof *b);
+    input_drop(b);
     D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
     u8 *init = calloc(1, cap);
+    watch_written(g, size, &b->seen);   /* (before reading: a write meanwhile is news next time) */
     read_gpu(va, size, init);
+    if (verify && (b->shadow = malloc(size))) memcpy(b->shadow, init, size);
     D3D11_SUBRESOURCE_DATA sd = {init, 0, 0};
     HRESULT hr = ID3D11Device_CreateBuffer(dev, &bd, &sd, &b->buf);
     free(init);
@@ -3219,8 +3630,59 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
     if (FAILED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)b->buf, &ud, &b->uav))) { ID3D11Buffer_Release(b->buf); b->buf = NULL; return NULL; }
     b->va = va; b->guest = g; b->size = size; b->used = ++input_clock;
-    ResetWriteWatch((void *)g, size);
     return b->uav;
+}
+
+/* ---- memory taken away --------------------------------------------------------------------
+ * Resident regions, kept constant buffers and compute inputs are made from the guest memory at
+ * a GPU address, and outlive the draws that made them. When the game unmaps that address, or
+ * the memory under it, the device layer says so (hle_nv.c, once the GPU thread's queued work
+ * has run) and they are dropped: their next use makes them again from what is there then.
+ * Before, nothing told them. A region went on checking memory that was gone - the graphics
+ * driver crashed reading it on the vsync thread, in players' games after 20-40 minutes - and a
+ * buffer the game mapped at the same address later read the old region's GPU data instead of
+ * its own. Dropped under the lock, as the outermost entry point leaves (for these calls, their
+ * own): no entry point keeps a pointer to a region or buffer across leave(), and resident_drop
+ * moves regions around. What is dropped may still be bound: its views are buried. */
+u64 gfx_stat_unmapped, gfx_stat_unmap_dropped;   /* (notices the renderer had; what they dropped) */
+
+static int spans(Span s, u64 a, u64 n) { return a && n && a < s.hi && s.lo < a + n; }
+
+static void forget_unmapped(void) {
+    Span va = unmapped_va, g = unmapped_guest;
+    unmapped_va = unmapped_guest = (Span){0, 0};
+    for (u32 i = 0; i < nresidents;) {
+        Resident *r = &residents[i];
+        if (spans(va, r->va, r->size) || spans(g, r->guest, r->size)) { resident_drop(r); gfx_stat_unmap_dropped++; }
+        else i++;   /* (resident_drop moved the last region here) */
+    }
+    for (u32 i = 0; i < KEPT_SETS * KEPT_WAYS; i++) {   /* (a kept buffer holds the part mapped in one piece) */
+        KeptCb *e = &kept[i];
+        if (e->srv && (spans(va, e->va, e->mapped) || spans(g, e->guest, e->mapped))) { kept_drop(e); gfx_stat_unmap_dropped++; }
+    }
+    for (u32 i = 0; i < 128; i++) {
+        InputBuf *b = &inputs[i];
+        if (b->buf && (spans(va, b->va, b->size) || spans(g, b->guest, b->size))) { input_drop(b); gfx_stat_unmap_dropped++; }
+    }
+}
+
+static void note_unmapped(Span *s, u64 lo, u64 size) {   /* (one waiting already: widened over both) */
+    if (!size) return;
+    if (!s->hi || lo < s->lo) s->lo = lo;
+    if (lo + size > s->hi) s->hi = lo + size;
+    gfx_stat_unmapped++;
+}
+
+void gfx_gpu_unmapped(u64 va, u64 size) {
+    if (!ready || !enter()) return;   /* (nothing is kept before the renderer is up) */
+    note_unmapped(&unmapped_va, va, size);
+    leave();
+}
+
+void gfx_guest_unmapped(u64 addr, u64 size) {
+    if (!ready || !enter()) return;
+    note_unmapped(&unmapped_guest, addr, size);
+    leave();
 }
 
 void gfx_dispatch(const u32 *regs, const u32 *q) {
@@ -3501,6 +3963,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     gfx_stat_presented++;
     release_graves();
     note_writes();
+    debug_messages();
     static int logged, frames_logged, frames_to_log;
     static const char *after_compute = (const char *)1;
     if (after_compute == (const char *)1) after_compute = getenv("SSBU_GFX_LOG_AFTER_COMPUTE");
@@ -3688,6 +4151,8 @@ void gfx_present(u64 guest, u32 width, u32 height) {
             for (u32 i = 0; i < KEPT_SETS * KEPT_WAYS; i++) nk += kept[i].srv != NULL;
             fprintf(stderr, "[stats] kept constant buffers: %u; so far %llu made, %llu updated by the command stream, %llu taken again after CPU writes, %llu mismatches\n",
                     nk, gfx_stat_kept_made, gfx_stat_kept_applied, gfx_stat_kept_reloaded, gfx_stat_kept_mismatches);
+            fprintf(stderr, "[stats] memory taken away: %llu unmaps heard, %llu resident regions, kept buffers and compute inputs dropped\n",
+                    gfx_stat_unmapped, gfx_stat_unmap_dropped);
             static u64 last_compared, compared_frames0;
             fprintf(stderr, "[stats] state objects: %u rasterizer, %u depth/stencil, %u blend, %u samplers; reuse checks compared %.2f MB/frame\n",
                     raster_state_count, depth_state_count, blend_state_count, nsamplers,

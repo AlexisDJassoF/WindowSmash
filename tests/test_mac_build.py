@@ -706,7 +706,7 @@ class BuildOnMacTests(unittest.TestCase):
             EXEFS=str(dump / 'exefs'), FONTS=str(dump / 'fonts'), MODULES=str(dump / 'modules'),
             SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'), EXE=str(self.exe),
             log=lambda msg='': self.logged.append(msg), check_tools=lambda: None, install_packages=lambda: None,
-            ask_folder=lambda key, given, saved: str(top), romfs_cfg_ok=lambda cfg: True, missing_fonts=lambda folder: [],
+            ask_folder=lambda key, given, saved: str(top), romfs_cfg_ok=lambda cfg: True, check_game_data=lambda cfg, game: None, missing_fonts=lambda folder: [],
             check_same_game=lambda rec: None, find_program=lambda game, keys: ('p', 0x01006A800016E000, {}, {'contents': []}),
             installed_ram_gb=lambda: 8.0, subprocess=fake_subprocess,
             run=lambda args, failure: self.calls.append([str(a) for a in args]))

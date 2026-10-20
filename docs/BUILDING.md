@@ -95,7 +95,7 @@ You need these files from your own Switch:
 | **DLC** you own | `.nsp` files | Optional |
 
 > [!NOTE]
-> **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. The program and the data must be the same version. To keep more than one version, set up one with this guide and [add the others](#add-another-version) afterwards.
+> **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. The program and the data must be the same version. The original release (1.0.0) needs its update: WindowSmash can't read its data on its own yet. To keep more than one version, set up one with this guide and [add the others](#add-another-version) afterwards.
 
 > [!TIP]
 > **With `Install WindowSmash.bat` or `launchers\Build WindowSmash.bat` you don't need `romfs.bin`.** Put the game (a game card dump `.xci`, an `.nsp`, or its `.nca` files; or point at the folder yuzu or Ryujinx installed it in), your update's `.nsp` if you have one, and your DLC `.nsp` files (loose, or in a `dlc` folder) into one folder. They find the program, decrypt what needs it, and apply the update over the game themselves. Decrypting the game needs about 15 GB more space and the update about 4 GB; both take a few minutes. The game as first released (version 1.0.0) is the best base for an update: it applies exactly.
@@ -351,7 +351,7 @@ python tools/recomp.py all dump/exefs --out build --jobs 8
 python tools/recomp.py all dump/exefs --out build --jobs 16
 ```
 
-- It takes **30 minutes to a few hours**, and prints a lot while it works. The PC can be slow meanwhile.
+- It takes **30 minutes to a few hours**, and prints a lot while it works. The PC can be slow meanwhile. A bar on the last line shows how far it has got and the time left (once the first files are compiled); the window's title shows it too.
 - If it's interrupted (a restart, the PC going to sleep), run the same command again: it carries on where it stopped.
 - It's finished when a line says `linked … objects into build\ssbu.exe` and the `PS C:\WindowSmash>` line comes back.
 
@@ -412,6 +412,7 @@ By hand: download the ZIP again, unblock it as in [step 5](#step-5-download-wind
 | `Install WindowSmash.bat` stops at a check | It says what the PC lacks: 64-bit Windows 10 or 11, a processor with AVX2, 8 GB of RAM, or free space (about 60 GB, less what is built already). Free some space or move WindowSmash to a drive with room, then run it again. |
 | `Install WindowSmash.bat` says winget is not available | Install the compiler by hand: download the **Build Tools for Visual Studio** from <https://visualstudio.microsoft.com/visual-cpp-build-tools/>, tick **Desktop development with C++** and, under Installation details, **C++ Clang tools for Windows**, install, then run `Install WindowSmash.bat` again. |
 | The installer's window says a folder has a problem | The line under the folder says what: no `prod.keys`, no `.nca` files, no program among the game files. Point it at the right folder ([Part 2](#part-2-gather-your-game-files)) and click **Check files**. |
+| `is an early release` (in the installer's window, or when the build stops at its step 6) | Your game files are the game as first released, or another early release, without its update, and WindowSmash can't read that release's data yet. Put the game's update `.nsp` (the newest you have) next to the game. If the installer's window said it, click **Check files** and go on. If the build said it, that WindowSmash folder is set up for the early release already: extract a fresh WindowSmash folder and run `Install WindowSmash.bat` there. |
 | `is the game's update, whose data is a patch over the game's own` | Your folder has the update but not the game itself. Put the game's own (base) program `.nca` next to it; from yuzu or Ryujinx, the installed-content folder has both. |
 | `python` is not recognized, or *Python was not found* | Python isn't installed, or **Add python.exe to PATH** wasn't ticked. Install it again ([step 3](#step-3-install-python)), then open a new PowerShell window. Or double-click `Install WindowSmash.bat`, which brings its own. |
 | `No module named 'Cryptodome'` or `No module named 'zstandard'` | Run [step 7](#step-7-install-windowsmashs-helpers) (with the same Python as the failing command). |

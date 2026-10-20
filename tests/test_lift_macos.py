@@ -27,10 +27,15 @@ ON_ARM64_MAC = sys.platform == 'darwin' and platform.machine() == 'arm64' and CL
 
 
 def lifted(*words, setjmp=None, entries=None, pads=None):
-    """The C of one function made of these instruction words (at the module's start)."""
+    """The C of one function made of these instruction words (at the module's start), every
+    register in the context (the register cache off: its own forms are tests/test_regcache.py's)."""
     img = struct.pack(f'<{len(words)}I', *words) + bytes(0x100)
     lifter = lift.Lifter(img, entries or {0}, setjmp=setjmp, pads=pads)
-    text, reasons, _callees = lifter.lift_function(0, 4 * len(words))
+    cached, lift.REGCACHE = lift.REGCACHE, False
+    try:
+        text, reasons, _callees = lifter.lift_function(0, 4 * len(words))
+    finally:
+        lift.REGCACHE = cached
     return text, reasons
 
 
@@ -126,6 +131,8 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(got, 'if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0;')
         other = body(0x94000010, entries={0, 0x40})                 # the same call to an ordinary function
         self.assertEqual(other, 'X(30) = 0x7100000004ull; f_7100000040(c);')
+        # and the register cache (tools/regcache.py) finds it: everything spilled before, read back after a longjmp
+        self.assertEqual(lift.mark_syncs(got), '@F@ if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0; else { @A@ }')
 
     def test_recomp_h_lda_is_seq_cst(self):
         """C's acquire would be ldapr on arm64 (RCpc): too weak for the guest's ldar after stlr."""

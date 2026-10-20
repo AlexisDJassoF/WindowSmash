@@ -11,6 +11,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_reference')
+sys.path.insert(0, str(ROOT / 'tests'))
+import test_arc_table as arc_table  # noqa: E402  (made-up data.arc's)
 pick_program, jobs_for_ram, romfs_cfg_ok = BUILD['pick_program'], BUILD['jobs_for_ram'], BUILD['romfs_cfg_ok']
 Failed = BUILD['Failed']
 PROGRAM, META, CONTROL = 0, 1, 2
@@ -77,16 +79,20 @@ class BuildStepsTests(unittest.TestCase):
                         'app': '01006A800016E000', 'kind': 'update', 'version': 2031616, 'title_id': '01006A800016E000'}
         self.contents = [self.program]
         self.calls = []
+        self.logged = []
         # (the module's own globals, which build() reads: run_path returns a copy of them)
         self.ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_steps')['build'].__globals__
+        self.check_game_data = self.ns['check_game_data']
+        self.cfg = dump / 'modules' / 'romfs.cfg'
         folders = {'game': str(self.game), 'keys': str(keys), 'firmware': str(firmware)}
         self.ns.update(
-            DUMP=str(dump), EXEFS=str(exefs), FONTS=str(dump / 'fonts'), MODULES=str(dump / 'modules'),
+            ROOT=str(top / 'port'), DUMP=str(dump), EXEFS=str(exefs), FONTS=str(dump / 'fonts'), MODULES=str(dump / 'modules'),
             SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'),
-            log=lambda msg='': None, check_tools=lambda: None, install_packages=lambda: None,
+            log=lambda msg='': self.logged.append(msg), check_tools=lambda: None, install_packages=lambda: None,
             ask_folder=lambda key, given, saved: folders[key],
             find_program=lambda game, keys: (self.program['path'], BASE, self.program, {'contents': self.contents}),
             romfs_cfg_ok=lambda cfg: True, missing_fonts=lambda folder: [], check_same_game=lambda rec: None,
+            check_game_data=lambda cfg, game: None,
             run=lambda args, failure: self.calls.append([str(a) for a in args]))
         self.args = types.SimpleNamespace(game=str(self.game), keys=str(keys), firmware=str(firmware), jobs=None,
                                           prepare_only=True)
@@ -115,6 +121,47 @@ class BuildStepsTests(unittest.TestCase):
         self.ns['build'](self.args)
         self.assertIsNone(self.aoc_call())
         self.assertTrue(any('arc.py' in ' '.join(c) for c in self.calls))
+
+    def game_data(self, parts):
+        """romfs.cfg (step 6's, done) reading a RomFS that holds this data.arc (tests/test_arc_table.py)."""
+        image = Path(self.temp.name) / 'romfs.bin'
+        image.write_bytes(arc_table.romfs(arc_table.flat(parts)))
+        self.cfg.write_text(f'{image}\n0\n')
+        self.ns['check_game_data'] = self.check_game_data
+
+    def test_an_early_release_stops_at_step_6(self):
+        self.game_data(arc_table.EARLY[('uncompressed', 'v1')])
+        with self.assertRaises(self.ns['Failed']) as e:
+            self.ns['build'](self.args)
+        text = str(e.exception)
+        self.assertIn(f'The game in {self.game} is an early release', text)
+        self.assertIn('uncompressed file table, v1 layout', text)
+        self.assertIn(f"Put the game's update (an .nsp file; the newest you have) in {self.game}", text)
+        self.assertIn('extract a fresh WindowSmash folder and run Install WindowSmash.bat there', text)
+        self.assertNotIn('romfs.bin', text)
+        steps = [m.strip() for m in self.logged if m.lstrip().startswith('[')]
+        self.assertTrue(steps[-1].startswith('[6/9]'), steps[-1])
+        self.assertEqual(self.calls, [])   # (no DLC, no fighters)
+
+    def test_a_newer_release_goes_on(self):
+        self.game_data(arc_table.pieces(arc_table.zstd_header()))
+        self.ns['write_version'] = lambda: None   # (that header is all there is to read)
+        self.ns['build'](self.args)
+        self.assertTrue(any('arc.py' in ' '.join(c) for c in self.calls))
+
+    def test_unreadable_game_data(self):
+        self.game_data({0: bytes(0x38)})   # (no data.arc as the game's begins)
+        with self.assertRaises(self.ns['Failed']) as e:
+            self.ns['build'](self.args)
+        self.assertIn('damaged or incomplete', str(e.exception))
+
+    def test_told_by_the_scan_before_decrypting(self):
+        self.ns['romfs_cfg_ok'] = lambda cfg: False   # (step 6 to do)
+        self.program.update(kind='base', romfs='encrypted', data_arc=['zstd', 'v1'], display_version='1.0.0')
+        with self.assertRaises(self.ns['Failed']) as e:
+            self.ns['build'](self.args)
+        self.assertIn('zstd file table, v1 layout', str(e.exception))
+        self.assertFalse(any('decrypt' in c for c in self.calls))
 
 
 class MarkerTests(unittest.TestCase):

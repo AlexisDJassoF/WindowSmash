@@ -48,7 +48,8 @@ static struct {
     int mode, width, height, latency, hide_cursor;
     Pacing pacing;
     int loaded;
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0};
+    char gpu[64];
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, "auto"};
 
 static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
@@ -109,7 +110,15 @@ static const char DEFAULT_INI[] =
     "; latency = 1-3: how many frames the graphics card may work ahead. Lower is more responsive.\n"
     "latency = 3\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
-    "hide_cursor = 1\n";
+    "hide_cursor = 1\n"
+#ifdef _WIN32
+    "\n"
+    "; gpu = auto, or part of a graphics card's name (e.g. nvidia, radeon, intel)\n"
+    ";   auto: the fastest card. On a laptop with two, the NVIDIA or AMD one, not the processor's own.\n"
+    ";   The game's log (build\\play.log) lists the cards it found at its start.\n"
+    "gpu = auto\n"
+#endif
+    ;
 
 static void parse_window(const char *v) {
     if (!_stricmp(v, "windowed")) cfg.mode = MODE_WINDOWED;
@@ -154,9 +163,11 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "pacing")) parse_pacing(value);
         else if (!_stricmp(key, "latency")) cfg.latency = atoi(value);
         else if (!_stricmp(key, "hide_cursor")) cfg.hide_cursor = atoi(value) != 0;
+        else if (!_stricmp(key, "gpu")) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", value);
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
+    if ((env = getenv("SSBU_GPU")) && *env) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", env);
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
@@ -175,6 +186,7 @@ static void load(void) {
 
 int display_latency(void) { load(); return cfg.latency; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
+const char *display_gpu(void) { load(); return cfg.gpu; }
 
 #ifdef _WIN32
 void display_dpi_aware(void) {

@@ -1235,9 +1235,10 @@ DWORD kernel_lock_owner(void);
 
 /* what the rest of the runtime would give the loader and kernel */
 u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_stat_dispatched, gfx_stat_residents, gfx_stat_clears,
-    gfx_stat_drawn, gfx_stat_skipped, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us, gfx_skip_shader,
-    gfx_skip_topology, gfx_skip_target;
+    gfx_stat_drawn, gfx_stat_skipped, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked, gfx_stat_watch_us,
+    gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_unmap_dropped;
 u64 present_frames(void) { return 0; }
+void gpu_memory_unmapping(u64 addr, u64 size) { (void)addr; (void)size; }   /* (hle_nv.c's: no GPU here) */
 void gfx_report_compiles(void (*line)(const char *text)) { line("(shimtest: no shaders)\n"); }
 void display_dpi_aware(void) {}
 void fiber_counts(u32 *slots, u32 *finalized, u64 *made) { *slots = *finalized = 0; *made = 0; }

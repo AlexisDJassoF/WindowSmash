@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'linux'))
@@ -67,6 +68,104 @@ class SystemTests(unittest.TestCase):
         self.assertIsNone(pm('ID=nixos\n'))
         self.assertIsNone(pm('ID=fedora\n', have=lambda tool: tool != 'dnf'))   # (its tool missing)
         self.assertEqual(set(il.PACKAGES), set(il.INSTALL))
+
+    def test_image_based_fedora(self):
+        """An ostree-booted system (Silverblue, Kinoite, Bazzite, Bluefin, Aurora): rpm-ostree, whatever its ID;
+        dnf is there too, but its system folders are read-only."""
+        bazzite = 'NAME="Bazzite"\nID=bazzite\nID_LIKE="fedora"\nVERSION_ID=42\nVARIANT_ID=bazzite\n'
+        silverblue = 'NAME="Fedora Linux"\nID=fedora\nVERSION_ID=42\nVARIANT_ID=silverblue\n'
+        for text in (bazzite, silverblue):
+            self.assertEqual(il.package_manager(il.os_release(text), image_based=True), 'rpm-ostree')
+            self.assertEqual(il.package_manager(il.os_release(text), image_based=False), 'dnf')
+        self.assertEqual(il.package_manager(il.os_release(bazzite), lambda tool: tool != 'rpm-ostree', image_based=True), 'dnf')
+        self.assertEqual(il.PACKAGES['rpm-ostree'], il.PACKAGES['dnf'])
+
+    def test_layering(self):
+        def run_with(results):
+            calls = []
+
+            def run(cmd):
+                calls.append(cmd)
+                return results.pop(0)
+            return run, calls
+        missing = ['clang', 'SDL2-devel', 'vulkan-tools']
+        run, calls = run_with([True])                       # applied to the running system
+        self.assertTrue(il.install_layered(missing, run))
+        self.assertEqual(calls, [['rpm-ostree', 'install', '--idempotent', '--allow-inactive', '--apply-live', *missing]])
+        run, calls = run_with([False, True])                # (an unknown optional one) again without it
+        self.assertTrue(il.install_layered(missing, run))
+        self.assertEqual(calls[1][-2:], ['clang', 'SDL2-devel'])
+        run, calls = run_with([False, False, True])         # not live: for the next start
+        self.assertTrue(il.install_layered(missing, run))
+        self.assertNotIn('--apply-live', calls[2])
+        run, calls = run_with([False, False, False])
+        self.assertFalse(il.install_layered(missing, run))
+        run, calls = run_with([False])                      # only optional ones, not taken: no more tries
+        self.assertFalse(il.install_layered(['vulkan-tools'], run))
+        self.assertEqual(len(calls), 1)
+
+    def test_still_missing(self):
+        here = {'clang', 'lld'}
+        self.assertEqual(il.still_missing(['clang', 'lld', 'bison', 'zenity'], lambda p: p in here), ['bison'])
+
+    def test_headers_on_disk(self):
+        # sdl2 installed as far as pacman knows, its headers not there (SteamOS leaves them out of its image)
+        there = {'/usr/include/stdio.h', '/usr/include/linux/userfaultfd.h', '/usr/include/opus/opus.h',
+                 '/usr/include/vpx/vpx_decoder.h'}
+        self.assertEqual(il.missing_headers('pacman', there.__contains__), [('SDL2/SDL.h', 'sdl2')])
+        self.assertEqual(il.missing_headers('apt', lambda p: True), [])
+        self.assertIn(('SDL2/SDL.h', 'SDL2-devel'), il.missing_headers('rpm-ostree', lambda p: False))
+        self.assertIn(('SDL2/SDL.h', None), il.missing_headers(None, lambda p: False))
+
+    def test_header_packages(self):
+        # each header's package is the one in the package list that the build installs (or one it pulls in)
+        for manager, pkgs in il.PACKAGES.items():
+            for header, by in il.HEADERS.items():
+                if header.split('/')[0] in ('SDL2', 'opus', 'vpx'):
+                    self.assertIn(by['dnf' if manager == 'rpm-ostree' else manager], pkgs, (manager, header))
+
+    def test_putting_headers_back(self):
+        here = {'sdl2'}
+        self.assertEqual(il.header_fix('pacman', ['sdl2', 'opus'], here.__contains__),
+                         [['pacman', '-S', '--noconfirm', 'sdl2'], ['pacman', '-S', '--needed', '--noconfirm', 'opus']])
+        self.assertEqual(il.header_fix('apt', ['libsdl2-dev'], lambda p: True),
+                         [['apt-get', 'install', '-y', '--reinstall', 'libsdl2-dev']])
+        self.assertEqual(il.header_fix('dnf', ['SDL2-devel'], lambda p: False), [['dnf', 'install', '-y', 'SDL2-devel']])
+
+    def step_3(self, gone, puts_back=True, ro=False, no_packages=False):
+        """step_packages on SteamOS as a tester had it: every package installed as far as pacman knows,
+        the headers in gone not there. The commands it ran."""
+        calls = []
+
+        def run(cmd, dry):
+            calls.append(cmd)
+            if puts_back:
+                gone.clear()
+            return True
+        with unittest.mock.patch.multiple(il, read_text=lambda path: 'ID=steamos\nID_LIKE=arch\n',
+                                          installed=lambda m, p: True, sudo_run=run, vulkan_ready=lambda: True,
+                                          info=lambda text: None, step=lambda text: None, read_only=lambda path='/usr': ro,
+                                          missing_headers=lambda m, exists: [(h, by[m]) for h, by in il.HEADERS.items()
+                                                                             if h in gone]), \
+                unittest.mock.patch('shutil.which', return_value='/usr/bin/pacman'), \
+                unittest.mock.patch('os.path.exists', return_value=False):
+            il.step_packages(types.SimpleNamespace(no_packages=no_packages, dry_run=False))
+        return calls
+
+    def test_step_3_puts_headers_back(self):
+        self.assertEqual(self.step_3({'SDL2/SDL.h', 'stdio.h'}), [['pacman', '-S', '--noconfirm', 'glibc', 'sdl2']])
+        self.assertEqual(self.step_3({'SDL2/SDL.h'}), [['pacman', '-S', '--noconfirm', 'sdl2']])
+        self.assertEqual(self.step_3(set()), [])
+        with self.assertRaises(il.Stop) as stop:                    # still not there after: says which
+            self.step_3({'SDL2/SDL.h'}, puts_back=False)
+        self.assertIn('SDL2/SDL.h', str(stop.exception))
+        with self.assertRaises(il.Stop) as stop:                    # read-only system folders: says so first
+            self.step_3({'SDL2/SDL.h'}, ro=True)
+        self.assertIn('steamos-readonly disable', str(stop.exception))
+        with self.assertRaises(il.Stop) as stop:                    # --no-packages: names the package
+            self.step_3({'opus/opus.h'}, no_packages=True)
+        self.assertIn('opus/opus.h', str(stop.exception))
+        self.assertIn(': opus,', str(stop.exception))
 
     def test_packages_cover_the_build(self):
         for manager, pkgs in il.PACKAGES.items():
@@ -211,7 +310,8 @@ class BuildOnLinuxTests(unittest.TestCase):
             MODULES=str(dump / 'modules'), SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'),
             EXE=str(top / 'port' / 'build-linux' / 'ssbu'), log=lambda msg='': None, check_tools=lambda: None,
             install_packages=lambda: None, ask_folder=lambda key, given, saved: str(top),
-            romfs_cfg_ok=lambda cfg: True, missing_fonts=lambda folder: [], check_same_game=lambda rec: None,
+            romfs_cfg_ok=lambda cfg: True, check_game_data=lambda cfg, game: None, missing_fonts=lambda folder: [],
+            check_same_game=lambda rec: None,
             find_program=lambda game, keys: ('p', 0x01006A800016E000, {}, {'contents': []}),
             installed_ram_gb=lambda: 8.0, linux_toolchain=lambda: fake_tc,
             run=lambda args, failure: self.calls.append([str(a) for a in args]))
@@ -238,6 +338,92 @@ class BuildOnLinuxTests(unittest.TestCase):
         self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_linux.py'])
 
 
+    def test_game_files_not_asked_for_when_read(self):
+        # an update's build: dump/ has everything from the game files, so no folder is asked for
+        asked = []
+        self.ns['ask_folder'] = lambda key, given, saved: asked.append(key) or str(self.vkd3d)
+        self.ns['build'](self.args)
+        self.assertEqual(asked, [])
+        self.assertTrue(self.ns['prepared']())
+
+    def test_no_dlc_is_remembered(self):
+        # without DLC there is no aoc.cfg: the game folder was asked for at every build
+        modules = Path(self.ns['MODULES'])
+        (modules / 'aoc.cfg').unlink()
+        asked = []
+        self.ns['ask_folder'] = lambda key, given, saved: asked.append(key) or self.temp.name
+        self.assertFalse(self.ns['prepared']())
+        self.ns['build'](self.args)
+        self.assertEqual(asked, ['game', 'keys'])
+        self.assertTrue((modules / 'aoc.none').is_file())
+        self.assertTrue(self.ns['prepared']())
+        self.ns['build'](self.args)
+        self.assertEqual(asked, ['game', 'keys'])
+        # a game folder named now is looked at again, and may have DLC
+        self.args.game = self.temp.name
+        self.ns['build'](self.args)
+        self.assertEqual(asked, ['game', 'keys', 'game', 'keys'])
+
+    def test_check_ready(self):
+        modules = Path(self.ns['MODULES'])
+        with unittest.mock.patch.object(sys, 'argv', ['build_game.py', '--check-ready']):
+            self.assertEqual(self.ns['main'](), 0)
+            (modules / 'aoc.cfg').unlink()
+            self.assertEqual(self.ns['main'](), 1)
+            self.ns['missing_fonts'] = lambda folder: ['x.bfttf']
+            (modules / 'aoc.none').write_text('')
+            self.assertEqual(self.ns['main'](), 1)
+
+
+class RebuildTests(unittest.TestCase):
+    """Run again after an update: the game files that were read already are not asked for."""
+
+    def args(self, **kw):
+        return types.SimpleNamespace(**{**dict(game=None, keys=None, firmware=None, dry_run=False, online_name=None, yes=False,
+                                               jobs=None, skip_build=False), **kw})
+
+    def test_not_asked_when_read(self):
+        patches = [unittest.mock.patch.object(il, 'files_ready', return_value=True),
+                   unittest.mock.patch.object(il, 'venv_python', return_value=sys.executable),
+                   unittest.mock.patch.object(il, 'read_text', return_value='Me\n'),
+                   unittest.mock.patch.object(il, 'ask', side_effect=AssertionError('asked'))]
+        with contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO()):
+            for p in patches:
+                stack.enter_context(p)
+            files = il.step_files(self.args())
+        self.assertEqual(files, {'game': None, 'keys': None, 'firmware': None, 'name': 'Me'})
+
+    def test_a_named_game_folder_is_looked_at(self):
+        with unittest.mock.patch.object(il, 'files_ready', side_effect=AssertionError('checked')),                 unittest.mock.patch.object(il, 'venv_python', return_value=sys.executable),                 unittest.mock.patch.object(il, 'check_keys', return_value=(False, 'no')),                 contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(il.Stop):   # (not interactive: the keys folder it was given is no good)
+                il.step_files(self.args(game='/g', keys='/k', firmware='/f', yes=True))
+
+    def test_build_command_has_only_the_folders_given(self):
+        seen = []
+        run = lambda cmd, **kw: seen.append(cmd) or types.SimpleNamespace(returncode=0)   # noqa: E731
+        with unittest.mock.patch.object(il.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()):
+            il.step_build(self.args(), {'game': None, 'keys': None, 'firmware': None})
+            il.step_build(self.args(), {'game': '/g', 'keys': '/k', 'firmware': '/f'})
+        self.assertNotIn('--game', seen[0])
+        self.assertEqual(seen[1][seen[1].index('--game') + 1], '/g')
+
+
+class CheckToolsTests(unittest.TestCase):
+    def test_missing_header_named(self):
+        # SDL2's headers gone (SteamOS): the check says which file, before trying the compiler
+        ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_check')['build'].__globals__
+        tc = types.SimpleNamespace(DXVK_LIBS='dxvk', DXVK_INCLUDE='include', VKD3D_SRC='vkd3d', TOOLCHAIN='deps',
+                                   CLANG='/usr/bin/clang', TARGET=[])
+        ns.update(linux_toolchain=lambda: tc, log=lambda msg='': None)
+        with unittest.mock.patch('shutil.which', return_value='/usr/bin/bison'), \
+                unittest.mock.patch('os.path.exists', side_effect=lambda p: not p.endswith('SDL.h')), \
+                unittest.mock.patch('subprocess.run') as run:
+            with self.assertRaises(ns['Failed']) as failed:
+                ns['check_linux_tools']()
+        self.assertIn('SDL2/SDL.h missing from /usr/include', str(failed.exception))
+        run.assert_not_called()
+
+
 class GenerateOnlyTests(unittest.TestCase):
     def test_no_compile_no_link(self):
         """recomp.py all --generate-only: every module's C, stamped; nothing compiled or linked."""
@@ -252,20 +438,22 @@ class GenerateOnlyTests(unittest.TestCase):
             g.update(
                 TREE=tmp, NRO_DIR=os.path.join(tmp, 'nro'),
                 module_paths=lambda e: {'main': os.path.join(e, 'main'), 'sdk': os.path.join(e, 'sdk')},
-                check=lambda e: 0, tools_fingerprint=lambda: 'fp', image=lambda nso, img: done.append(('image', nso)),
-                Module=lambda nso: types.SimpleNamespace(build_id='b' * 64), MODULES={'main': 1, 'sdk': 2},
+                check=lambda e, mods=None: 0, tools_fingerprint=lambda: 'fp', image=lambda nso, img: done.append(('image', nso)),
+                Module=lambda nso: types.SimpleNamespace(build_id='b' * 64, text=types.SimpleNamespace(mem=0, end=4000)),
+                MODULES={'main': 1, 'sdk': 2}, stale_files=lambda target: [],
                 build=lambda nso, target, jobs, per_file: done.append(('build', os.path.basename(target))),
-                compile_dir=lambda target, jobs: done.append(('compile', target)) or True,
+                compile_dir=lambda target, jobs, shown=None: done.append(('compile', target)) or True,
                 link=lambda dirs, exe: done.append(('link', exe)) or True,
                 modcache=types.SimpleNamespace(build_info=lambda t: None, find_built=lambda *x: None,
                                                write_stamp=lambda t, *x: stamps.append(os.path.basename(t))))
-            with contextlib.redirect_stdout(io.StringIO()):
+            no_title = unittest.mock.patch.object(g['progress'], 'save_title', return_value=None)   # (the bar's)
+            with contextlib.redirect_stdout(io.StringIO()), no_title:
                 self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4, False))
             self.assertEqual([d for d in done if d[0] in ('compile', 'link')], [])
             self.assertEqual([d[1] for d in done if d[0] == 'build'], ['main', 'sdk'])
             self.assertEqual(stamps, ['main', 'sdk'])
             done.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), no_title:
                 self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4))   # (the Windows build: both)
             self.assertEqual([d[0] for d in done if d[0] in ('compile', 'link')], ['compile', 'compile', 'link'])
 

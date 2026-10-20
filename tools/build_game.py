@@ -24,7 +24,9 @@ carries on where it stopped. --check does the first step only (the installer use
                tools/Configure-Game-Data.ps1; without one, the program NCA's own RomFS, read in
                place when it is decrypted (tools/nca.py romfs-cfg), else decrypted first into
                dump/modules (tools/nca.py decrypt); an update's, which is a patch, is applied
-               over the base's next to it (tools/update.py apply: a layered romfs.cfg)
+               over the base's next to it (tools/update.py apply: a layered romfs.cfg); then
+               data.arc's file table is checked (tools/arc.py table_form): an early release's,
+               without a newer update, can't be read yet, and the update is the way on
   7. dlc       dump/modules/aoc.cfg from the game folder's dlc folder (DLC .nsp files, or
                installed content), or from the DLC installed next to the game (an emulator's)
   8. fighters  the fighter modules in data.arc into dump/nro (tools/arc.py nro, which skips the
@@ -53,6 +55,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -155,6 +158,19 @@ def romfs_cfg_ok(cfg):
     return bool(files) and all(os.path.isfile(p) for p in files)
 
 
+def aoc_done(modules=None):
+    """The DLC step is done: aoc.cfg is there, or step 7 found no DLC (aoc.none)."""
+    modules = modules or MODULES
+    return os.path.exists(os.path.join(modules, "aoc.cfg")) or os.path.exists(os.path.join(modules, "aoc.none"))
+
+
+def prepared():
+    """Everything step 3 to 8 make from the game files is there: the program, the fonts, the game
+    data's cfg (and the files it reads) and the DLC step. Then the game files are not asked for."""
+    return (not [n for n in EXEFS_FILES if not os.path.isfile(os.path.join(EXEFS, n))]
+            and not missing_fonts(FONTS) and romfs_cfg_ok(os.path.join(MODULES, "romfs.cfg")) and aoc_done())
+
+
 def missing_packages(requirements):
     """The packages of a requirements file that are not installed."""
     from importlib import metadata
@@ -242,6 +258,11 @@ def check_linux_tools():
     absent = [name for name, path in parts.items() if not path or not os.path.exists(path)]
     if absent:
         raise Failed(f"{', '.join(absent)} not found in {tc.TOOLCHAIN}. Run install-windowsmash.sh: it downloads them.")
+    import install_linux   # (beside toolchain.py)
+    gone = [h for h, _ in install_linux.missing_headers(None, os.path.exists)]
+    if gone:
+        raise Failed(f"{', '.join(gone)} missing from {install_linux.INCLUDE}, and the build needs them (a package can be "
+                     "installed without its headers). Run install-windowsmash.sh: it puts back the packages they come with.")
     with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
         src, exe = os.path.join(tmp, "check.cpp"), os.path.join(tmp, "check")
         with open(src, "w") as f:
@@ -564,6 +585,31 @@ def missing_fonts(folder):
     return [n for n in FONT_FILES if not os.path.isfile(os.path.join(folder, n))]
 
 
+def early_release(game, form):
+    """What to do about game data whose data.arc tools/arc.py can't read (arc.table_form): an
+    early release's. Step 4 has set this folder up for that release already (game_source.txt), so
+    the build with the update goes in a fresh folder."""
+    where = game or "your game folder"
+    by_hand = os.path.isfile(os.path.join(game, "romfs.bin")) if game else False
+    return (f"The game in {where} is an early release, without a newer update: WindowSmash can't read its data "
+            f"yet ({form}).\n"
+            f"  1. Put the game's update (an .nsp file; the newest you have) in {where}, next to the game."
+            + (" Make romfs.bin again too, with the update applied (setup guide part 2)." if by_hand else "") + "\n"
+            "  2. This WindowSmash folder is set up for that early release now and would refuse the update: extract "
+            "a fresh WindowSmash folder and run Install WindowSmash.bat there.")
+
+
+def check_game_data(cfg, game):
+    """The game data step 6 connected has a data.arc that tools/arc.py (step 8) reads."""
+    import arc
+    try:
+        form, layout, _size = arc.game_data_form(cfg)
+    except (SystemExit, OSError, ValueError, struct.error) as e:
+        raise Failed(f"The game data in {cfg} can't be read: {e}")
+    if not arc.readable(form, layout):
+        raise Failed(early_release(game, arc.form_text(form, layout)))
+
+
 def write_romfs_cfg(game, keys, the_program):
     romfs_bin = os.path.join(game, "romfs.bin")
     if os.path.isfile(romfs_bin) and (LINUX or MACOS):   # (Configure-Game-Data.ps1's checks are Windows-only: the format's here)
@@ -583,8 +629,12 @@ def write_romfs_cfg(game, keys, the_program):
             f"{romfs_bin} could not be used (see above): it must be the game's data, unencrypted and with "
             "your update applied (setup guide part 2).")
         return
+    import arc
     import gamefiles
     path, _title, program, result = the_program()
+    form = program.get("data_arc")   # (told by the scan: no decrypting a release whose data can't be used)
+    if form and not arc.readable(*form):
+        raise Failed(early_release(game, arc.form_text(*form)))
     cfg = os.path.join("dump", "modules", "romfs.cfg")
     state = program["romfs"]
     if state == "plain":   # readable in place
@@ -642,7 +692,7 @@ def write_version():
         data = f"{v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}"
         text = (f"{data}\n# game version of this folder (tools/build_game.py): the version, then what it is made of\n"
                 f"main {Module(os.path.join(EXEFS, 'main')).build_id}\ndata.arc {data}\n")
-    except Exception as e:
+    except (SystemExit, Exception) as e:   # (arc.py says what it can't read with SystemExit)
         log(f"  (the game version could not be read for the launchers: {e})")
         return
     with open(path, "w", newline="\n") as f:
@@ -742,7 +792,9 @@ def build(a):
     log("\n[2/9] Install the Python packages")
     install_packages()
 
-    cfg, aoc = os.path.join(MODULES, "romfs.cfg"), os.path.join(MODULES, "aoc.cfg")
+    cfg, aoc, no_aoc = os.path.join(MODULES, "romfs.cfg"), os.path.join(MODULES, "aoc.cfg"), os.path.join(MODULES, "aoc.none")
+    if a.game and os.path.exists(no_aoc):   # (a game folder named now may have DLC that the last one hadn't)
+        os.remove(no_aoc)
     exefs_done = not [n for n in EXEFS_FILES if not os.path.isfile(os.path.join(EXEFS, n))]
     romfs_done = romfs_cfg_ok(cfg)
     log("\n[3/9] Your folders")
@@ -750,7 +802,7 @@ def build(a):
     saved = load_saved()
     game = keys = firmware = fonts_from = None
     # (a game folder named on the command line is always looked at: it may hold another version now)
-    if a.game or not (exefs_done and romfs_done and os.path.exists(aoc)):
+    if a.game or not (exefs_done and romfs_done and aoc_done()):
         game = ask_folder("game", a.game, saved)
     if missing_fonts(FONTS):
         fonts_from = "game" if game and not missing_fonts(os.path.join(game, "fonts")) else "firmware"
@@ -799,15 +851,18 @@ def build(a):
         if os.path.exists(cfg):
             log(f"  {cfg} reads a file that is not there any more: setting it again")
         write_romfs_cfg(game, keys, the_program)
+    check_game_data(cfg, game or saved.get("game"))
 
     log(shown("\n[7/9] Turn on your DLC (dump\\modules\\aoc.cfg)"))
-    if os.path.exists(aoc):
+    if aoc_done():
         log("  already done")
     else:
         _path, title, rec, result = the_program()
         dlc = dlc_folder(game, rec, result["contents"])
         if not dlc:
             log(f"  no dlc folder in {game}, and no DLC among its files: no DLC")
+            with open(no_aoc, "w", newline="\n") as f:   # (so that the game files are not asked for again for this)
+                f.write("no DLC was found in the game files; give --game to look again\n")
         else:
             run([sys.executable, os.path.join("tools", "nca.py"), "aoc-cfg", dlc, "--keys", keys,
                  "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{title & ~0xFFF:016X}"],
@@ -909,7 +964,11 @@ def main():
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
     ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
     ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")
+    ap.add_argument("--check-ready", action="store_true",
+                    help="only say (exit status 0) whether steps 3 to 8 are done, so that no game files are needed")
     a = ap.parse_args()
+    if a.check_ready:
+        return 0 if prepared() else 1
     try:
         if a.check:
             log("[1/9] Check the tools")

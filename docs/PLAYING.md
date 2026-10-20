@@ -123,8 +123,9 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 | `pacing` | `clock`: a steady 60 frames a second. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. | `clock` |
 | `latency` | How many frames the graphics card may work ahead, 1–3. Lower is more responsive. | `3` |
 | `hide_cursor` | `1` hides the mouse pointer after two seconds without movement. | `1` |
+| `gpu` | Which graphics card draws the game. `auto`: the fastest; on a laptop with two, the NVIDIA or AMD one rather than the processor's own. Or part of a card's name, such as `nvidia`, `radeon` or `intel`. `build\play.log` lists the cards found (a `[gfx] graphics cards` line). | `auto` |
 
-`controllers.ini` and `display.ini` apply to every game version started from the same folder.
+`controllers.ini` and `display.ini` apply to every game version started from the same folder. A `display.ini` written by an older version has no `gpu` line; the game then uses `auto`.
 
 ## Shaders and first-time stutter
 
@@ -136,6 +137,7 @@ To prepare them all before playing, double-click **`launchers\Prepare Shaders.ba
 
 If matches run slowly on a PC that should manage them (press <kbd>F1</kbd> for the frame rate), check these first:
 
+- **A laptop is drawing with its processor's graphics.** With two graphics chips, the game takes the NVIDIA or AMD one by itself. Check the `[gfx] drawing with` line near the top of `build\play.log`, and see `gpu` in [`display.ini`](#window-and-display).
 - **Prepare Shaders is still running.** It uses most of the processor; let it finish, or close it while you play.
 - **NVIDIA's shader cache is off.** In NVIDIA Control Panel → *Manage 3D settings*, set **Shader Cache Size** to *Driver default* (not *Disabled*). Without it, the graphics driver redoes its part of every shader each time the game starts.
 - **Windows uses a slow system timer.** Some "gaming tweaks" set Windows to time everything with an old, slow timer (the HPET). WindowSmash notices and works around it, and says so near the top of `build\play.log`: a `[clock]` line ending in *slow*. Other programs stay slower, though; to undo the tweak, run `bcdedit /deletevalue useplatformclock` in a Command Prompt opened as administrator, then restart the PC.

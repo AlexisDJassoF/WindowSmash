@@ -56,9 +56,20 @@ char *shader_hlsl(const u8 *program, u32 size, int stage, u32 vs_outputs, Shader
 typedef u32 CbufReader(void *user, u32 bank, u32 offset);
 char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
 
+/* A pixel shader that also does the fixed-function alpha test (ALPHA_TEST): render target 0's
+ * alpha compared with DrawParams.frag[3], the pixel discarded when the outcome (less, equal,
+ * greater, or unordered) is not one of the bits in frag[2] (see alpha_test_mask). Draws with the
+ * test on use it in place of the plain one. */
+char *shader_hlsl_alpha_tested(const u8 *program, u32 size, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
+
 /* A compute program (no header: pass it with 0x50 bytes of anything in front, so that its
  * addresses line up with those of the other stages), its workgroup size and shared memory. */
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user);
+
+/* The alpha test's passing outcomes for a D3D11_COMPARISON_FUNC (NEVER 1 .. ALWAYS 8): bit 0 the
+ * alpha less than the reference, 1 equal, 2 greater - the function less one - and 3 unordered
+ * (a NaN), which only NOT_EQUAL and ALWAYS pass. */
+static inline u32 alpha_test_mask(u32 func) { return (func - 1) | (func == 6 || func == 8 ? 8u : 0u); }
 
 /* Output languages: HLSL for fxc (Windows), HLSL within what vkd3d-shader compiles (Linux, or
  * SSBU_HLSL_FOR_VKD3D; shader_hlsl* write the build's), Metal Shading Language (macOS). */
@@ -69,6 +80,8 @@ enum { SHADER_HLSL_FXC, SHADER_HLSL_VKD3D, SHADER_MSL };
  * threads at once in MSL (HLSL names texture results by a count shared by every program). */
 char *shader_translate(int lang, const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared,
                        ShaderInfo *info, CbufReader *read, void *user);
+/* And a pixel shader with the alpha test, as shader_hlsl_alpha_tested's, in any of them. */
+char *shader_translate_alpha_tested(int lang, const u8 *program, u32 size, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
 
 /* ---- Metal (SHADER_MSL) -------------------------------------------------------------------
  * Entry points vs_main, ps_main, cs_main, each with, in its stage's argument tables:
@@ -133,7 +146,7 @@ static inline int shader_msl_texture(const ShaderTexture *t) {
 typedef struct DrawParams {
     u32 attr[32][4];       /* vertex attribute: format word, stream stride, instance divisor (0: per vertex), stream bound */
     float fix[4];          /* clip-space fix-up: x sign, y sign, z scale, z offset */
-    float frag[4];         /* fragment y: flip (nonzero), render target height */
+    float frag[4];         /* fragment y: flip (nonzero), render target height; alpha test: passing outcomes (bits, not a float), reference */
     u32 base[4];           /* base vertex, base instance */
     u32 swz[2][32];        /* per texture of each stage (vertex, pixel): component sources, 3 bits each (MSL: bits 12-24 the sampler's LOD bias) */
     u32 sb[2][16][4];      /* per storage buffer of each stage: GPU address low, high, size */

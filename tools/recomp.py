@@ -50,6 +50,7 @@ from multiprocessing import Pool
 # sets up when the PC has none) does not put a script's own folder on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modcache  # noqa: E402
+import progress  # noqa: E402
 from funcs import discover  # noqa: E402
 from lift import Lifter  # noqa: E402
 from nso import Module  # noqa: E402
@@ -204,8 +205,9 @@ def resolve_wraps(mod, base, sizes, name):
 
 def tools_fingerprint():
     """What the generated C depends on besides the module and its address (modcache)."""
+    import lift
     wraps = sorted(hle_wraps().items())
-    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps))
+    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + f"\nregcache {int(lift.REGCACHE)}")
 
 
 def write_if_changed(path, text):
@@ -515,22 +517,35 @@ def build(path, outdir, jobs, per_file):
           f"{imports:,} symbols referenced by {relocs:,} relocations")
 
 
-def compile_dir(outdir, jobs):
-    import cc
+def stale_files(outdir):
+    """What compile_dir compiles, in order: (source, object, optimisation level, estimated
+    seconds: progress.file_cost) of each file whose object is missing or older than it."""
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
     todo = []
-    for name, _insns, biggest in rows + [["g_module.c", "0", "0"]]:
+    for name, insns, biggest in rows + [["g_module.c", "0", "0"]]:
         src = os.path.join(outdir, name)
         obj = src[:-2] + ".obj"
         if not os.path.exists(obj) or os.path.getmtime(obj) < os.path.getmtime(src):
             # very large functions make the optimiser superlinear; build those at a lower level
-            todo.append((src, obj, "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2"))
-    for _src, obj, _opt in todo:   # a new file, not one written through (it may be a link: modcache.adopt)
+            todo.append((src, obj, "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2",
+                         progress.TABLE if name == "g_module.c" else progress.file_cost(int(insns), int(biggest))))
+    return todo
+
+
+def compile_dir(outdir, jobs, shown=None):
+    """Compile a module's stale files; `shown`, a progress.Build, follows them."""
+    import cc
+    todo = stale_files(outdir)
+    for _src, obj, _opt, _cost in todo:   # a new file, not one written through (it may be a link: modcache.adopt)
         if os.path.exists(obj):
             os.remove(obj)
     t0 = time.time()
-    failures = cc.compile_each(todo, jobs)
+    if shown:
+        shown.begin("compile", os.path.basename(outdir), [(src, cost) for src, _obj, _opt, cost in todo])
+    failures = cc.compile_each([t[:3] for t in todo], jobs, *((shown.started, shown.finished) if shown else ()))
+    if shown:
+        shown.end("compile", os.path.basename(outdir))
     objs = [n for n in os.listdir(outdir) if n.endswith(".obj")]
     total = sum(os.path.getsize(os.path.join(outdir, n)) for n in objs)
     print(f"{os.path.basename(outdir)}: compiled {len(todo) - len(failures)} of {len(todo)} stale files in "
@@ -609,46 +624,67 @@ def module_paths(exefs):
     return {name: os.path.join(NRO_DIR, name + ".nro") if name in nros else os.path.join(exefs, name) for name in MODULES}
 
 
-def check(exefs):
+def check(exefs, mods=None):
     """The imports no module exports and the runtime does not implement, listed before
-    anything is compiled."""
-    mods = {name: Module(path) for name, path in module_paths(exefs).items()}
+    anything is compiled. mods: the modules, if loaded already (name -> Module)."""
+    mods = mods or {name: Module(path) for name, path in module_paths(exefs).items()}
     return modcache.report_imports(mods, hle_names(), os.path.join(TREE, "build", "imports.unresolved.txt"))
 
 
 def build_all(exefs, out, jobs, compile_c=True):
-    dirs = []
+    """Every module's C first, then each module's compile, then the link: once the C is there,
+    what is left to compile is known, and the progress bar's time left (progress.Build) can say
+    how long it takes. compile_c False (--generate-only): the C only."""
     paths = module_paths(exefs)
-    check(exefs)
+    mods = {name: Module(path) for name, path in paths.items()}
+    check(exefs, mods)
     fp = tools_fingerprint()
-    reused = 0
-    for name, nso in paths.items():
-        target = os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
-        img = os.path.join(TREE, "dump", "modules", name + ".reloc.bin")
-        if not os.path.exists(img) or os.path.getmtime(img) < os.path.getmtime(nso):
-            image(nso, img)
-        mod, base = Module(nso), MODULES[name]
-        info = modcache.build_info(target)
-        if not info or info[:2] != (mod.build_id, base):   # another tree may have built it
-            src = modcache.find_built(mod.build_id, base, target, fp)
-            if src:
-                linked, copied = modcache.adopt(src, target)
-                print(f"{name}: build files of {src} ({linked} linked, {copied} copied)")
-                info = modcache.build_info(target)
-        if info == (mod.build_id, base, name, fp):
-            print(f"{name}: C up to date (build id {mod.build_id[:16]}, same tools)")
-            reused += 1
-        else:
-            build(nso, target, jobs, 40000)
-        if compile_c and not compile_dir(target, min(jobs, 16)):
-            return False
-        modcache.write_stamp(target, mod.build_id, base, name, fp)
-        dirs.append(target)
-    print(f"{reused} of {len(paths)} modules reused without generating their C again")
-    if not compile_c:
-        print(f"the C of {len(dirs)} modules is in {out} (--generate-only: not compiled here)")
-        return True
-    return link(dirs, os.path.join(out, "ssbu.exe"))
+    targets = {name: os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
+               for name, nso in paths.items()}
+    shown = progress.Build(min(jobs, 16), compile=compile_c, link=progress.LINK if compile_c else None)
+    for name, mod in mods.items():
+        current = modcache.build_info(targets[name]) == (mod.build_id, MODULES[name], name, fp)
+        shown.module(name, (mod.text.end - mod.text.mem) // 4,
+                     [(t[0], t[3]) for t in stale_files(targets[name])] if current else None)
+    build_ids = {name: mod.build_id for name, mod in mods.items()}
+    del mods   # (the compilers want the memory)
+    exe = os.path.join(out, "ssbu.exe")
+    with progress.Line(shown.status, title=f"building {os.path.basename(exe)}" if compile_c else "writing the game's C"):
+        reused = 0
+        for name, nso in paths.items():
+            shown.begin("gen", name)
+            target, build_id, base = targets[name], build_ids[name], MODULES[name]
+            img = os.path.join(TREE, "dump", "modules", name + ".reloc.bin")
+            if not os.path.exists(img) or os.path.getmtime(img) < os.path.getmtime(nso):
+                image(nso, img)
+            info = modcache.build_info(target)
+            if not info or info[:2] != (build_id, base):   # another tree may have built it
+                src = modcache.find_built(build_id, base, target, fp)
+                if src:
+                    linked, copied = modcache.adopt(src, target)
+                    print(f"{name}: build files of {src} ({linked} linked, {copied} copied)")
+                    info = modcache.build_info(target)
+            if info == (build_id, base, name, fp):
+                print(f"{name}: C up to date (build id {build_id[:16]}, same tools)")
+                reused += 1
+            else:
+                build(nso, target, jobs, 40000)
+            if not compile_c:
+                modcache.write_stamp(target, build_id, base, name, fp)
+            shown.written(name, [(t[0], t[3]) for t in stale_files(target)])
+            shown.end("gen", name)
+        print(f"{reused} of {len(paths)} modules reused without generating their C again")
+        if not compile_c:
+            print(f"the C of {len(paths)} modules is in {out} (--generate-only: not compiled here)")
+            return True
+        for name in paths:
+            if not compile_dir(targets[name], min(jobs, 16), shown):
+                return False
+            modcache.write_stamp(targets[name], build_ids[name], MODULES[name], name, fp)
+        shown.begin("link")
+        ok = link(list(targets.values()), exe)
+        shown.end("link")
+        return ok
 
 
 def arg(name, default=None):

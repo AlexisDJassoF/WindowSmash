@@ -36,9 +36,10 @@ except ImportError:                                               # 3.10 to 3.13
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arc as A    # noqa: E402
-import cc          # noqa: E402
+from progress import bar, time_left   # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LINUX = sys.platform.startswith("linux")   # (compiled with vkd3d-shader there, with fxc on Windows)
 LOW40 = (1 << 40) - 1
 MAX_PROGRAM = 0x40000   # as the renderer reads
 
@@ -118,19 +119,65 @@ def write_pack(programs, path):
 
 def build_tool(exe):
     sources = [os.path.join(ROOT, "tools", "shaderaot.c"), os.path.join(ROOT, "runtime", "gpu_shader.c")]
-    headers = [os.path.join(ROOT, "runtime", n) for n in ("gpu_shader.h", "gpu_shader_cache.h")]
+    headers = [os.path.join(ROOT, "runtime", n) for n in ("host.h", "gpu_shader.h", "gpu_shader_cache.h")]
+    if LINUX:
+        sources.append(os.path.join(ROOT, "runtime", "linux", "d3dcompile_vkd3d.c"))
     if os.path.exists(exe) and os.path.getmtime(exe) > max(os.path.getmtime(p) for p in sources + headers):
         return
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    if LINUX:
+        build_tool_linux(exe, sources)
+        return
+    import cc
     r = subprocess.run([cc.CLANG, "/nologo", "/O2", *cc.CFLAGS, *sources, "/Fe" + exe, "/link", "d3dcompiler.lib"],
                        capture_output=True, text=True, cwd=os.path.dirname(exe))
     if r.returncode:
         raise SystemExit("cannot build shaderaot:\n" + (r.stdout + r.stderr)[-3000:])
 
 
+def build_tool_linux(exe, sources):
+    """On Linux the renderer's D3DCompile is vkd3d-shader (runtime/linux/d3dcompile_vkd3d.c): the tool
+    is linked with it, so that it makes the same DXBC the game would."""
+    sys.path.insert(0, os.path.join(ROOT, "tools", "linux"))
+    import toolchain as T
+    vkd3d = os.path.join(T.VKD3D_BUILD, "linux", "libvkd3d-shader.a")
+    if not os.path.isfile(vkd3d):
+        print("the shader compiler (vkd3d-shader), once:", flush=True)
+        if subprocess.run([sys.executable, os.path.join(ROOT, "tools", "linux", "build_vkd3d.py"), "linux"]).returncode:
+            raise SystemExit("vkd3d-shader could not be built (see above)")
+    includes = ["-I", os.path.join(ROOT, "runtime", "linux", "include"), "-I", os.path.join(T.DXVK_INCLUDE, "windows"),
+                "-I", os.path.join(T.DXVK_INCLUDE, "directx"), "-I", os.path.join(T.SYSROOT, "usr", "include", "SDL2"),
+                "-I", os.path.join(T.VKD3D_SRC, "include")]
+    r = subprocess.run([T.CLANG, "-O2", *T.CFLAGS, "-D_GNU_SOURCE", "-D_REENTRANT", *includes, *sources, vkd3d, "-fuse-ld=lld",
+                        "-no-pie", "-lm", "-lpthread", "-ldl", "-o", exe], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit("cannot build shaderaot:\n" + (r.stdout + r.stderr)[-3000:])
+
+
+def default_jobs():
+    """One process per core but two (the PC stays usable), and as many as the RAM holds: each
+    reads the whole pack of programs (about 0.4 GB) and translates them."""
+    jobs = max(1, (os.cpu_count() or 2) - 2)
+    if LINUX:
+        try:
+            gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30)
+            jobs = min(jobs, max(1, int(gb // 2)))
+        except (ValueError, OSError):
+            pass
+    return jobs
+
+
+def low_priority():
+    """Popen's arguments that run the compile below normal priority."""
+    if LINUX:
+        return {"preexec_fn": lambda: os.nice(10)}
+    return {"creationflags": getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--tree", default=ROOT, help="the game version's folder (default: the port's own)")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--jobs", type=int, default=default_jobs())
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
     tree = os.path.abspath(a.tree)
@@ -144,20 +191,20 @@ def main():
     os.makedirs(work, exist_ok=True)
     pack = os.path.join(work, "programs.pack")
     write_pack(programs, pack)
-    exe = os.path.join(ROOT, "build", "shaderaot.exe")
+    exe = os.path.join(ROOT, "build-linux", "shaderaot") if LINUX else os.path.join(ROOT, "build", "shaderaot.exe")
     build_tool(exe)
     cache = os.path.join(tree, "dump", "shadercache")
     os.makedirs(cache, exist_ok=True)
     jobs = 1 if a.dry else a.jobs
     procs = [subprocess.Popen([exe, pack, cache, str(i), str(jobs)] + (["--dry"] if a.dry else []),
                               stdout=subprocess.PIPE if a.dry else subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                              creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+                              **low_priority())
              for i in range(jobs)]
     if a.dry:
         outs = [p.communicate() for p in procs]
         print("\n".join(line for _out, err in outs for line in err.splitlines() if line.startswith("part ")))
     else:
-        print(f"compiling with {jobs} processes at low priority (the PC stays usable; close this window to stop: "
+        print(f"compiling with {jobs} processes at low priority (the PC stays usable; stop it with " + ("Ctrl+C" if LINUX else "closing this window") + ": "
               "what is done stays done)", flush=True)
         parts = follow(procs, Progress(sys.stdout))
         print(summary(parts) or "\n".join(parts))
@@ -181,21 +228,10 @@ def parse_progress(line):
     return None
 
 
-def time_left(seconds):
-    """A time left, as a person says it."""
-    minutes = round(seconds / 60)
-    if minutes < 1:
-        return "under a minute left"
-    if minutes < 60:
-        return f"about {minutes} min left"
-    return f"about {minutes // 60} h {minutes % 60:02d} min left"
-
-
 def progress_text(done, of, rate=None, width=30):
     """The bar, the share done, and the time left at `rate` shaders a second (once there is one)."""
     frac = min(1.0, done / of) if of else 1.0
-    filled = int(frac * width)
-    text = f"[{'#' * filled}{'-' * (width - filled)}] {frac:4.0%}  {done:,} of {of:,} shaders"
+    text = f"{bar(frac, width)} {frac:4.0%}  {done:,} of {of:,} shaders"
     if rate and 0 < done < of:
         text += ", " + time_left((of - done) / rate)
     return text

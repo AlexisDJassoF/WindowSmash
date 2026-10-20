@@ -104,7 +104,7 @@ Compare your PC with [what you need](#what-you-need) above. (**Settings → Syst
 | `D:\MyKeys` | `prod.keys` and `title.keys`, from your Switch. |
 | `D:\MyFirmware` | Your Switch's firmware: a few hundred `.nca` files. WindowSmash takes the game's fonts from them. |
 
-- **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. With an update file next to the game, the installer applies it for you. The game as first released (1.0.0) is the best base for an update.
+- **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. With an update file next to the game, the installer applies it for you. The game as first released (1.0.0) is the best base for an update. Without its update, though, the original release doesn't work yet: WindowSmash can't read its data.
 - **Compressed files** (`.nsz`, `.xcz`) have to be turned back into `.nsp` or `.xci` first.
 - **Leave your game files where they are** after the install: depending on their kind, the game keeps reading its data from them.
 
@@ -155,6 +155,7 @@ Then:
 
 First it prepares your game files, which takes a few minutes: it decrypts the game if needed and applies your update (up to about 17 GB more space). Then it builds the game: your PC translates it into a Windows program, which takes **30 minutes to a few hours**.
 
+- A progress line shows how far the build has got and the time left. The time left appears once the first files are compiled, a few minutes in. The window's title shows it too, so you can follow it from the taskbar.
 - You can keep using the PC, though it will be slower. Set it not to sleep while plugged in (**Settings → System → Power**) until the build is done.
 - If the build stops (a restart, the PC going to sleep, an error you fixed), double-click `Install WindowSmash.bat` again: it carries on where it stopped.
 - It's finished when the window says **Done**. Press a key to close it.

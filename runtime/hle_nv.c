@@ -24,6 +24,7 @@
 
 #include "host.h"
 #include "gpu.h"
+#include "gpu_backend.h"   /* (gfx_gpu_unmapped, gfx_guest_unmapped) */
 
 enum { NV_OK = 0, NV_NOT_SUPPORTED = 2, NV_BAD_PARAMETER = 4, NV_TIMEOUT = 5, NV_CONFIG_NOT_FOUND = 0x30006 };
 enum { DEV_NONE, DEV_CTRL, DEV_CTRL_GPU, DEV_AS, DEV_NVMAP, DEV_CHANNEL, DEV_HOST1X };
@@ -61,6 +62,24 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     return TRUE;
 }
 
+/* Does guest memory [addr, addr + size) hold any nvmap allocation - memory the GPU (thread) may
+ * read? (The game frees ordinary heap pages mid-match too.) */
+static int gpu_memory_overlaps(u64 addr, u64 size) {
+    u32 n = next_handle < NVMAP_MAX ? next_handle : NVMAP_MAX;
+    for (u32 h = 1; h < n; h++)
+        if (gpu_maps[h].addr && gpu_maps[h].size && gpu_maps[h].addr < addr + size && addr < gpu_maps[h].addr + gpu_maps[h].size) return 1;
+    return 0;
+}
+
+/* The kernel is about to decommit guest memory [addr, addr + size). If the GPU may read it,
+ * queued GPU work runs first, and the renderer lets go of what it made from it: nothing may
+ * read that memory once it is gone (the graphics driver crashed doing so). */
+void gpu_memory_unmapping(u64 addr, u64 size) {
+    if (!gpu_memory_overlaps(addr, size)) return;
+    gpu_queue_drain();
+    gfx_guest_unmapped(addr, size);
+}
+
 u64 gpu_va_to_guest(u64 va) {   /* 0 when unmapped */
     u64 page = va >> PAGE_BITS;
     if (page >> LEAF_BITS >= TOP_COUNT) return 0;
@@ -69,7 +88,13 @@ u64 gpu_va_to_guest(u64 va) {   /* 0 when unmapped */
     return g ? g + (va & ((1u << PAGE_BITS) - 1)) : 0;
 }
 
-static void set_pages(u64 va, u64 size, u64 guest) {   /* guest 0: unmap */
+u64 gpu_stat_drains;   /* (the GPU thread's queue drained for an unmapping) */
+
+/* Point the pages of [va, va + size) at guest memory from `guest` on (0: unmap them). Where a
+ * page mapped other memory before, queued GPU work runs first (it may still read the old), and
+ * the renderer then lets go of what it made from the old mapping. */
+static void set_pages(u64 va, u64 size, u64 guest) {
+    u64 lo = 0, hi = 0;   /* (the pages that mapped other memory) */
     for (u64 off = 0; off < size; off += 1u << PAGE_BITS) {
         u64 page = (va + off) >> PAGE_BITS;
         if (page >> LEAF_BITS >= TOP_COUNT) break;
@@ -78,8 +103,15 @@ static void set_pages(u64 va, u64 size, u64 guest) {   /* guest 0: unmap */
             if (!guest) continue;
             *leaf = calloc(1u << LEAF_BITS, sizeof **leaf);
         }
-        (*leaf)[page & ((1u << LEAF_BITS) - 1)] = guest ? guest + off : 0;
+        u64 *entry = &(*leaf)[page & ((1u << LEAF_BITS) - 1)], now = guest ? guest + off : 0;
+        if (*entry && *entry != now) {
+            if (!hi && gpu_threaded()) { gpu_queue_drain(); gpu_stat_drains++; }
+            if (!hi) lo = va + off;
+            hi = va + off + (1u << PAGE_BITS);
+        }
+        *entry = now;
     }
+    if (hi) gfx_gpu_unmapped(lo, hi - lo);
 }
 
 static void unmap_range(u64 va) {
@@ -91,7 +123,18 @@ static void unmap_range(u64 va) {
         }
 }
 
+/* Is [va, va + size) one mapping of guest memory from `guest` on already? */
+static int mapped_as(u64 va, u64 size, u64 guest) {
+    u32 i = 0;
+    while (i < map_count && map_sizes[i].va != va) i++;
+    if (i == map_count || map_sizes[i].size != size) return 0;
+    for (u64 off = 0; off < size; off += 1u << PAGE_BITS)
+        if (gpu_va_to_guest(va + off) != guest + off) return 0;
+    return 1;
+}
+
 static void map_range(u64 va, u64 size, u64 guest) {
+    if (mapped_as(va, size, guest)) return;   /* (the same again: what the renderer made of it stays) */
     unmap_range(va);
     if (map_count == map_cap) map_sizes = realloc(map_sizes, sizeof *map_sizes * (map_cap = map_cap * 2 + 1024));
     map_sizes[map_count].va = va;
@@ -119,11 +162,23 @@ static u32 ctrl(u32 nr, u64 a, u32 request) {
     switch (nr) {
     case 0x1B: return NV_CONFIG_NOT_FOUND;                       /* GetConfig */
     case 0x1D: case 0x1E: {                                      /* EventWait / EventWaitAsync */
-        u32 id = ld32(a), value = ld32(a + 4);
+        u32 id = ld32(a), value = ld32(a + 4), timeout = ld32(a + 8);
         if (id >= SYNCPT_MAX) return NV_BAD_PARAMETER;
-        /* The driver also advances sync points from inside its command lists. Until those
-         * lists are executed, the GPU is modelled as finishing everything instantly: any
-         * value waited for has been reached. */
+        /* A value submitted work will reach: wait for the GPU thread to get there (the async
+         * form too - it then has nothing to wait for). A timeout past a few seconds is taken
+         * as none being meant: whatever is wrong, the game goes on rather than hanging. */
+        if (gpu_threaded() && (i32)(gpu_syncpt_max[id] - value) >= 0 && (i32)(gpu_syncpt_min[id] - value) < 0) {
+            if (!gpu_syncpt_wait(id, value, timeout && timeout < 5000 ? timeout : 5000)) {
+                if (timeout && timeout < 5000) return NV_TIMEOUT;
+                static int warned;
+                if (warned++ < 4) fprintf(stderr, "[nvdrv] sync point %u: still short of %u after 5 s - going on\n", id, value);
+            }
+            st32(a + 12, gpu_syncpt_min[id]);
+            return NV_OK;
+        }
+        /* The driver also advances sync points from inside its command lists, and values no
+         * submission will reach are taken as reached: the GPU is modelled as finishing
+         * everything instantly. */
         if ((i32)(gpu_syncpt_max[id] - value) < 0) gpu_syncpt_max[id] = value;
         if ((i32)(gpu_syncpt_min[id] - value) < 0) gpu_syncpt_min[id] = value;
         st32(a + 12, gpu_syncpt_min[id]);
@@ -232,6 +287,7 @@ static u32 address_space(u32 nr, u64 a, u32 request) {
     case 0x09: return NV_OK;                                              /* AllocAsEx / InitializeEx */
     case 0x14: {                                                          /* Remap: entries of 0x14 bytes */
         u32 n = ((request >> 16) & 0x3FFF) / 0x14;
+        if (gpu_threaded()) { gpu_queue_drain(); gpu_stat_drains++; }      /* (queued work may still read what moves) */
         for (u32 i = 0; i < n; i++) {
             u64 e = a + 0x14ull * i;
             u32 handle = ld32(e + 4);
@@ -288,12 +344,17 @@ static u32 nvmap(u32 nr, u64 a, u32 request) {
 
 static u32 submit(u32 fd, u64 a, u64 entries, u32 count) {
     u32 flags = ld32(a + 12), id = files[fd].syncpoint;
-    gpu_submit(fd, P(u64, entries), count);
-    if (flags & ((1u << 1) | (1u << 8))) {   /* increment requested: two for the GPU, plus any extra */
-        u32 extra = flags & (1u << 8) ? ld32(a + 20) : 0;
-        gpu_syncpt_max[id] += 2 + extra;
+    u32 incr = 0;
+    if (flags & ((1u << 1) | (1u << 8)))   /* increment requested: two for the GPU, plus any extra */
+        incr = 2 + (flags & (1u << 8) ? ld32(a + 20) : 0);
+    if (gpu_threaded()) {   /* run later, on the GPU thread: the sync point reaches the fence then */
+        gpu_syncpt_max[id] += incr;
+        gpu_queue_submit(fd, P(u64, entries), count, id, gpu_syncpt_max[id]);
+    } else {
+        gpu_submit(fd, P(u64, entries), count);
+        gpu_syncpt_max[id] += incr;
+        gpu_syncpt_min[id] = gpu_syncpt_max[id];   /* everything completes now */
     }
-    gpu_syncpt_min[id] = gpu_syncpt_max[id];   /* null back end: everything completes now */
     st32(a + 16, id);
     st32(a + 20, gpu_syncpt_max[id]);
     return NV_OK;

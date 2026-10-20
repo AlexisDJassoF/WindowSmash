@@ -10,7 +10,8 @@ Usage: bash install-windowsmash.sh [--game <dir>] [--keys <dir>] [--firmware <di
                 commit it is), then this installer starts again as the new version
   2. this PC    x86-64 with AVX2, the memory, the free space
   3. packages   from the distribution, through sudo (apt, dnf, pacman or zypper): clang, lld and
-                llvm, bison and flex, SDL2, libopus and libvpx, Vulkan, zenity, Python's venv
+                llvm, bison and flex, SDL2, libopus and libvpx, Vulkan, zenity, Python's venv; and
+                the headers the build needs, put back where a package is installed without them
   4. Python     a Python of WindowSmash's own in deps/venv, with requirements.txt and Pillow
   5. parts      DXVK 3.1.1 and its headers, vkd3d 2.1 and SPIRV-Headers, downloaded into
                 deps/linux-toolchain (each checked against its SHA-256)
@@ -54,7 +55,7 @@ NEED_DISK_GB = 30   # (the C, the objects and the program: 7 GB; the update's da
 MIN_RAM_GB = 7   # (8 GB machines report a little less)
 PYTHON_EXTRA = ["pillow"]   # (the overlay font: tools/linux/make_overlay_font.py)
 LAUNCHERS = ["install-windowsmash.sh", "play-ssbu.sh", "launchers/play-ssbu-offline.sh", "launchers/host-ssbu-netplay.sh",
-             "launchers/join-ssbu-netplay.sh", "launchers/unlock-all-fighters.sh"]   # (as the .bat ones: two at the top)
+             "launchers/join-ssbu-netplay.sh", "launchers/unlock-all-fighters.sh", "launchers/prepare-shaders.sh"]   # (as the .bat ones: two at the top)
 # The third-party parts of the build (tools/linux/toolchain.py): (what, URL, SHA-256, file, where it goes,
 # the archive's folder whose contents go there)
 PARTS = [
@@ -89,7 +90,23 @@ PACKAGES = {
 OPTIONAL = {"libvulkan1", "vulkan-loader", "vulkan-icd-loader", "mesa-vulkan-drivers", "vulkan-tools", "zenity",
             "fontconfig", "fonts-dejavu-core", "dejavu-sans-mono-fonts", "ttf-dejavu", "dejavu-fonts"}
 INSTALL = {"apt": ["apt-get", "install", "-y"], "dnf": ["dnf", "install", "-y"],
-           "pacman": ["pacman", "-S", "--needed", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install"]}
+           "pacman": ["pacman", "-S", "--needed", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install"],
+           "rpm-ostree": ["rpm-ostree", "install", "--idempotent", "--allow-inactive"]}
+PACKAGES["rpm-ostree"] = PACKAGES["dnf"]   # (an image-based Fedora: the same packages, layered)
+# The headers the build compiles with, from /usr/include, and the package each comes with. A package
+# manager can list a package as installed without them: SteamOS, for one, leaves every package's
+# headers out of its system image.
+INCLUDE = "/usr/include"
+HEADERS = {
+    "stdio.h": {"apt": "libc6-dev", "dnf": "glibc-devel", "pacman": "glibc", "zypper": "glibc-devel"},
+    "linux/userfaultfd.h": {"apt": "linux-libc-dev", "dnf": "kernel-headers", "pacman": "linux-api-headers",
+                            "zypper": "linux-glibc-devel"},
+    "SDL2/SDL.h": {"apt": "libsdl2-dev", "dnf": "SDL2-devel", "pacman": "sdl2", "zypper": "SDL2-devel"},
+    "opus/opus.h": {"apt": "libopus-dev", "dnf": "opus-devel", "pacman": "opus", "zypper": "libopus-devel"},
+    "vpx/vpx_decoder.h": {"apt": "libvpx-dev", "dnf": "libvpx-devel", "pacman": "libvpx", "zypper": "libvpx-devel"},
+}
+REINSTALL = {"apt": ["apt-get", "install", "-y", "--reinstall"], "dnf": ["dnf", "reinstall", "-y"],
+             "pacman": ["pacman", "-S", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install", "--force"]}
 
 
 class Stop(Exception):
@@ -174,9 +191,13 @@ def os_release(text):
     return out
 
 
-def package_manager(fields, have=lambda tool: True):
+def package_manager(fields, have=lambda tool: True, image_based=False):
     """The package manager for this distribution (apt, dnf, pacman or zypper), from os-release's
-    ID and ID_LIKE, among those installed (have); None for one it does not know."""
+    ID and ID_LIKE, among those installed (have); None for one it does not know. On an image-based
+    system booted by ostree (Fedora Silverblue and Kinoite, and the ones built on them: Bazzite,
+    Bluefin, Aurora and others) the system's own folders are read-only: rpm-ostree adds packages."""
+    if image_based and have("rpm-ostree"):
+        return "rpm-ostree"
     ids = [fields.get("ID", "").lower()] + fields.get("ID_LIKE", "").lower().split()
     by_family = [("apt", {"debian", "ubuntu", "linuxmint", "pop", "elementary", "zorin", "kali", "raspbian"}),
                  ("dnf", {"fedora", "rhel", "centos", "rocky", "almalinux", "nobara", "ultramarine"}),
@@ -573,11 +594,12 @@ def step_check_pc():
 
 # ---- step 3: the distribution's packages --------------------------------------------------------------
 def installed(manager, pkg):
-    """Whether a package (or, for dnf, zypper and pacman, something that provides it) is installed."""
+    """Whether a package (or, for dnf, zypper, rpm-ostree and pacman, something that provides it) is
+    installed - in the running system (rpm-ostree: not one layered for the next start)."""
     if manager == "apt":
         r = subprocess.run(["dpkg-query", "-W", "-f=${Status}", pkg], capture_output=True, text=True)
         return r.returncode == 0 and "install ok installed" in r.stdout
-    if manager in ("dnf", "zypper"):
+    if manager in ("dnf", "zypper", "rpm-ostree"):
         return subprocess.run(["rpm", "-q", "--whatprovides", pkg], capture_output=True).returncode == 0
     if manager == "pacman":
         return subprocess.run(["pacman", "-T", pkg], capture_output=True).returncode == 0
@@ -590,6 +612,53 @@ def sudo_run(cmd, dry):
     if dry:
         return True
     return subprocess.run(full).returncode == 0
+
+
+def install_layered(missing, run):
+    """rpm-ostree: the packages layered onto the system image and applied to the running one at once
+    (--apply-live), so that no restart is needed; where that can't be done (an update waiting for
+    the next start, say), the build's own for the next start. One name the repositories don't know
+    fails a whole transaction: the second try leaves out those the build does without. Whether
+    rpm-ostree took the build's packages (step_packages then sees whether they are there yet)."""
+    needed = [p for p in missing if p not in OPTIONAL]
+    for pkgs in [missing] + ([needed] if needed != missing else []):
+        if pkgs and run([*INSTALL["rpm-ostree"], "--apply-live", *pkgs]):
+            return True
+    return bool(needed) and run([*INSTALL["rpm-ostree"], *needed])
+
+
+def still_missing(wanted, is_installed):
+    """The build's packages that are not installed (the ones it does without left out)."""
+    return [p for p in wanted if p not in OPTIONAL and not is_installed(p)]
+
+
+def missing_headers(manager, exists):
+    """The build's headers that are not in /usr/include, each with the package it comes with (None
+    for a package manager without a list here)."""
+    names = "dnf" if manager == "rpm-ostree" else manager
+    return [(h, by.get(names)) for h, by in HEADERS.items() if not exists(posixpath.join(INCLUDE, h))]
+
+
+def header_fix(manager, pkgs, is_installed):
+    """The commands that put back the packages whose headers are missing: reinstalled where the
+    package manager has them (the files went after), installed where it doesn't."""
+    there = [p for p in pkgs if is_installed(p)]
+    rest = [p for p in pkgs if p not in there]
+    return ([[*REINSTALL[manager], *there]] if there else []) + ([[*INSTALL[manager], *rest]] if rest else [])
+
+
+def read_only(path="/usr"):
+    """Whether the system's folders are mounted read-only (SteamOS's are, for one)."""
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except (AttributeError, OSError):
+        return False
+
+
+def need_writable_system():
+    if read_only():
+        raise Stop("The system's folders are read-only, so packages can't be added or put back. Make them writable "
+                   "(on SteamOS: sudo steamos-readonly disable), then run bash install-windowsmash.sh again.")
 
 
 def debian_cxx_headers(manager, dry):
@@ -616,16 +685,53 @@ def vulkan_ready():
                                                               "/etc/vulkan/icd.d"))
 
 
+def step_headers(manager, a):
+    """The build's headers, there on disk: the package manager can list a package as installed without
+    them (HEADERS), and the build stops at the first one missing. Their packages are put back."""
+    gone = missing_headers(manager, os.path.exists)
+    if not gone:
+        return
+    pkgs = list(dict.fromkeys(p for _, p in gone if p))
+    names = ", ".join(h for h, _ in gone)
+    if manager in REINSTALL and not a.no_packages:
+        info(f"missing from {INCLUDE}, although the build needs them: {names}. Putting back {', '.join(pkgs)}")
+        if not a.dry_run:
+            need_writable_system()
+        for cmd in header_fix(manager, pkgs, lambda p: installed(manager, p)):
+            sudo_run(cmd, a.dry_run)
+        if a.dry_run:
+            return
+        gone = missing_headers(manager, os.path.exists)
+        if gone:
+            raise Stop(f"{', '.join(h for h, _ in gone)} still missing from {INCLUDE} after putting back "
+                       f"{', '.join(pkgs)} (see above). Reinstall them yourself, then run this again.")
+        info("there now")
+        return
+    if a.dry_run:
+        info(f"missing from {INCLUDE}, although the build needs them: {names}")
+        return
+    if manager == "rpm-ostree":
+        raise Stop(f"{names} not there yet (they come with {', '.join(pkgs)}). If rpm-ostree added them for the next "
+                   "start, restart the PC, then run bash install-windowsmash.sh again.")
+    what = (f"the package{'s' if len(pkgs) != 1 else ''} they come with: {', '.join(pkgs)}" if pkgs else
+            "your distribution's packages for them (Debian calls them "
+            f"{', '.join(dict.fromkeys(HEADERS[h]['apt'] for h, _ in gone))})")
+    raise Stop(f"{names} missing from {INCLUDE}, and the build needs them. Install (or reinstall) {what}, then run "
+               "this again with --no-packages.")
+
+
 def step_packages(a):
     step("[3/8] Packages from your distribution")
     fields = os_release(read_text("/etc/os-release"))
-    manager = package_manager(fields, lambda tool: shutil.which(INSTALL[tool][0]) is not None)
+    manager = package_manager(fields, lambda tool: shutil.which(INSTALL[tool][0]) is not None,
+                              image_based=os.path.exists("/run/ostree-booted"))
     if not manager:
         info(f"{fields.get('PRETTY_NAME', 'this distribution')}: no package list for it here. Install these (or what "
              "your distribution calls them) yourself, then run this again with --no-packages:")
         info("  " + ", ".join(PACKAGES["apt"]))
         if not a.no_packages:
             raise Stop("Install the packages above, then run this again with --no-packages.")
+        step_headers(None, a)
         return
     wanted = PACKAGES[manager]
     missing = [p for p in wanted if not installed(manager, p)]
@@ -633,8 +739,19 @@ def step_packages(a):
         info(f"installed ({manager}): {', '.join(wanted)}")
     elif a.no_packages:
         info(f"not installing (--no-packages); missing: {', '.join(missing)}")
+    elif manager == "rpm-ostree":
+        info(f"adding {', '.join(missing)} to the system with rpm-ostree (an image-based system); sudo asks for your "
+             "password. This takes some minutes.")
+        needed = [p for p in missing if p not in OPTIONAL]
+        if not install_layered(missing, lambda cmd: sudo_run(cmd, a.dry_run)):
+            if needed:
+                raise Stop(f"rpm-ostree could not add {', '.join(needed)} (see above). If it says another transaction "
+                           "is running (an update), wait for it, then run this again.")
+            info(f"not added, and not needed for the build: {', '.join(missing)}")
     else:
         info(f"installing {', '.join(missing)} with {manager}; sudo asks for your password")
+        if not a.dry_run:
+            need_writable_system()
         if manager == "apt" and not sudo_run(["apt-get", "update"], a.dry_run):
             raise Stop("apt-get update failed (see above). Fix that, then run this again.")
         if not sudo_run([*INSTALL[manager], *missing], a.dry_run):
@@ -649,6 +766,15 @@ def step_packages(a):
                 info(f"not installed, and not needed for the build: {', '.join(failed)}")
     if manager == "apt" and not a.no_packages:
         debian_cxx_headers(manager, a.dry_run)
+    if missing and not a.no_packages and not a.dry_run:   # (installed, as far as the package manager said: are they there?)
+        still = still_missing(wanted, lambda p: installed(manager, p))
+        if still and manager == "rpm-ostree":
+            raise Stop("The packages are added to the system for its next start (they could not be applied to the "
+                       "running one): restart the PC, then run bash install-windowsmash.sh again.")
+        if still:
+            raise Stop(f"These packages are still not installed: {', '.join(still)} (see above). Install them (or what "
+                       "your distribution calls them) yourself, then run this again with --no-packages.")
+    step_headers(manager, a)
     if not a.dry_run and not vulkan_ready():
         info("note: no Vulkan driver is installed. The game draws through Vulkan: install your graphics card's driver "
              "(Mesa's covers AMD and Intel, and has a software one, lavapipe; NVIDIA has its own)")
@@ -797,8 +923,27 @@ def ask_folder(label, value, check, interactive):
         value = ask(f"{label.capitalize()} folder", value, True)
 
 
+def files_ready():
+    """Whether the build has read everything it needs from the game files already (dump/: the
+    program, fonts, game data, DLC; tools/build_game.py --check-ready): then they are not asked for
+    again - an update only builds what changed."""
+    return subprocess.run([venv_python(), os.path.join(ROOT, "tools", "build_game.py"), "--check-ready"],
+                          cwd=ROOT, capture_output=True).returncode == 0
+
+
 def step_files(a):
     step("[6/8] Your game files")
+    if not (a.game or a.keys or a.firmware) and not a.dry_run and os.path.isfile(venv_python()) and files_ready():
+        info("already read from your game files (dump/): not asking for them again. To build from other game files, "
+             "run: bash install-windowsmash.sh --game <folder>")
+        name_file = os.path.join(ROOT, "online_name.txt")
+        name = a.online_name or read_text(name_file).strip()
+        if name and name != read_text(name_file).strip():
+            with open(name_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(name + "\n")
+        if name:
+            info(f"online name: {name}")
+        return {"game": None, "keys": None, "firmware": None, "name": name}
     found = detected_folders()
     for key in ("game", "keys", "firmware"):
         if getattr(a, key):
@@ -852,7 +997,7 @@ def step_launchers(a):
         os.chmod(entry, 0o755)
         info(f"applications menu: WindowSmash ({entry})")
     info("in this folder: play-ssbu.sh (online); in launchers/: play-ssbu-offline.sh, host-ssbu-netplay.sh, "
-         "join-ssbu-netplay.sh, unlock-all-fighters.sh")
+         "join-ssbu-netplay.sh, unlock-all-fighters.sh, prepare-shaders.sh")
     firewall = None
     if shutil.which("ufw") and "Status: active" in subprocess.run(["ufw", "status"], capture_output=True, text=True).stdout:
         firewall = "sudo ufw allow 39420/udp"
@@ -865,8 +1010,10 @@ def step_launchers(a):
 # ---- step 8: the build --------------------------------------------------------------------------------------
 def step_build(a, files):
     step("[8/8] Build the game")
-    cmd = [venv_python(), os.path.join(ROOT, "tools", "build_game.py"), "--game", files["game"], "--keys", files["keys"],
-           "--firmware", files["firmware"]]
+    cmd = [venv_python(), os.path.join(ROOT, "tools", "build_game.py")]
+    for key in ("game", "keys", "firmware"):
+        if files.get(key):   # (none when the game files were read already: files_ready)
+            cmd += [f"--{key}", files[key]]
     if a.jobs:
         cmd += ["--jobs", str(a.jobs)]
     if a.skip_build:
@@ -918,6 +1065,8 @@ def main(argv=None):
         built = step_build(a, files)
         print()
         print("Done. Start the game with ./play-ssbu.sh, or WindowSmash in your applications menu." if built else "Setup done.")
+        if built:
+            print("To make the game's shaders in advance (no hitch when an effect shows first): bash launchers/prepare-shaders.sh")
         return 0
     except Stop as e:
         print(f"\nERROR: {e}")

@@ -1072,8 +1072,126 @@ static void test_cache(void) {
         if (f) fclose(f);
     }
     if (d) closedir(d);
-    check(files == 10 && good == files, "%d MSL files written (10 programs: ps_color for both vertex programs, whose outputs are alike), %d of them whole",
-          files, good);
+    check(files == 11 && good == files, "%d MSL files written (11: 10 programs - ps_color for both vertex programs, whose outputs are "
+          "alike - and ps_color's alpha-tested variant), %d of them whole", files, good);
+}
+
+/* ---- what upstream fixed in both renderers: the alpha test, the shared write watch, unmaps ---- */
+extern u64 gfx_stat_unmap_dropped, gfx_stat_unmapped;
+void gfx_gpu_unmapped(u64 va, u64 size);
+void gfx_guest_unmapped(u64 addr, u64 size);
+
+/* the alpha test: a draw (wait: again until it is discarded - the plain shader draws while the
+ * alpha-tested variant and its pipeline compile) */
+static u32 alpha_draw(int on, float alpha, u32 func, float ref, int wait) {
+    float c[4] = {0, 1, 0, alpha};
+    vertex(VERTS, 0, -1, -1, 0.5f, c); vertex(VERTS, 1, 3, -1, 0.5f, c); vertex(VERTS, 2, -1, 3, 0.5f, c);
+    stream(VERTS, 3);
+    regs[M_VERTEX_ARRAY_START] = 0; regs[M_VERTEX_ARRAY_COUNT] = 3;
+    regs[M_ALPHA_TEST] = (u32)on; regs[M_ALPHA_FUNC] = func; regs[M_ALPHA_REF] = fbits(ref);
+    u32 got = 0;
+    for (int i = 0; i < 400; i++) {
+        clear_color(0, 0, 0, 0, 0, 0xF);
+        draw(0);
+        read_rt(RT_A, 0);
+        got = px(30, 30);
+        if (!wait || got == RGBA(0, 0, 0, 0)) break;
+        usleep(5000);
+    }
+    return got;
+}
+
+static void test_alpha(void) {
+    printf("the alpha test\n");
+    setup(RT_A, 64, 64, 0, VS_PASS, PS_COLOR);
+    u32 a = alpha_draw(1, 0.25f, 0x204, 0.5f, 1);   /* greater */
+    check(a == RGBA(0, 0, 0, 0), "alpha 0.25, greater than 0.5: discarded (%08x)", a);
+    a = alpha_draw(1, 0.75f, 0x204, 0.5f, 0);
+    check(rgba_near(a, RGBA(0, 255, 0, 191), 1), "alpha 0.75, greater than 0.5: drawn (%08x)", a);
+    a = alpha_draw(1, 0.75f, 0x201, 0.5f, 0);   /* less */
+    check(a == RGBA(0, 0, 0, 0), "alpha 0.75, less than 0.5: discarded (%08x)", a);
+    a = alpha_draw(1, 0.25f, 0x201, 0.5f, 0);
+    check(rgba_near(a, RGBA(0, 255, 0, 64), 1), "alpha 0.25, less than 0.5: drawn (%08x)", a);
+    a = alpha_draw(1, 0.5f, 0x202, 0.5f, 0);   /* equal */
+    check(rgba_near(a, RGBA(0, 255, 0, 128), 1), "alpha 0.5, equal to 0.5: drawn (%08x)", a);
+    a = alpha_draw(1, 0.5f, 0x205, 0.5f, 0);   /* not equal */
+    check(a == RGBA(0, 0, 0, 0), "alpha 0.5, not equal to 0.5: discarded (%08x)", a);
+    a = alpha_draw(1, 0.25f, 0x207, 0.5f, 0);   /* always */
+    check(rgba_near(a, RGBA(0, 255, 0, 64), 1), "always: drawn (%08x)", a);
+    a = alpha_draw(1, 0.75f, 0x200, 0.5f, 0);   /* never */
+    check(a == RGBA(0, 0, 0, 0), "never: discarded (%08x)", a);
+    a = alpha_draw(0, 0.25f, 0x204, 0.5f, 0);
+    check(rgba_near(a, RGBA(0, 255, 0, 64), 1), "the test off: drawn (%08x)", a);
+    regs[M_ALPHA_TEST] = 0;
+}
+
+/* two kept constant buffers over one page: the CPU's write is news to both */
+static void test_shared_news(void) {
+    printf("two kept constant buffers on one page, the CPU writing it\n");
+    setup(RT_K, 64, 64, 0, VS_CBUF, PS_COLOR);
+    clear_color(0, 0, 0, 0, 1, 0xF);
+    float none[4] = {0};
+    vertex(VERTS, 0, -1, -1, 0.5f, none); vertex(VERTS, 1, 0, -1, 0.5f, none); vertex(VERTS, 2, -1, 1, 0.5f, none);
+    vertex(VERTS, 3, 0.01f, -1, 0.5f, none); vertex(VERTS, 4, 1, -1, 0.5f, none); vertex(VERTS, 5, 1, 1, 0.5f, none);
+    stream(VERTS, 6);
+    memset(mem(CB3 - 0x1000), 0, 0x3000);
+    memcpy(mem(CB3 + 0xFF0), RED, 16);    /* buffer A: [CB3, CB3 + 0x1000), its colour at +0xFF0 */
+    memcpy(mem(CB3 + 0xFE0), BLUE, 16);   /* buffer B: [CB3 - 0x10, CB3 + 0xFF0), its colour at +0xFF0 = CB3 + 0xFE0 */
+    for (int round = 0; round < 2; round++) {
+        gpu_stat_batches++;
+        clear_color(0, 0, 0, 0, 1, 0xF);
+        cb[STAGE_VERTEX][3] = (CbBinding){CB3, 0x1000};
+        regs[M_VERTEX_ARRAY_START] = 0; regs[M_VERTEX_ARRAY_COUNT] = 3;
+        draw(0);
+        cb[STAGE_VERTEX][3] = (CbBinding){CB3 - 0x10, 0x1000};
+        regs[M_VERTEX_ARRAY_START] = 3;
+        draw(0);
+    }
+    read_rt(RT_K, 0);
+    check(px(5, 5) == RGBA(255, 0, 0, 255) && px(60, 5) == RGBA(0, 0, 255, 255), "red and blue (%08x %08x)", px(5, 5), px(60, 5));
+    memcpy(mem(CB3 + 0xFF0), GREEN, 16);   /* the CPU writes both colours (one page) */
+    memcpy(mem(CB3 + 0xFE0), GREEN, 16);
+    gpu_stat_batches++;
+    clear_color(0, 0, 0, 0, 1, 0xF);
+    cb[STAGE_VERTEX][3] = (CbBinding){CB3, 0x1000};
+    regs[M_VERTEX_ARRAY_START] = 0;
+    draw(0);
+    cb[STAGE_VERTEX][3] = (CbBinding){CB3 - 0x10, 0x1000};
+    regs[M_VERTEX_ARRAY_START] = 3;
+    draw(0);
+    read_rt(RT_K, 0);
+    check(px(5, 5) == RGBA(0, 255, 0, 255), "the first buffer asked takes the write (%08x)", px(5, 5));
+    check(px(60, 5) == RGBA(0, 255, 0, 255), "and the second, on the same page, too (%08x)", px(60, 5));
+}
+
+/* unmap notices: what was made from the memory is dropped, and made again at its next use */
+static void test_unmapped(void) {
+    printf("memory taken away\n");
+    u64 before = gfx_stat_unmap_dropped;
+    gfx_gpu_unmapped(VA0, GSIZE);
+    check(gfx_stat_unmap_dropped > before, "a GPU unmap drops what was made there (%llu)", gfx_stat_unmap_dropped - before);
+    before = gfx_stat_unmap_dropped;
+    gfx_guest_unmapped(ALIAS_BASE, GSIZE);
+    check(gfx_stat_unmap_dropped == before, "nothing left to drop (%llu)", gfx_stat_unmap_dropped - before);
+    /* compute again (learnt: the results stay on the GPU), in a region made anew */
+    enum { N = 64 };
+    u32 sb[8] = {(u32)CS_IN, (u32)(CS_IN >> 32), N * 16, 0, (u32)CS_OUT, (u32)(CS_OUT >> 32), N * 16, 0};
+    memset(mem(CS_CB0), 0, 0x1000);
+    memcpy(mem(CS_CB0 + SB_FIRST), sb, sizeof sb);
+    for (u32 i = 0; i < N * 4; i++) put32(CS_IN + 4 * i, 0x5000 + i);
+    memset(mem(CS_OUT), 0, N * 16);
+    dispatch(2);
+    check(get32(CS_OUT + 4 * 9) == 0, "the results on the GPU (%#x in guest memory)", get32(CS_OUT + 4 * 9));
+    gfx_resident_flush(CS_OUT, N * 16);
+    check(get32(CS_OUT + 4 * 9) == 0x5009, "brought back from the region made anew (%#x)", get32(CS_OUT + 4 * 9));
+    before = gfx_stat_unmap_dropped;
+    gfx_guest_unmapped(gpu_va_to_guest(CS_OUT), 0x1000);
+    check(gfx_stat_unmap_dropped > before, "guest memory taken away under it drops it (%llu)", gfx_stat_unmap_dropped - before);
+    for (u32 i = 0; i < N * 4; i++) put32(CS_IN + 4 * i, 0x6000 + i);
+    dispatch(2);
+    gfx_resident_flush(CS_OUT, N * 16);
+    check(get32(CS_OUT + 4 * 9) == 0x6009, "and the next dispatch makes it again (%#x)", get32(CS_OUT + 4 * 9));
+    test_kept_constants();   /* (its buffers dropped above: made again) */
 }
 
 int main(int argc, char **argv) {
@@ -1136,6 +1254,9 @@ int main(int argc, char **argv) {
         test_resident_full();
         test_resident_host_page(0x20000, 0x4100, "in the next host page");
         test_resident_host_page(0x60000, 0x100, "in the same host page");
+        test_alpha();
+        test_shared_news();
+        test_unmapped();
         test_stress();
         test_present();
         test_overlay();

@@ -18,8 +18,10 @@
  * they are Shared memory, made resident for each encoder that reads them. Shaders are the
  * translator's Metal Shading Language, compiled at run time by our compiler threads.
  *
- * Every entry point takes the back end's lock: GPU work arrives from the game's submitting
- * threads, frames from the display's vsync thread. */
+ * Every entry point takes the back end's lock: GPU work arrives from the GPU thread (gpu_queue.c;
+ * with SSBU_GPU_THREAD=0 the game's submitting threads), notices of unmapped memory from the
+ * game's threads (hle_nv.c), frames from the display's vsync thread. Nothing here is tied to the
+ * thread that calls (but the command stream's pending writes, below: kept_flush). */
 #define _CRT_SECURE_NO_WARNINGS
 #include "gpu_metal.h"
 #include <dirent.h>
@@ -751,9 +753,16 @@ static int enter(void) {
     return 1;
 }
 
+/* GPU addresses and guest memory taken away, whose cached data is not dropped yet ([lo, hi);
+ * hi 0: none). Dropped as the outermost entry point leaves (below: forget_unmapped). */
+typedef struct Span { u64 lo, hi; } Span;
+static Span unmapped_va, unmapped_guest;
+static void forget_unmapped(void);
+
 static void leave(void) {
+    if (enter_depth == 1 && (unmapped_va.hi || unmapped_guest.hi)) forget_unmapped();
     if (!--enter_depth) {
-        gbuf_release();   /* (buffers given up meanwhile: no longer bound by anything of the call's) */
+        gbuf_release();   /* (buffers given up meanwhile, forget_unmapped's too: no longer bound by anything of the call's) */
         objc_autoreleasePoolPop(enter_pool);
         gfx_stat_busy_ns += rt_clock_ns() - enter_t0;
     }
@@ -1368,11 +1377,14 @@ static void find_copies(const Shader *s, u64 g, const u8 *p, u32 size) {
     }
 }
 
-/* The shader for the program at guest address g, ready (state 1) or not. */
-static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
+/* The shader for the program at guest address g, ready (state 1) or not. alpha_tested: a pixel
+ * shader's variant that does the fixed-function alpha test (its own hash, so its own cache file,
+ * and its own pipelines: a Shader of its own). */
+static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared, int alpha_tested) {
     /* a compute program has no header: it is translated as if it had one (never read) */
     const u8 *p = stage == SHADER_COMPUTE ? P(u8, g) - 0x50 : P(u8, g);
-    u64 key = (u64)stage | (u64)vs_outputs << 4 | (stage == SHADER_COMPUTE ? ((u64)local[0] ^ (u64)local[1] << 11 ^ (u64)local[2] << 22 ^ (u64)shared << 33) << 36 : 0);
+    u64 key = (u64)stage | (u64)vs_outputs << 4 | (stage == SHADER_COMPUTE ? ((u64)local[0] ^ (u64)local[1] << 11 ^ (u64)local[2] << 22 ^ (u64)shared << 33) << 36 : 0)
+            | (u64)(alpha_tested != 0) << 63;
     ShaderSlot *slot = &shader_slots[((g >> 4) * 0x9E3779B97F4A7C15ull ^ key) >> 50 & (SHADER_SLOTS - 1)];
     if (slot->s && slot->g == g && slot->key == key && slot->print == fingerprint(stage, p, slot->size)) {
         Shader *s = slot->s;
@@ -1385,6 +1397,9 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     u32 size = shader_size(p, 0x40000), skip = stage == SHADER_COMPUTE ? 0x50 : 0;
     u64 h = shader_program_hash(p + skip, size - skip);
     if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
+    u64 program_hash = h;
+    /* (gpu_d3d11.c's salt: it changes with the alpha test's code, so cache files of an older form are not used) */
+    if (alpha_tested) h = (h ^ 0x616C706861743032ull) * 1099511628211ull;
     CbufSource src = {stage_cb};
     for (u32 i = 0; i < shader_count; i++) {
         Shader *s = shader_cache[i];
@@ -1400,8 +1415,10 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     s->hash = h; s->stage = stage; s->vs_outputs = vs_outputs;
     if (stage == SHADER_COMPUTE) memcpy(s->local, local, sizeof s->local);
     *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s, 0};
-    snprintf(s->name, sizeof s->name, "%s_%016llx", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", h);
-    s->msl = shader_translate(SHADER_MSL, p, size, stage, vs_outputs, stage == SHADER_COMPUTE ? local : NULL, shared, &s->info, read_cbuf_word, &src);
+    snprintf(s->name, sizeof s->name, "%s_%016llx%s", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", program_hash,
+             alpha_tested ? "_alphatest" : "");
+    s->msl = alpha_tested ? shader_translate_alpha_tested(SHADER_MSL, p, size, vs_outputs, &s->info, read_cbuf_word, &src)
+                          : shader_translate(SHADER_MSL, p, size, stage, vs_outputs, stage == SHADER_COMPUTE ? local : NULL, shared, &s->info, read_cbuf_word, &src);
     const char *cdump = getenv("SSBU_DUMP_SHADERS");
     if (cdump && stage == SHADER_COMPUTE) {   /* C_<hash>_<local x>x<y>x<z>_<shared>.bin, behind 0x50 zero bytes */
         char path[1024];
@@ -1443,7 +1460,7 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
 
 /* The ready shader for the program at guest address g, or NULL while it compiles. */
 static Shader *get_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
-    Shader *s = find_shader_ex(g, stage, vs_outputs, stage_cb, local, shared);
+    Shader *s = find_shader_ex(g, stage, vs_outputs, stage_cb, local, shared, 0);
     return s && state_of(&s->state) == 1 ? s : NULL;
 }
 
@@ -1639,6 +1656,7 @@ typedef struct Resident {
     u8 *edge;
     u32 head, tail;
     u64 checked;   /* the submission it was last checked against the write watch in */
+    u64 seen;      /* (the write watch's clock then: watch_written) */
     u64 used;      /* the gfx_* call (op_seq) that last used it: with the table full, the region used longest ago goes */
 } Resident;
 static Resident residents[512];
@@ -1646,12 +1664,78 @@ static u32 nresidents;
 u64 gfx_stat_residents, gfx_stat_resident_pages;
 static int watched(u64 g, u64 size);
 
+/* The write watch keeps one bit a 4 KiB page of the alias area (macos/memory.c), and a query that
+ * resets it takes the news from everyone else watching that page. Textures, kept constant buffers,
+ * compute inputs and resident regions share pages - memory a scene gives up is handed out again
+ * for something else - and whoever asked first kept the news for good (gpu_d3d11.c: the No
+ * Contest screen skinned the fighters' arms from inputs never taken again). A query and a reset
+ * made apart lose a write landing between them, too (the game writes on other threads as the GPU
+ * thread draws). So every question goes through here: pages found written get the next stamp,
+ * kept per page, taken and reset in one call; each user keeps the clock as it was when it last
+ * asked ("seen"): its data is current unless one of its pages has a newer stamp. (A write
+ * anywhere in a 16 KiB host page reports all of its 4 KiB pages: more news than happened, never
+ * less - which the resident regions' edges see to, below.) */
+#define WATCH_CHUNK 512   /* pages a chunk: 2 MB */
+typedef struct WatchChunk { u64 newest, page[WATCH_CHUNK]; } WatchChunk;
+static WatchChunk *watch_chunks[ALIAS_SIZE / (WATCH_CHUNK * 0x1000ull)];
+static u64 watch_clock;   /* stamps given so far */
+
+/* Take the write watch's news for guest pages [lo, hi) (4 KiB aligned, watched): resetting the
+ * bits as they are read (under the shim's lock: a write is either reported now or news next time). */
+static void watch_take(u64 lo, u64 hi) {
+    static void *pages[65536];   /* (256 MB: the largest range asked about, in one call) */
+    void *first;
+    ULONG_PTR count = 1;
+    ULONG granularity;
+    /* (asking is cheap, resetting is not - it protects the host pages again, even where nothing
+     * was written: so ask first) */
+    if (GetWriteWatch(0, G2H(lo), hi - lo, &first, &count, &granularity) != 0 || !count) return;
+    for (u64 at = H2G(first); at < hi;) {
+        count = 65536;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, G2H(at), hi - at, pages, &count, &granularity) != 0 || !count) return;
+        u64 stamp = ++watch_clock;
+        for (ULONG_PTR k = 0; k < count; k++) {
+            u64 p = (H2G(pages[k]) - ALIAS_BASE) >> 12;
+            WatchChunk **c = &watch_chunks[p / WATCH_CHUNK];
+            if (!*c && !(*c = calloc(1, sizeof **c))) continue;
+            (*c)->page[p % WATCH_CHUNK] = (*c)->newest = stamp;
+        }
+        if (count < 65536) return;
+        at = H2G(pages[count - 1]) + 0x1000;
+    }
+}
+
+/* The first page in [p, hi) stamped after `seen` (hi if none). */
+static u64 watch_next(u64 p, u64 hi, u64 seen) {
+    while (p < hi) {
+        u64 i = (p - ALIAS_BASE) >> 12, end = (i / WATCH_CHUNK + 1) * WATCH_CHUNK;
+        const WatchChunk *c = watch_chunks[i / WATCH_CHUNK];
+        if (c && c->newest > seen)
+            for (; i < end && ALIAS_BASE + (i << 12) < hi; i++)
+                if (c->page[i % WATCH_CHUNK] > seen) return ALIAS_BASE + (i << 12);
+        p = ALIAS_BASE + (end << 12);
+    }
+    return hi;
+}
+
+/* Has guest memory [g, g + size) (watched) been written since *seen? (*seen moves on to now.) Ask
+ * before reading the memory, so that a write meanwhile is news next time. */
+static int watch_written(u64 g, u64 size, u64 *seen) {
+    u64 lo = g & ~0xFFFull, hi = (g + size + 0xFFF) & ~0xFFFull;
+    watch_take(lo, hi);
+    int written = watch_next(lo, hi, *seen) < hi;
+    *seen = watch_clock;
+    return written;
+}
+
 static void resident_drop(Resident *r) {
     gbuf_free(r->buf);
     free(r->edge);
     *r = residents[--nresidents];
     memset(&residents[nresidents], 0, sizeof *residents);
 }
+
+static int read_guarded(void *dst, u64 g, u32 n);
 
 /* The edges are the host's pages (16 KiB), not the guest's: a write anywhere in a host page
  * reports every 4 KiB page of it (macos/memory.c), so the write watch tells nothing of a guest
@@ -1664,12 +1748,15 @@ static void resident_snapshot(Resident *r) {
     r->head = head;
     r->tail = tail;
     r->edge = realloc(r->edge, head + tail + 1);
-    memcpy(r->edge, P(void, r->guest), head);
-    memcpy(r->edge + head, P(void, r->guest + r->size - tail), tail);
+    /* (zeros where the memory is gone - a region made over older ones may reach memory the
+     * guest has unmapped since: resident_sync finds it gone too, and leaves it alone) */
+    if (head && !read_guarded(r->edge, r->guest, head)) memset(r->edge, 0, head);
+    if (tail && !read_guarded(r->edge + head, r->guest + r->size - tail, tail)) memset(r->edge + head, 0, tail);
 }
 
 /* n bytes of guest memory at g, or 0 if they are not there any more: the guest can unmap the
- * memory under a resident region (svc UnmapPhysicalMemory) and the renderer does not hear of it.
+ * memory under a resident region (svc UnmapPhysicalMemory). The renderer hears of that and drops
+ * the region (gfx_guest_unmapped), but only if the memory held an nvmap allocation when it went.
  * (The kernel reads it for us: an unmapped or inaccessible page fails the call, not the process.) */
 static int read_guarded(void *dst, u64 g, u32 n) {
     mach_vm_size_t got = 0;
@@ -1695,26 +1782,30 @@ static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
     return 1;
 }
 
-/* The write watch over the region's whole host pages starts over (after its GPU copy took guest
- * memory). Not over its partial ones: their bits belong to whatever shares them as well. */
+/* The write watch's news over the region's whole host pages is taken (after its GPU copy took
+ * guest memory). Not over its partial ones: they are compared by content instead. */
 static void resident_watch_reset(Resident *r) {
     u64 lo = (r->guest + 0x3FFF) & ~0x3FFFull, hi = (r->guest + r->size) & ~0x3FFFull;
-    if (lo < hi) ResetWriteWatch(G2H(lo), hi - lo);
+    if (lo < hi) watch_take(lo, hi);
+    r->seen = watch_clock;
 }
 
 /* Has the CPU written guest memory inside the region since its GPU copy last took it? Host pages
- * (16 KiB) wholly inside that it wrote (the write watch says) are taken from guest memory. The
- * partial host pages at either end are compared byte for byte, every time, and taken where the
- * bytes inside the region changed - the CPU may have written just its own data next to the
- * region, or (memory reused) right over a region no program writes any more. Not by the write
- * watch: a write anywhere in a host page reports all of it, and whoever checks a page first
- * resets it for everyone - so a report of nothing does not excuse the comparison. Small regions
- * pack several to a page in the effect ring (GPU particle output among the CPU's per-draw
- * attributes); the first one checked took the bit and its neighbours kept stale data for good,
- * which drew effect meshes at a stale size over the whole screen (the white-outs). Checked
- * when a draw or dispatch uses the region (once a submission) and once a frame for all. */
+ * (16 KiB) wholly inside that it wrote (the write watch says: watch_written's stamps) are taken
+ * from guest memory. The partial host pages at either end are compared byte for byte, every time,
+ * and taken where the bytes inside the region changed - the CPU may have written just its own
+ * data next to the region, or (memory reused) right over a region no program writes any more.
+ * Not by the write watch: a write anywhere in a host page reports all of it, so a report says
+ * nothing of the bytes inside the region. Small regions pack several to a page in the effect ring
+ * (GPU particle output among the CPU's per-draw attributes); when the first one checked took the
+ * page's bit, its neighbours kept stale data for good, which drew effect meshes at a stale size
+ * over the whole screen (the white-outs). Checked when a draw or dispatch uses the region (once a
+ * submission) and once a frame for all. Whole pages go to the GPU copy through a copy of their
+ * own too, never straight from guest memory: a region outlives the memory under it when the guest
+ * unmaps that without the renderer hearing of it (gfx_guest_unmapped hears of nvmap memory only),
+ * and a region with no partial pages has no edges to find that out by - the copy would fault
+ * (gpu_d3d11.c: players' games crashed in the graphics driver after 20-40 minutes). */
 static void resident_sync(Resident *r, int every_frame) {
-    static void *pages[16384];
     static int no_pages = -1;   /* debug: leave resident regions alone */
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
     if (no_pages || (!every_frame && r->checked == gpu_stat_batches) || !r->edge || !watched(r->guest, r->size)) return;
@@ -1723,16 +1814,18 @@ static void resident_sync(Resident *r, int every_frame) {
         return;   /* (its memory is gone: left alone; once mapped again its bytes differ, and are taken) */
     u64 lo = (r->guest + 0x3FFF) & ~0x3FFFull, hi = (r->guest + r->size) & ~0x3FFFull;   /* the whole host pages */
     if (lo >= hi) return;
-    ULONG_PTR count = 16384;
-    ULONG granularity;
-    if (GetWriteWatch(0, G2H(lo), hi - lo, pages, &count, &granularity) != 0 || !count) return;
-    ResetWriteWatch(G2H(lo), hi - lo);   /* (before taking them: what the CPU writes meanwhile is seen next time) */
-    for (ULONG_PTR k = 0; k < count; k++) {
-        u64 pg = H2G(pages[k]), end = pg + granularity;
-        if (pg < r->guest) pg = r->guest;   /* (within the region: a page the report rounds out) */
-        if (end > r->guest + r->size) end = r->guest + r->size;
-        if (pg < end) gpu_write(r->buf, pg - r->guest, P(void, pg), (u32)(end - pg));
-        gfx_stat_resident_pages++;
+    u64 seen = r->seen;
+    watch_take(lo, hi);   /* (before taking them: what the CPU writes meanwhile is news next time) */
+    r->seen = watch_clock;
+    for (u64 pg = watch_next(lo, hi, seen); pg < hi;) {
+        u8 now[0x4000];   /* (a run of written pages, a host page's worth at most, in one copy) */
+        u32 n = 0x1000;
+        while (n < sizeof now && pg + n < hi && watch_next(pg + n, pg + n + 0x1000, seen) == pg + n) n += 0x1000;
+        if (read_guarded(now, pg, n)) {   /* (gone: left as it is) */
+            gpu_write(r->buf, pg - r->guest, now, n);
+            gfx_stat_resident_pages += n >> 12;
+        }
+        pg = watch_next(pg + n, hi, seen);
     }
 }
 
@@ -1966,15 +2059,16 @@ void gfx_resident_written(u64 va, u64 bytes) {
  * use in each submission; memory outside the watched area is never kept. A buffer a recorded
  * draw has used is not written again: a change after that goes into a copy of it (what the
  * draws before it read stays as it was), which later draws use. */
-typedef struct KeptCb { u64 va, guest, used, checked; u32 size, mapped; int stale, bound; GBuf *buf; u8 *shadow; } KeptCb;
+typedef struct KeptCb { u64 va, guest, used, checked, seen; u32 size, mapped; int stale, bound; GBuf *buf; u8 *shadow; } KeptCb;
 #define KEPT_SETS 256
 #define KEPT_WAYS 4
 static KeptCb kept[KEPT_SETS * KEPT_WAYS];
 static u64 kept_clock;
 static u16 kept_blocks[1 << 16];   /* how many kept buffers touch each (hashed) 64 KB block of GPU VA */
 #define KEPT_BLOCK(block) ((u32)((u64)(block) * 0x9E3779B97F4A7C15ull >> 48))
-/* Command stream writes not yet applied to kept buffers: per thread (a command list runs on
- * the thread that submits it, its draws too), so extending the run needs no lock. */
+/* Command stream writes not yet applied to kept buffers: per thread (a command list runs on one
+ * thread, its draws too - the GPU thread, or with SSBU_GPU_THREAD=0 the one that submits it), so
+ * extending the run needs no lock. */
 static __thread u64 pending_lo, pending_hi;
 static int kept_verify = -1;   /* SSBU_KEPT_VERIFY (debugging): keep a copy of what each holds, and report draws that find memory different */
 u64 gfx_stat_kept_mismatches, gfx_stat_kept_made, gfx_stat_kept_applied, gfx_stat_kept_reloaded, gfx_stat_kept_copies;
@@ -1997,6 +2091,14 @@ static void kept_write(KeptCb *e, u32 off, const void *src, u32 n) {
     memcpy(e->buf->cpu + off, src, n);
 }
 
+/* A kept buffer given up: its memory is handed out again once the work recorded now is done. */
+static void kept_drop(KeptCb *e) {
+    if (e->buf) kept_blocks_add(e, -1);
+    pool_put(e->buf, 0);   /* (not handed out again before what is recorded is done) */
+    free(e->shadow);
+    memset(e, 0, sizeof *e);
+}
+
 /* The command stream wrote [lo, hi) of GPU VA (guest memory has it already). */
 static void kept_apply(u64 lo, u64 hi) {
     int any = 0;
@@ -2007,6 +2109,11 @@ static void kept_apply(u64 lo, u64 hi) {
         if (!e->buf || e->stale || hi <= e->va || lo >= e->va + e->mapped) continue;
         u64 a = (lo > e->va ? lo : e->va) & ~3ull, z = ((hi < e->va + e->mapped ? hi : e->va + e->mapped) + 3) & ~3ull;
         if (z > e->va + e->mapped) z = e->va + e->mapped;
+        /* Only from the memory it was made from, still mapped there: the guest may have mapped
+         * other memory at these addresses since (and unmapped the old: the copy would fault
+         * reading it). Otherwise it is taken again, or made again, at its next use. */
+        u64 g = gpu_va_to_guest(a);
+        if (g != e->guest + (a - e->va) || gpu_va_to_guest(z - 1) != g + (z - 1 - a)) { e->stale = 1; continue; }
         kept_write(e, (u32)(a - e->va), P(void, e->guest + (a - e->va)), (u32)(z - a));
         if (e->shadow) memcpy(e->shadow + (a - e->va), P(void, e->guest + (a - e->va)), (size_t)(z - a));
         gfx_stat_kept_applied++;
@@ -2038,6 +2145,13 @@ void gfx_stream_end(void) {
     if (pending_hi && enter()) { kept_flush(); leave(); }
 }
 
+/* How much of [va, va + size) maps to guest memory in one piece from g (at va). */
+static u32 kept_mapped(u64 va, u64 g, u32 size) {
+    u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
+    while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
+    return mapped > size ? size : mapped;
+}
+
 static View kept_cb(u64 va, u32 size) {
     KeptCb *set = &kept[((va >> 4) * 0x9E3779B97F4A7C15ull >> 56) * KEPT_WAYS], *e = NULL, *lru = &set[0];
     for (u32 w = 0; w < KEPT_WAYS && !e; w++) {
@@ -2045,15 +2159,13 @@ static View kept_cb(u64 va, u32 size) {
         else if (set[w].used < lru->used) lru = &set[w];
     }
     u64 g = gpu_va_to_guest(va);
-    if (e && e->guest == g) {
+    /* (still mapped as when it was made, asked at its first use in a submission and before it
+     * is taken again: a 64 KB binding reaches past the program's constants, into memory the
+     * guest may have unmapped since - the copy would fault reading it - or mapped other memory
+     * at: then it is made again, below) */
+    if (e && e->guest == g && ((e->checked == gpu_stat_batches && !e->stale) || kept_mapped(va, g, size) == e->mapped)) {
         if (e->checked != gpu_stat_batches) {   /* first use in this submission: has the CPU written it since? */
-            void *page;
-            ULONG_PTR count = 1;
-            ULONG granularity;
-            if (GetWriteWatch(0, G2H(g), e->mapped, &page, &count, &granularity) == 0 && count) {
-                e->stale = 1;
-                ResetWriteWatch(G2H(g), e->mapped);
-            }
+            if (watch_written(g, e->mapped, &e->seen)) e->stale = 1;
             e->checked = gpu_stat_batches;
         }
         if (e->stale) {   /* take it all again */
@@ -2078,19 +2190,15 @@ static View kept_cb(u64 va, u32 size) {
         return (View){e->buf, 0, (size + 15) & ~15u};
     }
     if (!g || size < 0x1000) return (View){0};
-    u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
-    while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
-    if (mapped > size) mapped = size;
+    u32 mapped = kept_mapped(va, g, size);
     if (!watched(g, mapped)) return (View){0};
     if (!e) e = lru;
-    if (e->buf) kept_blocks_add(e, -1);
-    pool_put(e->buf, 0);   /* (not handed out again before what is recorded is done) */
-    free(e->shadow);
-    memset(e, 0, sizeof *e);
+    kept_drop(e);
     if (kept_verify < 0) kept_verify = getenv("SSBU_KEPT_VERIFY") != NULL;
     u32 cap = (size + 15) & ~15u;
     if (!(e->buf = pool_get(cap, 0))) return (View){0};
     memset(e->buf->cpu, 0, e->buf->size);
+    watch_written(g, mapped, &e->seen);   /* (before reading: a write meanwhile is news next submission) */
     memcpy(e->buf->cpu, P(void, g), mapped);
     e->va = va; e->guest = g; e->size = size; e->mapped = mapped; e->used = ++kept_clock; e->checked = gpu_stat_batches;
     if (kept_verify) { e->shadow = malloc(mapped); memcpy(e->shadow, P(void, g), mapped); }
@@ -2108,6 +2216,7 @@ typedef struct Texture {
     u32 tic[8];
     u64 sample_hash;
     int watched, stale;    /* in the write-watched alias area; written since it was read */
+    u64 seen;              /* (the write watch's clock when it was read: watch_written) */
     int integer;           /* integer texels, as floats of the same bits (sampled nearest) */
     id<MTLTexture> tex;
     id<MTLTexture> view[8];   /* as each type a shader declares (TEX_*, shader_msl_texture) where that differs */
@@ -2116,6 +2225,11 @@ typedef struct Texture {
 static Texture textures[4096];
 static u32 ntextures;
 u64 gfx_stat_textures, gfx_stat_watch_us;
+/* Block-compressed textures copied to their exact size (the status line's "unpacked"): Direct3D
+ * 11 makes such a texture whole 4x4 blocks, so gpu_d3d11.c copies one whose size is not a
+ * multiple of 4 into an uncompressed one of its size. Metal makes it at its size (upload_texture:
+ * the last blocks' copy is clipped to the texture's edge), so none here. */
+u64 gfx_stat_unpacked;
 
 static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
     static u64 rest;
@@ -2126,29 +2240,18 @@ static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
 
 /* Which textures has the CPU (or a copy) written since they were read? The alias area is
  * reserved with MEM_WRITE_WATCH, so the shim tracks the pages written (macos/memory.c: by page
- * protection, 4 KB pages reported). A texture's range is asked about the first time a frame draws
- * with it - not every texture every frame: the cost goes by the pages asked about, and a match
- * keeps thousands of textures from earlier screens it never draws. Pages found written start
- * over at once (before the texture is read again, so what the CPU writes meanwhile is seen next
- * time), and as one bit a page belongs to every texture on it, each of those is taken again at
- * its next use. */
+ * protection, 4 KB pages reported; watch_written). A texture's range is asked about the first
+ * time a frame draws with it - not every texture every frame: the cost goes by the pages asked
+ * about, and a match keeps thousands of textures from earlier screens it never draws. A write is
+ * news to every texture on its pages (and everything else there), each taken again at its next
+ * use. */
 static int watched(u64 g, u64 size) { return g >= ALIAS_BASE && g + size <= ALIAS_BASE + ALIAS_SIZE; }
 
 static void texture_ask(Texture *t) {
     if (!t->watched || t->stale || t->asked == gfx_stat_presented) return;
     t->asked = gfx_stat_presented;
     u64 t0 = rt_clock_ns();
-    void *page;
-    ULONG_PTR count = 1;
-    ULONG granularity;
-    if (GetWriteWatch(0, G2H(t->guest), t->size, &page, &count, &granularity) == 0 && count) {
-        ResetWriteWatch(G2H(t->guest), t->size);
-        u64 lo = t->guest & ~0xFFFull, hi = (t->guest + t->size + 0xFFF) & ~0xFFFull;
-        for (u32 i = 0; i < ntextures; i++) {   /* (t among them) */
-            Texture *o = &textures[i];
-            if (o->tex && o->watched && (o->guest & ~0xFFFull) < hi && ((o->guest + o->size + 0xFFF) & ~0xFFFull) > lo) o->stale = 1;
-        }
-    }
+    if (watch_written(t->guest, t->size, &t->seen)) t->stale = 1;
     watch_time(rt_clock_ns() - t0);
 }
 
@@ -2472,6 +2575,7 @@ static Bound get_texture(const u32 *tic, int type, int shadow) {
     u32 levels = d.type == TIC_3D ? 1 : d.levels, max_levels = 1;
     while ((d.width >> max_levels) || (d.height >> max_levels)) max_levels++;
     if (levels > max_levels) levels = max_levels;
+    if (watch) watch_written(g, size, &t->seen);   /* (before reading: a write meanwhile is news next frame) */
     if (!(t->tex = upload_texture(&d, g, &k, layers, levels))) { warn_texture(&d); t->guest = 0; return none; }
     t->guest = g; t->size = size; t->watched = watch; t->stale = 0; t->asked = gfx_stat_presented; t->integer = k.integer;
     memcpy(t->tic, tic, 32); t->sample_hash = sh; t->used = ++tick;
@@ -2724,7 +2828,8 @@ static id<MTLDepthStencilState> depth_state(const DepthKey *d) {
 /* ---- draws ------------------------------------------------------------------------------ */
 u64 gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target;
 /* SSBU_GFX_DEBUG bits: 1 all colour channels written, 2 no depth/stencil test, 4 no culling,
- * 8 no blending, 16 log every draw of one frame (after SSBU_GFX_LOG_AT seconds), 32 magenta */
+ * 8 no blending, 16 log every draw of one frame (after SSBU_GFX_LOG_AT seconds), 32 magenta,
+ * 64 no alpha test (Direct3D's 128 has nothing to turn off here: see gfx_stat_unpacked) */
 static u32 gfx_debug(void) {
     static int checked;
     static u32 v;
@@ -3126,9 +3231,16 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     u64 ps_g = regs[M_PIPELINE(5)] & 1 ? gpu_va_to_guest(region + regs[M_PIPELINE(5) + 1]) : 0;
     /* the pixel shader is asked for once the vertex shader is translated (its outputs are the
      * pixel shader's inputs), not once it is compiled: both compile at the same time */
-    Shader *vs_e = vs_g ? find_shader_ex(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], NULL, 0) : NULL;
-    Shader *ps_e = vs_e && state_of(&vs_e->state) != 2 && ps_g ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0) : NULL;
-    Shader *vs = vs_e && state_of(&vs_e->state) == 1 ? vs_e : NULL, *ps = ps_e && state_of(&ps_e->state) == 1 ? ps_e : NULL;
+    Shader *vs_e = vs_g ? find_shader_ex(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], NULL, 0, 0) : NULL;
+    Shader *ps_e = vs_e && state_of(&vs_e->state) != 2 && ps_g ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 0) : NULL;
+    /* The fixed-function alpha test (ui2d's alpha compare: the main menu's stencil masks are cut
+     * from a texture's alpha this way) needs the pixel shader's variant that discards; while that
+     * compiles, the plain one draws as before. */
+    MTLCompareFunction alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : MTLCompareFunctionAlways;
+    Shader *pa_e = alpha_func != MTLCompareFunctionAlways && ps_e && state_of(&ps_e->state) != 2 && (ps_e->info.color_mask & 1)
+                 ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 1) : NULL;
+    Shader *vs = vs_e && state_of(&vs_e->state) == 1 ? vs_e : NULL;
+    Shader *ps = pa_e && state_of(&pa_e->state) == 1 ? pa_e : ps_e && state_of(&ps_e->state) == 1 ? ps_e : NULL;
     /* no fragment stage (depth only: shadow maps, depth pre-passes) draws with no pixel shader */
     if (!vs || (ps_g && !ps) || !topo) {
         gfx_stat_skipped++;
@@ -3181,6 +3293,9 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.fix[3] = minus_one ? 0.5f : 0.0f;
     params.frag[0] = lower_left ? 1.0f : 0.0f;
     params.frag[1] = (float)rt_h;
+    /* (the variant's passing outcomes, alpha_test_mask's of a D3D11_COMPARISON_FUNC: Metal's
+     * MTLCompareFunction is that less one) */
+    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask((u32)alpha_func + 1)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * Metal judges the winding as seen on the target, as Direct3D does: after the fix-up above that
@@ -3302,12 +3417,13 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         u32 sh = regs[M_SCISSOR(0) + 1], sv = regs[M_SCISSOR(0) + 2];
         fprintf(stderr, "[draw]   scissor %s x %u-%u y %u-%u | stencil %d func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
                 "two-sided %u: back func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
-                "blend src %d dst %d op %d, alpha src %d dst %d op %d\n",
+                "blend src %d dst %d op %d, alpha src %d dst %d op %d | alpha test %u func %#x ref %g\n",
                 regs[M_SCISSOR(0)] & 1 ? "on" : "off", sh & 0xFFFF, sh >> 16, sv & 0xFFFF, sv >> 16, dk.stencil_on, regs[M_STENCIL_FUNC],
                 regs[M_STENCIL_REF] & 0xFF, regs[M_STENCIL_FUNC_MASK] & 0xFF, regs[M_STENCIL_MASK] & 0xFF, regs[M_STENCIL_OP_FAIL],
                 regs[M_STENCIL_OP_ZFAIL], regs[M_STENCIL_OP_ZPASS], regs[M_TWO_SIDED_STENCIL] & 1, regs[M_BACK_STENCIL_FUNC],
                 regs[M_BACK_STENCIL_REF] & 0xFF, regs[M_BACK_STENCIL_FUNC_MASK] & 0xFF, regs[M_BACK_STENCIL_MASK] & 0xFF,
-                regs[M_BACK_STENCIL_OP_FAIL], regs[M_BACK_STENCIL_OP_ZFAIL], regs[M_BACK_STENCIL_OP_ZPASS], bl[2], bl[3], bl[1], bl[5], bl[6], bl[4]);
+                regs[M_BACK_STENCIL_OP_FAIL], regs[M_BACK_STENCIL_OP_ZFAIL], regs[M_BACK_STENCIL_OP_ZPASS], bl[2], bl[3], bl[1], bl[5], bl[6], bl[4],
+                regs[M_ALPHA_TEST] & 1, regs[M_ALPHA_FUNC], f32_of(regs[M_ALPHA_REF]));
     }
 
     /* vertex streams: each attribute the shader reads gets its stream's data (bind table vb[n]) */
@@ -3866,11 +3982,19 @@ static u64 first_dispatch_ns;
  * the whole model's for every part skinned): kept on the GPU for as long as guest memory under
  * them goes unwritten (the write watch says), instead of uploaded in full for every dispatch. A
  * buffer a dispatch recorded uses is not written: new data goes into a new copy. */
-typedef struct InputBuf { u64 va, guest; u32 size; GBuf *buf; int bound; u64 used; } InputBuf;
+typedef struct InputBuf { u64 va, guest; u32 size; GBuf *buf; int bound; u64 used, seen; u8 *shadow; } InputBuf;
 static InputBuf inputs[128];
 static u64 input_clock;
 
+static void input_drop(InputBuf *b) {
+    pool_put(b->buf, 1);   /* (not handed out again before what is recorded is done) */
+    free(b->shadow);
+    memset(b, 0, sizeof *b);
+}
+
 static View input_view(u64 va, u32 size) {
+    static int verify = -1;   /* SSBU_INPUT_VERIFY (debugging): keep a copy of what each holds, and report uses that find memory different */
+    if (verify < 0) verify = getenv("SSBU_INPUT_VERIFY") != NULL;
     u64 g = gpu_va_to_guest(va);
     if (!g || !size || !watched(g, size) || gpu_va_to_guest(va + size - 1) != g + size - 1) return (View){0};   /* one watched piece only */
     InputBuf *b = NULL, *lru = &inputs[0];
@@ -3880,10 +4004,7 @@ static View input_view(u64 va, u32 size) {
     }
     u32 cap = (size + 15) & ~15u;
     if (b) {
-        void *page;
-        ULONG_PTR count = 1;
-        ULONG granularity;
-        if (GetWriteWatch(0, G2H(g), size, &page, &count, &granularity) == 0 && count) {   /* written since: take it again */
+        if (watch_written(g, size, &b->seen)) {   /* written since: take it again */
             if (b->bound) {
                 GBuf *n = pool_get(cap, 1);
                 if (!n) return (View){0};
@@ -3893,22 +4014,83 @@ static View input_view(u64 va, u32 size) {
             }
             memcpy(b->buf->cpu, P(void, g), size);
             gfx_stat_upload_bytes += size;
-            ResetWriteWatch(G2H(g), size);
+            if (b->shadow) memcpy(b->shadow, b->buf->cpu, size);
+        } else if (b->shadow && memcmp(b->shadow, P(void, g), size)) {
+            static int reported;
+            u32 o = 0;
+            while (o < size && b->shadow[o] == P(u8, g)[o]) o++;
+            if (reported++ < 200)
+                fprintf(stderr, "[input] va %#llx (%#x bytes) +%#x: kept %02x, memory %02x (submission %llu)\n", va, size, o, b->shadow[o], P(u8, g)[o],
+                        gpu_stat_batches);
+            memcpy(b->shadow, P(void, g), size);
         }
         b->used = ++input_clock;
         b->bound = 1;
         return (View){b->buf, 0, cap};
     }
     b = lru;
-    pool_put(b->buf, 1);
-    memset(b, 0, sizeof *b);
+    input_drop(b);
     if (!(b->buf = pool_get(cap, 1))) return (View){0};
     memset(b->buf->cpu + size, 0, b->buf->size - size);
+    watch_written(g, size, &b->seen);   /* (before reading: a write meanwhile is news next time) */
     read_gpu(va, size, b->buf->cpu);
+    if (verify && (b->shadow = malloc(size))) memcpy(b->shadow, b->buf->cpu, size);
     gfx_stat_upload_bytes += size;
     b->va = va; b->guest = g; b->size = size; b->used = ++input_clock; b->bound = 1;
-    ResetWriteWatch(G2H(g), size);
     return (View){b->buf, 0, cap};
+}
+
+/* ---- memory taken away --------------------------------------------------------------------
+ * Resident regions, kept constant buffers and compute inputs are made from the guest memory at
+ * a GPU address, and outlive the draws that made them. When the game unmaps that address, or
+ * the memory under it, the device layer says so (hle_nv.c, once the GPU thread's queued work
+ * has run) and they are dropped: their next use makes them again from what is there then.
+ * Before, nothing told them: a region went on checking memory that was gone (gpu_d3d11.c: the
+ * graphics driver crashed reading it on the vsync thread, in players' games after 20-40
+ * minutes), and a buffer the game mapped at the same address later read the old region's GPU
+ * data instead of its own. Dropped under the lock, as the outermost entry point leaves (for
+ * these calls, their own): no entry point keeps a pointer to a region or buffer across leave(),
+ * and resident_drop moves regions around. What is dropped may still be bound by recorded work:
+ * gbuf_free and pool_put keep its memory until that is done. */
+u64 gfx_stat_unmapped, gfx_stat_unmap_dropped;   /* (notices the renderer had; what they dropped) */
+
+static int spans(Span s, u64 a, u64 n) { return a && n && a < s.hi && s.lo < a + n; }
+
+static void forget_unmapped(void) {
+    Span va = unmapped_va, g = unmapped_guest;
+    unmapped_va = unmapped_guest = (Span){0, 0};
+    for (u32 i = 0; i < nresidents;) {
+        Resident *r = &residents[i];
+        if (spans(va, r->va, r->size) || spans(g, r->guest, r->size)) { resident_drop(r); gfx_stat_unmap_dropped++; }
+        else i++;   /* (resident_drop moved the last region here) */
+    }
+    for (u32 i = 0; i < KEPT_SETS * KEPT_WAYS; i++) {   /* (a kept buffer holds the part mapped in one piece) */
+        KeptCb *e = &kept[i];
+        if (e->buf && (spans(va, e->va, e->mapped) || spans(g, e->guest, e->mapped))) { kept_drop(e); gfx_stat_unmap_dropped++; }
+    }
+    for (u32 i = 0; i < 128; i++) {
+        InputBuf *b = &inputs[i];
+        if (b->buf && (spans(va, b->va, b->size) || spans(g, b->guest, b->size))) { input_drop(b); gfx_stat_unmap_dropped++; }
+    }
+}
+
+static void note_unmapped(Span *s, u64 lo, u64 size) {   /* (one waiting already: widened over both) */
+    if (!size) return;
+    if (!s->hi || lo < s->lo) s->lo = lo;
+    if (lo + size > s->hi) s->hi = lo + size;
+    gfx_stat_unmapped++;
+}
+
+void gfx_gpu_unmapped(u64 va, u64 size) {
+    if (!ready || !enter()) return;   /* (nothing is kept before the renderer is up) */
+    note_unmapped(&unmapped_va, va, size);
+    leave();
+}
+
+void gfx_guest_unmapped(u64 addr, u64 size) {
+    if (!ready || !enter()) return;
+    note_unmapped(&unmapped_guest, addr, size);
+    leave();
 }
 
 void gfx_dispatch(const u32 *regs, const u32 *q) {
@@ -4257,6 +4439,8 @@ void gfx_present(u64 guest, u32 width, u32 height) {
             fprintf(stderr, "[stats] kept constant buffers: %u; so far %llu made, %llu updated by the command stream (%llu into copies), "
                             "%llu taken again after CPU writes, %llu mismatches\n",
                     nk, gfx_stat_kept_made, gfx_stat_kept_applied, gfx_stat_kept_copies, gfx_stat_kept_reloaded, gfx_stat_kept_mismatches);
+            fprintf(stderr, "[stats] memory taken away: %llu unmaps heard, %llu resident regions, kept buffers and compute inputs dropped\n",
+                    gfx_stat_unmapped, gfx_stat_unmap_dropped);
             static u64 last_compared, compared_frames0;
             fprintf(stderr, "[stats] state objects: %u pipelines (%llu ready), %u depth/stencil, %u samplers; %llu command buffers (%llu failed); "
                             "upload memory %.0f MB; reuse checks compared %.2f MB/frame\n",
