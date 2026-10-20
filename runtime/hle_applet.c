@@ -1,7 +1,7 @@
 /* Library applets - the system's own full-screen programs a game can call up: web pages
- * (the electronic manual, news), the software keyboard, the shop. The keyboard is a Windows
- * text box here; the others don't exist, so each behaves as if the player opened it and
- * immediately backed out. */
+ * (the electronic manual, news), the software keyboard, the shop. The keyboard is a text box
+ * here (Windows' dialog, an alert on macOS, zenity's on Linux); the others don't exist, so each
+ * behaves as if the player opened it and immediately backed out. */
 #define _CRT_SECURE_NO_WARNINGS
 #include "host.h"
 #include "gpu_backend.h"
@@ -151,9 +151,12 @@ HLE(_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE) {
 }
 
 #else
-/* Linux: the text box is zenity's (GNOME's dialog tool), else kdialog's, else the terminal's. */
+/* Linux: the text box is zenity's (GNOME's dialog tool), else kdialog's, else the terminal's.
+ * macOS: an alert over the game's window (macos/window.m: AppKit's, on the main thread; it shows
+ * in the game's full-screen space too, and takes the keyboard), else the terminal's. */
 #include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 extern char **environ;
 
@@ -195,6 +198,10 @@ static size_t utf16_of(const char *s, u16 *out, size_t cap) {   /* UTF-8 -> UTF-
 
 static size_t count16(const u16 *w) { size_t n = 0; while (w[n]) n++; return n; }
 
+#ifdef __APPLE__
+/* (macos/window.m) 1 OK (the answer in text), 0 cancelled, -1 no window */
+int rt_window_ask_text(const char *prompt, const char *initial, char *text, size_t cap);
+#else
 /* Run a dialog program; its standard output (trailing newline dropped) into out. Returns its
  * exit status, or -1 if it could not run. */
 static int run_dialog(char *const argv[], char *out, size_t cap) {
@@ -221,9 +228,15 @@ static int run_dialog(char *const argv[], char *out, size_t cap) {
     if (n && out[n - 1] == '\n') out[--n] = 0;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+#endif
 
 /* Ask for the text: 1 OK (answer in text), 0 cancelled. */
 static int ask_text_now(const char *prompt, const char *initial, int multiline, char *text, size_t cap) {
+#ifdef __APPLE__
+    (void)multiline;   /* (one line, as on Linux) */
+    int r = rt_window_ask_text(prompt, initial, text, cap);
+    if (r >= 0) return r;
+#else
     char marked[4096];   /* (zenity reads its text as Pango markup) */
     size_t m = 0;
     for (const char *q = prompt; *q && m + 6 < sizeof marked; q++) {
@@ -241,6 +254,7 @@ static int ask_text_now(const char *prompt, const char *initial, int multiline, 
     r = run_dialog(kdialog, text, cap);
     if (r == 0) return 1;
     if (r == 1) return 0;
+#endif
     if (isatty(0)) {   /* no dialog program: the terminal the game runs in */
         fprintf(stderr, "\n[keyboard] %s\n[keyboard] text (empty line keeps \"%s\"): ", prompt, initial);
         if (!fgets(text, (int)cap, stdin)) return 0;
@@ -248,7 +262,11 @@ static int ask_text_now(const char *prompt, const char *initial, int multiline, 
         if (!text[0]) snprintf(text, cap, "%s", initial);
         return 1;
     }
+#ifdef __APPLE__
+    fprintf(stderr, "[keyboard] no window or terminal: answering with the initial text\n");
+#else
     fprintf(stderr, "[keyboard] no zenity, kdialog or terminal: answering with the initial text\n");
+#endif
     snprintf(text, cap, "%s", initial);
     return 1;
 }

@@ -88,6 +88,44 @@ static void put64(u8 *p, u64 v) { put32(p, (u32)(v >> 32)); put32(p + 4, (u32)v)
 static u64 now_ms(void) { return GetTickCount64(); }
 static void header(u8 *p, int type) { p[0] = MAGIC0; p[1] = MAGIC1; p[2] = NET_PROTOCOL; p[3] = (u8)type; }
 
+/* Every packet goes out here. macOS refuses packets to the local network (EHOSTUNREACH, or
+ * EPERM) until the user lets the game reach it - macOS asks the first time; System Settings >
+ * Privacy & Security > Local Network changes it later: the first refusal is told, with where. */
+#ifdef __APPLE__
+static int local_network(u32 ip) {   /* (host order) private, link-local, multicast, broadcast */
+    return (ip >> 24) == 10 || (ip >> 20) == 0xAC1 || (ip >> 16) == 0xC0A8 || (ip >> 16) == 0xA9FE || (ip >> 28) == 0xE || ip == 0xFFFFFFFFu;
+}
+#endif
+static void send_udp(SOCKET s, const void *p, int n, const struct sockaddr_in *to) {
+    if (sendto(s, (const char *)p, n, 0, (const struct sockaddr *)to, sizeof *to) >= 0) return;
+#ifdef __APPLE__
+    static volatile LONG told;
+    int err = errno;
+    if ((err == EHOSTUNREACH || err == EPERM) && local_network(ntohl(to->sin_addr.s_addr)) && !InterlockedExchange(&told, 1)) {
+        char ip[16];
+        inet_ntop(AF_INET, &to->sin_addr, ip, sizeof ip);
+        fprintf(stderr, "[net] macOS keeps the game off your local network (%s:%u: %s): allow WindowSmash in System Settings > "
+                        "Privacy & Security > Local Network\n", ip, ntohs(to->sin_port), strerror(err));
+    }
+#endif
+}
+
+/* (POSIX) room in a socket's send buffer for the biggest datagram the game sends (net_send's
+ * 65000 bytes and a header), as a bigger one is refused: macOS's buffer holds 9216 bytes to start
+ * with (Linux's far more already; Windows' is left as it is). */
+static void big_sends(SOCKET s) {
+#ifndef _WIN32
+    int size = 0;
+    socklen_t len = sizeof size;
+    if (getsockopt(s, SOL_SOCKET, SO_SNDBUF, &size, &len) || size < 65536) {
+        size = 65536;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
+    }
+#else
+    (void)s;
+#endif
+}
+
 /* ---- configuration ------------------------------------------------------------------ */
 static int configured = -1, hosting, logging;
 static char relay_text[256], room[NAME_LEN + 1] = "smash", name[NAME_LEN + 1] = "Player";
@@ -161,7 +199,7 @@ static void tell_members(const Room *r) {
     u8 p[4 + 1 + ROOM_MEMBERS * (4 + NAME_LEN)];
     header(p, T_MEMBERS);
     int n = 4 + member_list(r, p + 4);
-    for (int i = 0; i < r->count; i++) sendto(relay_sock, (const char *)p, n, 0, (const struct sockaddr *)&r->members[i].at, sizeof r->members[i].at);
+    for (int i = 0; i < r->count; i++) send_udp(relay_sock, p, n, &r->members[i].at);
 }
 
 static void drop_member(Room *r, int i) {
@@ -180,7 +218,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             memcpy(out + 4, p + 4, 8);
             out[12] = 2;
             snprintf((char *)out + 13, 64, "different netplay version (relay %d, you %d)", NET_PROTOCOL, p[2]);
-            sendto(relay_sock, (const char *)out, 4 + 8 + 1 + 64, 0, (const struct sockaddr *)from, sizeof *from);
+            send_udp(relay_sock, out, 4 + 8 + 1 + 64, from);
         }
         return;
     }
@@ -216,7 +254,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
                 put64(out + 4, nonce);
                 out[12] = r && r->count < ROOM_MEMBERS ? 3 : 1;
                 snprintf((char *)out + 13, 64, "%s", why);
-                sendto(relay_sock, (const char *)out, 4 + 8 + 1 + 64, 0, (const struct sockaddr *)from, sizeof *from);
+                send_udp(relay_sock, out, 4 + 8 + 1 + 64, from);
                 return;
             }
             if (!r->count) memcpy(r->build, build, BUILD_LEN);
@@ -242,7 +280,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
         put64(out + 16, 0);   /* (cookie: a private room's relay checks none) */
         out[24] = 0;          /* (flags: not a lobby) */
         int len = 25 + member_list(r, out + 25);
-        sendto(relay_sock, (const char *)out, len, 0, (const struct sockaddr *)from, sizeof *from);
+        send_udp(relay_sock, out, len, from);
         return;
     }
     case T_PING:
@@ -253,7 +291,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
         put16(out + 12, (u16)r->count);
         put16(out + 14, 0);
         out[16] = 0;
-        sendto(relay_sock, (const char *)out, 17, 0, (const struct sockaddr *)from, sizeof *from);
+        send_udp(relay_sock, out, 17, from);
         return;
     case T_LEAVE:
         if (m >= 0) drop_member(r, m);
@@ -266,7 +304,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
         u32 dst = get32(p + 8);
         for (int j = 0; j < r->count; j++)
             if (j != m && (dst == NET_BROADCAST || dst == 0xFFFFFFFFu || r->members[j].ip == dst))
-                sendto(relay_sock, (const char *)p, n, 0, (const struct sockaddr *)&r->members[j].at, sizeof r->members[j].at);
+                send_udp(relay_sock, p, n, &r->members[j].at);
         return;
     }
     }
@@ -498,7 +536,7 @@ static void send_punch(Peer *q, int c, int ack, u64 word, u64 t) {   /* (word: a
     p[20] = (u8)ack;
     put64(p + 21, word);
     q->cand[c].sent = t;
-    sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&q->cand[c].at, sizeof q->cand[c].at);
+    send_udp(client_sock, p, sizeof p, &q->cand[c].at);
 }
 static void hello(Peer *q, int c, u64 t) {
     Candidate *k = &q->cand[c];
@@ -734,7 +772,7 @@ void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *da
         h = body - DIRECT_HEAD;
         header(h, T_DIRECT);
         put64(h + 4, direct[i].secret);
-        sendto(client_sock, (const char *)h, n + DIRECT_HEAD, 0, (const struct sockaddr *)&direct[i].at, sizeof direct[i].at);
+        send_udp(client_sock, h, n + DIRECT_HEAD, &direct[i].at);
     }
     if (!nd || (broadcast && relayed)) {
         if (nd) {   /* (a broadcast some players got directly: the lobby leaves those out) */
@@ -746,7 +784,7 @@ void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *da
             h = body - 4;
             header(h, T_DATA);
         }
-        sendto(client_sock, (const char *)h, (int)(body - h) + n, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+        send_udp(client_sock, h, (int)(body - h) + n, &relay_at);
     }
     if (buf != stack) free(buf);
 }
@@ -798,7 +836,7 @@ static void send_join(void) {
     const char *build = rt_module_main.build_id ? rt_module_main.build_id : "";
     size_t build_len = strlen(build);
     memcpy(p + 12 + 2 * NAME_LEN, build, build_len < BUILD_LEN ? build_len : BUILD_LEN);
-    sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+    send_udp(client_sock, p, sizeof p, &relay_at);
 }
 
 void net_lobby_list(u32 seq) {
@@ -807,7 +845,7 @@ void net_lobby_list(u32 seq) {
     header(p, T_LIST);
     put64(p + 4, cookie);
     put32(p + 12, seq);
-    sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+    send_udp(client_sock, p, sizeof p, &relay_at);
 }
 
 static void read_members(const u8 *p, int n) {
@@ -851,7 +889,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             put16(p + 38, local_port);
             p[40] = (u8)direct_ok;
             p[41] = (u8)direct_now;
-            sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+            send_udp(client_sock, p, sizeof p, &relay_at);
             last_ping = t;
         }
         if (joined && t - last_pong > TIMEOUT_MS) {
@@ -927,7 +965,7 @@ static void leave(void) {
     u8 p[12];
     header(p, T_LEAVE);
     put64(p + 4, nonce);
-    sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+    send_udp(client_sock, p, sizeof p, &relay_at);
 }
 
 /* Started on first use (the overlay asks every frame), once Winsock is up. */
@@ -962,6 +1000,7 @@ static void start(void) {
             } else {
                 setsockopt(relay_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
                 no_connreset(relay_sock);
+                big_sends(relay_sock);
                 CloseHandle(CreateThread(NULL, 0, relay_thread, NULL, 0, NULL));
                 const char *upnp = getenv("SSBU_NET_UPNP");   /* 0: leave the router alone */
                 if (upnp && !strcmp(upnp, "0")) { lan_address(); upnp_state = 3; }
@@ -975,6 +1014,7 @@ static void start(void) {
             no_connreset(client_sock);
             int big = 1 << 20;
             setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof big);
+            big_sends(client_sock);
             CloseHandle(CreateThread(NULL, 0, client_thread, NULL, 0, NULL));
             atexit(leave);
         }

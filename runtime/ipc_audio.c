@@ -1,4 +1,5 @@
-/* Audio output (audout:u), natively, played through the Windows waveOut API (SDL on Linux).
+/* Audio output (audout:u), natively, played through the Windows waveOut API (SDL on Linux and
+ * macOS).
  *
  * The game mixes its own sound and streams 48 kHz stereo 16-bit PCM through the SDK's
  * AudioOut interface. Each buffer it appends is copied to the sound card; when the card has
@@ -11,6 +12,8 @@
 #include "ipc.h"
 #ifdef _WIN32
 #include <mmsystem.h>   /* after windows.h */
+#elif defined __APPLE__
+#include <SDL3/SDL.h>
 #else
 #include <SDL.h>
 #endif
@@ -113,10 +116,16 @@ static void append(u64 desc, u64 tag) {
 
 #else
 /* Linux: SDL plays the buffers - its callback takes them in order, and a reaper reports each
- * one played (as waveOut's completion does on Windows), outside the audio thread. */
+ * one played (as waveOut's completion does on Windows), outside the audio thread.
+ * macOS: the same with SDL3, whose audio stream asks for what its device is about to play
+ * (pull, which feeds it). */
 typedef struct Pending { u8 *data; u32 size, pos; u64 tag; int used; } Pending;   /* used: 1 queued, 2 played */
 static struct {
+#ifdef __APPLE__
+    SDL_AudioStream *out;
+#else
     SDL_AudioDeviceID out;
+#endif
     Pending pending[MAX_BUFFERS];
     u32 order[MAX_BUFFERS], head, count;   /* queued slots, oldest first */
     u64 released[MAX_BUFFERS * 2];
@@ -150,6 +159,19 @@ static void SDLCALL feed(void *user, Uint8 *out, int len) {
     if (any) SetEvent(played_event);
 }
 
+#ifdef __APPLE__
+/* (SDL3's audio thread) the stream wants `wanted` more bytes: feed's, a period's worth at a time */
+static void SDLCALL pull(void *user, SDL_AudioStream *stream, int wanted, int total) {
+    (void)total;
+    Uint8 buf[4096];
+    for (wanted = (wanted + 3) & ~3; wanted > 0; wanted -= (int)sizeof buf) {   /* (whole frames) */
+        int n = wanted < (int)sizeof buf ? wanted : (int)sizeof buf;
+        feed(user, buf, n);
+        SDL_PutAudioStreamData(stream, buf, n);
+    }
+}
+#endif
+
 static DWORD WINAPI reaper(void *arg) {
     (void)arg;
     SetThreadDescription(GetCurrentThread(), L"audio reaper");
@@ -177,6 +199,21 @@ static void open_device(void) {
     InitializeCriticalSection(&audio.lock);
     played_event = CreateEventA(NULL, FALSE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 0, reaper, NULL, 0, NULL));
+#ifdef __APPLE__
+    /* (the game keeps a few short buffers queued: small pulls keep up with it. SDL's audio
+     * started with the window, on the main thread.) */
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) SDL_InitSubSystem(SDL_INIT_AUDIO);
+    SDL_AudioSpec want = {SDL_AUDIO_S16, CHANNELS, RATE}, got;
+    int frames = 0;
+    audio.out = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, pull, NULL);
+    if (!audio.out) fprintf(stderr, "[audio] no audio device (%s); sound is dropped\n", SDL_GetError());
+    else {
+        if (!SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(audio.out), &got, &frames)) got.freq = 0;
+        fprintf(stderr, "[audio] SDL %s output, %d Hz, %d-sample periods\n", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", got.freq, frames);
+        SDL_ResumeAudioStreamDevice(audio.out);
+    }
+#else
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof want);
     want.freq = RATE;
@@ -191,6 +228,7 @@ static void open_device(void) {
         fprintf(stderr, "[audio] SDL %s output, %d Hz, %d-sample periods\n", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", got.freq, got.samples);
         SDL_PauseAudioDevice(audio.out, 0);
     }
+#endif
     audio.event = kernel_create_event();
 }
 

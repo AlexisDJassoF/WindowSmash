@@ -1,7 +1,9 @@
 /* Display options (display.ini): the window's mode and size, the picture's place in it, and the
  * pacing of frames (gpu_display.c). */
 #pragma once
+#ifndef __OBJC__   /* (macOS's window and renderer are Objective-C, whose BOOL is not the shim's: they need none of it) */
 #include <windows.h>
+#endif
 
 typedef enum { PACING_CLOCK, PACING_VRR, PACING_DISPLAY } Pacing;
 
@@ -12,10 +14,11 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
 /* The window procedure offers every message here first: nonzero = handled, the answer in *result. */
 int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result);
 #else
-/* Linux: linux/window.c makes the window with SDL from display.ini's settings and reports to it. */
+/* Linux and macOS: linux/window.c or macos/window.m makes the window with SDL from display.ini's
+ * settings and reports to it. */
 enum { DISPLAY_WINDOWED, DISPLAY_BORDERLESS, DISPLAY_FULLSCREEN };
 int display_window_mode(void);
-void display_window_size(int *width, int *height);
+void display_window_size(int *width, int *height);   /* (macOS: in points) */
 int display_hide_cursor(void);
 void display_note_size(unsigned w, unsigned h);   /* the window's inside changed (pixels) */
 void display_note_refresh(int hz);                /* the window's monitor refreshes hz times a second */
