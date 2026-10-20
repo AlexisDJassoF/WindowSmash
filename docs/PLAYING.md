@@ -33,7 +33,7 @@ Everything starts from a launcher. `Play SSBU.bat` and `Install WindowSmash.bat`
 | **`launchers\Build WindowSmash.bat`** | Builds the game from your files, when the tools are already installed ([setup guide](BUILDING.md#shortcut-build-windowsmashbat)). |
 | **`launchers\Configure Game Data.bat`** | Points WindowSmash at your game data and fonts ([setup guide, step 10](BUILDING.md#step-10-connect-your-game-data)). |
 
-`Play SSBU.bat` first opens a small window where you pick the [game version](VERSIONS.md) and change the most used settings: your online name and lobby, the window and frame pacing, the graphics card, and which player the keyboard is. **Play** saves what you changed and starts the game; **Close** changes nothing. It edits the same files as the in-game [settings](#settings), keeping their comments. Tick **Start the game directly next time** to skip the window; hold <kbd>Shift</kbd> while you start `Play SSBU.bat` to see it again.
+`Play SSBU.bat` first opens a small window where you pick the [game version](VERSIONS.md) and change the most used settings: your online name and lobby, the window and frame pacing, the render scale, the graphics card, and which player the keyboard is. **Play** saves what you changed and starts the game; **Close** changes nothing. It edits the same files as the in-game [settings](#settings), keeping their comments. Tick **Start the game directly next time** to skip the window; hold <kbd>Shift</kbd> while you start `Play SSBU.bat` to see it again.
 
 With [more than one game version](VERSIONS.md) built, the other launchers ask which one to start. The last one you picked is the default.
 

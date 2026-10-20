@@ -66,6 +66,10 @@ A lobby code hides your rooms from everyone who doesn't use the same code.
 2. Set **Play online in** to **private lobby**, choose **Lobby code**, and type your code.
 3. Choose **Restart now**. Everyone in your group does the same, with the same code.
 
+The window `Play SSBU.bat` opens before the game does the same: set **Lobby** to **Private lobby (a code)** and type your code.
+
+Capital letters count: `OurCode` and `ourcode` are two different lobbies.
+
 Or, with the game closed, add a space and your code after the address in `online_server.txt`, for example:
 
 ```text
