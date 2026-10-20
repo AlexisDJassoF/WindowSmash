@@ -4,6 +4,7 @@
 #include <windows.h>
 
 typedef enum { PACING_CLOCK, PACING_VRR, PACING_DISPLAY } Pacing;
+enum { DISPLAY_WINDOWED, DISPLAY_BORDERLESS, DISPLAY_FULLSCREEN };
 
 void display_dpi_aware(void);           /* first thing in main: window sizes in real pixels */
 #ifdef _WIN32
@@ -13,7 +14,6 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
 int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result);
 #else
 /* Linux: linux/window.c makes the window with SDL from display.ini's settings and reports to it. */
-enum { DISPLAY_WINDOWED, DISPLAY_BORDERLESS, DISPLAY_FULLSCREEN };
 int display_window_mode(void);
 void display_window_size(int *width, int *height);
 int display_hide_cursor(void);
@@ -32,3 +32,16 @@ void display_set_tearing(int supported);
 unsigned display_present_flags(void);
 /* The vsync thread: returns when the next refresh the game sees is due. */
 void display_wait_tick(void);
+
+/* The settings menu (gpu_menu.c), which saves display.ini itself: the settings in effect, and
+ * changes that take effect now. The window's size and the graphics card count at the next start. */
+typedef struct DisplaySettings { int mode, width, height, latency, hide_cursor, overlay; Pacing pacing; char gpu[64]; } DisplaySettings;
+void display_settings(DisplaySettings *out);
+const char *display_ini_path(void);
+int display_overlay(void);                /* overlay = 1: the frame-rate overlay shows from the start */
+void display_set_mode(int mode);          /* DISPLAY_*: the window switches now (and F11 goes back to it) */
+int display_take_mode(void);              /* (Linux, the window's loop) a mode asked for, or -1 */
+void display_set_pacing(Pacing pacing);
+void display_set_hide_cursor(int on);
+void display_set_latency(int frames);
+int display_take_latency(void);           /* the renderer, at a present: a new latency, or 0 */

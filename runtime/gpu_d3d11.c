@@ -13,6 +13,7 @@
 #include "debug_profile.h"
 #include "display.h"
 #include "gpu_backend.h"
+#include "gpu_menu.h"
 #include "gpu_overlay.h"
 #include "net.h"
 #include "pad.h"
@@ -278,11 +279,37 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
 static volatile LONG hotkeys;
 
 #ifdef _WIN32
+/* The settings menu's keys (gpu_menu.c): Esc always, the others while it is open. */
+static int menu_keys(UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_CHAR) {
+        if (!menu_is_open()) return 0;
+        menu_char((unsigned)w);
+        return 1;
+    }
+    if (msg != WM_KEYDOWN) return 0;
+    int repeat = (l & (1 << 30)) != 0, key = 0;
+    switch (w) {
+    case VK_ESCAPE: if (!repeat) key = MENU_KEY_ESC; break;
+    case VK_UP: key = MENU_KEY_UP; break;
+    case VK_DOWN: key = MENU_KEY_DOWN; break;
+    case VK_LEFT: key = MENU_KEY_LEFT; break;
+    case VK_RIGHT: key = MENU_KEY_RIGHT; break;
+    case VK_RETURN: if (!repeat) key = MENU_KEY_ENTER; break;
+    case VK_BACK: key = MENU_KEY_BACKSPACE; break;
+    case VK_DELETE: key = MENU_KEY_DELETE; break;
+    case VK_TAB: if (!repeat) key = GetKeyState(VK_SHIFT) & 0x8000 ? MENU_KEY_SHIFT_TAB : MENU_KEY_TAB; break;
+    }
+    if (!key || (key != MENU_KEY_ESC && !menu_is_open())) return 0;
+    menu_key(key);
+    return 1;
+}
+
 static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     LRESULT result;
     if (display_message(h, msg, w, l, &result)) return result;   /* size, full screen, pointer (gpu_display.c) */
     if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); ExitProcess(0); }
     if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F6 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
+    if (menu_keys(msg, w, l)) return 0;
     return DefWindowProcW(h, msg, w, l);
 }
 
@@ -423,6 +450,33 @@ static void adapter_name(const DXGI_ADAPTER_DESC1 *d, char *out, size_t size) {
     size_t i = 0;
     for (; i + 1 < size && d->Description[i]; i++) out[i] = d->Description[i] < 128 ? (char)d->Description[i] : '?';
     out[i] = 0;
+}
+
+/* The graphics cards' names, fastest first, without the software ones (the settings menu). */
+int gfx_adapter_names(char names[][64], int max) {
+    IDXGIFactory1 *f1;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return 0;
+    IDXGIFactory6 *f6 = NULL;
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;
+    int n = 0;
+    for (UINT i = 0; n < max; i++) {
+        IDXGIAdapter1 *a = NULL;
+        HRESULT hr = f6 ? IDXGIFactory6_EnumAdapterByGpuPreference(f6, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_IDXGIAdapter1, (void **)&a)
+                        : IDXGIFactory1_EnumAdapters1(f1, i, &a);
+        if (FAILED(hr)) break;
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            char name[128];
+            adapter_name(&d, name, sizeof name);
+            int again = 0;
+            for (int k = 0; k < n; k++) again |= !strcmp(names[k], name);
+            if (!again) snprintf(names[n++], 64, "%s", name);
+        }
+        IDXGIAdapter1_Release(a);
+    }
+    if (f6) IDXGIFactory6_Release(f6);
+    IDXGIFactory1_Release(f1);
+    return n;
 }
 
 /* The adapter to create the device on (referenced), or NULL for the system's default; *warp:
@@ -4051,9 +4105,19 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     if (f4_at == -1) f4_at = getenv("SSBU_F4_AT") ? atof(getenv("SSBU_F4_AT")) : -2;
     if (f4_at >= 0 && rt_now_ns() > (u64)(f4_at * 1e9)) { f4_at = -2; keys |= 8; }
     static int overlay = -1, details;
-    if (overlay < 0) overlay = !getenv("SSBU_OVERLAY") || atoi(getenv("SSBU_OVERLAY")) != 0;
+    if (overlay < 0) overlay = getenv("SSBU_OVERLAY") ? atoi(getenv("SSBU_OVERLAY")) != 0 : display_overlay();
     if (keys & 1) overlay = !overlay;
     if (keys & 2) { details = !details; overlay = 1; }
+    int menu_shot = menu_frame(&overlay, (keys & 4) != 0) & MENU_SHOT;   /* the settings menu (gpu_menu.c) */
+    if (menu_shot) keys &= ~4;
+    int latency = display_take_latency();   /* (changed in the menu) */
+    if (latency) {
+        IDXGIDevice1 *dxgi1;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_IDXGIDevice1, (void **)&dxgi1))) {
+            IDXGIDevice1_SetMaximumFrameLatency(dxgi1, (UINT)latency);
+            IDXGIDevice1_Release(dxgi1);
+        }
+    }
     if (keys & 4) {   /* F3: the frame as the game drew it (without the overlay) */
         CreateDirectoryA("screenshots", NULL);
         SYSTEMTIME st;
@@ -4117,7 +4181,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  "draws %llu/frame  compute %llu/frame  GPU waits %llu  skipped %.0f/s\n"
                  "shaders %llu (%ld compiling, prewarm %ld/%ld)  textures %u  surfaces %u\n"
                  "GPU-resident buffers %u  write watch %.1f ms/s  depth sampling %s\n"
-                 "F1 overlay  F2 details  F3 screenshot  F4 log a frame\n"
+                 "Esc settings  F1 overlay  F2 details  F3 screenshot  F4 log a frame\n"
                  "F5 depth sampling on/off  F6 profile 10 s%s",
                  gpu_frames ? (double)(gfx_stat_inflight - last_inflight) / gpu_frames : 0.0,
                  (gfx_stat_present_ticks - last_present_ticks) * 1000.0 / (double)freq.QuadPart / frames,
@@ -4132,7 +4196,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
                  profile_running() ? "  (profiling...)" : "");
         char net[512];
         net_status(net, sizeof net);
-        snprintf(hint, sizeof hint, "F2 details%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
+        snprintf(hint, sizeof hint, "F2 details  Esc settings%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
                  profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
         if (net[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", net); }
         char pads[256];
@@ -4167,6 +4231,16 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
     overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
+    if (menu_shot) {   /* F3 with the settings menu open: the window as it is, menu and all */
+        CreateDirectoryA("screenshots", NULL);
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char path[128];
+        snprintf(path, sizeof path, "screenshots/ssbu_%04u%02u%02u_%02u%02u%02u_%03u_menu.bmp", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                 st.wSecond, st.wMilliseconds);
+        save_bmp(back, path);
+        fprintf(stderr, "[gfx] screenshot: %s\n", path);
+    }
 
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);

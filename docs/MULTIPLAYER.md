@@ -49,7 +49,7 @@ Each WindowSmash window is one player. A private room holds up to eight members,
 
 This is what `Play SSBU.bat` does by default. Every Local Wireless room that anyone creates shows up for every player with the same game version.
 
-1. Double-click **`Play SSBU.bat`**. The first time, it asks for the name other players see. Type one and press <kbd>Enter</kbd>.
+1. Double-click **`Play SSBU.bat`**. The first time, the game picks the name other players see, such as `Player1234`, and shows it at the bottom of the screen. To change it, press <kbd>Esc</kbd> in the game, go to **Online**, choose **Your name**, then **Game → Restart the game** ([settings](PLAYING.md#settings)).
 2. If Windows Security asks about `ssbu.exe`, click **Allow**. No port forwarding is needed: your game only sends to the lobby.
 3. In the game's main menu, choose **Local Wireless**.
    - **To host:** choose **Create a Room**. When a challenger appears, accept them.
@@ -62,21 +62,22 @@ This is what `Play SSBU.bat` does by default. Every Local Wireless room that any
 
 A lobby code hides your rooms from everyone who doesn't use the same code.
 
-1. Close the game and open `online_server.txt` in Notepad.
-2. Add a space and your code after the address, for example:
+1. Press <kbd>Esc</kbd> in the game and go to **Online**.
+2. Set **Play online in** to **private lobby**, choose **Lobby code**, and type your code.
+3. Choose **Restart now**. Everyone in your group does the same, with the same code.
 
-   ```text
-   smash.recomps.wtf:39421 ourcode
-   ```
+Or, with the game closed, add a space and your code after the address in `online_server.txt`, for example:
 
-3. Save it. Everyone in your group does the same, with the same code.
+```text
+smash.recomps.wtf:39421 ourcode
+```
 
 The overlay shows the code after `Online`. A lobby code is not a password: anyone who knows it can join.
 
 ### Playing offline
 
 - `launchers\Play SSBU Offline.bat` never goes online.
-- To make `Play SSBU.bat` start offline too, write `off` in `online_server.txt` in place of the address.
+- To make `Play SSBU.bat` start offline too, set **Play online in** to **offline** in the settings (**Online** page), or write `off` in `online_server.txt` in place of the address.
 - If the lobby doesn't answer for five seconds, the game plays offline by itself and keeps trying in the background.
 
 ## Online mode (Quickplay)
@@ -122,7 +123,7 @@ Direct connections need a lobby running this version of `tools/ssbu_relay.py`. W
 > [!NOTE]
 > **Your internet address.** The players in a room with you learn your internet (IP) address, as they would playing online on a console. The lobby introduces only players whose games are already playing together in a room, and introduces each player in at most 20 rooms an hour.
 >
-> To keep your address to yourself, create a file named `online_direct.txt` next to `Play SSBU.bat` (on Linux, next to `run.sh`) containing the word `off`. All your traffic then goes through the lobby, which gives your address to nobody.
+> To keep your address to yourself, turn **Direct connections** off in the settings (**Online** page), then restart the game. Or create a file named `online_direct.txt` next to `Play SSBU.bat` (on Linux, next to `run.sh`) containing the word `off`. All your traffic then goes through the lobby, which gives your address to nobody.
 
 Private rooms always go through the host.
 

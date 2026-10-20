@@ -15,6 +15,7 @@
 #include "host.h"
 #include "clock.h"
 #include "display.h"
+#include "settings.h"
 #ifdef _WIN32
 #include <dbghelp.h>
 #else
@@ -943,6 +944,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--trace")) rt_trace = 1;
         if (!strcmp(argv[i], "--status") && i + 1 < argc) status_every = atoi(argv[++i]);
     }
+    settings_args(argc, argv);   /* --online: the netplay settings from online_*.txt (hle_settings.c) */
 #ifdef _WIN32
     crash_reporter_start();
     AddVectoredExceptionHandler(1, on_fault);

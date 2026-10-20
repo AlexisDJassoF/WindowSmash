@@ -81,8 +81,19 @@ static struct {
     char path[MAX_PATH];
 } cfg = {.keyboard_slot = 0, .background = 1, .def = {"", -1, -1, -1, -1}};
 
+static void config_defaults(void) {
+    char path[MAX_PATH];
+    memcpy(path, cfg.path, sizeof path);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.keyboard_slot = 0;
+    cfg.background = 1;
+    cfg.def.layout = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
+    memcpy(cfg.path, path, sizeof path);
+}
+
 static const char DEFAULT_INI[] =
-    "; controllers.ini: how pads become players. Read when the game starts.\n"
+    "; controllers.ini: how pads become players. Read when the game starts; the settings menu (Esc,\n"
+    "; or the pad's Home / PS / Xbox button in the game) changes it too.\n"
     "; Delete this file to get it written again with the defaults. A line starting with ';' is a comment.\n"
     ";\n"
     "; Any controller SDL3 knows works: Xbox, PlayStation, Switch Pro, and most others. Each new pad takes\n"
@@ -235,7 +246,9 @@ typedef struct Dev {
     SDL_GameController *gp;
 #endif
     char guid[40], name[96], type[24], serial[64], path[192];
-    int deadzone, rumble, trigger;
+    int deadzone, rumble, trigger, layout;
+    int labels[4], has_labels;    /* the letters on its face buttons (dev_configure) */
+    char section[96];             /* the [device ...] it takes settings from ("" = only default) */
     Mapping map;
     u16 sent_low, sent_high;      /* rumble last sent, and when */
     ULONGLONG sent_at;
@@ -253,6 +266,8 @@ static int dev_matches(const Dev *d, const char *what) {
  * names it most exactly (GUID, then name, then type). `labels` gives the console button each face
  * button is printed with (N_A..N_Y), or -1 each when the pad has no such letters. */
 static void dev_configure(Dev *d, const int labels[4]) {
+    if (labels && labels != d->labels) { memcpy(d->labels, labels, sizeof d->labels); d->has_labels = 1; }
+    else if (!labels) d->has_labels = 0;
     const DevCfg *best = NULL;
     for (int rank = 0; rank < 3 && !best; rank++)
         for (int i = 0; i < cfg.ndev && !best; i++) {
@@ -261,6 +276,7 @@ static void dev_configure(Dev *d, const int labels[4]) {
                 best = &cfg.dev[i];
         }
     const DevCfg *layers[2] = {&cfg.def, best};
+    snprintf(d->section, sizeof d->section, "%s", best ? best->match : "");
     int layout = 0;
     d->deadzone = 0; d->rumble = 100; d->trigger = 25;
     for (int l = 0; l < 2; l++) {
@@ -280,6 +296,7 @@ static void dev_configure(Dev *d, const int labels[4]) {
         {N_LEFT, {SRC_BUTTON, RB_DPAD_LEFT}}, {N_UP, {SRC_BUTTON, RB_DPAD_UP}},
         {N_RIGHT, {SRC_BUTTON, RB_DPAD_RIGHT}}, {N_DOWN, {SRC_BUTTON, RB_DPAD_DOWN}},
     };
+    d->layout = layout;
     memset(&d->map, 0, sizeof d->map);
     for (int i = 0; i < 16; i++) { d->map.src[POSITIONAL[i].npad][0] = POSITIONAL[i].src; d->map.n[POSITIONAL[i].npad] = 1; }
     if (layout == 1 && labels && labels[0] >= 0 && labels[1] >= 0 && labels[2] >= 0 && labels[3] >= 0)
@@ -359,13 +376,41 @@ static void dev_state(const Dev *d, const Raw *raw, PadState *o) {
 static SRWLOCK lock = SRWLOCK_INIT;
 static PadState slots[PAD_SLOTS];
 static char slot_names[PAD_SLOTS][48];
+static PadInfo slot_info[PAD_SLOTS];
 static float rumble_amp[PAD_SLOTS][2];
 static ULONGLONG rumble_at[PAD_SLOTS];
 
-static void publish(const PadState fresh[PAD_SLOTS], const char names[PAD_SLOTS][48]) {
+/* What the settings menu shows of a pad, and its controls as pressed now (PAD_RAW_*). */
+static void dev_info(const Dev *d, const Raw *raw, PadInfo *o) {
+    o->connected = 1;
+    o->slot = d->slot;
+    snprintf(o->name, sizeof o->name, "%s", d->name);
+    snprintf(o->type, sizeof o->type, "%s", d->type);
+    snprintf(o->guid, sizeof o->guid, "%s", d->guid);
+    snprintf(o->section, sizeof o->section, "%s", d->section);
+    o->layout = d->layout; o->deadzone = d->deadzone; o->rumble = d->rumble; o->trigger = d->trigger;
+    o->xinput = d->xinput >= 0;
+    for (int b = 0; b < 16; b++) {
+        int n = 0;
+        o->map[b][0] = 0;
+        for (int j = 0; j < d->map.n[b]; j++) {
+            Source src = d->map.src[b][j];
+            const char *name = src.kind == SRC_TRIGGER ? (src.index == RA_LEFT_TRIGGER ? "lefttrigger" : "righttrigger") : RAW_BUTTON_NAMES[src.index];
+            n += snprintf(o->map[b] + n, sizeof o->map[b] - (size_t)n, "%s%s", n ? ", " : "", name);
+            if (n >= (int)sizeof o->map[b]) break;
+        }
+        if (!o->map[b][0]) snprintf(o->map[b], sizeof o->map[b], "none");
+    }
+    o->raw = raw->buttons & ((1u << RB_COUNT) - 1);
+    if (raw->axis[RA_LEFT_TRIGGER] > 16384) o->raw |= PAD_RAW_LEFT_TRIGGER;
+    if (raw->axis[RA_RIGHT_TRIGGER] > 16384) o->raw |= PAD_RAW_RIGHT_TRIGGER;
+}
+
+static void publish(const PadState fresh[PAD_SLOTS], const char names[PAD_SLOTS][48], const PadInfo info[PAD_SLOTS]) {
     AcquireSRWLockExclusive(&lock);
     memcpy(slots, fresh, sizeof slots);
     memcpy(slot_names, names, sizeof slot_names);
+    memcpy(slot_info, info, sizeof slot_info);
     ReleaseSRWLockExclusive(&lock);
 }
 
@@ -436,7 +481,7 @@ static int xinput_start(void) {
 
 /* Pads 0-3 are players 1-4. A missing pad is asked for again every half second only: XInput is
  * slow to answer for an empty user index. */
-static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
+static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadInfo info[PAD_SLOTS]) {
     static ULONGLONG retry[4];
     ULONGLONG now = GetTickCount64();
     for (int i = 0; i < 4; i++) {
@@ -460,6 +505,7 @@ static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         Raw raw;
         xinput_raw(&s.pad, &raw);
         dev_state(d, &raw, &fresh[i]);
+        dev_info(d, &raw, &info[i]);
         snprintf(names[i], sizeof names[i], "%s", d->name);
         u16 low, high;
         if (xinput_set_state && rumble_due(d, now, &low, &high)) { XVibration v = {low, high}; xinput_set_state((DWORD)i, &v); }
@@ -538,7 +584,7 @@ static void sdl_open(SDL_JoystickID id) {
 }
 
 /* Pads that came and went (every 100 ms), then every pad's state. */
-static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
+static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadInfo info[PAD_SLOTS]) {
     static ULONGLONG scanned;
     ULONGLONG now = GetTickCount64();
     p_SDL_UpdateGamepads();
@@ -577,6 +623,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
             if (p_SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = p_SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a);
         dev_state(d, &raw, &fresh[d->slot]);
+        dev_info(d, &raw, &info[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
         if (rumble_due(d, now, &low, &high)) p_SDL_RumbleGamepad(d->gp, low, high, low || high ? 200 : 0);
@@ -649,7 +696,7 @@ static void sdl_open(int index) {
 }
 
 /* Pads that came and went (every 100 ms), then every pad's state. */
-static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
+static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadInfo info[PAD_SLOTS]) {
     static ULONGLONG scanned;
     ULONGLONG now = GetTickCount64();
     SDL_GameControllerUpdate();
@@ -685,6 +732,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
             if (SDL_GameControllerGetButton(d->gp, (SDL_GameControllerButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = SDL_GameControllerGetAxis(d->gp, (SDL_GameControllerAxis)a);
         dev_state(d, &raw, &fresh[d->slot]);
+        dev_info(d, &raw, &info[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
         if (rumble_due(d, now, &low, &high)) SDL_GameControllerRumble(d->gp, low, high, low || high ? 200 : 0);
@@ -692,8 +740,70 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
 }
 #else
 static int sdl_start(void) { return 0; }
-static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) { (void)fresh; (void)names; }
+static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadInfo info[PAD_SLOTS]) { (void)fresh; (void)names; (void)info; }
 #endif
+
+/* ---- controllers.ini again (the settings menu) ---------------------------------------- */
+static volatile LONG reload_asked;
+
+/* On the input thread: the file read again, every pad set up again and given its player again
+ * (pinned pads first, then the others in their players' order, so nobody moves without a reason). */
+static void config_reload(int sdl) {
+    config_defaults();
+    config_load();
+    Dev *order[sizeof devs / sizeof *devs];
+    int n = 0;
+    for (int pinned = 1; pinned >= 0; pinned--)
+        for (int s = -1; s < PAD_SLOTS; s++)
+            for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
+                Dev *d = &devs[i];
+                if (!d->used || d->slot != s) continue;
+                int is_pinned = 0;
+                for (int k = 0; k < PAD_SLOTS && !is_pinned; k++) is_pinned = dev_matches(d, cfg.pin[k]);
+                if (is_pinned == pinned) order[n++] = d;
+            }
+    int was[sizeof devs / sizeof *devs];
+    for (int i = 0; i < n; i++) {
+        was[i] = order[i]->slot;
+        dev_configure(order[i], order[i]->has_labels ? order[i]->labels : NULL);
+        if (order[i]->xinput < 0) order[i]->slot = -1;   /* (XInput pads keep theirs: pad n is player n) */
+    }
+    for (int i = 0; i < n; i++) {
+        Dev *d = order[i];
+        if (d->xinput >= 0) continue;
+        d->slot = dev_assign(d);
+        if (d->slot >= 0) dev_remember(d);
+#ifdef SSBU_HAVE_SDL3
+        if (sdl && d->slot >= 0) p_SDL_SetGamepadPlayerIndex(d->gp, d->slot);
+#elif defined SSBU_HAVE_SDL2
+        if (sdl && d->slot >= 0) SDL_GameControllerSetPlayerIndex(d->gp, d->slot);
+#endif
+        if (d->slot != was[i]) log_connect(d);
+    }
+    (void)sdl;
+    fprintf(stderr, "[input] %s read again: %d pad%s set up again\n", cfg.path, n, n == 1 ? "" : "s");
+}
+
+void pad_reload(void) { pad_start(); InterlockedExchange(&reload_asked, 1); }
+const char *pad_ini_path(void) { pad_start(); return cfg.path; }
+
+int pad_info(u32 slot, PadInfo *out) {
+    memset(out, 0, sizeof *out);
+    if (slot >= PAD_SLOTS) return 0;
+    pad_start();
+    AcquireSRWLockShared(&lock);
+    *out = slot_info[slot];
+    ReleaseSRWLockShared(&lock);
+    return out->connected;
+}
+
+const char *pad_raw_name(int bit) {
+    if (bit == PAD_RAW_LEFT_TRIGGER_BIT) return "lefttrigger";
+    if (bit == PAD_RAW_RIGHT_TRIGGER_BIT) return "righttrigger";
+    return bit >= 0 && bit < RB_COUNT ? RAW_BUTTON_NAMES[bit] : "none";
+}
+
+const char *pad_button_name(int npad) { return npad >= 0 && npad < 16 ? NPAD_BUTTON_NAMES[npad] : "?"; }
 
 /* ---- the input thread ---------------------------------------------------------------- */
 static DWORD WINAPI input_thread(LPVOID unused) {
@@ -707,9 +817,12 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
         char names[PAD_SLOTS][48] = {{0}};
-        if (sdl) sdl_poll(fresh, names);
-        else xinput_poll(fresh, names);
-        publish(fresh, names);
+        static PadInfo info[PAD_SLOTS];
+        memset(info, 0, sizeof info);
+        if (InterlockedExchange(&reload_asked, 0)) config_reload(sdl);
+        if (sdl) sdl_poll(fresh, names, info);
+        else xinput_poll(fresh, names, info);
+        publish(fresh, names, info);
         LARGE_INTEGER due = {.QuadPart = -10000};   /* 1 ms */
         if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
         else Sleep(1);

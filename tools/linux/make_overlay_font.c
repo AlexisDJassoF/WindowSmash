@@ -8,8 +8,8 @@
 #include <string.h>
 #include <windows.h>
 
-#define CELL_W 12
-#define CELL_H 24
+#define CELL_W 24
+#define CELL_H 48
 #define COLS 16
 #define ATLAS_W (CELL_W * COLS)
 #define ATLAS_H (CELL_H * 6)
@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
     HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     if (!bmp) return 1;
     SelectObject(dc, bmp);
-    HFONT font = CreateFontW(-20, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+    HFONT font = CreateFontW(-40, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                              FIXED_PITCH | FF_MODERN, L"Consolas");
     SelectObject(dc, font);
     SetTextColor(dc, RGB(255, 255, 255));
@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
     SetBkMode(dc, OPAQUE);
     for (int c = 32; c < 127; c++) {
         char ch = (char)c;
-        TextOutA(dc, (c - 32) % COLS * CELL_W, (c - 32) / COLS * CELL_H + 1, &ch, 1);
+        TextOutA(dc, (c - 32) % COLS * CELL_W, (c - 32) / COLS * CELL_H + 2, &ch, 1);
     }
     GdiFlush();
     FILE *f = fopen(argv[1], "w");

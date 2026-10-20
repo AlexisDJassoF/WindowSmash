@@ -111,6 +111,7 @@ static void npad_state(u64 out, u32 id) {
         }
         if (id == NPAD_NO1) buttons |= scripted_buttons(&lx, &ly);
         if ((int)id == pad_keyboard_slot()) buttons |= keyboard_buttons(&lx, &ly, &rx, &ry);
+        if (menu_blocks_input()) { buttons = 0; lx = ly = rx = ry = 0; }   /* the settings menu has them (still connected) */
         {
             /* the stick directions also exist as buttons */
             if (lx < -16384) buttons |= 1ull << B_SL_LEFT;

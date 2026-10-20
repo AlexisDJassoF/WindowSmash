@@ -1,8 +1,10 @@
 /* The debug overlay: frame rate, a graph of recent frame times and the renderer's statistics,
- * drawn in the corner of each presented frame.
+ * drawn in the corner of each presented frame; and, while it is open, the settings menu
+ * (gpu_menu.c), with the same quads.
  *
  * Text comes from a glyph atlas GDI draws once (a monospaced font, printable ASCII, plus a
- * solid cell for rectangles); everything is quads from one dynamic vertex buffer. */
+ * solid cell for rectangles), at twice the overlay's own text size so the menu's larger text
+ * stays sharp; everything is quads from one dynamic vertex buffer. */
 #define COBJMACROS
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdarg.h>
@@ -13,9 +15,12 @@
 #include <d3dcompiler.h>
 
 #include "gpu_overlay.h"
+#include "gpu_menu.h"
 
-#define CELL_W 12
-#define CELL_H 24
+#define CELL_W 24                 /* the atlas's cells */
+#define CELL_H 48
+#define TEXT_W 12                 /* the overlay's own letters: half size */
+#define TEXT_H 24
 #define COLS 16
 #define ATLAS_W (CELL_W * COLS)
 #define ATLAS_H (CELL_H * 6)      /* ' '..'~', then the solid cell (127) */
@@ -70,7 +75,7 @@ static int make_atlas(ID3D11Device *dev) {
     HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     if (!bmp) { DeleteDC(dc); return 0; }
     HGDIOBJ old_bmp = SelectObject(dc, bmp);
-    HFONT font = CreateFontW(-20, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+    HFONT font = CreateFontW(-40, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                              FIXED_PITCH | FF_MODERN, L"Consolas");
     HGDIOBJ old_font = SelectObject(dc, font);
     SetTextColor(dc, RGB(255, 255, 255));
@@ -78,7 +83,7 @@ static int make_atlas(ID3D11Device *dev) {
     SetBkMode(dc, OPAQUE);
     for (int c = 32; c < 127; c++) {
         char ch = (char)c;
-        TextOutA(dc, (c - 32) % COLS * CELL_W, (c - 32) / COLS * CELL_H + 1, &ch, 1);
+        TextOutA(dc, (c - 32) % COLS * CELL_W, (c - 32) / COLS * CELL_H + 2, &ch, 1);
     }
     GdiFlush();
     const unsigned *px = bits;
@@ -147,22 +152,27 @@ static void quad(float x, float y, float w, float h, int cell, unsigned color) {
 }
 static void rect(float x, float y, float w, float h, unsigned color) { quad(x, y, w, h, 127 - 32, color); }
 
-#define RGBA(r, g, b, a) ((unsigned)(r) | (unsigned)(g) << 8 | (unsigned)(b) << 16 | (unsigned)(a) << 24)
+#define RGBA OVL_RGBA
 
-/* Text at (x, y), one line per '\n'; returns the y below it. */
-static float text(float x, float y, unsigned color, const char *s) {
-    float cx = x;
+/* Text at (x, y), letters size high, one line per '\n'; returns the y below it. */
+static float text_sized(float x, float y, float size, unsigned color, const char *s) {
+    float cx = x, w = size / 2, shadow = size >= 32 ? 2.0f : 1.0f;
     for (; *s; s++) {
-        if (*s == '\n') { cx = x; y += CELL_H; continue; }
+        if (*s == '\n') { cx = x; y += size; continue; }
         int c = (unsigned char)*s;
         if (c > 32 && c < 127) {
-            quad(cx + 1, y + 1, CELL_W, CELL_H, c - 32, RGBA(0, 0, 0, 200));   /* shadow */
-            quad(cx, y, CELL_W, CELL_H, c - 32, color);
+            quad(cx + shadow, y + shadow, w, size, c - 32, RGBA(0, 0, 0, 200));   /* shadow */
+            quad(cx, y, w, size, c - 32, color);
         }
-        cx += CELL_W;
+        cx += w;
     }
-    return y + CELL_H;
+    return y + size;
 }
+
+static float text(float x, float y, unsigned color, const char *s) { return text_sized(x, y, TEXT_H, color, s); }
+
+void ovl_rect(float x, float y, float w, float h, unsigned color) { rect(x, y, w, h, color); }
+float ovl_text(float x, float y, float size, unsigned color, const char *s) { return text_sized(x, y, size, color, s); }
 
 static int lines_of(const char *s, int *widest) {
     int n = 1, w = 0, cur = 0;
@@ -172,6 +182,8 @@ static int lines_of(const char *s, int *widest) {
 }
 
 /* ---- the frame ---------------------------------------------------------------------- */
+static void hud(const char *detail);
+static void draw(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h);
 static double history[HISTORY];   /* milliseconds per frame, newest at [head - 1] */
 static unsigned head, filled;
 
@@ -187,10 +199,18 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
         if (filled < HISTORY) filled++;
     }
     last = now;
-    if (!show) return;
+    int menu = menu_visible();
+    if (!show && !menu) return;
     if (!state) state = init(dev) ? 1 : -1;
     if (state < 0) return;
+    nverts = 0;
+    if (show && !menu_blocks_input()) hud(detail);   /* (an open menu instead of the overlay) */
+    if (menu) menu_draw((float)w, (float)h);
+    draw(ctx, rtv, x0, y0, w, h);
+}
 
+/* The overlay: the last second's frame rate and a graph of the last 240 frames' times. */
+static void hud(const char *detail) {
     /* the last second: frames, slowest and fastest */
     double total = 0, worst = 0, best = 1e9;
     unsigned frames = 0;
@@ -201,12 +221,11 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
         if (ms < best) best = ms;
     }
     double fps = total > 0 ? frames * 1000.0 / total : 0, last_ms = filled ? history[(head + HISTORY - 1) % HISTORY] : 0;
-    nverts = 0;
     char line[256];
     float x = 16, y = 16, gw = 2.0f * HISTORY, gh = 100;   /* graph: 2 px a frame; 100 px = 50 ms */
     int detail_w = 0, detail_lines = detail ? lines_of(detail, &detail_w) : 0;
-    float panel_w = gw + 16, panel_h = 2 * CELL_H + 8 + gh + 12 + detail_lines * CELL_H;
-    if (detail_w * CELL_W + 16 > panel_w) panel_w = (float)(detail_w * CELL_W + 16);
+    float panel_w = gw + 16, panel_h = 2 * TEXT_H + 8 + gh + 12 + detail_lines * TEXT_H;
+    if (detail_w * TEXT_W + 16 > panel_w) panel_w = (float)(detail_w * TEXT_W + 16);
     rect(x - 8, y - 6, panel_w, panel_h, RGBA(0, 0, 0, 150));
     unsigned fps_color = fps >= 57 ? RGBA(120, 255, 120, 255) : fps >= 45 ? RGBA(255, 230, 90, 255) : RGBA(255, 100, 90, 255);
     snprintf(line, sizeof line, "%5.1f FPS  %5.1f ms", fps, last_ms);
@@ -227,8 +246,10 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
     rect(x, y + gh - 33.33f * scale, gw, 1, RGBA(255, 255, 255, 70));
     y += gh + 6;
     if (detail) text(x, y, RGBA(210, 225, 255, 255), detail);
+}
 
-    /* draw it all */
+/* Every queued quad, over the picture at (x0, y0), w x h. */
+static void draw(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h) {
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
     memcpy(m.pData, verts, nverts * sizeof *verts);
