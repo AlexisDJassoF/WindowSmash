@@ -61,6 +61,15 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     return TRUE;
 }
 
+/* Does guest memory [addr, addr + size) hold any nvmap allocation - memory the GPU (thread) may
+ * read? (The kernel asks before decommitting: the game frees ordinary heap pages mid-match too.) */
+int gpu_memory_overlaps(u64 addr, u64 size) {
+    u32 n = next_handle < NVMAP_MAX ? next_handle : NVMAP_MAX;
+    for (u32 h = 1; h < n; h++)
+        if (gpu_maps[h].addr && gpu_maps[h].size && gpu_maps[h].addr < addr + size && addr < gpu_maps[h].addr + gpu_maps[h].size) return 1;
+    return 0;
+}
+
 u64 gpu_va_to_guest(u64 va) {   /* 0 when unmapped */
     u64 page = va >> PAGE_BITS;
     if (page >> LEAF_BITS >= TOP_COUNT) return 0;
@@ -82,9 +91,12 @@ static void set_pages(u64 va, u64 size, u64 guest) {   /* guest 0: unmap */
     }
 }
 
+u64 gpu_stat_drains;   /* (the GPU thread's queue drained for an unmapping) */
+
 static void unmap_range(u64 va) {
     for (u32 i = 0; i < map_count; i++)
         if (map_sizes[i].va == va) {
+            if (gpu_threaded()) { gpu_queue_drain(); gpu_stat_drains++; }   /* (queued work may still read it) */
             set_pages(va, map_sizes[i].size, 0);
             map_sizes[i] = map_sizes[--map_count];
             return;
@@ -119,11 +131,23 @@ static u32 ctrl(u32 nr, u64 a, u32 request) {
     switch (nr) {
     case 0x1B: return NV_CONFIG_NOT_FOUND;                       /* GetConfig */
     case 0x1D: case 0x1E: {                                      /* EventWait / EventWaitAsync */
-        u32 id = ld32(a), value = ld32(a + 4);
+        u32 id = ld32(a), value = ld32(a + 4), timeout = ld32(a + 8);
         if (id >= SYNCPT_MAX) return NV_BAD_PARAMETER;
-        /* The driver also advances sync points from inside its command lists. Until those
-         * lists are executed, the GPU is modelled as finishing everything instantly: any
-         * value waited for has been reached. */
+        /* A value submitted work will reach: wait for the GPU thread to get there (the async
+         * form too - it then has nothing to wait for). A timeout past a few seconds is taken
+         * as none being meant: whatever is wrong, the game goes on rather than hanging. */
+        if (gpu_threaded() && (i32)(gpu_syncpt_max[id] - value) >= 0 && (i32)(gpu_syncpt_min[id] - value) < 0) {
+            if (!gpu_syncpt_wait(id, value, timeout && timeout < 5000 ? timeout : 5000)) {
+                if (timeout && timeout < 5000) return NV_TIMEOUT;
+                static int warned;
+                if (warned++ < 4) fprintf(stderr, "[nvdrv] sync point %u: still short of %u after 5 s - going on\n", id, value);
+            }
+            st32(a + 12, gpu_syncpt_min[id]);
+            return NV_OK;
+        }
+        /* The driver also advances sync points from inside its command lists, and values no
+         * submission will reach are taken as reached: the GPU is modelled as finishing
+         * everything instantly. */
         if ((i32)(gpu_syncpt_max[id] - value) < 0) gpu_syncpt_max[id] = value;
         if ((i32)(gpu_syncpt_min[id] - value) < 0) gpu_syncpt_min[id] = value;
         st32(a + 12, gpu_syncpt_min[id]);
@@ -232,6 +256,7 @@ static u32 address_space(u32 nr, u64 a, u32 request) {
     case 0x09: return NV_OK;                                              /* AllocAsEx / InitializeEx */
     case 0x14: {                                                          /* Remap: entries of 0x14 bytes */
         u32 n = ((request >> 16) & 0x3FFF) / 0x14;
+        if (gpu_threaded()) { gpu_queue_drain(); gpu_stat_drains++; }      /* (queued work may still read what moves) */
         for (u32 i = 0; i < n; i++) {
             u64 e = a + 0x14ull * i;
             u32 handle = ld32(e + 4);
@@ -288,12 +313,17 @@ static u32 nvmap(u32 nr, u64 a, u32 request) {
 
 static u32 submit(u32 fd, u64 a, u64 entries, u32 count) {
     u32 flags = ld32(a + 12), id = files[fd].syncpoint;
-    gpu_submit(fd, P(u64, entries), count);
-    if (flags & ((1u << 1) | (1u << 8))) {   /* increment requested: two for the GPU, plus any extra */
-        u32 extra = flags & (1u << 8) ? ld32(a + 20) : 0;
-        gpu_syncpt_max[id] += 2 + extra;
+    u32 incr = 0;
+    if (flags & ((1u << 1) | (1u << 8)))   /* increment requested: two for the GPU, plus any extra */
+        incr = 2 + (flags & (1u << 8) ? ld32(a + 20) : 0);
+    if (gpu_threaded()) {   /* run later, on the GPU thread: the sync point reaches the fence then */
+        gpu_syncpt_max[id] += incr;
+        gpu_queue_submit(fd, P(u64, entries), count, id, gpu_syncpt_max[id]);
+    } else {
+        gpu_submit(fd, P(u64, entries), count);
+        gpu_syncpt_max[id] += incr;
+        gpu_syncpt_min[id] = gpu_syncpt_max[id];   /* everything completes now */
     }
-    gpu_syncpt_min[id] = gpu_syncpt_max[id];   /* null back end: everything completes now */
     st32(a + 16, id);
     st32(a + 20, gpu_syncpt_max[id]);
     return NV_OK;
