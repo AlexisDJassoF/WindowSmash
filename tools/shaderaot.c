@@ -64,6 +64,16 @@ static int exists(const char *path) { return access(path, F_OK) == 0; }
 
 static struct { u32 compiled, existing, tables, failed, translate_failed, keys, fallback; } count;
 
+/* A key that will not compile (or is left out): an empty "<file>.failed" beside where its file
+ * would be, so that the start-up screen (runtime/gpu_precompile.c) does not try it again at every
+ * start. Its name carries the cache version: a new translator tries again. */
+static void mark_failed(const char *path) {
+    char marker[1300];
+    snprintf(marker, sizeof marker, "%s.failed", path);
+    FILE *f = fopen(marker, "wb");
+    if (f) fclose(f);
+}
+
 /* Compile and write one cache file, dated as not yet used. A structured program whose HLSL does
  * not compile is compiled as its dispatch loop instead, as the renderer does. */
 static void compile_to(Program *p, u32 vs_outputs, const char *hlsl, int structured, const char *name, const char *path) {
@@ -83,6 +93,7 @@ static void compile_to(Program *p, u32 vs_outputs, const char *hlsl, int structu
     }
     if (FAILED(hr)) {
         count.failed++;
+        mark_failed(path);
         fprintf(stderr, "%s: fxc failed: %.300s\n", name, errors ? (const char *)errors->lpVtbl->GetBufferPointer(errors) : "?");
     } else {
         char tmp[1300];
@@ -222,7 +233,7 @@ int main(int argc, char **argv) {
             snprintf(name, sizeof name, "vs_%016llx", (unsigned long long)p->hash);
             shader_cache_file(path, sizeof path, dir, SHADER_VERTEX, p->hash, 0, 0);
             if (dry) printf("vs %016llx\n", (unsigned long long)p->hash);
-            else if (info.ntables) count.tables++;
+            else if (info.ntables) { count.tables++; mark_failed(path); }
             else if (exists(path)) count.existing++;
             else compile_to(p, 0, hlsl, info.flow == SHADER_FLOW_STRUCTURED, name, path);
             if (!dry) report();
@@ -259,8 +270,8 @@ int main(int argc, char **argv) {
             if (dry) { printf("ps %016llx %08x\n", (unsigned long long)p->hash, masks[m]); continue; }
             if (exists(path)) { count.existing++; report(); continue; }
             char *hlsl = translate(p, masks[m], &info, 0);
-            if (!hlsl) { count.translate_failed++; report(); continue; }
-            if (info.ntables) count.tables++;
+            if (!hlsl) { count.translate_failed++; mark_failed(path); report(); continue; }
+            if (info.ntables) { count.tables++; mark_failed(path); }
             else compile_to(p, masks[m], hlsl, info.flow == SHADER_FLOW_STRUCTURED, name, path);
             free(hlsl);
             report();

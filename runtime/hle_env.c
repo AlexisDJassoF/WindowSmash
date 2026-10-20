@@ -19,17 +19,47 @@
 #define R_UNAVAILABLE RESULT(124, 300)   /* "not available": any failure takes the offline path */
 
 /* ---- nn::oe ---------------------------------------------------------------------- */
-HLE(_ZN2nn2oe10InitializeEv) {
-    /* The notification event is a static the SDK hands out; it must be a live event that
-     * simply never fires (no focus changes, no sleep, no docking changes). */
-    u64 event = rt_callsym(c, "_ZN2nn2oe27GetNotificationMessageEventEv", 0);
-    rt_callsym(c, CREATE_SYSTEM_EVENT, 3, event, 1 /* auto clear */, 0);
+/* The notification messages (AppletMessage): none, but for a switch between docked and
+ * handheld while playing (F7, display_toggle_operation_mode): 30 OperationModeChanged and 31
+ * PerformanceModeChanged, as the console sends when it is put in or taken out of its dock. The
+ * SDK's notification event is a static it hands out, given a kernel event native code can
+ * signal (rt_attach_system_event). */
+static u32 oe_event;
+static SRWLOCK oe_lock = SRWLOCK_INIT;
+static u32 oe_messages[16], oe_count;
+
+void oe_notify(u32 message) {
+    AcquireSRWLockExclusive(&oe_lock);
+    if (oe_count < 16) oe_messages[oe_count++] = message;
+    ReleaseSRWLockExclusive(&oe_lock);
+    if (oe_event) kernel_signal_event(oe_event);
 }
-HLE(_ZN2nn2oe16GetOperationModeEv) {   /* 1 docked (TV output), 0 handheld: display.ini's mode */
+
+HLE(_ZN2nn2oe10InitializeEv) {
+    u64 event = rt_callsym(c, "_ZN2nn2oe27GetNotificationMessageEventEv", 0);
+    oe_event = rt_attach_system_event(c, event, 1 /* auto clear */);
+}
+HLE(_ZN2nn2oe16GetOperationModeEv) {   /* 1 docked (TV output), 0 handheld: display.ini's mode, or F7's */
+    static int told = -1;
     c->x[0] = display_operation_mode() == OP_HANDHELD ? 0 : 1;
+    if (told >= 0 && told != (int)c->x[0]) fprintf(stderr, "[oe] the game read the operation mode: %s\n", c->x[0] ? "docked" : "handheld");
+    told = (int)c->x[0];
 }
 HLE(_ZN2nn2oe20GetCurrentFocusStateEv) { c->x[0] = 1; }             /* in focus */
-HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) { c->x[0] = 0; }       /* no messages */
+HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) {
+    static int polled;
+    if (!polled++) fprintf(stderr, "[oe] the game polls its notification messages\n");
+    u64 out = c->x[0];
+    AcquireSRWLockExclusive(&oe_lock);
+    int got = oe_count > 0;
+    if (got) {
+        st32(out, oe_messages[0]);
+        memmove(oe_messages, oe_messages + 1, --oe_count * sizeof *oe_messages);
+    }
+    ReleaseSRWLockExclusive(&oe_lock);
+    if (got) fprintf(stderr, "[oe] message %u to the game\n", ld32(out));
+    c->x[0] = (u64)got;
+}
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) {                             /* a LanguageCode, by value */
     u64 code = 0;
     memcpy(&code, "en-US", 5);

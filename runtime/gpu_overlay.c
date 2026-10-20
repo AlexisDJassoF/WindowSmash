@@ -289,3 +289,82 @@ void overlay_progress(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderT
     text((w - (float)(sizeof hint - 1) * CELL_W) / 2, y, RGBA(150, 150, 150, 255), hint);
     flush(ctx, rtv, 0, 0, w, h);
 }
+
+/* The start-up menu (gpu_menu.c): a title, then a row per shown item - its label, and its value
+ * between < > - the selected one lit, the button row (Play) as a button, and a footer; centred
+ * in the w x h back buffer. Each row's place goes to rects (x, y, w, h; 0 for a row not shown),
+ * and where the values start to *value_x, for clicks. */
+void overlay_menu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned w, unsigned h, const char *title, int n,
+                  const char *const labels[], const char *const values[], const int shown[], int selected, int button, const char *footer,
+                  float *rects, float *value_x) {
+    if (!state) state = init(dev) ? 1 : -1;
+    if (state < 0) return;
+    nverts = 0;
+    int rows = 0;
+    for (int i = 0; i < n; i++) rows += shown[i] != 0;
+    float row_h = CELL_H + 14, pw = 34 * CELL_W + 48, ph = (rows + 1) * row_h + 3 * CELL_H + 40;
+    if (pw > w - 16.0f) pw = w - 16.0f;
+    float px = (w - pw) / 2, py = (h - ph) / 2, lx = px + 24, vx = px + 24 + 12 * CELL_W;
+    rect(px, py, pw, ph, RGBA(24, 24, 28, 235));
+    text((w - (float)strlen(title) * CELL_W) / 2, py + 14, RGBA(240, 240, 240, 255), title);
+    float y = py + 14 + CELL_H + 18;
+    for (int i = 0; i < n; i++) {
+        float *r = rects + 4 * i;
+        r[0] = r[1] = r[2] = r[3] = 0;
+        if (!shown[i]) continue;
+        int sel = i == selected;
+        if (i == button) {
+            y += 8;
+            float bw = 12.0f * CELL_W, bx = (w - bw) / 2;
+            rect(bx, y, bw, row_h - 4, sel ? RGBA(90, 200, 110, 255) : RGBA(60, 60, 66, 255));
+            text((w - (float)strlen(labels[i]) * CELL_W) / 2, y + (row_h - 4 - CELL_H) / 2, sel ? RGBA(10, 10, 10, 255) : RGBA(230, 230, 230, 255),
+                 labels[i]);
+            r[0] = bx, r[1] = y, r[2] = bw, r[3] = row_h - 4;
+        } else {
+            if (sel) rect(px + 8, y - 4, pw - 16, row_h - 6, RGBA(70, 90, 140, 200));
+            text(lx, y + 2, RGBA(225, 225, 225, 255), labels[i]);
+            char v[96];
+            snprintf(v, sizeof v, "<  %s  >", values[i]);
+            text(vx, y + 2, sel ? RGBA(255, 255, 255, 255) : RGBA(190, 200, 220, 255), v);
+            r[0] = px + 8, r[1] = y - 4, r[2] = pw - 16, r[3] = row_h - 6;
+        }
+        y += row_h;
+    }
+    if (footer) text((w - (float)strlen(footer) * CELL_W) / 2, py + ph - CELL_H - 12, RGBA(150, 150, 150, 255), footer);
+    *value_x = vx;
+    flush(ctx, rtv, 0, 0, w, h);
+}
+
+/* A short notice (F7's mode) at the top of the picture at (x0, y0, w x h), in a box. */
+void overlay_notice(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h,
+                    const char *note) {
+    if (!state) state = init(dev) ? 1 : -1;
+    if (state < 0) return;
+    nverts = 0;
+    float tw = (float)strlen(note) * CELL_W, bw = tw + 40, bh = CELL_H + 20, bx = (w - bw) / 2, by = h * 0.06f;
+    rect(bx, by, bw, bh, RGBA(20, 20, 24, 210));
+    rect(bx, by + bh - 3, bw, 3, RGBA(90, 200, 110, 255));
+    text(bx + 20, by + 10, RGBA(245, 245, 245, 255), note);
+    flush(ctx, rtv, x0, y0, w, h);
+}
+
+/* The mode bar across the top of a window (bar px tall): the mode as a button, and the keys. The
+ * button's place goes to button (x, y, w, h). */
+void overlay_bar(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned w, unsigned h, unsigned bar, const char *mode,
+                 int button[4]) {
+    if (!state) state = init(dev) ? 1 : -1;
+    if (state < 0) return;
+    nverts = 0;
+    float ty = (bar - CELL_H) / 2.0f;
+    rect(0, 0, (float)w, (float)bar, RGBA(32, 32, 38, 255));
+    rect(0, (float)bar - 1, (float)w, 1, RGBA(70, 70, 80, 255));
+    text(10, ty, RGBA(170, 170, 180, 255), "Mode:");
+    float bx = 10 + 6.0f * CELL_W, bw = (float)strlen(mode) * CELL_W + 24, bh = bar - 8.0f;
+    rect(bx, 4, bw, bh, RGBA(70, 90, 140, 255));
+    text(bx + 12, ty, RGBA(245, 245, 245, 255), mode);
+    static const char keys[] = "F7: docked/handheld   F11: full screen";
+    float kx = w - (float)(sizeof keys - 1) * CELL_W - 12;
+    if (kx > bx + bw + 24) text(kx, ty, RGBA(140, 140, 150, 255), keys);
+    button[0] = (int)bx, button[1] = 4, button[2] = (int)bw, button[3] = (int)bh;
+    flush(ctx, rtv, 0, 0, w, h);
+}

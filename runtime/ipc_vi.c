@@ -19,9 +19,9 @@
 #define LAYER_ID 1
 #define BINDER_ID 1
 /* The screen the game is told of: 1920 x 1080 docked, 1280 x 720 handheld (display.ini's mode) */
-static unsigned screen(int height) {
-    static unsigned w, h;
-    if (!w) display_screen_size(&w, &h);
+static unsigned screen(int height) {   /* (asked each time: F7 changes the mode while playing) */
+    unsigned w, h;
+    display_screen_size(&w, &h);
     return height ? h : w;
 }
 #define WIDTH screen(0)

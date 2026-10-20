@@ -99,6 +99,8 @@ long precompile_missing(const char *keys_path, const char *cache_dir, FILE *miss
         else if (got == 3 && !strcmp(kind, "ps")) shader_cache_file(path, sizeof path, "", SHADER_PIXEL, hash, mask, 0);
         else continue;
         if (name_has(&ns, path + 1)) continue;   /* (path + 1: the name, past the empty directory's '/') */
+        strncat(path, ".failed", sizeof path - strlen(path) - 1);
+        if (name_has(&ns, path + 1)) continue;   /* (shaderaot tried it and could not: not every start again) */
         n++;
         if (missing) fputs(line, missing);
     }

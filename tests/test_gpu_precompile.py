@@ -97,6 +97,15 @@ class PrecompileTests(unittest.TestCase):
         self.assertIn('0000000000000003', out)
         self.assertNotIn('0000000000000001', out)
 
+    def test_failed_marker_counts_as_tried(self):   # (shaderaot could not compile it: not every start again)
+        keys = self.aot / 'keys.txt'
+        keys.write_text('vs 0000000000000001\nvs 0000000000000002\n')
+        (self.cache / (vs_name(1) + '.failed')).touch()
+        (self.cache / (f'v{VERSION - 1}_vs_0000000000000002_00000000_0000000000000000.dxbc.failed')).touch()   # (an older version's: tried again)
+        n, out = self.missing(keys)
+        self.assertEqual(n, 1)
+        self.assertIn('0000000000000002', out)
+
     def test_missing_without_keys(self):
         self.assertEqual(self.missing(self.aot / 'none.txt')[0], -1)
 

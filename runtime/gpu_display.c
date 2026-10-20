@@ -42,7 +42,14 @@ static struct {
     OperationMode operation;
     Upscale upscale;
     float sharpness;
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f};
+    int menu;
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, 1};
+
+/* What the start-up menu shows and may write (gpu_menu.c): the file's own values (before the
+ * environment's), and which of them a variable fixes */
+static DisplaySettings from_file;
+static unsigned locked;
+static char ini_path[1024];
 
 static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
@@ -67,7 +74,8 @@ static const char DEFAULT_INI[] =
     "width = 1280\n"
     "height = 720\n"
     "\n"
-    "; pacing = clock | vrr | display\n"
+    "; pacing = vsync | clock | vrr | display\n"
+    ";   vsync:   the 60-a-second clock, each frame shown at the monitor's next refresh: no tearing.\n"
 #ifdef _WIN32
     ";   clock:   a steady 60 frames a second; each is shown at the monitor's next refresh.\n"
     ";   vrr:     for G-Sync / FreeSync monitors: each frame is shown the moment it is ready, so every\n"
@@ -97,7 +105,10 @@ static const char DEFAULT_INI[] =
     ";   fsr: AMD FidelityFX Super Resolution 1, sharper edges than linear (best with mode = handheld).\n"
     "upscale = linear\n"
     "; sharpness = 0.0-2.0: fsr's sharpening, 0.0 the most; each 1.0 halves it.\n"
-    "sharpness = 0.2\n";
+    "sharpness = 0.2\n"
+    "\n"
+    "; menu = 1: the settings menu at every start (mode, upscale, vsync, window); 0: straight to the game.\n"
+    "menu = 1\n";
 
 static void parse_window(const char *v) {
     if (!_stricmp(v, "windowed")) cfg.mode = MODE_WINDOWED;
@@ -110,7 +121,8 @@ static void parse_pacing(const char *v) {
     if (!_stricmp(v, "clock")) cfg.pacing = PACING_CLOCK;
     else if (!_stricmp(v, "vrr")) cfg.pacing = PACING_VRR;
     else if (!_stricmp(v, "display")) cfg.pacing = PACING_DISPLAY;
-    else fprintf(stderr, "[display] pacing is clock, vrr or display, not '%s'\n", v);
+    else if (!_stricmp(v, "vsync")) cfg.pacing = PACING_VSYNC;
+    else fprintf(stderr, "[display] pacing is vsync, clock, vrr or display, not '%s'\n", v);
 }
 
 static void parse_operation(const char *v) {
@@ -164,9 +176,17 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "mode")) parse_operation(value);
         else if (!_stricmp(key, "upscale")) parse_upscale(value);
         else if (!_stricmp(key, "sharpness")) parse_sharpness(value);
+        else if (!_stricmp(key, "menu")) cfg.menu = atoi(value) != 0;
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
+    snprintf(ini_path, sizeof ini_path, "%s", path);
+    from_file = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing};
+    if ((env = getenv("SSBU_WINDOW")) && *env) locked |= LOCK_WINDOW;
+    if ((env = getenv("SSBU_PACING")) && *env) locked |= LOCK_PACING;
+    if ((env = getenv("SSBU_MODE")) && *env) locked |= LOCK_MODE;
+    if ((env = getenv("SSBU_UPSCALE")) && *env) locked |= LOCK_UPSCALE;
+    if ((env = getenv("SSBU_MENU")) && *env) cfg.menu = atoi(env) != 0;
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
@@ -198,6 +218,105 @@ void display_screen_size(unsigned *w, unsigned *h) {
 Upscale display_upscale(void) { load(); return cfg.upscale; }
 float display_sharpness(void) { load(); return cfg.sharpness; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
+void oe_notify(u32 message);   /* hle_env.c */
+
+/* F7: docked <-> handheld while playing, told to the game as the console tells it (messages 30
+ * and 31). Not written to display.ini: the start-up menu decides the next start. */
+static volatile ULONGLONG toggled_at;
+
+void display_toggle_operation_mode(void) {
+    load();
+    cfg.operation = cfg.operation == OP_HANDHELD ? OP_DOCKED : OP_HANDHELD;
+    toggled_at = GetTickCount64();
+    fprintf(stderr, "[display] F7: %s\n", cfg.operation == OP_HANDHELD ? "handheld (720p)" : "docked (1080p)");
+    oe_notify(30);   /* OperationModeChanged */
+    oe_notify(31);   /* PerformanceModeChanged */
+}
+
+/* The 2 s after F7: what to show over the picture ("Handheld (720p)"); 0 the rest of the time */
+int display_notice(char *out, unsigned n) {
+    ULONGLONG at = toggled_at;
+    if (!at || GetTickCount64() - at > 2000) return 0;
+    snprintf(out, n, "%s", cfg.operation == OP_HANDHELD ? "Handheld (720p)" : "Docked (1080p)");
+    return 1;
+}
+
+unsigned display_sync_interval(void) { load(); return cfg.pacing == PACING_VSYNC ? 1 : 0; }
+int display_menu_enabled(void) { load(); return cfg.menu; }
+
+/* ---- the start-up menu's settings (gpu_menu.c) ----------------------------------------- */
+void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed) {
+    load();
+    *now = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing};
+    if (file) *file = from_file;
+    if (fixed) *fixed = locked;
+}
+
+static volatile LONG window_request = -1;   /* a window mode for linux/window.c to switch to */
+int display_take_window_request(void) { return (int)InterlockedExchange(&window_request, -1); }
+
+/* Before the game starts: the settings from now on (nothing has read them yet but the window and
+ * the renderer's start, which read the window mode and upscale again where they matter). */
+void display_apply(const DisplaySettings *s) {
+    load();
+    if (s->window != cfg.mode) InterlockedExchange(&window_request, s->window);
+    cfg.mode = s->window;
+    cfg.operation = s->operation;
+    cfg.upscale = s->upscale;
+    cfg.sharpness = s->sharpness < 0 ? 0 : s->sharpness > 2 ? 2 : s->sharpness;
+    cfg.pacing = s->pacing;
+}
+
+char *display_ini_rewrite(const char *text, const char *defaults, int n, const char *const keys[], const char *const values[]);
+
+/* The settings that differ from the file's, and no variable fixes, written into display.ini
+ * (gpu_display_ini.c): whole or not at all, the first time with a copy beside it (display.ini.bak).
+ * 1 if written (or nothing to write). */
+int display_save(const DisplaySettings *s) {
+    load();
+    static const char *const WINDOW[] = {"windowed", "borderless", "fullscreen"}, *const PACE[] = {"clock", "vrr", "display", "vsync"};
+    const char *keys[5], *values[5];
+    char sharp[16];
+    int n = 0;
+    if (!(locked & LOCK_WINDOW) && s->window != from_file.window) keys[n] = "window", values[n++] = WINDOW[s->window];
+    if (!(locked & LOCK_MODE) && s->operation != from_file.operation) keys[n] = "mode", values[n++] = s->operation == OP_HANDHELD ? "handheld" : "docked";
+    if (!(locked & LOCK_UPSCALE) && s->upscale != from_file.upscale) keys[n] = "upscale", values[n++] = s->upscale == UPSCALE_FSR ? "fsr" : "linear";
+    if (s->sharpness != from_file.sharpness) {
+        snprintf(sharp, sizeof sharp, "%.1f", s->sharpness);
+        keys[n] = "sharpness", values[n++] = sharp;
+    }
+    if (!(locked & LOCK_PACING) && s->pacing != from_file.pacing) keys[n] = "pacing", values[n++] = PACE[s->pacing];
+    if (!n) return 1;
+    char *old = NULL;
+    FILE *f = fopen(ini_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        old = calloc(1, (size_t)len + 1);
+        if (old && fread(old, 1, (size_t)len, f) != (size_t)len) { free(old); old = NULL; }
+        fclose(f);
+    }
+    char *text = display_ini_rewrite(old ? old : DEFAULT_INI, DEFAULT_INI, n, keys, values);
+    char bak[1100], tmp[1100];
+    snprintf(bak, sizeof bak, "%s.bak", ini_path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", ini_path);
+    if (old && !(f = fopen(bak, "rb"))) {   /* (the user's own file, once) */
+        if ((f = fopen(bak, "wb"))) { fputs(old, f); fclose(f); }
+    } else if (old) fclose(f);
+    int ok = 0;
+    if ((f = fopen(tmp, "wb"))) {
+        ok = fputs(text, f) >= 0;
+        ok = fclose(f) == 0 && ok;
+        ok = ok && MoveFileExA(tmp, ini_path, MOVEFILE_REPLACE_EXISTING);
+        if (!ok) DeleteFileA(tmp);
+    }
+    if (ok) from_file = *s;
+    else fprintf(stderr, "[display] cannot write %s\n", ini_path);
+    free(old);
+    free(text);
+    return ok;
+}
 
 #ifdef _WIN32
 void display_dpi_aware(void) {
@@ -295,13 +414,29 @@ int display_take_size(unsigned *w, unsigned *h) {
     return 1;
 }
 
+/* The mode bar over the picture in a window (Linux: linux/window.c says how tall, 0 in full
+ * screen), and its button's place, drawn by the renderer and clicked in the window */
+static volatile LONG bar_px;
+static volatile LONG bar_button[4];
+void display_note_bar(unsigned px) { InterlockedExchange(&bar_px, (LONG)px); }
+unsigned display_bar_height(void) { return (unsigned)bar_px; }
+void display_note_bar_button(int x, int y, int w, int h) {
+    InterlockedExchange(&bar_button[0], x); InterlockedExchange(&bar_button[1], y);
+    InterlockedExchange(&bar_button[2], w); InterlockedExchange(&bar_button[3], h);
+}
+int display_bar_hit(int x, int y) {
+    return bar_px && x >= bar_button[0] && x < bar_button[0] + bar_button[2] && y >= bar_button[1] && y < bar_button[1] + bar_button[3];
+}
+
 void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw, unsigned *fh) {
+    unsigned bar = display_bar_height() < h ? display_bar_height() : 0;   /* (below the mode bar, in a window) */
+    h -= bar;
     if ((unsigned long long)w * 9 > (unsigned long long)h * 16) { *fh = h; *fw = h * 16 / 9; }   /* wider: bars left and right */
     else { *fw = w; *fh = w * 9 / 16; }
     if (!*fw) *fw = 1;
     if (!*fh) *fh = 1;
     *x = (w - *fw) / 2;
-    *y = (h - *fh) / 2;
+    *y = bar + (h - *fh) / 2;
 }
 
 #ifdef _WIN32
@@ -482,7 +617,7 @@ void display_wait_tick(void) {
         logged = 1;
         int hz = monitor_hz();
         fprintf(stderr, "[display] %d Hz monitor, %s pacing%s\n", hz,
-                cfg.pacing == PACING_VRR ? "vrr" : cfg.pacing == PACING_DISPLAY ? "display" : "clock",
+                cfg.pacing == PACING_VRR ? "vrr" : cfg.pacing == PACING_DISPLAY ? "display" : cfg.pacing == PACING_VSYNC ? "vsync" : "clock",
                 cfg.pacing == PACING_VRR && !tearing ? " (no tearing support: as clock)" : "");
     }
     if (cfg.pacing == PACING_DISPLAY && vblank_tick()) {   /* the clock restarts from here if it is needed later */

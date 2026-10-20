@@ -17,6 +17,9 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed);
 void gfx_present(u64 guest, u32 x, u32 y, u32 w, u32 h);
 /* The start-up's shader screen (gpu_precompile.c): one frame of it. 0 without a device. */
 int gfx_progress(const char *title, unsigned done, unsigned total, const char *status);
+/* The start-up settings menu (gpu_menu.c): one frame of it (overlay_menu's arguments). 0 without a device. */
+int gfx_menu(const char *title, int n, const char *const labels[], const char *const values[], const int shown[], int selected, int button,
+             const char *footer, float *rects, float *value_x);
 
 /* The 2D engine's scaled copy between surfaces (PIXELS_FROM_MEMORY), with its registers. */
 void gfx_blit2d(const u32 *regs);

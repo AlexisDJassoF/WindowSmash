@@ -327,6 +327,7 @@ BOOL SetFileTime(HANDLE h, const FILETIME *created, const FILETIME *accessed, co
 BOOL DeleteFileA(LPCSTR path);
 BOOL CreateDirectoryA(LPCSTR path, void *security);
 BOOL RemoveDirectoryA(LPCSTR path);
+#define MOVEFILE_REPLACE_EXISTING 0x1   /* (rename() replaces anyway) */
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags);
 DWORD GetFileAttributesA(LPCSTR path);
 HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *data);

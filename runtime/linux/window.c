@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include "../display.h"
+#include "../gpu_menu.h"
 #include "../gpu_precompile.h"
 
 static SDL_Window *window;
@@ -49,9 +50,12 @@ static void note_refresh(void) {   /* the refresh rate of the window's monitor *
 
 static const char *mode_name(int m) { return m == DISPLAY_WINDOWED ? "windowed" : m == DISPLAY_BORDERLESS ? "borderless" : "fullscreen"; }
 
+#define BAR_PX 32   /* the mode bar at the top of a window (gpu_d3d11.c draws it; its button is F7) */
+
 static void set_mode(int m) {
     if (m == mode) return;
     mode = m;
+    display_note_bar(m == DISPLAY_WINDOWED ? BAR_PX : 0);
     if (SDL_SetWindowFullscreen(window, m == DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP))
         fprintf(stderr, "[display] cannot switch to %s: %s\n", mode_name(m), SDL_GetError());
     else fprintf(stderr, "[display] %s\n", mode_name(m));
@@ -119,6 +123,8 @@ int rt_window_init(void) {
     int width, height;
     display_window_size(&width, &height);
     mode = display_window_mode();
+    if (mode == DISPLAY_WINDOWED) height += BAR_PX;   /* (the mode bar above the picture: the picture keeps its size) */
+    display_note_bar(mode == DISPLAY_WINDOWED ? BAR_PX : 0);
     window = SDL_CreateWindow("Super Smash Bros. Ultimate (native)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height,
                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
                               (mode == DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP));
@@ -138,13 +144,120 @@ int rt_window_init(void) {
     return 1;
 }
 
+/* ---- the start-up menu's input (gpu_menu.c) ----------------------------------------------
+ * While it is up, the arrows, Enter, Esc and left clicks go to it, not to the game; and the
+ * controllers are read as hle_pad.c reads them while playing - their state, not their events
+ * (this loop has those off), with gamecontrollerdb.txt's mappings, looked for every 100 ms -
+ * the D-pad and left stick as presses that repeat while held, the south button to play, the east
+ * one to start without changes. Once the menu closes they are closed again, for hle_pad.c. */
+static SDL_GameController *menu_pads[8];
+static int menu_pads_open;
+
+static void menu_pads_stop(void) {
+    for (int i = 0; i < 8; i++) if (menu_pads[i]) { SDL_GameControllerClose(menu_pads[i]); menu_pads[i] = NULL; }
+    menu_pads_open = 0;
+}
+
+static void menu_pads_poll(Uint64 now) {
+    static Uint64 scanned, held_since, repeated;
+    static int held = -1, was_accept, was_back;
+    if (!menu_pads_open) {
+        SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");   /* (as hle_pad.c: some pads need it) */
+        menu_pads_open = 1;
+        scanned = 0;
+    }
+    SDL_GameControllerUpdate();
+    if (now - scanned >= 100) {   /* pads that came and went */
+        scanned = now;
+        for (int i = 0; i < 8; i++)
+            if (menu_pads[i] && !SDL_GameControllerGetAttached(menu_pads[i])) { SDL_GameControllerClose(menu_pads[i]); menu_pads[i] = NULL; }
+        for (int k = 0; k < SDL_NumJoysticks() && k < 8; k++) {
+            static int told;
+            if (!SDL_IsGameController(k)) {   /* (no mapping: the game would not read it either) */
+                if (!(told & 1 << k)) fprintf(stderr, "[menu] joystick %d (%s) has no controller mapping\n", k, SDL_JoystickNameForIndex(k));
+                told |= 1 << k;
+                continue;
+            }
+            SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(k);
+            int open = 0;
+            for (int i = 0; i < 8 && !open; i++) open = menu_pads[i] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(menu_pads[i])) == id;
+            for (int i = 0; i < 8 && !open; i++)
+                if (!menu_pads[i]) {
+                    menu_pads[i] = SDL_GameControllerOpen(k);
+                    open = 1;
+                    const char *name = menu_pads[i] ? SDL_GameControllerName(menu_pads[i]) : NULL;
+                    fprintf(stderr, "[menu] controller: %s\n", menu_pads[i] ? (name ? name : "gamepad") : SDL_GetError());
+                }
+        }
+    }
+    /* every pad's buttons together: a direction (D-pad or stick past half way), accept, back */
+    int dir = -1, accept = 0, back = 0;
+    for (int i = 0; i < 8; i++) {
+        SDL_GameController *gp = menu_pads[i];
+        if (!gp) continue;
+        int x = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_LEFTX), y = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_LEFTY);
+        if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_UP) || y < -16000) dir = MENU_UP;
+        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || y > 16000) dir = MENU_DOWN;
+        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || x < -16000) dir = MENU_LEFT;
+        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || x > 16000) dir = MENU_RIGHT;
+        accept |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_A);   /* (positional: the south button) */
+        back |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_B);     /* (the east one) */
+    }
+    if (dir != held) {   /* a new press: now, then again after 400 ms held, every 120 ms */
+        held = dir;
+        held_since = repeated = now;
+        if (dir >= 0) menu_input(dir, 0, 0);
+    } else if (dir >= 0 && now - held_since >= 400 && now - repeated >= 120) {
+        repeated = now;
+        menu_input(dir, 0, 0);
+    }
+    if (accept && !was_accept) menu_input(MENU_ACCEPT, 0, 0);
+    if (back && !was_back) menu_input(MENU_BACK, 0, 0);
+    was_accept = accept;
+    was_back = back;
+}
+
+/* 1 if the menu took the event */
+static int menu_event_of(const SDL_Event *e) {
+    if (!menu_active) return 0;
+    switch (e->type) {
+    case SDL_KEYDOWN:
+        switch (e->key.keysym.scancode) {
+        case SDL_SCANCODE_UP: menu_input(MENU_UP, 0, 0); return 1;
+        case SDL_SCANCODE_DOWN: menu_input(MENU_DOWN, 0, 0); return 1;
+        case SDL_SCANCODE_LEFT: menu_input(MENU_LEFT, 0, 0); return 1;
+        case SDL_SCANCODE_RIGHT: menu_input(MENU_RIGHT, 0, 0); return 1;
+        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE:
+            if (e->key.keysym.mod & KMOD_ALT) return 0;   /* (Alt+Enter: full screen) */
+            if (!e->key.repeat) menu_input(MENU_ACCEPT, 0, 0);
+            return 1;
+        case SDL_SCANCODE_ESCAPE: if (!e->key.repeat) menu_input(MENU_BACK, 0, 0); return 1;
+        default: return 0;
+        }
+    case SDL_MOUSEBUTTONDOWN: {
+        if (e->button.button != SDL_BUTTON_LEFT) return 0;
+        int ww = 1, wh = 1, dw = 1, dh = 1;   /* (window units to the drawable's pixels: they differ on a scaled desktop) */
+        SDL_GetWindowSize(window, &ww, &wh);
+        SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+        menu_input(MENU_CLICK, e->button.x * dw / (ww ? ww : 1), e->button.y * dh / (wh ? wh : 1));
+        return 1;
+    }
+    }
+    return 0;
+}
+
 /* Runs on the main thread for good. `status` is called every `every` seconds (0: never). */
 void rt_window_loop(int every, void (*status)(void)) {
     Uint64 last = SDL_GetTicks64();
     for (;;) {
         SDL_Event e;
+        if (menu_active) menu_pads_poll(SDL_GetTicks64());
+        else if (menu_pads_open) menu_pads_stop();
+        int request = display_take_window_request();   /* (the menu's Window setting) */
+        if (request >= 0 && window) set_mode(request);
         int got = window ? SDL_WaitEventTimeout(&e, 8) : (SDL_Delay(50), 0);
         while (got) {
+            if (menu_event_of(&e)) { got = SDL_PollEvent(&e); continue; }
             switch (e.type) {
             case SDL_QUIT:
                 fprintf(stderr, "[gfx] window closed\n");
@@ -155,6 +268,14 @@ void rt_window_loop(int every, void (*status)(void)) {
                 if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) note_size();
                 if (e.window.event == SDL_WINDOWEVENT_MOVED || e.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED) note_refresh();
                 break;
+            case SDL_MOUSEBUTTONDOWN:   /* the mode bar's button (in a window) */
+                if (e.button.button == SDL_BUTTON_LEFT && !precompile_active) {
+                    int ww = 1, wh = 1, dw = 1, dh = 1;
+                    SDL_GetWindowSize(window, &ww, &wh);
+                    SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+                    if (display_bar_hit(e.button.x * dw / (ww ? ww : 1), e.button.y * dh / (wh ? wh : 1))) display_toggle_operation_mode();
+                }
+                break;
             case SDL_MOUSEMOTION:
                 mouse_moved_at = SDL_GetTicks64();
                 if (cursor_hidden) { SDL_ShowCursor(SDL_ENABLE); cursor_hidden = 0; }
@@ -164,6 +285,7 @@ void rt_window_loop(int every, void (*status)(void)) {
                 if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE && precompile_active) precompile_skip = 1;   /* (the start-up's shader screen) */
                 if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F6)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
+                if (e.key.keysym.scancode == SDL_SCANCODE_F7 && !menu_active && !precompile_active) display_toggle_operation_mode();
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 ||
                     (e.key.keysym.scancode == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT))) {
                     int full = display_window_mode() == DISPLAY_FULLSCREEN ? DISPLAY_FULLSCREEN : DISPLAY_BORDERLESS;

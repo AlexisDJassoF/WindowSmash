@@ -14,6 +14,7 @@
 
 #include "host.h"
 #include "display.h"
+#include "gpu_menu.h"
 #include "gpu_precompile.h"
 #ifdef _WIN32
 #include <dbghelp.h>
@@ -870,7 +871,8 @@ static DWORD WINAPI crash_test(void *seconds) {
 #ifndef _WIN32
 static DWORD WINAPI start_game(LPVOID unused) {
     (void)unused;
-    precompile_run();
+    menu_run();         /* the settings, every start (gpu_menu.c) */
+    precompile_run();   /* then the shaders the cache lacks */
     /* Guest call depth becomes host call depth, so the guest runs on a thread with a large stack. */
     CloseHandle(CreateThread(NULL, 512ull << 20, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL));
     return 0;
@@ -932,7 +934,7 @@ int main(int argc, char **argv) {
     HANDLE t = CreateThread(NULL, 512ull << 20, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     while (WaitForSingleObject(t, status_every ? status_every * 1000 : INFINITE) == WAIT_TIMEOUT) print_status();
 #else
-    /* the start-up's thread: the shaders the cache lacks first (gpu_precompile.c), then the game's;
+    /* the start-up's thread: the settings menu and the shaders the cache lacks first, then the game's;
      * the window's events stay on this one meanwhile */
     CloseHandle(CreateThread(NULL, 0, start_game, NULL, 0, NULL));
     if (status_every > 0) CloseHandle(CreateThread(NULL, 0, status_thread, NULL, 0, NULL));

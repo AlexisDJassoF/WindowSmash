@@ -446,17 +446,6 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     D3D11_SAMPLER_DESC smp = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
                               D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, {0}, 0, D3D11_FLOAT32_MAX};
     ID3D11Device_CreateSamplerState(dev, &smp, &linear_sampler);
-    if (display_upscale() == UPSCALE_FSR) {
-        D3D11_BUFFER_DESC cbd = {64, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
-        easu_ps = optional_ps(FSR_HLSL, "ps_easu", "FSR");
-        rcas_ps = easu_ps ? optional_ps(FSR_HLSL, "ps_rcas", "FSR") : NULL;
-        if (rcas_ps && FAILED(ID3D11Device_CreateBuffer(dev, &cbd, NULL, &fsr_cb))) fsr_cb = NULL;
-        if (!easu_ps || !rcas_ps || !fsr_cb) {
-            if (easu_ps) { ID3D11PixelShader_Release(easu_ps); easu_ps = NULL; }
-            if (rcas_ps) { ID3D11PixelShader_Release(rcas_ps); rcas_ps = NULL; }
-            fprintf(stderr, "[gfx] FSR unavailable: the picture is enlarged with the linear filter\n");
-        } else fprintf(stderr, "[gfx] FSR 1 ready (EASU + RCAS, sharpness %.1f)\n", display_sharpness());
-    }
     D3D11_TEXTURE2D_DESC fd = {FINAL_W, FINAL_H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
                                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &fd, NULL, &final_tex)) ||
@@ -3273,6 +3262,26 @@ static void gpu_timer_frame(void) {
 void watchdog_present(void);   /* debug_watchdog.c */
 void hitch_present(void);      /* debug_profile.c */
 
+/* FSR's shaders, made the first time a present needs them (the start-up menu may turn it on
+ * after the renderer started); 0 if they could not be */
+static int fsr_ready(void) {
+    static int tried;
+    if (tried) return easu_ps != NULL;
+    tried = 1;
+    D3D11_BUFFER_DESC cbd = {64, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+    easu_ps = optional_ps(FSR_HLSL, "ps_easu", "FSR");
+    rcas_ps = easu_ps ? optional_ps(FSR_HLSL, "ps_rcas", "FSR") : NULL;
+    if (rcas_ps && FAILED(ID3D11Device_CreateBuffer(dev, &cbd, NULL, &fsr_cb))) fsr_cb = NULL;
+    if (!easu_ps || !rcas_ps || !fsr_cb) {
+        if (easu_ps) { ID3D11PixelShader_Release(easu_ps); easu_ps = NULL; }
+        if (rcas_ps) { ID3D11PixelShader_Release(rcas_ps); rcas_ps = NULL; }
+        fprintf(stderr, "[gfx] FSR unavailable: the picture is enlarged with the linear filter\n");
+        return 0;
+    }
+    fprintf(stderr, "[gfx] FSR 1 ready (EASU + RCAS, sharpness %.1f)\n", display_sharpness());
+    return 1;
+}
+
 /* FSR's middle texture at w x h, made again when the picture's size in the window changes; 0 if it cannot be */
 static int fsr_target(unsigned w, unsigned h) {
     if (fsr_tex && fsr_w == w && fsr_h == h) return 1;
@@ -3386,7 +3395,7 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     int cropped = src && crop_w && crop_h && crop_x + crop_w <= src->width && crop_y + crop_h <= src->height;
     u32 pic_x = cropped ? crop_x : 0, pic_y = cropped ? crop_y : 0;
     u32 pic_w = src ? (cropped ? crop_w : src->width) : 0, pic_h = src ? (cropped ? crop_h : src->height) : 0;
-    if (src && easu_ps && (pic_w < fit_w || pic_h < fit_h) && fsr_target(fit_w, fit_h)) {
+    if (src && display_upscale() == UPSCALE_FSR && (pic_w < fit_w || pic_h < fit_h) && fsr_ready() && fsr_target(fit_w, fit_h)) {
         /* FSR 1: EASU from the game's surface to the picture's size in the window, RCAS into it */
         uint32_t con[16];
         D3D11_MAPPED_SUBRESOURCE m;
@@ -3542,21 +3551,30 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
     overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
+    char note[48];
+    if (display_notice(note, sizeof note)) overlay_notice(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, note);   /* (F7's mode) */
+    unsigned bar = display_bar_height();
+    if (bar && bar < back_desc.Height) {   /* (the mode bar of a window) */
+        int button[4];
+        overlay_bar(dev, ctx, rtv, back_desc.Width, back_desc.Height, bar,
+                    display_operation_mode() == OP_HANDHELD ? "Handheld (720p)" : "Docked (1080p)", button);
+        display_note_bar_button(button[0], button[1], button[2], button[3]);
+    }
 
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
     gpu_timer_frame();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
-    IDXGISwapChain1_Present(swapchain, 0, display_present_flags());   /* (blocks while the GPU is frames behind) */
+    IDXGISwapChain1_Present(swapchain, display_sync_interval(), display_present_flags());   /* (blocks while the GPU is frames behind) */
     QueryPerformanceCounter(&p1);
     gfx_stat_present_ticks += (u64)(p1.QuadPart - p0.QuadPart);
     leave();
 }
 
-/* The start-up's shader screen (gpu_precompile.c), before the game draws anything: the device
- * is made here if the game has not made it yet. 0 if there is no device to draw with. */
-int gfx_progress(const char *title, unsigned done, unsigned total, const char *status) {
+/* The start-up's own screens - the settings menu (gpu_menu.c) and the shaders' (gpu_precompile.c) -
+ * before the game draws anything: the device is made here if the game has not made it yet. */
+static int screen_begin(ID3D11RenderTargetView **rtv, ID3D11Texture2D **back, unsigned *w, unsigned *h) {
     if (!enter()) return 0;
     unsigned bw, bh;
     if (display_take_size(&bw, &bh)) {
@@ -3564,20 +3582,45 @@ int gfx_progress(const char *title, unsigned done, unsigned total, const char *s
         ID3D11DeviceContext_Flush(ctx);
         IDXGISwapChain1_ResizeBuffers(swapchain, 0, bw, bh, DXGI_FORMAT_UNKNOWN, swapchain_flags);
     }
-    ID3D11Texture2D *back;
-    IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&back);
+    IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)back);
     D3D11_TEXTURE2D_DESC back_desc;
-    ID3D11Texture2D_GetDesc(back, &back_desc);
-    ID3D11RenderTargetView *rtv;
-    ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)back, NULL, &rtv);
+    ID3D11Texture2D_GetDesc(*back, &back_desc);
+    ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)*back, NULL, rtv);
     static const float dark[4] = {0.06f, 0.06f, 0.07f, 1};
-    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, dark);
-    overlay_progress(dev, ctx, rtv, back_desc.Width, back_desc.Height, title, done, total, status);
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, *rtv, dark);
+    *w = back_desc.Width;
+    *h = back_desc.Height;
+    return 1;
+}
+
+static void screen_end(ID3D11RenderTargetView *rtv, ID3D11Texture2D *back) {
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);
     IDXGISwapChain1_Present(swapchain, 1, 0);
     forget_draw_state();   /* (the overlay changed the pipeline's state) */
     leave();
+}
+
+/* One frame of the shaders' screen. 0 if there is no device to draw with. */
+int gfx_progress(const char *title, unsigned done, unsigned total, const char *status) {
+    ID3D11RenderTargetView *rtv;
+    ID3D11Texture2D *back;
+    unsigned w, h;
+    if (!screen_begin(&rtv, &back, &w, &h)) return 0;
+    overlay_progress(dev, ctx, rtv, w, h, title, done, total, status);
+    screen_end(rtv, back);
+    return 1;
+}
+
+/* One frame of the settings menu (overlay_menu's arguments). 0 if there is no device to draw with. */
+int gfx_menu(const char *title, int n, const char *const labels[], const char *const values[], const int shown[], int selected, int button,
+             const char *footer, float *rects, float *value_x) {
+    ID3D11RenderTargetView *rtv;
+    ID3D11Texture2D *back;
+    unsigned w, h;
+    if (!screen_begin(&rtv, &back, &w, &h)) return 0;
+    overlay_menu(dev, ctx, rtv, w, h, title, n, labels, values, shown, selected, button, footer, rects, value_x);
+    screen_end(rtv, back);
     return 1;
 }
 

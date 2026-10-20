@@ -27,5 +27,10 @@ void present_frame(const u8 *graphic_buffer, u32 size, const i32 crop[4]) {
         (crop[0] || crop[1] || (u32)crop[2] < width || (u32)crop[3] < height)) {
         cx = (u32)crop[0]; cy = (u32)crop[1]; cw = (u32)(crop[2] - crop[0]); ch = (u32)(crop[3] - crop[1]);
     }
+    static u32 last_w, last_h;   /* (the picture's size in the log when it changes: docked, handheld, F7) */
+    u32 pw = cw ? cw : width, ph = ch ? ch : height;
+    if (pw != last_w || ph != last_h) fprintf(stderr, "[present] the game's picture: %u x %u%s\n", pw, ph, cw ? " (cropped)" : "");
+    last_w = pw;
+    last_h = ph;
     gfx_present(gpu_maps[handle].addr + offset, cx, cy, cw, ch);
 }

@@ -3,7 +3,7 @@
 #pragma once
 #include <windows.h>
 
-typedef enum { PACING_CLOCK, PACING_VRR, PACING_DISPLAY } Pacing;
+typedef enum { PACING_CLOCK, PACING_VRR, PACING_DISPLAY, PACING_VSYNC } Pacing;   /* (vsync: the clock, presented at the next refresh) */
 typedef enum { OP_DOCKED, OP_HANDHELD } OperationMode;   /* display.ini's mode: the console the game sees */
 typedef enum { UPSCALE_LINEAR, UPSCALE_FSR } Upscale;      /* display.ini's upscale */
 
@@ -31,6 +31,25 @@ OperationMode display_operation_mode(void);               /* docked (as it ships
 void display_screen_size(unsigned *w, unsigned *h);       /* the screen the game is told of: 1920x1080 or 1280x720 */
 Upscale display_upscale(void);
 float display_sharpness(void);                            /* fsr's sharpening in stops: 0.0 (most) to 2.0 */
+unsigned display_sync_interval(void);                     /* Present's: 1 with pacing = vsync, else 0 */
+int display_menu_enabled(void);                           /* display.ini's menu (SSBU_MENU overrides) */
+
+/* The start-up menu's settings (gpu_menu.c): window is the window mode (0 windowed, 1 borderless,
+ * 2 fullscreen). LOCK_*: set by an environment variable, not the menu's to change. */
+typedef struct DisplaySettings { int window; OperationMode operation; Upscale upscale; float sharpness; Pacing pacing; } DisplaySettings;
+enum { LOCK_WINDOW = 1, LOCK_MODE = 2, LOCK_UPSCALE = 4, LOCK_PACING = 8 };
+void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed);
+void display_apply(const DisplaySettings *s);             /* before the game starts */
+int display_save(const DisplaySettings *s);               /* what changed from the file, into display.ini */
+void display_toggle_operation_mode(void);                  /* F7: docked <-> handheld while playing, told to the game */
+int display_notice(char *out, unsigned n);                /* for 2 s after F7: the mode, to show over the picture */
+/* The mode bar at the top of a window (its button switches as F7 does): its height in the drawable's
+ * pixels (0: none, in full screen), and its button's place, drawn by the renderer and clicked in the window */
+void display_note_bar(unsigned px);
+unsigned display_bar_height(void);
+void display_note_bar_button(int x, int y, int w, int h);
+int display_bar_hit(int x, int y);
+int display_take_window_request(void);                    /* linux/window.c: a window mode display_apply asked for, or -1 */
 Pacing display_pacing(void);
 /* The renderer says whether the swap chain can tear (for VRR); the flags each Present gets. */
 void display_set_tearing(int supported);
