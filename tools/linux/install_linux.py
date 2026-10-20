@@ -10,7 +10,8 @@ Usage: bash install-windowsmash.sh [--game <dir>] [--keys <dir>] [--firmware <di
                 commit it is), then this installer starts again as the new version
   2. this PC    x86-64 with AVX2, the memory, the free space
   3. packages   from the distribution, through sudo (apt, dnf, pacman or zypper): clang, lld and
-                llvm, bison and flex, SDL2, libopus and libvpx, Vulkan, zenity, Python's venv
+                llvm, bison and flex, SDL2, libopus and libvpx, Vulkan, zenity, Python's venv; and
+                the headers the build needs, put back where a package is installed without them
   4. Python     a Python of WindowSmash's own in deps/venv, with requirements.txt and Pillow
   5. parts      DXVK 3.1.1 and its headers, vkd3d 2.1 and SPIRV-Headers, downloaded into
                 deps/linux-toolchain (each checked against its SHA-256)
@@ -92,6 +93,20 @@ INSTALL = {"apt": ["apt-get", "install", "-y"], "dnf": ["dnf", "install", "-y"],
            "pacman": ["pacman", "-S", "--needed", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install"],
            "rpm-ostree": ["rpm-ostree", "install", "--idempotent", "--allow-inactive"]}
 PACKAGES["rpm-ostree"] = PACKAGES["dnf"]   # (an image-based Fedora: the same packages, layered)
+# The headers the build compiles with, from /usr/include, and the package each comes with. A package
+# manager can list a package as installed without them: SteamOS, for one, leaves every package's
+# headers out of its system image.
+INCLUDE = "/usr/include"
+HEADERS = {
+    "stdio.h": {"apt": "libc6-dev", "dnf": "glibc-devel", "pacman": "glibc", "zypper": "glibc-devel"},
+    "linux/userfaultfd.h": {"apt": "linux-libc-dev", "dnf": "kernel-headers", "pacman": "linux-api-headers",
+                            "zypper": "linux-glibc-devel"},
+    "SDL2/SDL.h": {"apt": "libsdl2-dev", "dnf": "SDL2-devel", "pacman": "sdl2", "zypper": "SDL2-devel"},
+    "opus/opus.h": {"apt": "libopus-dev", "dnf": "opus-devel", "pacman": "opus", "zypper": "libopus-devel"},
+    "vpx/vpx_decoder.h": {"apt": "libvpx-dev", "dnf": "libvpx-devel", "pacman": "libvpx", "zypper": "libvpx-devel"},
+}
+REINSTALL = {"apt": ["apt-get", "install", "-y", "--reinstall"], "dnf": ["dnf", "reinstall", "-y"],
+             "pacman": ["pacman", "-S", "--noconfirm"], "zypper": ["zypper", "--non-interactive", "install", "--force"]}
 
 
 class Stop(Exception):
@@ -617,6 +632,35 @@ def still_missing(wanted, is_installed):
     return [p for p in wanted if p not in OPTIONAL and not is_installed(p)]
 
 
+def missing_headers(manager, exists):
+    """The build's headers that are not in /usr/include, each with the package it comes with (None
+    for a package manager without a list here)."""
+    names = "dnf" if manager == "rpm-ostree" else manager
+    return [(h, by.get(names)) for h, by in HEADERS.items() if not exists(posixpath.join(INCLUDE, h))]
+
+
+def header_fix(manager, pkgs, is_installed):
+    """The commands that put back the packages whose headers are missing: reinstalled where the
+    package manager has them (the files went after), installed where it doesn't."""
+    there = [p for p in pkgs if is_installed(p)]
+    rest = [p for p in pkgs if p not in there]
+    return ([[*REINSTALL[manager], *there]] if there else []) + ([[*INSTALL[manager], *rest]] if rest else [])
+
+
+def read_only(path="/usr"):
+    """Whether the system's folders are mounted read-only (SteamOS's are, for one)."""
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except (AttributeError, OSError):
+        return False
+
+
+def need_writable_system():
+    if read_only():
+        raise Stop("The system's folders are read-only, so packages can't be added or put back. Make them writable "
+                   "(on SteamOS: sudo steamos-readonly disable), then run bash install-windowsmash.sh again.")
+
+
 def debian_cxx_headers(manager, dry):
     """libstdc++-<n>-dev for the GCC clang picks, when it is missing (libstdcxx_package)."""
     gcc = "/usr/lib/gcc/x86_64-linux-gnu"
@@ -641,6 +685,41 @@ def vulkan_ready():
                                                               "/etc/vulkan/icd.d"))
 
 
+def step_headers(manager, a):
+    """The build's headers, there on disk: the package manager can list a package as installed without
+    them (HEADERS), and the build stops at the first one missing. Their packages are put back."""
+    gone = missing_headers(manager, os.path.exists)
+    if not gone:
+        return
+    pkgs = list(dict.fromkeys(p for _, p in gone if p))
+    names = ", ".join(h for h, _ in gone)
+    if manager in REINSTALL and not a.no_packages:
+        info(f"missing from {INCLUDE}, although the build needs them: {names}. Putting back {', '.join(pkgs)}")
+        if not a.dry_run:
+            need_writable_system()
+        for cmd in header_fix(manager, pkgs, lambda p: installed(manager, p)):
+            sudo_run(cmd, a.dry_run)
+        if a.dry_run:
+            return
+        gone = missing_headers(manager, os.path.exists)
+        if gone:
+            raise Stop(f"{', '.join(h for h, _ in gone)} still missing from {INCLUDE} after putting back "
+                       f"{', '.join(pkgs)} (see above). Reinstall them yourself, then run this again.")
+        info("there now")
+        return
+    if a.dry_run:
+        info(f"missing from {INCLUDE}, although the build needs them: {names}")
+        return
+    if manager == "rpm-ostree":
+        raise Stop(f"{names} not there yet (they come with {', '.join(pkgs)}). If rpm-ostree added them for the next "
+                   "start, restart the PC, then run bash install-windowsmash.sh again.")
+    what = (f"the package{'s' if len(pkgs) != 1 else ''} they come with: {', '.join(pkgs)}" if pkgs else
+            "your distribution's packages for them (Debian calls them "
+            f"{', '.join(dict.fromkeys(HEADERS[h]['apt'] for h, _ in gone))})")
+    raise Stop(f"{names} missing from {INCLUDE}, and the build needs them. Install (or reinstall) {what}, then run "
+               "this again with --no-packages.")
+
+
 def step_packages(a):
     step("[3/8] Packages from your distribution")
     fields = os_release(read_text("/etc/os-release"))
@@ -652,6 +731,7 @@ def step_packages(a):
         info("  " + ", ".join(PACKAGES["apt"]))
         if not a.no_packages:
             raise Stop("Install the packages above, then run this again with --no-packages.")
+        step_headers(None, a)
         return
     wanted = PACKAGES[manager]
     missing = [p for p in wanted if not installed(manager, p)]
@@ -670,6 +750,8 @@ def step_packages(a):
             info(f"not added, and not needed for the build: {', '.join(missing)}")
     else:
         info(f"installing {', '.join(missing)} with {manager}; sudo asks for your password")
+        if not a.dry_run:
+            need_writable_system()
         if manager == "apt" and not sudo_run(["apt-get", "update"], a.dry_run):
             raise Stop("apt-get update failed (see above). Fix that, then run this again.")
         if not sudo_run([*INSTALL[manager], *missing], a.dry_run):
@@ -692,6 +774,7 @@ def step_packages(a):
         if still:
             raise Stop(f"These packages are still not installed: {', '.join(still)} (see above). Install them (or what "
                        "your distribution calls them) yourself, then run this again with --no-packages.")
+    step_headers(manager, a)
     if not a.dry_run and not vulkan_ready():
         info("note: no Vulkan driver is installed. The game draws through Vulkan: install your graphics card's driver "
              "(Mesa's covers AMD and Intel, and has a software one, lavapipe; NVIDIA has its own)")

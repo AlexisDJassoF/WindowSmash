@@ -48,6 +48,12 @@ the build needs, finds your game files, and builds the game. It needs:
   image-based Fedora (Silverblue, Kinoite, Bazzite, Bluefin, Aurora and the like), whose system
   folders are read-only, it adds them with `rpm-ostree`, to the running system where it can. If
   they can only come with the next start, it says so: restart the PC and run the installer again.
+  On SteamOS (a Steam Deck), make the system folders writable first with
+  `sudo steamos-readonly disable`, and give the `deck` user a password with `passwd` if it has
+  none. If pacman then says its keyring isn't set up, run `sudo pacman-key --init` and
+  `sudo pacman-key --populate archlinux holo`. SteamOS leaves every package's header files out;
+  the installer puts back the ones the build needs. A SteamOS update puts the system back as it
+  was, so if something is missing after one, run the installer again.
 - **Your own game files**: the game (its `.nca` files, or an `.nsp` or `.xci`), with its update
   and DLC if you have them; your keys (`prod.keys` and `title.keys`); and your firmware's `.nca`
   files. An emulator's own folders work as they are.
@@ -312,6 +318,7 @@ back.
 | What you see | What to do |
 | :--- | :--- |
 | *Some libraries the game needs are not installed* | Run `bash install-deps.sh`. |
+| *`SDL.h` file not found*, or another `.h` file, while building | The package is installed without its header files (SteamOS does this). Run `bash install-windowsmash.sh` again: it puts them back. |
 | A black window, or `cannot create the window` / DXVK errors in the log | Run `vulkaninfo --summary`. If it lists no device, install `mesa-vulkan-drivers`. |
 | No sound | SDL uses PulseAudio or PipeWire. Check the log for `[audio]` lines. |
 | A crash | It writes `reports/crash_<date>_<time>.txt`: the guest function and host frames (`*** host exception`), also at the end of the log. Send it with `build/play.log`. When the port stops the game itself (something it can't do yet), it writes `reports/stopped_*.txt`. |

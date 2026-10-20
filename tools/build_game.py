@@ -226,6 +226,11 @@ def check_linux_tools():
     absent = [name for name, path in parts.items() if not path or not os.path.exists(path)]
     if absent:
         raise Failed(f"{', '.join(absent)} not found in {tc.TOOLCHAIN}. Run install-windowsmash.sh: it downloads them.")
+    import install_linux   # (beside toolchain.py)
+    gone = [h for h, _ in install_linux.missing_headers(None, os.path.exists)]
+    if gone:
+        raise Failed(f"{', '.join(gone)} missing from {install_linux.INCLUDE}, and the build needs them (a package can be "
+                     "installed without its headers). Run install-windowsmash.sh: it puts back the packages they come with.")
     with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
         src, exe = os.path.join(tmp, "check.cpp"), os.path.join(tmp, "check")
         with open(src, "w") as f:

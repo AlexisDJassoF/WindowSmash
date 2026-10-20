@@ -108,6 +108,65 @@ class SystemTests(unittest.TestCase):
         here = {'clang', 'lld'}
         self.assertEqual(il.still_missing(['clang', 'lld', 'bison', 'zenity'], lambda p: p in here), ['bison'])
 
+    def test_headers_on_disk(self):
+        # sdl2 installed as far as pacman knows, its headers not there (SteamOS leaves them out of its image)
+        there = {'/usr/include/stdio.h', '/usr/include/linux/userfaultfd.h', '/usr/include/opus/opus.h',
+                 '/usr/include/vpx/vpx_decoder.h'}
+        self.assertEqual(il.missing_headers('pacman', there.__contains__), [('SDL2/SDL.h', 'sdl2')])
+        self.assertEqual(il.missing_headers('apt', lambda p: True), [])
+        self.assertIn(('SDL2/SDL.h', 'SDL2-devel'), il.missing_headers('rpm-ostree', lambda p: False))
+        self.assertIn(('SDL2/SDL.h', None), il.missing_headers(None, lambda p: False))
+
+    def test_header_packages(self):
+        # each header's package is the one in the package list that the build installs (or one it pulls in)
+        for manager, pkgs in il.PACKAGES.items():
+            for header, by in il.HEADERS.items():
+                if header.split('/')[0] in ('SDL2', 'opus', 'vpx'):
+                    self.assertIn(by['dnf' if manager == 'rpm-ostree' else manager], pkgs, (manager, header))
+
+    def test_putting_headers_back(self):
+        here = {'sdl2'}
+        self.assertEqual(il.header_fix('pacman', ['sdl2', 'opus'], here.__contains__),
+                         [['pacman', '-S', '--noconfirm', 'sdl2'], ['pacman', '-S', '--needed', '--noconfirm', 'opus']])
+        self.assertEqual(il.header_fix('apt', ['libsdl2-dev'], lambda p: True),
+                         [['apt-get', 'install', '-y', '--reinstall', 'libsdl2-dev']])
+        self.assertEqual(il.header_fix('dnf', ['SDL2-devel'], lambda p: False), [['dnf', 'install', '-y', 'SDL2-devel']])
+
+    def step_3(self, gone, puts_back=True, ro=False, no_packages=False):
+        """step_packages on SteamOS as a tester had it: every package installed as far as pacman knows,
+        the headers in gone not there. The commands it ran."""
+        calls = []
+
+        def run(cmd, dry):
+            calls.append(cmd)
+            if puts_back:
+                gone.clear()
+            return True
+        with unittest.mock.patch.multiple(il, read_text=lambda path: 'ID=steamos\nID_LIKE=arch\n',
+                                          installed=lambda m, p: True, sudo_run=run, vulkan_ready=lambda: True,
+                                          info=lambda text: None, step=lambda text: None, read_only=lambda path='/usr': ro,
+                                          missing_headers=lambda m, exists: [(h, by[m]) for h, by in il.HEADERS.items()
+                                                                             if h in gone]), \
+                unittest.mock.patch('shutil.which', return_value='/usr/bin/pacman'), \
+                unittest.mock.patch('os.path.exists', return_value=False):
+            il.step_packages(types.SimpleNamespace(no_packages=no_packages, dry_run=False))
+        return calls
+
+    def test_step_3_puts_headers_back(self):
+        self.assertEqual(self.step_3({'SDL2/SDL.h', 'stdio.h'}), [['pacman', '-S', '--noconfirm', 'glibc', 'sdl2']])
+        self.assertEqual(self.step_3({'SDL2/SDL.h'}), [['pacman', '-S', '--noconfirm', 'sdl2']])
+        self.assertEqual(self.step_3(set()), [])
+        with self.assertRaises(il.Stop) as stop:                    # still not there after: says which
+            self.step_3({'SDL2/SDL.h'}, puts_back=False)
+        self.assertIn('SDL2/SDL.h', str(stop.exception))
+        with self.assertRaises(il.Stop) as stop:                    # read-only system folders: says so first
+            self.step_3({'SDL2/SDL.h'}, ro=True)
+        self.assertIn('steamos-readonly disable', str(stop.exception))
+        with self.assertRaises(il.Stop) as stop:                    # --no-packages: names the package
+            self.step_3({'opus/opus.h'}, no_packages=True)
+        self.assertIn('opus/opus.h', str(stop.exception))
+        self.assertIn(': opus,', str(stop.exception))
+
     def test_packages_cover_the_build(self):
         for manager, pkgs in il.PACKAGES.items():
             text = ' '.join(pkgs).lower()
@@ -276,6 +335,22 @@ class BuildOnLinuxTests(unittest.TestCase):
         (self.vkd3d / 'linux' / 'libvkd3d-shader.a').write_bytes(b'')
         self.ns['build'](self.args)
         self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_linux.py'])
+
+
+class CheckToolsTests(unittest.TestCase):
+    def test_missing_header_named(self):
+        # SDL2's headers gone (SteamOS): the check says which file, before trying the compiler
+        ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_check')['build'].__globals__
+        tc = types.SimpleNamespace(DXVK_LIBS='dxvk', DXVK_INCLUDE='include', VKD3D_SRC='vkd3d', TOOLCHAIN='deps',
+                                   CLANG='/usr/bin/clang', TARGET=[])
+        ns.update(linux_toolchain=lambda: tc, log=lambda msg='': None)
+        with unittest.mock.patch('shutil.which', return_value='/usr/bin/bison'), \
+                unittest.mock.patch('os.path.exists', side_effect=lambda p: not p.endswith('SDL.h')), \
+                unittest.mock.patch('subprocess.run') as run:
+            with self.assertRaises(ns['Failed']) as failed:
+                ns['check_linux_tools']()
+        self.assertIn('SDL2/SDL.h missing from /usr/include', str(failed.exception))
+        run.assert_not_called()
 
 
 class GenerateOnlyTests(unittest.TestCase):
