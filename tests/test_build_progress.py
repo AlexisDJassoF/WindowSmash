@@ -141,6 +141,36 @@ class EstimateTests(unittest.TestCase):
         self.assertAlmostEqual(b.pace(clock.now), 1.0)
         self.assertIsNone(P.Build(1).pace(0))
 
+    def test_generate_only_goes_by_the_pace_of_writing_c(self):
+        clock = Clock()
+        b = P.Build(4, compile=False, link=None, clock=clock)   # (recomp.py all --generate-only, the Linux build's)
+        b.module('main', 30_000_000)
+        b.module('sdk', 30_000_000, [('sdk/g0000.c', 4.0)])     # (C there: nothing to write, nothing to compile)
+        b.module('item', 30_000_000)
+        self.assertEqual(sum(b.cost.values()), 2 * (P.GEN[0] + P.GEN[1] * 30_000_000))
+        b.begin('gen', 'main')
+        clock.now = 31
+        b.end('gen', 'main')                                    # twice its estimate
+        b.begin('gen', 'sdk')
+        b.end('gen', 'sdk')
+        b.begin('gen', 'item')
+        frac, left, label = b.status()
+        self.assertEqual(label, 'writing the C code: item, 3 of 3 modules')
+        self.assertAlmostEqual(frac, 0.5)
+        self.assertAlmostEqual(left, 31)
+
+    def test_linux_build_has_no_c_to_write(self):
+        clock = Clock()
+        b = P.Build(2, link=None, clock=clock)                  # (build_linux.py --runtime-only)
+        b.module('runtime', 0, [('rt/host.c', 2.0), ('rt/gpu_d3d11.c', 6.0)])
+        self.assertEqual(sum(b.cost.values()), 6.0)
+        b.begin('compile', 'runtime', b.files['runtime'])
+        self.assertEqual(b.status()[2], 'compiling runtime: 0 of 2 files')
+        b.module('game', 0, [(f'g{i}.c', 1.0) for i in range(1500)])
+        b.end('compile', 'runtime')
+        b.begin('compile', 'game', b.files['game'])
+        self.assertEqual(b.status()[2], 'compiling game: 0 of 1,500 files')
+
 
 class LineTests(unittest.TestCase):
     def test_text(self):
@@ -190,6 +220,22 @@ class LineTests(unittest.TestCase):
             clock.now = 1000 + t
             line.show(0.3, None, 'compiling lua2cpp_item: 62 of 63 files')
         self.assertEqual(len(out2.getvalue().splitlines()), 1)
+
+    def test_terminal_title_on_linux(self):
+        class Tty(io.StringIO):
+            def close(self):
+                self.closed_ = True
+        tty = Tty()
+        with mock.patch.object(P.sys, 'platform', 'linux'), mock.patch.dict(os.environ, {'TERM': 'xterm-256color'}), \
+                mock.patch.object(P, 'open', create=True, return_value=tty) as opened:
+            saved = P.save_title()
+            P.set_title(saved, '45% - about 12 min left - building ssbu')
+            P.restore_title(saved)
+        opened.assert_called_once_with('/dev/tty', 'w')         # (the terminal itself: the output may go through tee)
+        self.assertEqual(tty.getvalue(), '\x1b[22;0t' '\x1b]0;45% - about 12 min left - building ssbu\x07' '\x1b[23;0t')
+        self.assertTrue(tty.closed_)
+        with mock.patch.object(P.sys, 'platform', 'linux'), mock.patch.dict(os.environ, {'TERM': 'dumb'}):
+            self.assertIsNone(P.save_title())
 
     def test_a_broken_estimate_does_not_stop_the_build(self):
         out = Out(tty=False)

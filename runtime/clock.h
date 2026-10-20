@@ -112,8 +112,13 @@ static BOOL CALLBACK clock_setup(PINIT_ONCE once, PVOID param, PVOID *context) {
         clock_rescale();
         next_refine = cal_tsc + (uint64_t)((double)(clock_tsc() - cal_tsc) * 100);   /* after some 2 s */
     }
+#ifdef _WIN32
+#define CLOCK_SLOW_WHY "Windows set to use the HPET? \"bcdedit /deletevalue useplatformclock\" undoes that"
+#else   /* (the Linux port: clock_gettime, slow when the kernel's clock source is) */
+#define CLOCK_SLOW_WHY "the kernel's clock source, in /sys/devices/system/clocksource/clocksource0/current_clocksource, hpet or acpi_pm?"
+#endif
     fprintf(stderr, "[clock] system timer %.2f MHz, %.0f ns a read%s\n", qpc_hz / 1e6, clock_read_ns,
-            tsc ? (slow ? ": slow (Windows set to use the HPET? \"bcdedit /deletevalue useplatformclock\" undoes that) - timing from the CPU's counter instead"
+            tsc ? (slow ? ": slow (" CLOCK_SLOW_WHY ") - timing from the CPU's counter instead"
                         : ": timing from the CPU's counter (SSBU_CLOCK=tsc)")
                 : slow ? (clock_steady ? " (SSBU_CLOCK=qpc)" : ": slow, and this CPU's counter does not run at a constant rate - expect a lower frame rate")
                        : want && !strcmp(want, "tsc") ? " (SSBU_CLOCK=tsc, but this CPU's counter does not run at a constant rate)" : "");

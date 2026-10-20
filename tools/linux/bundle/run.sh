@@ -3,11 +3,12 @@
 # online_server.txt, where Local Wireless lists everyone's rooms (see docs/MULTIPLAYER.md). If the lobby
 # does not answer, the game plays offline; run-offline.sh never goes online.
 # Usage: bash run.sh [--trace]. The log goes to build/play.log (and this terminal). See docs/LINUX.md.
-cd "$(dirname "$(readlink -f "$0")")" || exit 1
-. ./scripts/common.sh
+here="$(dirname "$(readlink -f "$0")")"
+cd "${SSBU_GAME_DIR:-$here}" || exit 1   # (a WindowSmash folder built on Linux: see scripts/common.sh)
+. "$here/scripts/common.sh"
 find_game_data || exit 1
 check_libraries || exit 1
 go_online
 mkdir -p build
 echo "Starting the game (log: build/play.log)..."
-./ssbu dump/modules --status 30 "$@" 2>&1 | tee build/play.log
+"$SSBU_EXE" dump/modules --status 30 "$@" 2>&1 | tee build/play.log

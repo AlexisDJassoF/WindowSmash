@@ -9,7 +9,7 @@ Usage:
   recomp.py build    <nso> --out <dir> [--jobs N] [--per-file INSNS]
   recomp.py compile  <dir> [--jobs N]
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
-  recomp.py all      <exefs dir> --out <build dir> [--jobs N]
+  recomp.py all      <exefs dir> --out <build dir> [--jobs N] [--generate-only]
   recomp.py check    <exefs dir>
   recomp.py wrap-sig <nso> <address>
 
@@ -24,7 +24,9 @@ build     write C for a whole module, split across many files, plus its loader t
 compile   compile a build directory to objects (incremental; reports per-file failures)
 link      compile the host runtime and link module build directories into an executable
 all       image + build + compile every module of an ExeFS, then link; a module another game
-          version tree already built (same build id) is reused, not built again (modcache.py)
+          version tree already built (same build id) is reused, not built again (modcache.py);
+          --generate-only stops before compiling (the Linux build compiles the C itself:
+          tools/linux/build_linux.py)
 check     list each module's imports that no module exports and the runtime does not implement
 wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
 
@@ -627,17 +629,17 @@ def check(exefs, mods=None):
     return modcache.report_imports(mods, hle_names(), os.path.join(TREE, "build", "imports.unresolved.txt"))
 
 
-def build_all(exefs, out, jobs):
+def build_all(exefs, out, jobs, compile_c=True):
     """Every module's C first, then each module's compile, then the link: once the C is there,
     what is left to compile is known, and the progress bar's time left (progress.Build) can say
-    how long it takes."""
+    how long it takes. compile_c False (--generate-only): the C only."""
     paths = module_paths(exefs)
     mods = {name: Module(path) for name, path in paths.items()}
     check(exefs, mods)
     fp = tools_fingerprint()
     targets = {name: os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
                for name, nso in paths.items()}
-    shown = progress.Build(min(jobs, 16))
+    shown = progress.Build(min(jobs, 16), compile=compile_c, link=progress.LINK if compile_c else None)
     for name, mod in mods.items():
         current = modcache.build_info(targets[name]) == (mod.build_id, MODULES[name], name, fp)
         shown.module(name, (mod.text.end - mod.text.mem) // 4,
@@ -645,7 +647,7 @@ def build_all(exefs, out, jobs):
     build_ids = {name: mod.build_id for name, mod in mods.items()}
     del mods   # (the compilers want the memory)
     exe = os.path.join(out, "ssbu.exe")
-    with progress.Line(shown.status, title=f"building {os.path.basename(exe)}"):
+    with progress.Line(shown.status, title=f"building {os.path.basename(exe)}" if compile_c else "writing the game's C"):
         reused = 0
         for name, nso in paths.items():
             shown.begin("gen", name)
@@ -665,9 +667,14 @@ def build_all(exefs, out, jobs):
                 reused += 1
             else:
                 build(nso, target, jobs, 40000)
+            if not compile_c:
+                modcache.write_stamp(target, build_id, base, name, fp)
             shown.written(name, [(t[0], t[3]) for t in stale_files(target)])
             shown.end("gen", name)
         print(f"{reused} of {len(paths)} modules reused without generating their C again")
+        if not compile_c:
+            print(f"the C of {len(paths)} modules is in {out} (--generate-only: not compiled here)")
+            return True
         for name in paths:
             if not compile_dir(targets[name], min(jobs, 16), shown):
                 return False
@@ -703,7 +710,7 @@ if __name__ == "__main__":
     elif cmd == "link":
         sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
-        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20"))) else 1)
+        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), "--generate-only" not in sys.argv) else 1)
     elif cmd == "check":
         check(nso)
     elif cmd == "wrap-sig":

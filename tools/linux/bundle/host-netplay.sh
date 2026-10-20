@@ -3,8 +3,9 @@
 # 39420, opened on the router with UPnP when the router allows it). See docs/MULTIPLAYER.md.
 # The address to give the other players appears in the game's overlay (F2) and in
 # netplay_address.txt; the log goes to build/play.log.
-cd "$(dirname "$(readlink -f "$0")")" || exit 1
-. ./scripts/common.sh
+here="$(dirname "$(readlink -f "$0")")"
+cd "${SSBU_GAME_DIR:-$here}" || exit 1   # (a WindowSmash folder built on Linux: see scripts/common.sh)
+. "$here/scripts/common.sh"
 find_game_data || exit 1
 check_libraries || exit 1
 read -r -p "Your player name [$USER]: " SSBU_NET_NAME
@@ -13,7 +14,7 @@ read -r -p "UDP port [39420]: " SSBU_NET_PORT
 export SSBU_NET_NAME="${SSBU_NET_NAME:-$USER}" SSBU_NET_ROOM="${SSBU_NET_ROOM:-smash}" SSBU_NET_PORT="${SSBU_NET_PORT:-39420}" SSBU_NET_HOST=1
 rm -f netplay_address.txt
 mkdir -p build
-./ssbu dump/modules --status 30 > build/play.log 2>&1 &
+"$SSBU_EXE" dump/modules --status 30 > build/play.log 2>&1 &
 echo
 echo "Starting the game as host of room \"$SSBU_NET_ROOM\"..."
 echo "In the game: Online > Local Wireless > Create a Room. The others pick your room from the list."

@@ -468,8 +468,11 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     char name[96], report[MAX_PATH];
     fflush(stdout);
     report_open("crash", report, sizeof report);
-    out("\n*** host exception (signal %d: %s) during %s", sig, sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error" :
-        sig == SIGILL ? "illegal instruction" : sig == SIGFPE ? "arithmetic" : "?", phase);
+    /* a fault right at the stack pointer: the thread's stack ran out (this runs on its signal stack) */
+    u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
+    int overflow = sig == SIGSEGV && (u64)si->si_addr + 65536 > sp && (u64)si->si_addr < sp + 65536;
+    out("\n*** host exception (signal %d: %s%s) during %s", sig, sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error" :
+        sig == SIGILL ? "illegal instruction" : sig == SIGFPE ? "arithmetic" : "?", overflow ? ", stack overflow" : "", phase);
     if (sig == SIGSEGV || sig == SIGBUS)
         out(": %s address %s", uc->uc_mcontext.gregs[REG_ERR] & 2 ? "writing" : "reading", rt_describe((u64)si->si_addr, name, sizeof name));
     out("\n");

@@ -1,6 +1,7 @@
 """Progress bars with the time left, for the long jobs: the build (tools/recomp.py all, through
 Build and Line) and Prepare Shaders (tools/shader_aot.py)."""
 import heapq
+import os
 import shutil
 import sys
 import threading
@@ -50,6 +51,7 @@ GEN = (0.5, 5e-7)               # writing a module's C: seconds, plus per instru
 LINK = 25.0                     # compiling the runtime, and the link
 PRIOR = (40000, 6000)           # a file of a module whose C is still to be written: instructions, biggest function
 MEASURED = 60.0                 # (estimated) seconds of compiling to go by before the time left is given
+MEASURED_GEN = 10.0             # of writing C, when that is all there is to do (recomp.py all --generate-only)
 WINDOW = 600                    # the time left goes by the pace of the last 10 minutes' compiles
 BIG = 60                        # a file compiling this many seconds is said to be a big one (the line would look stuck)
 
@@ -74,18 +76,22 @@ class Build:
     has an estimate in seconds as a fast PC takes it (above; a module's compile as `jobs` compilers
     working through its files in order, as cc.compile_each does), which says the share done; the
     time left is the rest of the estimate at this PC's pace: how long its compiles have taken
-    against their estimates. Until there are some of those, the time left is not known.
+    against their estimates (when there is no compiling to do, compile=False, how long writing
+    the C has taken). Until there are some of those, the time left is not known. The Linux build
+    (tools/linux/build_linux.py) uses it for its compile alone: its "modules" are the runtime and
+    the game, and its link's estimate (link=None: no link).
 
     Its methods are called as the build goes (started and finished from the compiler threads);
     status() says where it is, for a Line."""
 
-    def __init__(self, jobs, clock=time.time):
+    def __init__(self, jobs, compile=True, link=LINK, clock=time.time):
         self.jobs = jobs
+        self.compiling = compile
         self.clock = clock
         self.lock = threading.Lock()
         self.names = []            # the modules, in build order
         self.files = {}            # module -> [(source, estimate)]: its compile's files, once known
-        self.cost = {("link", None): LINK}   # step -> estimate; steps ("gen" | "compile", module), ("link", None)
+        self.cost = {("link", None): link} if link else {}   # step -> estimate; steps ("gen" | "compile", module), ("link", None)
         self.done = set()
         self.step = None           # the step under way, and since when
         self.since = 0.0
@@ -93,6 +99,7 @@ class Build:
         self.running = {}          # (compile) source -> (estimate, started at)
         self.compiled = 0          # (compile) files finished
         self.samples = []          # (when, seconds, estimate) of every file compiled
+        self.gen_samples = []      # the same of every module whose C was written
         self.shown = 0.0
         self.label = ""
 
@@ -103,14 +110,15 @@ class Build:
             self.names.append(name)
             if files is None:   # (how much compiling it is, is a guess until its C is written)
                 self.cost[("gen", name)] = GEN[0] + GEN[1] * insns
-                self.cost[("compile", name)] = makespan([file_cost(*PRIOR)] * max(1, -(-insns // PRIOR[0])), [0.0] * self.jobs)
+                self.cost[("compile", name)] = makespan([file_cost(*PRIOR)] * max(1, -(-insns // PRIOR[0])),
+                                                        [0.0] * self.jobs) if self.compiling else 0.0
             else:
                 self.cost[("gen", name)] = 0.0
                 self._set_files(name, files)
 
     def _set_files(self, name, files):
         self.files[name] = list(files)
-        self.cost[("compile", name)] = makespan([c for _s, c in files], [0.0] * self.jobs)
+        self.cost[("compile", name)] = makespan([c for _s, c in files], [0.0] * self.jobs) if self.compiling else 0.0
 
     def written(self, name, files):
         """The module's C is there: compiling it is these files."""
@@ -139,6 +147,8 @@ class Build:
 
     def end(self, kind, name=None):
         with self.lock:
+            if kind == "gen" and self.cost[("gen", name)]:
+                self.gen_samples.append((self.clock(), self.clock() - self.since, self.cost[("gen", name)]))
             self.done.add((kind, name))
             self.step = None
 
@@ -147,16 +157,18 @@ class Build:
         if kind == "gen":
             return f"writing the C code: {name}, {self.names.index(name) + 1} of {len(self.names)} modules"
         if kind == "compile":
-            return f"compiling {name}: {self.compiled} of {len(self.files[name])} files"
+            return f"compiling {name}: {self.compiled:,} of {len(self.files[name]):,} files"
         return "linking"
 
     def pace(self, now):
-        """Seconds this PC takes for an estimated second of compiling, or None (not enough yet)."""
-        recent = [(s, c) for t, s, c in self.samples if t >= now - WINDOW]
-        if sum(c for _s, c in recent) < MEASURED:
-            recent = [(s, c) for _t, s, c in self.samples]
+        """Seconds this PC takes for an estimated second of compiling (or of writing C, when there
+        is no compiling to do), or None (not enough yet)."""
+        samples, enough = (self.samples, MEASURED) if self.compiling else (self.gen_samples, MEASURED_GEN)
+        recent = [(s, c) for t, s, c in samples if t >= now - WINDOW]
+        if sum(c for _s, c in recent) < enough:
+            recent = [(s, c) for _t, s, c in samples]
         est = sum(c for _s, c in recent)
-        return sum(s for s, _c in recent) / est if est >= MEASURED else None
+        return sum(s for s, _c in recent) / est if est >= enough else None
 
     def status(self, now=None):
         """(share done, seconds left or None, what is being done)."""
@@ -182,20 +194,52 @@ class Build:
 
 
 # ---- showing it -----------------------------------------------------------------------------------
-def console_title(text=None):
-    """The console window's title, or None when there is no console window; with `text`, sets it."""
-    if sys.platform != "win32":
+# The window title: on Windows the console's own; elsewhere the terminal's, set by the escape
+# sequence most terminals know, written to the terminal itself (so it works while the output goes
+# through a pipe, as the Linux installer's does through tee). A terminal's title can't be read
+# back: it is kept on the terminal's title stack instead (pushed, then popped at the end).
+def save_title():
+    """What restore_title needs to put the title back, or None if there is no window title to set."""
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.GetConsoleWindow():
+            return None
+        buf = ctypes.create_unicode_buffer(1024)
+        kernel32.GetConsoleTitleW(buf, len(buf))
+        return buf.value
+    if os.environ.get("TERM", "dumb") == "dumb":
         return None
-    import ctypes
-    kernel32 = ctypes.windll.kernel32
-    if not kernel32.GetConsoleWindow():
+    try:
+        tty = open("/dev/tty", "w")
+        tty.write("\033[22;0t")   # (push the title)
+        tty.flush()
+    except OSError:
         return None
-    if text is not None:
-        kernel32.SetConsoleTitleW(text)
-        return text
-    buf = ctypes.create_unicode_buffer(1024)
-    kernel32.GetConsoleTitleW(buf, len(buf))
-    return buf.value
+    return tty
+
+
+def set_title(saved, text):
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(text)
+        else:
+            saved.write(f"\033]0;{text}\007")
+            saved.flush()
+    except OSError:
+        pass
+
+
+def restore_title(saved):
+    try:
+        if sys.platform == "win32":
+            set_title(saved, saved)
+        else:
+            saved.write("\033[23;0t")   # (pop it)
+            saved.close()
+    except OSError:
+        pass
 
 
 class Line:
@@ -244,7 +288,7 @@ class Line:
             if self.title and self.old_title is not None:
                 title = f"{percent}% - {left_text(frac, left)} - {self.title}"
                 if title != self.shown_title:
-                    console_title(title)
+                    set_title(self.old_title, title)
                     self.shown_title = title
 
     def _draw(self):
@@ -289,7 +333,7 @@ class Line:
         self.saved = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = _Through(self, sys.stdout), _Through(self, sys.stderr)
         if self.title:
-            self.old_title = console_title()
+            self.old_title = save_title()
         self._update()
         self.thread = threading.Thread(target=self._tick, daemon=True)
         self.thread.start()
@@ -306,7 +350,7 @@ class Line:
                 self.drawn = 0
             sys.stdout, sys.stderr = self.saved
         if self.old_title is not None:
-            console_title(self.old_title)
+            restore_title(self.old_title)
         return False
 
 
