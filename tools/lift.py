@@ -152,7 +152,8 @@ class Lifter(SimdMixin):
             # setjmp returns twice: the second time by longjmp, into this very frame. The
             # host's setjmp does that for the C function; rt_setjmp saves the guest's
             # callee-saved registers, which the native longjmp restores (and sets X(0)).
-            return "if (!setjmp(*rt_setjmp(c))) X(0) = 0;"
+            # (RT_SETJMP: the host's cheapest setjmp, recomp.h)
+            return "if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0;"
         self.callees.add(target)
         return self.landing(ret, f"X(30) = {const(self.base +ret)}; f_{self.base + target:x}(c);")
 
@@ -382,7 +383,7 @@ class Lifter(SimdMixin):
             return self.sysreg(w), True
         if w >> 19 == 0x1AA1:              # sys: cache maintenance
             if (w >> 5) & 0x3FFF == 0x1BA1:    # dc zva: zero the 64-byte block containing the address
-                return f"memset((void *)({reg(w & 31)} & ~63ull), 0, 64);", True
+                return f"rt_zva({reg(w & 31)});", True
             return ";", True               # cache flushes / invalidations mean nothing here
         raise Unsupported("system instruction")
 
@@ -697,12 +698,13 @@ class Lifter(SimdMixin):
         bits = 8 << size
         if o1:
             raise Unsupported("exclusive pair / compare-and-swap")
-        if o2:   # ldar / stlr: ordinary accesses with ordering guarantees
+        if o2:   # ldar / stlr (and ldlar / stllr): accesses with ordering guarantees (recomp.h lda, sta)
             if load:
-                return wr(rt, 1, f"ld{bits}({base})")
+                return wr(rt, 1, f"lda{bits}({base})")
             return f"sta{bits}({base}, (u{bits}){reg(rt)});"
-        if load:
-            return f"{{ ex_a = {base}; ex_v = ld{bits}(ex_a); {wr(rt, 1, 'ex_v')} }}"
+        if load:   # ldxr, or with o0 ldaxr: the load also an acquire
+            ld = "lda" if (w >> 15) & 1 else "ld"
+            return f"{{ ex_a = {base}; ex_v = {ld}{bits}(ex_a); {wr(rt, 1, 'ex_v')} }}"
         ok = f"({base} == ex_a && cas{bits}(ex_a, ex_v, {reg(rt)}))"
         return f"{{ u32 ok_ = {ok}; ex_a = 0; {wr(rs, 0, '!ok_')} }}"
 

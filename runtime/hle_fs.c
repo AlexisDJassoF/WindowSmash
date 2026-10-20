@@ -188,7 +188,8 @@ static struct Mount *find_mount(const char *path, const char **rest) {
     const char *colon = strchr(path, ':');
     if (!colon) return NULL;
     for (int i = 0; i < 16; i++)
-        if (mounts[i].kind && strlen(mounts[i].name) == (size_t)(colon - path) && !memcmp(mounts[i].name, path, colon - path)) {
+        if (__atomic_load_n(&mounts[i].kind, __ATOMIC_ACQUIRE) && strlen(mounts[i].name) == (size_t)(colon - path) &&
+            !memcmp(mounts[i].name, path, colon - path)) {
             *rest = colon + 1;
             return &mounts[i];
         }
@@ -202,7 +203,6 @@ static u32 add_mount(const char *name, MountKind kind, const char *root) {
     for (int i = 0; i < 16; i++)
         if (!mounts[i].kind) {
             snprintf(mounts[i].name, sizeof mounts[i].name, "%s", name);
-            mounts[i].kind = kind;
             snprintf(mounts[i].root, sizeof mounts[i].root, "%s", root);
             if (kind == M_HOST) {   /* create the folder chain */
                 char tmp[512];
@@ -211,6 +211,7 @@ static u32 add_mount(const char *name, MountKind kind, const char *root) {
                     if (*p == '/' || *p == '\\') { char k = *p; *p = 0; CreateDirectoryA(tmp, NULL); *p = k; }
                 CreateDirectoryA(tmp, NULL);
             }
+            __atomic_store_n(&mounts[i].kind, kind, __ATOMIC_RELEASE);   /* (last: find_mount looks without the lock) */
             LeaveCriticalSection(&lock);
             return 0;
         }
