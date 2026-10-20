@@ -4,9 +4,12 @@ Addresses inside this module are module-relative offsets; BASE is added only whe
 value is materialised into guest-visible state (adr/adrp, link register, table cases).
 """
 import bisect
+import os
+import re
 import struct
 from collections import Counter
 
+import regcache
 from a64 import BASE, CONDS, M64, Unsupported, const, gpr_defs, reg, sx, ty, wr  # noqa: F401 (re-exported)
 from lift_simd import SimdMixin
 
@@ -75,6 +78,32 @@ def logical(sf, opc, a, b, rd, rd_sp):
     return wr(rd, sf, f"{a} {'&|^'[opc]} {b}", sp=rd_sp)
 
 
+# SSBU_REGCACHE=1: guest registers in C locals, the context brought up to date only where
+# something else reads it (tools/regcache.py).
+REGCACHE = os.environ.get("SSBU_REGCACHE") == "1"
+
+_RE_CALL = re.compile(r"(X\(30\) = 0x[0-9A-F]+ull; )(f_[0-9a-f]+\(c\);)")
+_RE_SVC = re.compile(r"(rt_svc\(c, 0x[0-9a-f]+\);)")
+_RE_PAD = re.compile(r"if \(lp_\) (goto L_[0-9a-f]+;)")
+_RE_TAIL = re.compile(r"TAIL\((f_[0-9a-f]+)\)")
+_RE_TRAP = re.compile(r"(rt_trap\(c, [^;]*;)")
+
+
+def mark_syncs(s):
+    """The places regcache.apply brings the context up to date, marked in a statement."""
+    s = _RE_CALL.sub(r"\1@S@ \2 @R@", s)
+    s = s.replace("rt_lookup(t_)(c);", "@S@ rt_lookup(t_)(c); @R@")
+    s = _RE_SVC.sub(r"@S@ \1 @R@", s)
+    s = s.replace("if (!setjmp(*rt_setjmp(c))) X(0) = 0;", "@F@ if (!setjmp(*rt_setjmp(c))) X(0) = 0; else { @A@ }")
+    s = _RE_PAD.sub(r"if (lp_) { @A@ \1 }", s)
+    s = _RE_TAIL.sub(r"{ @X@ TAIL(\1) }", s)
+    s = s.replace("__attribute__((musttail)) return t_(c);", "@X@ __attribute__((musttail)) return t_(c);")
+    s = _RE_TRAP.sub(r"{ @X@ \1 }", s)
+    if s == "return;":
+        s = "{ @X@ return; }"
+    return s
+
+
 def fp_imm8(imm8):
     b6 = (imm8 >> 6) & 1
     exp = ((b6 ^ 1) << 10) | ((0xFF if b6 else 0) << 2) | ((imm8 >> 4) & 3)
@@ -123,18 +152,23 @@ class Lifter(SimdMixin):
             except Unsupported as e:
                 reasons[(str(e), w)] += 1
                 stmt, falls = f'rt_trap(c, {const(self.base +pc)}, "unsupported");', True
-            body.append((pc, stmt))
+            body.append((pc, stmt, falls))
+        if falls and self.fend in self.entries:   # assembly routines may run on into the next one
+            self.callees.add(self.fend)
+            body.append((None, f"TAIL(f_{self.base + self.fend:x})", False))
+        elif falls:
+            body.append((None, f'rt_trap(c, {const(self.base + self.fend)}, "fell off the end of a function");', False))
+        decl = []
+        if REGCACHE:
+            decl, cached = regcache.apply([(pc, mark_syncs(s), f) for pc, s, f in body], self.leaders,
+                                          bool(self.sites) or any("rt_setjmp" in s for _pc, s, _f in body))
+            body = [(pc, s, f) for (pc, s), (_pc, _s, f) in zip(cached, body)]
         out = [f"void {name}(Cpu *c) {{",
-               "    u32 nf = 0, zf = 0, cf = 0, vf = 0; u64 ex_a = 0, ex_v = 0;"]
-        for pc, stmt in body:
+               "    u32 nf = 0, zf = 0, cf = 0, vf = 0; u64 ex_a = 0, ex_v = 0;"] + ["    " + d for d in decl]
+        for pc, stmt, _falls in body:
             if pc in self.leaders:
                 out.append(f"L_{pc:x}:;")
             out.append("    " + stmt)
-        if falls and self.fend in self.entries:   # assembly routines may run on into the next one
-            self.callees.add(self.fend)
-            out.append(f"    TAIL(f_{self.base + self.fend:x})")
-        elif falls:
-            out.append(f'    rt_trap(c, {const(self.base + self.fend)}, "fell off the end of a function");')
         out.append("}")
         return wrapper + "\n".join(out), reasons, self.callees
 
