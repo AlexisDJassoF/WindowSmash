@@ -22,13 +22,14 @@
 #include <windows.h>
 
 #include "../display.h"
+#include "../gpu_menu.h"
 
 static SDL_Window *window;
 static volatile int focused;
 static const Uint8 *keys;
 static int nkeys;
 static int mode;                    /* the window's mode now (DISPLAY_*) */
-static int hide_cursor, cursor_hidden;
+static int cursor_hidden;
 static Uint64 mouse_moved_at;
 
 void gfx_hotkey(int n);   /* (gpu_d3d11.c) F1 + n was pressed */
@@ -58,7 +59,7 @@ static void set_mode(int m) {
 
 /* (every turn of the event loop) the pointer hides over the focused window after 2 s still */
 static void idle_pointer(Uint64 now) {
-    if (hide_cursor && !cursor_hidden && focused && SDL_GetMouseFocus() == window && now - mouse_moved_at > 2000) {
+    if (display_hide_cursor() && !cursor_hidden && focused && SDL_GetMouseFocus() == window && now - mouse_moved_at > 2000) {
         SDL_ShowCursor(SDL_DISABLE);
         cursor_hidden = 1;
     }
@@ -100,6 +101,24 @@ SHORT GetAsyncKeyState(int vk) {
 HWND GetForegroundWindow(void) { return focused ? (HWND)window : NULL; }
 void *rt_window(void) { return window; }
 
+/* The settings menu's keys (gpu_menu.c): Esc always, the others while it is open. */
+static void menu_key_of(const SDL_KeyboardEvent *k) {
+    int key = 0;
+    switch (k->keysym.scancode) {
+    case SDL_SCANCODE_ESCAPE: if (!k->repeat) key = MENU_KEY_ESC; break;
+    case SDL_SCANCODE_UP: key = MENU_KEY_UP; break;
+    case SDL_SCANCODE_DOWN: key = MENU_KEY_DOWN; break;
+    case SDL_SCANCODE_LEFT: key = MENU_KEY_LEFT; break;
+    case SDL_SCANCODE_RIGHT: key = MENU_KEY_RIGHT; break;
+    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: if (!k->repeat && !(k->keysym.mod & KMOD_ALT)) key = MENU_KEY_ENTER; break;
+    case SDL_SCANCODE_BACKSPACE: key = MENU_KEY_BACKSPACE; break;
+    case SDL_SCANCODE_DELETE: key = MENU_KEY_DELETE; break;
+    case SDL_SCANCODE_TAB: if (!k->repeat) key = k->keysym.mod & KMOD_SHIFT ? MENU_KEY_SHIFT_TAB : MENU_KEY_TAB; break;
+    default: break;
+    }
+    if (key && (key == MENU_KEY_ESC || menu_is_open())) menu_key(key);
+}
+
 /* ---- start-up and the event loop ---------------------------------------------------- */
 int rt_window_init(void) {
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* (DXVK's native build asks which window system) */
@@ -127,7 +146,6 @@ int rt_window_init(void) {
     }
     SDL_SetWindowMinimumSize(window, 640, 360);
     if (mode != DISPLAY_WINDOWED) fprintf(stderr, "[display] %s\n", mode_name(mode));
-    hide_cursor = display_hide_cursor();
     mouse_moved_at = SDL_GetTicks64();
     note_size();
     note_refresh();
@@ -158,7 +176,12 @@ void rt_window_loop(int every, void (*status)(void)) {
                 mouse_moved_at = SDL_GetTicks64();
                 if (cursor_hidden) { SDL_ShowCursor(SDL_ENABLE); cursor_hidden = 0; }
                 break;
+            case SDL_TEXTINPUT:   /* (typed letters, for the settings menu) */
+                if (menu_is_open())
+                    for (const char *c = e.text.text; *c; c++) menu_char((unsigned char)*c);
+                break;
             case SDL_KEYDOWN:
+                menu_key_of(&e.key);
                 if (e.key.repeat) break;
                 if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F7)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
@@ -172,6 +195,8 @@ void rt_window_loop(int every, void (*status)(void)) {
             got = SDL_PollEvent(&e);
         }
         Uint64 now = SDL_GetTicks64();
+        int asked = display_take_mode();   /* (the settings menu) */
+        if (window && asked >= 0) set_mode(asked);
         if (window) idle_pointer(now);
         if (every > 0 && status && now - last >= (Uint64)every * 1000) {
             last = now;

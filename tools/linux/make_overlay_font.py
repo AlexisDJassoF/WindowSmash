@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The debug overlay's glyph atlas for a Linux build made on Linux: what make_overlay_font.c draws
-with GDI on Windows (Consolas, bold, 20 pixels, white on black), drawn here with Pillow from the
+with GDI on Windows (Consolas, bold, 40 pixels, white on black), drawn here with Pillow from the
 system's bold monospace font, into the same C header (overlay_font.h, a build product).
 
 Usage: make_overlay_font.py <output header> [font file]
@@ -12,9 +12,9 @@ import shutil
 import subprocess
 import sys
 
-CELL_W, CELL_H, COLS = 12, 24, 16
+CELL_W, CELL_H, COLS = 24, 48, 16
 ATLAS_W, ATLAS_H = CELL_W * COLS, CELL_H * 6
-SIZE = 20   # (CreateFontW(-20): a 20-pixel em)
+SIZE = 40   # (CreateFontW(-40): a 40-pixel em)
 KNOWN = ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",        # Debian, Ubuntu
          "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono-Bold.ttf",  # Fedora
          "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",                     # Arch
@@ -37,7 +37,7 @@ def atlas(font):
     img = Image.new("L", (ATLAS_W, ATLAS_H), 0)
     draw = ImageDraw.Draw(img)
     for c in range(32, 127):
-        x, y = (c - 32) % COLS * CELL_W, (c - 32) // COLS * CELL_H + 1
+        x, y = (c - 32) % COLS * CELL_W, (c - 32) // COLS * CELL_H + 2
         draw.text((x, y), chr(c), fill=255, font=font, anchor="la")   # (the top of the line, as GDI's TextOut)
     return img.tobytes()
 
