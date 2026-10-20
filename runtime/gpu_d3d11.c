@@ -1695,6 +1695,8 @@ static void resident_drop(Resident *r) {
     memset(&residents[nresidents], 0, sizeof *residents);
 }
 
+static int read_guarded(void *dst, u64 g, u32 n);
+
 static void resident_snapshot(Resident *r) {
     u32 head = (u32)(0x1000 - (r->guest & 0xFFF)) & 0xFFF;   /* up to the first page boundary */
     if (head > r->size) head = r->size;
@@ -1703,8 +1705,10 @@ static void resident_snapshot(Resident *r) {
     r->head = head;
     r->tail = tail;
     r->edge = realloc(r->edge, head + tail + 1);
-    memcpy(r->edge, P(void, r->guest), head);
-    memcpy(r->edge + head, P(void, r->guest + r->size - tail), tail);
+    /* (zeros where the memory is gone - a region made over older ones may reach memory the
+     * guest has unmapped since: resident_sync finds it gone too, and leaves it alone) */
+    if (!read_guarded(r->edge, r->guest, head)) memset(r->edge, 0, head);
+    if (!read_guarded(r->edge + head, r->guest + r->size - tail, tail)) memset(r->edge + head, 0, tail);
 }
 
 /* n bytes of guest memory at g, or 0 if they are not there any more: the guest can unmap the
@@ -1765,7 +1769,11 @@ static void resident_watch_reset(Resident *r) {
  * pack several to a page in the effect ring (GPU particle output among the CPU's per-draw
  * attributes); the first one checked took the bit and its neighbours kept stale data for good,
  * which drew effect meshes at a stale size over the whole screen (the white-outs). Checked
- * when a draw or dispatch uses the region (once a submission) and once a frame for all. */
+ * when a draw or dispatch uses the region (once a submission) and once a frame for all.
+ * Whole pages go to the GPU copy through a copy of their own too, never straight from guest
+ * memory: the driver reads what it is given unguarded, and a region outlives the memory under
+ * it when the guest unmaps that (a region with no partial pages has no edges to find that out
+ * by) - players' games crashed in the graphics driver on the vsync thread after 20-40 minutes. */
 static void resident_sync(Resident *r, int every_frame) {
     static int no_pages = -1;   /* debug: leave resident regions alone */
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
@@ -1779,8 +1787,10 @@ static void resident_sync(Resident *r, int every_frame) {
     watch_take(lo, hi);   /* (before taking them: what the CPU writes meanwhile is news next time) */
     r->seen = watch_clock;
     for (u64 pg = watch_next(lo, hi, seen); pg < hi; pg = watch_next(pg + 0x1000, hi, seen)) {
+        u8 now[0x1000];
+        if (!read_guarded(now, pg, 0x1000)) continue;   /* (gone: left as it is) */
         D3D11_BOX box = {(UINT)(pg - r->guest), 0, 0, (UINT)(pg + 0x1000 - r->guest), 1, 1};
-        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, P(void, pg), 0, 0);
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, now, 0, 0);
         gfx_stat_resident_pages++;
     }
 }
@@ -2561,6 +2571,11 @@ static void kept_apply(u64 lo, u64 hi) {
         KeptCb *e = &kept[i];
         if (!e->srv || e->stale || hi <= e->va || lo >= e->va + e->mapped) continue;
         u64 a = (lo > e->va ? lo : e->va) & ~3ull, z = (hi < e->va + e->mapped ? hi : e->va + e->mapped) + 3 & ~3ull;
+        /* Only from the memory it was made from, still mapped there: the guest may have mapped
+         * other memory at these addresses since (and unmapped the old: the driver would fault
+         * reading it). Otherwise it is taken again, or made again, at its next use. */
+        u64 g = gpu_va_to_guest(a);
+        if (g != e->guest + (a - e->va) || gpu_va_to_guest(z - 1) != g + (z - 1 - a)) { e->stale = 1; continue; }
         D3D11_BOX box = {(UINT)(a - e->va), 0, 0, (UINT)(z - e->va), 1, 1};
         ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)e->buf, 0, &box, P(void, e->guest + (a - e->va)), 0, 0);
         if (e->shadow) memcpy(e->shadow + (a - e->va), P(void, e->guest + (a - e->va)), (size_t)(z - a));
@@ -2593,6 +2608,13 @@ void gfx_stream_end(void) {
     if (pending_hi && enter()) { kept_flush(); leave(); }
 }
 
+/* How much of [va, va + size) maps to guest memory in one piece from g (at va). */
+static u32 kept_mapped(u64 va, u64 g, u32 size) {
+    u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
+    while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
+    return mapped > size ? size : mapped;
+}
+
 static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
     KeptCb *set = &kept[((va >> 4) * 0x9E3779B97F4A7C15ull >> 56) * KEPT_WAYS], *e = NULL, *lru = &set[0];
     for (u32 w = 0; w < KEPT_WAYS && !e; w++) {
@@ -2600,7 +2622,10 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
         else if (set[w].used < lru->used) lru = &set[w];
     }
     u64 g = gpu_va_to_guest(va);
-    if (e && e->guest == g) {
+    /* (still mapped as when it was made, asked at its first use in a submission and before it
+     * is taken again: a 64 KB binding reaches past the program's constants, into memory the
+     * guest may have unmapped since - the driver would fault reading it) */
+    if (e && e->guest == g && ((e->checked == gpu_stat_batches && !e->stale) || kept_mapped(va, g, size) == e->mapped)) {
         if (e->checked != gpu_stat_batches) {   /* first use in this submission: has the CPU written it since? */
             if (watch_written(g, e->mapped, &e->seen)) e->stale = 1;
             e->checked = gpu_stat_batches;
@@ -2625,9 +2650,7 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
         return e->srv;
     }
     if (!g || size < 0x1000) return NULL;
-    u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
-    while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
-    if (mapped > size) mapped = size;
+    u32 mapped = kept_mapped(va, g, size);
     if (!watched(g, mapped)) return NULL;
     if (!e) e = lru;
     if (e->srv) kept_blocks_add(e, -1);
