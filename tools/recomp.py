@@ -202,8 +202,9 @@ def resolve_wraps(mod, base, sizes, name):
 
 def tools_fingerprint():
     """What the generated C depends on besides the module and its address (modcache)."""
+    import lift
     wraps = sorted(hle_wraps().items())
-    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps))
+    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + f"\nregcache {int(lift.REGCACHE)}")
 
 
 def write_if_changed(path, text):
