@@ -17,14 +17,15 @@ import cc  # noqa: E402
 HAVE_CLANG = os.name == 'nt' and (os.path.exists(cc.CLANG) or shutil.which(cc.CLANG) is not None)
 
 
-@unittest.skipUnless(HAVE_CLANG, 'needs Windows and clang-cl (Visual Studio\'s C++ Clang tools)')
+@unittest.skipUnless(HAVE_CLANG, 'needs Windows and clang-cl (deps\\llvm, or Visual Studio\'s C++ Clang tools)')
 class SettingsFileTests(unittest.TestCase):
     def build_and_run(self, name):
         d = tempfile.mkdtemp()
         try:
             exe = os.path.join(d, name + '.exe')
-            r = subprocess.run([cc.CLANG, '/nologo', '/O1', *cc.CFLAGS, str(ROOT / 'tools' / 'dev' / (name + '.c')),
-                                '/Fe' + exe, '/Fo' + os.path.join(d, name + '.obj')], capture_output=True, text=True)
+            r = subprocess.run([cc.CLANG, '/nologo', '/O1', *cc.LINK_FLAGS, *cc.CFLAGS, str(ROOT / 'tools' / 'dev' / (name + '.c')),
+                                '/Fe' + exe, '/Fo' + os.path.join(d, name + '.obj'), '/link', *cc.LINK_OPTIONS],
+                               capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, name + '.c did not build:\n' + r.stdout + r.stderr)
             r = subprocess.run([exe], capture_output=True, text=True, timeout=60, cwd=d)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
