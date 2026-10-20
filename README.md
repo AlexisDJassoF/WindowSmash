@@ -13,6 +13,7 @@
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
   <a href="docs/UPDATES.md"><strong>Game updates</strong></a> ·
   <a href="docs/LINUX.md"><strong>Linux</strong></a> ·
+  <a href="docs/MACOS.md"><strong>macOS</strong></a> ·
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a>
 </p>
 
@@ -55,6 +56,7 @@ The game itself still comes from your files. This repository holds only the tran
 - **Your DLC fighters**, and a tool that unlocks the base-game roster on your own save.
 - **Any game version**, including 13.0.5 with Kazuya and Sora, and several versions side by side.
 - **An experimental Linux version**, built from the same source: `install-windowsmash.sh` sets it up on Linux in one go ([Linux](docs/LINUX.md)).
+- **An experimental macOS version** for Macs with Apple silicon, newer still: `Install WindowSmash.command` sets it up on the Mac in one go ([macOS](docs/MACOS.md)).
 
 ## What you need
 
@@ -245,6 +247,7 @@ Looking for people to play with? Ask on the [Discord server](https://discord.gg/
 | [Game updates](docs/UPDATES.md) | apply an update file, such as 13.0.5, as a version of its own. |
 | [Several versions](docs/VERSIONS.md) | keep more than one game version and choose one when you start. |
 | [Linux](docs/LINUX.md) | install, build and run the experimental Linux version. |
+| [macOS](docs/MACOS.md) | install, build and run the experimental version for Macs with Apple silicon. |
 | [Runtime packages](docs/RUNTIME-SETUP.md) | set up a ready-built runtime package with your own game data. |
 | [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
 | [Third-party notices](NOTICE.md) | see attributions and licenses. |
@@ -264,6 +267,7 @@ WindowSmash is **experimental**. Menus and matches run and Local Wireless connec
 | **DLC** | The DLC fighters your version has: 11.0.0 has them up to Pyra/Mythra; Kazuya came with 12.0.0 and Sora with 13.0.0. |
 | **Multiplayer** | The online lobby (with direct connections) and private rooms work. Complete matches between two PCs, and the whole roster online, haven't been fully verified. |
 | **Linux** | Experimental, built from the same source and drawn through DXVK on Vulkan: on Linux itself with `install-windowsmash.sh`, or cross-compiled on Windows. |
+| **macOS** | Experimental and new: Macs with Apple silicon and macOS 14.5 or newer, built on the Mac itself with `Install WindowSmash.command`, drawn by a Metal renderer of its own. |
 
 There is no connection to Nintendo's online service, no claim of general Switch compatibility, and no verified performance target.
 
@@ -321,7 +325,7 @@ The game-backed instruction and function tests are in the [technical guide](docs
 | :--- | :--- |
 | `launchers/` | The other launchers: offline play, private rooms, shader preparation, the unlock tool, building without the installer. |
 | `runtime/` | The native runtime: services, graphics, input, audio, networking. |
-| `tools/` | The recompiler, game-file readers and launch helpers; `tools/dev/` holds the developers' analysis and test tools, `tools/linux/` the Linux build. |
+| `tools/` | The recompiler, game-file readers and launch helpers; `tools/dev/` holds the developers' analysis and test tools, `tools/linux/` the Linux build, `tools/mac/` the macOS build, installer and launchers. |
 | `tests/` | Source-only tests. |
 | `third_party/` | The sources of libopus and libvpx's VP9 decoder, built during the build, with their license texts. |
 | `docs/` | These guides. |

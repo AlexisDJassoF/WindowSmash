@@ -7,6 +7,9 @@ This guide takes you from a fresh download to playing. No programming knowledge 
 > [!IMPORTANT]
 > WindowSmash doesn't include the game. You need your own copy of Super Smash Bros. Ultimate, dumped from your own Nintendo Switch, together with your console's keys and firmware. This guide starts once you have those files.
 
+> [!NOTE]
+> **On a Mac** with Apple silicon, `Install WindowSmash.command` does what this guide's installer does: see [WindowSmash on a Mac](MACOS.md).
+
 ## Install in one go
 
 **What you need:** a Windows 10 or 11 PC (64-bit, a processor with AVX2, 16 GB of RAM is comfortable, about 60 GB free) and your own game files: the game as dumped from your Switch, with its update if you have one, your console's keys (`prod.keys` and `title.keys`) and its firmware. If you have played the game in **yuzu or Ryujinx on this PC, you already have all three**, and the installer finds them by itself. Otherwise, put the game (its `.xci`, `.nsp` or `.nca` files), its update `.nsp` and your DLC `.nsp` files in one folder; [Part 2](#part-2-gather-your-game-files) below says what the files are.
