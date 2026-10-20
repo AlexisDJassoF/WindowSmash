@@ -13,6 +13,12 @@
  * every launcher starts the game) says how pads become players; it is written with the defaults
  * and their documentation when it does not exist.
  *
+ * GameCube controllers (on Nintendo's adapter or one in its "Wii U" mode, which SDL3 reads with its
+ * own driver, or any pad SDL names a GameCube controller) play as the console's GameCube controllers:
+ * the game then uses its GameCube controls, as with a GameCube adapter on a Switch. Their buttons go
+ * by their letters; Z is the console's ZR, and L and R are the analog triggers, which the game reads
+ * itself (a GameCube npad's state carries both). style = gamecube makes any pad play as one.
+ *
  * Linux: the program links SDL2 (SSBU_HAVE_SDL2), started by the window (linux/window.c), and
  * the input thread reads its game controllers the same way; there is no XInput.
  *
@@ -43,11 +49,12 @@
 enum {
     RB_SOUTH, RB_EAST, RB_WEST, RB_NORTH, RB_BACK, RB_GUIDE, RB_START, RB_LEFT_STICK, RB_RIGHT_STICK,
     RB_LEFT_SHOULDER, RB_RIGHT_SHOULDER, RB_DPAD_UP, RB_DPAD_DOWN, RB_DPAD_LEFT, RB_DPAD_RIGHT, RB_MISC1,
-    RB_RIGHT_PADDLE1, RB_LEFT_PADDLE1, RB_RIGHT_PADDLE2, RB_LEFT_PADDLE2, RB_TOUCHPAD, RB_COUNT = 26
+    RB_RIGHT_PADDLE1, RB_LEFT_PADDLE1, RB_RIGHT_PADDLE2, RB_LEFT_PADDLE2, RB_TOUCHPAD, RB_MISC2, RB_MISC3, RB_MISC4, RB_COUNT = 26
 };
 enum { RA_LEFTX, RA_LEFTY, RA_RIGHTX, RA_RIGHTY, RA_LEFT_TRIGGER, RA_RIGHT_TRIGGER, RA_COUNT };
 #ifdef SSBU_HAVE_SDL3
 _Static_assert(RB_SOUTH == SDL_GAMEPAD_BUTTON_SOUTH && RB_TOUCHPAD == SDL_GAMEPAD_BUTTON_TOUCHPAD &&
+               RB_MISC3 == SDL_GAMEPAD_BUTTON_MISC3 && RB_MISC4 == SDL_GAMEPAD_BUTTON_MISC4 &&
                RB_COUNT == SDL_GAMEPAD_BUTTON_COUNT && RA_RIGHT_TRIGGER == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "SDL numbering");
 #elif defined SSBU_HAVE_SDL2   /* (SDL2's numbering is SDL3's up to the touchpad; A is the bottom button) */
 _Static_assert(RB_SOUTH == SDL_CONTROLLER_BUTTON_A && RB_RIGHT_PADDLE1 == SDL_CONTROLLER_BUTTON_PADDLE1 &&
@@ -75,6 +82,7 @@ typedef struct Mapping { Source src[16][MAXSRC]; u8 n[16]; } Mapping;
 typedef struct DevCfg {
     char match[96];               /* GUID, name or type of the pad ("" = [device default]) */
     int layout;                   /* -1 unset, 0 positional, 1 labels */
+    int style;                    /* -1 unset, 0 auto, 1 pro, 2 gamecube */
     int deadzone, rumble, trigger;   /* percent; -1 unset */
     Source map[16][MAXSRC]; u8 nmap[16], has_map[16];
 } DevCfg;
@@ -86,7 +94,7 @@ static struct {
     DevCfg def, dev[32];
     int ndev;
     char path[MAX_PATH];
-} cfg = {.keyboard_slot = 0, .background = 1, .def = {"", -1, -1, -1, -1}};
+} cfg = {.keyboard_slot = 0, .background = 1, .def = {"", -1, -1, -1, -1, -1}};
 
 static void config_defaults(void) {
     char path[MAX_PATH];
@@ -94,7 +102,7 @@ static void config_defaults(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.keyboard_slot = 0;
     cfg.background = 1;
-    cfg.def.layout = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
+    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
     memcpy(cfg.path, path, sizeof path);
 }
 
@@ -103,9 +111,9 @@ static const char DEFAULT_INI[] =
     "; or the pad's Home / PS / Xbox button in the game) changes it too.\n"
     "; Delete this file to get it written again with the defaults. A line starting with ';' is a comment.\n"
     ";\n"
-    "; Any controller SDL3 knows works: Xbox, PlayStation, Switch Pro, and most others. Each new pad takes\n"
-    "; the lowest free player; a pad unplugged and plugged back in gets its player back. The game's log\n"
-    "; names every pad as it connects, e.g.\n"
+    "; Any controller SDL3 knows works: Xbox, PlayStation, Switch Pro, GameCube (on Nintendo's adapter), and\n"
+    "; most others. Each new pad takes the lowest free player; a pad unplugged and plugged back in gets its\n"
+    "; player back. The game's log names every pad as it connects, e.g.\n"
     ";   [input] player 2: \"DualSense Wireless Controller\" (ps5, GUID 050000004c050000e60c000000810000)\n"
     "\n"
     "[general]\n"
@@ -122,17 +130,23 @@ static const char DEFAULT_INI[] =
     "; layout = positional: buttons by position, as on a Switch pad (the bottom face button is B).\n"
     ";          labels: by the letter printed on the pad (an Xbox pad's A is A). PlayStation pads stay positional.\n"
     "layout = positional\n"
+    "; style = auto: GameCube controllers play as GameCube controllers (the game's GameCube controls; buttons\n"
+    ";        by their letters, analog L and R), every other pad as a Pro Controller.\n"
+    ";        gamecube: play as a GameCube controller (the triggers are L and R, the bumpers Z). pro: Pro Controller.\n"
+    "style = auto\n"
     "; deadzone = 0-50, percent of the stick's travel ignored around the centre. 0: only the game's own.\n"
     "deadzone = 0\n"
     "; rumble = 0-100, percent strength. 0: off.\n"
     "rumble = 100\n"
-    "; trigger_threshold = 1-99, percent: how far a trigger is pulled to press ZL / ZR.\n"
+    "; trigger_threshold = 1-99, percent: how far a trigger is pulled to press ZL / ZR. (As a GameCube controller,\n"
+    ";                     the game itself decides how far L and R are pulled.)\n"
     "trigger_threshold = 25\n"
     "; Remap: <console button> = <pad control>[, <pad control> ...]\n"
     ";   console buttons: A B X Y L R ZL ZR PLUS MINUS LSTICK RSTICK UP DOWN LEFT RIGHT\n"
     ";   pad controls:    south east west north leftshoulder rightshoulder lefttrigger righttrigger start back\n"
     ";                    guide leftstick rightstick dpup dpdown dpleft dpright misc1 leftpaddle1 rightpaddle1\n"
-    ";                    leftpaddle2 rightpaddle2 touchpad none\n"
+    ";                    leftpaddle2 rightpaddle2 touchpad misc3 misc4 none\n"
+    ";   (a GameCube controller's Z is rightshoulder; misc3 and misc4 are the clicks at the bottom of L and R)\n"
     "; ZR = rightshoulder\n"
     "; R = righttrigger\n"
     "\n"
@@ -168,6 +182,11 @@ static void config_line(DevCfg *dc, const char *key, char *value, int line) {
         if (!_stricmp(value, "positional")) dc->layout = 0;
         else if (!_stricmp(value, "labels")) dc->layout = 1;
         else fprintf(stderr, "[input] controllers.ini line %d: layout is positional or labels, not '%s'\n", line, value);
+    } else if (!_stricmp(key, "style")) {
+        if (!_stricmp(value, "auto")) dc->style = 0;
+        else if (!_stricmp(value, "pro")) dc->style = 1;
+        else if (!_stricmp(value, "gamecube")) dc->style = 2;
+        else fprintf(stderr, "[input] controllers.ini line %d: style is auto, pro or gamecube, not '%s'\n", line, value);
     } else if (!_stricmp(key, "deadzone")) dc->deadzone = atoi(value) < 0 ? 0 : atoi(value) > 50 ? 50 : atoi(value);
     else if (!_stricmp(key, "rumble")) dc->rumble = atoi(value) < 0 ? 0 : atoi(value) > 100 ? 100 : atoi(value);
     else if (!_stricmp(key, "trigger_threshold")) dc->trigger = atoi(value) < 1 ? 1 : atoi(value) > 99 ? 99 : atoi(value);
@@ -206,7 +225,7 @@ static void config_parse(FILE *f) {
                 else if (cfg.ndev < (int)(sizeof cfg.dev / sizeof *cfg.dev)) {
                     dc = &cfg.dev[cfg.ndev++];
                     memset(dc, 0, sizeof *dc);
-                    dc->layout = dc->deadzone = dc->rumble = dc->trigger = -1;
+                    dc->layout = dc->style = dc->deadzone = dc->rumble = dc->trigger = -1;
                     snprintf(dc->match, sizeof dc->match, "%s", what);
                 } else dc = NULL;
             } else fprintf(stderr, "[input] controllers.ini line %d: unknown section [%s]\n", line, name);
@@ -254,6 +273,7 @@ typedef struct Dev {
 #endif
     char guid[40], name[96], type[24], serial[64], path[192];
     int deadzone, rumble, trigger, layout;
+    int gc;                       /* plays as a GameCube controller */
     int labels[4], has_labels;    /* the letters on its face buttons (dev_configure) */
     char section[96];             /* the [device ...] it takes settings from ("" = only default) */
     Mapping map;
@@ -267,6 +287,14 @@ static int nknown;
 
 static int dev_matches(const Dev *d, const char *what) {
     return *what && (!_stricmp(what, d->guid) || !_stricmp(what, d->name) || !_stricmp(what, d->type));
+}
+
+/* A GameCube controller: SDL's type for one, or (SDL2, adapters in PC mode) a name that says so. */
+static int dev_is_gamecube(const Dev *d) {
+    if (!_stricmp(d->type, "gamecube")) return 1;
+    for (const char *s = d->name; *s; s++)
+        if (!_strnicmp(s, "gamecube", 8)) return 1;
+    return 0;
 }
 
 /* The settings of one pad: built-in defaults, then [device default], then the [device ...] that
@@ -284,11 +312,12 @@ static void dev_configure(Dev *d, const int labels[4]) {
         }
     const DevCfg *layers[2] = {&cfg.def, best};
     snprintf(d->section, sizeof d->section, "%s", best ? best->match : "");
-    int layout = 0;
+    int layout = 0, style = 0, gamecube = dev_is_gamecube(d);
     d->deadzone = 0; d->rumble = 100; d->trigger = 25;
     for (int l = 0; l < 2; l++) {
         if (!layers[l]) continue;
         if (layers[l]->layout >= 0) layout = layers[l]->layout;
+        if (layers[l]->style >= 0) style = layers[l]->style;
         if (layers[l]->deadzone >= 0) d->deadzone = layers[l]->deadzone;
         if (layers[l]->rumble >= 0) d->rumble = layers[l]->rumble;
         if (layers[l]->trigger >= 0) d->trigger = layers[l]->trigger;
@@ -306,11 +335,26 @@ static void dev_configure(Dev *d, const int labels[4]) {
     d->layout = layout;
     memset(&d->map, 0, sizeof d->map);
     for (int i = 0; i < 16; i++) { d->map.src[POSITIONAL[i].npad][0] = POSITIONAL[i].src; d->map.n[POSITIONAL[i].npad] = 1; }
-    if (layout == 1 && labels && labels[0] >= 0 && labels[1] >= 0 && labels[2] >= 0 && labels[3] >= 0)
+    /* A GameCube controller goes by its letters: SDL puts A at the bottom, X right, B left, Y on top. */
+    static const int GAMECUBE_LABELS[4] = {N_A, N_X, N_B, N_Y};
+    int lettered = labels && labels[0] >= 0 && labels[1] >= 0 && labels[2] >= 0 && labels[3] >= 0;
+    if (gamecube && !lettered) { labels = GAMECUBE_LABELS; lettered = 1; }
+    if ((layout == 1 || gamecube) && lettered)
         for (int f = 0; f < 4; f++) {   /* faces in RB_SOUTH..RB_NORTH order */
             d->map.src[labels[f]][0] = (Source){SRC_BUTTON, (u8)(RB_SOUTH + f)};
             d->map.n[labels[f]] = 1;
         }
+    /* As a GameCube controller, L and R are the triggers (with the clicks at their bottoms), and Z
+     * is the console's ZR, as a GameCube npad reports it: the right bumper (a GameCube controller's
+     * only one), or the left one on other pads. There is no ZL. */
+    d->gc = style == 2 || (style == 0 && gamecube);
+    if (d->gc) {
+        d->map.src[N_L][0] = (Source){SRC_TRIGGER, RA_LEFT_TRIGGER}; d->map.src[N_L][1] = (Source){SRC_BUTTON, RB_MISC3};
+        d->map.src[N_R][0] = (Source){SRC_TRIGGER, RA_RIGHT_TRIGGER}; d->map.src[N_R][1] = (Source){SRC_BUTTON, RB_MISC4};
+        d->map.src[N_ZR][0] = (Source){SRC_BUTTON, RB_RIGHT_SHOULDER}; d->map.src[N_ZR][1] = (Source){SRC_BUTTON, RB_LEFT_SHOULDER};
+        d->map.n[N_L] = d->map.n[N_R] = d->map.n[N_ZR] = 2;
+        d->map.n[N_ZL] = 0;
+    }
     for (int l = 0; l < 2; l++)
         for (int b = 0; layers[l] && b < 16; b++)
             if (layers[l]->has_map[b]) {
@@ -363,12 +407,27 @@ static void stick(int deadzone, i32 x, i32 y_down, i32 *ox, i32 *oy) {
     *oy = (i32)lround(fy * scale);
 }
 
+/* As a GameCube controller, L and R are analog: the furthest-pulled of their controls (a button
+ * counts as fully pulled). The game makes the buttons out of them itself. */
+static i32 dev_trigger(const Dev *d, const Raw *raw, int b) {
+    i32 v = 0;
+    for (int j = 0; j < d->map.n[b]; j++) {
+        Source s = d->map.src[b][j];
+        i32 t = s.kind == SRC_TRIGGER ? raw->axis[s.index] : s.kind == SRC_BUTTON && raw->buttons >> s.index & 1 ? 32767 : 0;
+        if (t > v) v = t > 32767 ? 32767 : t;
+    }
+    return v;
+}
+
 static void dev_state(const Dev *d, const Raw *raw, PadState *o) {
     i32 threshold = d->trigger * 32767 / 100;
     o->connected = 1;
+    o->gc = (u32)d->gc;
     o->buttons = 0;
+    o->lt = d->gc ? dev_trigger(d, raw, N_L) : 0;
+    o->rt = d->gc ? dev_trigger(d, raw, N_R) : 0;
     for (int b = 0; b < 16; b++)
-        for (int j = 0; j < d->map.n[b]; j++) {
+        for (int j = 0; j < d->map.n[b] && !(d->gc && (b == N_L || b == N_R)); j++) {
             Source s = d->map.src[b][j];
             if ((s.kind == SRC_BUTTON && raw->buttons >> s.index & 1) || (s.kind == SRC_TRIGGER && raw->axis[s.index] >= threshold)) {
                 o->buttons |= 1ull << b;
@@ -446,7 +505,8 @@ static int rumble_due(Dev *d, ULONGLONG now, u16 *low, u16 *high) {
 
 static void log_connect(const Dev *d) {
     if (d->slot >= 0)
-        fprintf(stderr, "[input] player %d: \"%s\" (%s, GUID %s)\n", d->slot + 1, d->name, d->type, d->guid);
+        fprintf(stderr, "[input] player %d: \"%s\" (%s, GUID %s)%s\n", d->slot + 1, d->name, d->type, d->guid,
+                d->gc ? ", as a GameCube controller" : "");
     else fprintf(stderr, "[input] \"%s\" (%s) connected, but all 8 players are taken\n", d->name, d->type);
 }
 
@@ -697,9 +757,12 @@ static void sdl_open(int index) {
     snprintf(d->type, sizeof d->type, "%s", sdl2_type(type));
     snprintf(d->serial, sizeof d->serial, "%s", (s = SDL_GameControllerGetSerial(gp)) ? s : "");
     snprintf(d->path, sizeof d->path, "%s", p_SDL_GameControllerPath && (s = p_SDL_GameControllerPath(gp)) ? s : "");
-    /* the letters on the face buttons (south, east, west, north), as SDL3 gives them by type */
-    static const int XBOX[4] = {N_A, N_B, N_X, N_Y}, NINTENDO[4] = {N_B, N_A, N_Y, N_X}, NONE[4] = {-1, -1, -1, -1};
-    const int *labels = type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5 ? NONE :
+    /* the letters on the face buttons (south, east, west, north), as SDL3 gives them by type (SDL2's
+     * GameCube driver, positional, puts X right and B left of A) */
+    static const int XBOX[4] = {N_A, N_B, N_X, N_Y}, NINTENDO[4] = {N_B, N_A, N_Y, N_X}, NONE[4] = {-1, -1, -1, -1},
+                     GAMECUBE[4] = {N_A, N_X, N_B, N_Y};
+    const int *labels = dev_is_gamecube(d) ? GAMECUBE :
+                        type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5 ? NONE :
                         type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO || (type >= 11 && type <= 13) ? NINTENDO : XBOX;
     dev_configure(d, labels);
     d->slot = dev_assign(d);

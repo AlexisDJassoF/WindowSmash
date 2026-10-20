@@ -1,5 +1,5 @@
 /* Offline checks of the controller layer (runtime/hle_pad.c) without a pad, SDL or the game:
- * configuration, button mapping, sticks, player slots and rumble pacing.
+ * configuration, button mapping, GameCube controllers, sticks, player slots and rumble pacing.
  *
  *   python -c "import sys; sys.path.insert(0,'tools'); import cc, subprocess; subprocess.run([cc.CLANG, '/nologo', '/O1', *cc.CFLAGS, 'tools/dev/padtest.c', '/Febuild/padtest.exe'], check=True)"
  *   build\padtest.exe
@@ -13,7 +13,7 @@ static int failures, checks;
 static void load_text(const char *text) {
     memset(&cfg, 0, sizeof cfg);
     cfg.keyboard_slot = 0; cfg.background = 1;
-    cfg.def.layout = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
+    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
     char path[MAX_PATH], dir[MAX_PATH];
     GetTempPathA(sizeof dir, dir);
     GetTempFileNameA(dir, "pad", 0, path);
@@ -35,6 +35,13 @@ static Dev make_dev(const char *guid, const char *serial, const char *path, cons
     snprintf(d.name, sizeof d.name, "%s", name);
     snprintf(d.type, sizeof d.type, "%s", type);
     return d;
+}
+
+static PadState state(const Dev *d, u32 raw_buttons, i32 lt, i32 rt) {
+    Raw raw = {raw_buttons, {0, 0, 0, 0, lt, rt}};
+    PadState o;
+    dev_state(d, &raw, &o);
+    return o;
 }
 
 static u64 press(const Dev *d, u32 raw_buttons, i32 lt, i32 rt) {
@@ -100,6 +107,61 @@ static void test_mapping(void) {
     Dev other = make_dev("g2", "", "", "Other", "ps4");
     dev_configure(&other, ps_labels);
     CHECK(press(&other, 1u << RB_SOUTH, 0, 0) == 1ull << N_B, "another type keeps positional");
+}
+
+static void test_gamecube(void) {
+    load_text("[device default]\nstyle = pro\n[device gamecube]\nstyle = gamecube\n[device x]\nstyle = sideways\n");
+    CHECK(cfg.def.style == 1 && cfg.dev[0].style == 2 && cfg.dev[1].style == -1, "style values");
+
+    load_text("");
+    int sdl_labels[4] = {N_A, N_X, N_B, N_Y};   /* SDL3's labels on a GameCube pad: A bottom, X right, B left, Y top */
+    Dev gc = make_dev("g", "", "", "Nintendo GameCube Controller", "gamecube");
+    dev_configure(&gc, sdl_labels);
+    CHECK(gc.gc, "a GameCube pad plays as one");
+    CHECK(press(&gc, 1u << RB_SOUTH, 0, 0) == 1ull << N_A, "GameCube A");
+    CHECK(press(&gc, 1u << RB_EAST, 0, 0) == 1ull << N_X, "GameCube X (right of A)");
+    CHECK(press(&gc, 1u << RB_WEST, 0, 0) == 1ull << N_B, "GameCube B (left of A)");
+    CHECK(press(&gc, 1u << RB_NORTH, 0, 0) == 1ull << N_Y, "GameCube Y");
+    CHECK(press(&gc, 1u << RB_RIGHT_SHOULDER, 0, 0) == 1ull << N_ZR, "Z is ZR");
+    CHECK(press(&gc, 1u << RB_START, 0, 0) == 1ull << N_PLUS, "Start is +");
+    PadState o = state(&gc, 0, 12000, 32767);
+    CHECK(o.gc && o.lt == 12000 && o.rt == 32767 && o.buttons == 0, "analog L/R, no L/R/ZL/ZR bits: %d %d %llx", o.lt, o.rt,
+          (unsigned long long)o.buttons);
+    o = state(&gc, 1u << RB_MISC3, 3000, 0);
+    CHECK(o.lt == 32767 && o.rt == 0, "the click at the bottom of L pulls it fully: %d", o.lt);
+    o = state(&gc, 1u << RB_MISC4, 0, 0);
+    CHECK(o.rt == 32767, "and of R");
+    dev_configure(&gc, NULL);
+    CHECK(press(&gc, 1u << RB_EAST, 0, 0) == 1ull << N_X && press(&gc, 1u << RB_SOUTH, 0, 0) == 1ull << N_A, "letters without SDL's labels");
+
+    Dev pcmode = make_dev("m", "", "", "Mayflash GameCube Controller Adapter", "standard");
+    dev_configure(&pcmode, NULL);
+    CHECK(pcmode.gc && press(&pcmode, 1u << RB_SOUTH, 0, 0) == 1ull << N_A, "a GameCube pad by name");
+
+    Dev xbox = make_dev("x", "", "", "Xbox Controller", "xboxone");
+    int xbox_labels[4] = {N_A, N_B, N_X, N_Y};
+    dev_configure(&xbox, xbox_labels);
+    CHECK(!xbox.gc && !state(&xbox, 0, 0, 0).gc, "an Xbox pad is a Pro Controller");
+
+    load_text("[device xboxone]\nstyle = gamecube\n[device gamecube]\nstyle = pro\n");
+    dev_configure(&xbox, xbox_labels);
+    CHECK(xbox.gc, "style = gamecube");
+    CHECK(press(&xbox, 1u << RB_SOUTH, 0, 0) == 1ull << N_B, "keeps its layout: bottom is B");
+    CHECK(press(&xbox, 1u << RB_RIGHT_SHOULDER, 0, 0) == 1ull << N_ZR && press(&xbox, 1u << RB_LEFT_SHOULDER, 0, 0) == 1ull << N_ZR,
+          "both bumpers are Z");
+    o = state(&xbox, 0, 20000, 0);
+    CHECK(o.lt == 20000 && o.buttons == 0, "its triggers are analog L and R");
+    dev_configure(&gc, sdl_labels);
+    CHECK(!gc.gc, "style = pro on a GameCube pad");
+    CHECK(press(&gc, 1u << RB_EAST, 0, 0) == 1ull << N_X, "still by its letters");
+    CHECK(press(&gc, 1u << RB_RIGHT_SHOULDER, 0, 0) == 1ull << N_R && press(&gc, 0, 0, 32767) == 1ull << N_ZR, "Z is R, triggers ZL/ZR");
+
+    load_text("[device gamecube]\nL = leftshoulder\nZR = south\n");
+    dev_configure(&gc, sdl_labels);
+    o = state(&gc, 1u << RB_LEFT_SHOULDER | 1u << RB_SOUTH, 30000, 0);
+    CHECK(o.lt == 32767 && o.buttons == (1ull << N_A | 1ull << N_ZR), "remaps: L on a button, ZR = south: %d %llx", o.lt,
+          (unsigned long long)o.buttons);
+    CHECK(state(&gc, 0, 30000, 0).lt == 0, "L remapped away from the trigger");
 }
 
 static void test_sticks(void) {
@@ -177,6 +239,7 @@ static void test_rumble(void) {
 int main(void) {
     test_config();
     test_mapping();
+    test_gamecube();
     test_sticks();
     test_slots();
     test_rumble();
