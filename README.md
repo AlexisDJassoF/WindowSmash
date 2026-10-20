@@ -153,6 +153,7 @@ Then:
 
 First it prepares your game files, which takes a few minutes: it decrypts the game if needed and applies your update (up to about 17 GB more space). Then it builds the game: your PC translates it into a Windows program, which takes **30 minutes to a few hours**.
 
+- A progress line shows how far the build has got and the time left. The time left appears once the first files are compiled, a few minutes in. The window's title shows it too, so you can follow it from the taskbar.
 - You can keep using the PC, though it will be slower. Set it not to sleep while plugged in (**Settings → System → Power**) until the build is done.
 - If the build stops (a restart, the PC going to sleep, an error you fixed), double-click `Install WindowSmash.bat` again: it carries on where it stopped.
 - It's finished when the window says **Done**. Press a key to close it.
