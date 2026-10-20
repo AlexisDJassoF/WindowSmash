@@ -12,7 +12,7 @@ static int failures, checks;
 
 static void load_text(const char *text) {
     memset(&cfg, 0, sizeof cfg);
-    cfg.keyboard_slot = 0; cfg.background = 1;
+    cfg.keyboard_slot = 0; cfg.background = 1; cfg.rumble = 1;
     cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
     char path[MAX_PATH], dir[MAX_PATH];
     GetTempPathA(sizeof dir, dir);
@@ -234,6 +234,15 @@ static void test_rumble(void) {
     CHECK(rumble_due(&d, t + 500, &lo, &hi) && lo, "start again");
     CHECK(rumble_due(&d, t + 3600, &lo, &hi) && !lo, "stopped when the game goes quiet for 3 s");
     CHECK(pad_rumble_value(5, 1) == 1.0f && pad_rumble_value(9, 1) == 0, "last value kept");
+
+    load_text("[general]\nrumble = 0\n[device default]\nrumble = 50\n");
+    CHECK(!cfg.rumble, "[general] rumble = 0");
+    d.sent_low = d.sent_high = 0; d.sent_at = 0;
+    pad_rumble(5, 1, 1.0f); pad_rumble(5, 2, 1.0f);
+    t = GetTickCount64();
+    CHECK(!rumble_due(&d, t, &lo, &hi) && !lo && !hi, "no controller rumbles: %u %u", lo, hi);
+    load_text("[general]\nrumble = 1\n");
+    CHECK(rumble_due(&d, t + 20, &lo, &hi) && lo, "on again: %u", lo);
 }
 
 int main(void) {

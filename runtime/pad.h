@@ -20,6 +20,7 @@ void pad_start(void);                                     /* once; the first hid
 int pad_get(u32 slot, PadState *out);                     /* returns out->connected */
 int pad_keyboard_slot(void);                              /* the keyboard's slot, or -1 */
 int pad_background(void);                                 /* pads work while the window is not focused */
+int pad_rumble_on(void);                                  /* 0: controllers.ini turns every pad's rumble off */
 /* Rumble on one side (1 left, 2 right) of a slot's pad, amplitude 0..1. */
 void pad_rumble(u32 slot, int side, float amplitude);
 float pad_rumble_value(u32 slot, int side);               /* what was last sent */

@@ -43,7 +43,7 @@ Press <kbd>Esc</kbd> in the game to open the settings (on Windows and Linux; the
 | Page | What you can change |
 | :--- | :--- |
 | **Display** | Window or full screen, frame pacing, how many frames the graphics card works ahead, the mouse pointer, the frame rate in the corner, the window's size, the render scale, the graphics card. |
-| **Controllers** | For each connected controller: which player it is, face buttons by position or by label, stick dead zone, rumble, how far a trigger is pulled for ZL / ZR, and which control is each button (**Buttons...**). For the keyboard: which player it adds to. Also whether controllers work while another window is in front. |
+| **Controllers** | For each connected controller: which player it is, face buttons by position or by label, stick dead zone, rumble, how far a trigger is pulled for ZL / ZR, and which control is each button (**Buttons...**). For the keyboard: which player it adds to. Also **Rumble** on or off for every controller, and whether controllers work while another window is in front. |
 | **Online** | Public lobby, a private lobby code, your own server, or offline; your name; direct connections ([multiplayer guide](MULTIPLAYER.md)). |
 | **Game** | Restart or quit the game, the keys, and the game version. |
 
@@ -125,13 +125,13 @@ The first time the game starts, it writes **`controllers.ini`** into the WindowS
 | `layout` | `positional`: buttons by position, as on a Switch pad. `labels`: by the letter printed on the pad (PlayStation pads stay positional). | `positional` |
 | `style` | `auto`: GameCube controllers play as GameCube controllers, other pads as Pro Controllers. `gamecube` or `pro`: this pad plays as that kind of controller. | `auto` |
 | `deadzone` | How much of the stick's travel around the centre is ignored, 0–50 percent. | `0` |
-| `rumble` | Rumble strength, 0–100 percent. `0` turns it off. | `100` |
+| `rumble` | Rumble strength, 0–100 percent. `0` turns it off. (In `[general]`: `0` turns rumble off for every controller, `1` leaves each at its own strength.) | `100` (`1` in `[general]`) |
 | `trigger_threshold` | How far a trigger must be pulled to press ZL or ZR, 1–99 percent. (On a GameCube controller, the game itself decides how far L and R are pulled.) | `25` |
 | *remaps* | `<Switch button> = <pad control>`, for example `ZR = rightshoulder`. The file lists every name. | |
 
 The file has these sections:
 
-- **`[general]`** holds `keyboard_player` and `background`.
+- **`[general]`** holds `keyboard_player`, `background` and `rumble` (on or off for every controller).
 - **`[players]`** reserves a player for one pad, for example `2 = DualSense Wireless Controller` (the settings' **Player** row writes the pad's GUID there). The log names every pad as it connects, with its type and GUID.
 - **`[device default]`** applies to every pad.
 - **`[device ps5]`**, **`[device <name>]`** or **`[device <GUID>]`** applies to one kind of pad, or one pad. Types include `xbox360`, `xboxone`, `ps4`, `ps5`, `switchpro`, `joyconpair` and `gamecube`. The settings write a controller's changes under `[device <its name>]`, or under the section it already takes its settings from.

@@ -90,11 +90,12 @@ typedef struct DevCfg {
 static struct {
     int keyboard_slot;            /* -1: no keyboard */
     int background;
+    int rumble;                   /* 0: no pad rumbles ([general] rumble) */
     char pin[PAD_SLOTS][96];
     DevCfg def, dev[32];
     int ndev;
     char path[MAX_PATH];
-} cfg = {.keyboard_slot = 0, .background = 1, .def = {"", -1, -1, -1, -1, -1}};
+} cfg = {.keyboard_slot = 0, .background = 1, .rumble = 1, .def = {"", -1, -1, -1, -1, -1}};
 
 static void config_defaults(void) {
     char path[MAX_PATH];
@@ -102,6 +103,7 @@ static void config_defaults(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.keyboard_slot = 0;
     cfg.background = 1;
+    cfg.rumble = 1;
     cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
     memcpy(cfg.path, path, sizeof path);
 }
@@ -121,6 +123,8 @@ static const char DEFAULT_INI[] =
     "keyboard_player = 1\n"
     "; background = 1: pads work while the game's window is not focused. 0: only while it is.\n"
     "background = 1\n"
+    "; rumble = 1: controllers rumble (each as strong as its own rumble below). 0: no controller rumbles.\n"
+    "rumble = 1\n"
     "\n"
     "[players]\n"
     "; Keep a player for one pad: <player> = <GUID, name or type of the pad>. Other pads leave it free.\n"
@@ -239,6 +243,7 @@ static void config_parse(FILE *f) {
             int n = atoi(value);
             cfg.keyboard_slot = n >= 1 && n <= PAD_SLOTS ? n - 1 : -1;
         } else if (section == 1 && !_stricmp(key, "background")) cfg.background = atoi(value) != 0;
+        else if (section == 1 && !_stricmp(key, "rumble")) cfg.rumble = atoi(value) != 0;
         else if (section == 2) {
             int n = atoi(key);
             if (n >= 1 && n <= PAD_SLOTS) snprintf(cfg.pin[n - 1], sizeof cfg.pin[n - 1], "%s", value);
@@ -490,7 +495,7 @@ static int rumble_due(Dev *d, ULONGLONG now, u16 *low, u16 *high) {
     AcquireSRWLockShared(&lock);
     l = rumble_amp[d->slot][0]; r = rumble_amp[d->slot][1]; at = rumble_at[d->slot];
     ReleaseSRWLockShared(&lock);
-    if (now - at > 3000) l = r = 0;
+    if (now - at > 3000 || !cfg.rumble) l = r = 0;
     l = l < 0 ? 0 : l > 1 ? 1 : l;
     r = r < 0 ? 0 : r > 1 ? 1 : r;
     *low = (u16)(l * 65535.0f * d->rumble / 100);
@@ -928,6 +933,7 @@ int pad_get(u32 slot, PadState *out) {
 
 int pad_keyboard_slot(void) { pad_start(); return cfg.keyboard_slot; }
 int pad_background(void) { pad_start(); return cfg.background; }
+int pad_rumble_on(void) { pad_start(); return cfg.rumble; }
 
 void pad_rumble(u32 slot, int side, float amplitude) {
     if (slot >= PAD_SLOTS || side < 1 || side > 2) return;
