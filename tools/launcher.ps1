@@ -6,7 +6,7 @@ settings, then Play.
 .DESCRIPTION
 It edits the same files the game's settings menu (Esc) and players edit by hand, in place, keeping
 their comments and every line it does not change:
-  display.ini       window, width, height, pacing, gpu, hide_cursor, overlay
+  display.ini       window, width, height, pacing, render_scale, gpu, hide_cursor, overlay
   controllers.ini   [general] keyboard_player, background
   online_server.txt the first line that is not a '#' comment: host:port [lobby code], or off
   online_name.txt   the online name (empty: the game picks one at its first online start)
@@ -41,7 +41,7 @@ $PublicLobby = 'smash.recomps.wtf:39421'   # (the online_server.txt the port com
 # The game's own values when a file or key is missing (runtime/gpu_display.c, hle_pad.c).
 $Defaults = @{
     window = 'windowed'; width = '1280'; height = '720'; pacing = 'clock'; latency = '3'
-    hide_cursor = '1'; overlay = '1'; gpu = 'auto'; keyboard_player = '1'; background = '1'
+    hide_cursor = '1'; overlay = '1'; gpu = 'auto'; render_scale = '1'; keyboard_player = '1'; background = '1'
 }
 # What Play SSBU.bat clears, so the files count (the variables win over them in the game).
 $ClearedVars = @('SSBU_DATA_ROOT', 'SSBU_INPUT', 'SSBU_NET_HOST', 'SSBU_NET_RELAY', 'SSBU_NET_BIND',
@@ -348,7 +348,7 @@ $form = New-Object Windows.Forms.Form
 $form.Text = 'WindowSmash'
 $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
 $form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
-$form.ClientSize = New-Object Drawing.Size(760, 540)
+$form.ClientSize = New-Object Drawing.Size(760, 574)
 $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
 $form.StartPosition = [Windows.Forms.FormStartPosition]::CenterScreen
@@ -432,7 +432,25 @@ $pacingBox = New-Choice @(
     @{ Value = 'vrr'; Text = 'G-Sync / FreeSync monitor' },
     @{ Value = 'display'; Text = "Follow the monitor's refresh" }) (Get-Setting $displayIni '' 'pacing') $LC 152 $LW `
     "Steady 60: 60 frames a second, each shown at the monitor's next refresh.`nG-Sync / FreeSync: each frame shown the moment it is ready; best borderless. Tears without G-Sync / FreeSync.`nFollow the monitor: its own rate (60, 120 or 240 Hz only), e.g. 59.94 frames a second."
-[void](New-Text 'Graphics card' $L 189 120)
+[void](New-Text 'Render scale' $L 189 120)
+# (as the game reads it: auto, or a number from 0.5 to 4; anything else is 1)
+$scale = (Get-Setting $displayIni '' 'render_scale').Trim().ToLowerInvariant()
+$scaleNumber = 0.0
+if ($scale -ne 'auto') {
+    if ([double]::TryParse($scale, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$scaleNumber) -and
+        $scaleNumber -ge 0.5 -and $scaleNumber -le 4) { $scale = $scaleNumber.ToString([Globalization.CultureInfo]::InvariantCulture) }
+    else { $scale = '1' }
+}
+$scaleItems = @(
+    @{ Value = '1'; Text = "1: 1920x1080 (the game's own)" },
+    @{ Value = 'auto'; Text = 'Auto: as big as the window' },
+    @{ Value = '1.5'; Text = '1.5: 2880x1620' },
+    @{ Value = '2'; Text = '2: 3840x2160 (4K)' },
+    @{ Value = '3'; Text = '3: 5760x3240' })
+if (-not ($scaleItems | Where-Object { $_.Value -eq $scale })) { $scaleItems += @{ Value = $scale; Text = "$scale (from display.ini)" } }
+$scaleBox = New-Choice $scaleItems $scale $LC 186 $LW `
+    "How big the game draws its pictures. Bigger is sharper on a big screen and more work for the graphics card (2 = four times the pixels of 1).`nAuto: as many pixels as the game's window has when the game starts, at least 1."
+[void](New-Text 'Graphics card' $L 223 120)
 $gpu = Get-Setting $displayIni '' 'gpu'
 $gpuItems = @(@{ Value = 'auto'; Text = 'The fastest (auto)' })
 try {
@@ -444,11 +462,11 @@ $gpuItems += @{ Value = 'warp'; Text = 'WARP (Windows itself, no card: slow)' }
 if (-not ($gpuItems | Where-Object { [string]::Equals($_.Value, $gpu, [StringComparison]::OrdinalIgnoreCase) })) {
     $gpuItems += @{ Value = $gpu; Text = "$gpu (from display.ini)" }
 }
-$gpuBox = New-Choice $gpuItems $gpu $LC 186 $LW `
+$gpuBox = New-Choice $gpuItems $gpu $LC 220 $LW `
     "Auto picks the fastest card (on a laptop, the NVIDIA or AMD one, not the processor's own)."
-$cursorBox = New-Check 'Hide the mouse pointer when it stops moving' ((Get-Number (Get-Setting $displayIni '' 'hide_cursor')) -ne 0) $L 222 344 `
+$cursorBox = New-Check 'Hide the mouse pointer when it stops moving' ((Get-Number (Get-Setting $displayIni '' 'hide_cursor')) -ne 0) $L 256 344 `
     'Hides the pointer over the game after 2 seconds without moving it.'
-$overlayBox = New-Check 'Show the frame rate in the corner' ((Get-Number (Get-Setting $displayIni '' 'overlay')) -ne 0) $L 248 344 `
+$overlayBox = New-Check 'Show the frame rate in the corner' ((Get-Number (Get-Setting $displayIni '' 'overlay')) -ne 0) $L 282 344 `
     'F1 shows or hides it while playing.'
 
 # Online (right column)
@@ -465,7 +483,7 @@ $modeBox = New-Choice @(
     @{ Value = 'offline'; Text = 'Offline' }) $netMode $RC 118 $RW `
     "Public lobby: everyone's rooms in Local Wireless, and Online.`nPrivate lobby: only the players with the same code.`nYour own server: the host:port of a lobby you run (docs\MULTIPLAYER.md)."
 [void](New-Text 'Lobby code' $R 155 120)
-$codeBox = New-TextBox $lobbyCode 32 $RC 152 $RW 'A word your friends use too, without spaces.'
+$codeBox = New-TextBox $lobbyCode 32 $RC 152 $RW 'A word your friends type too, without spaces. Capital letters count: Smash and smash are two lobbies.'
 [void](New-Text 'Server' $R 189 120)
 $serverBox = New-TextBox $(if ($netMode -eq 'custom') { $lobbyHost } else { '' }) 0 $RC 186 $RW 'host:port, e.g. 192.168.1.20:39420'
 $directBox = New-Check 'Direct connections' (-not ((Get-LineValue $directFile) -match '^(?i)off')) $R 222 344 `
@@ -479,7 +497,7 @@ $updateNet = {
     $directBox.Enabled = $m -ne 'offline'
     $netNote.Text = switch ($m) {
         'public' { "The game joins $PublicLobby." }
-        'private' { 'Only the players with the same code see your rooms.' }
+        'private' { 'Only the players with the same code (same capitals too) see your rooms.' }
         'custom' { 'Your own lobby server; the code is optional.' }
         'offline' { 'The game does not go online.' }
     }
@@ -488,17 +506,17 @@ $modeBox.Add_SelectedIndexChanged($updateNet)
 & $updateNet
 
 # Controllers
-[void](New-Text 'Controllers' $L 298 344 -Bold)
-[void](New-Text 'Keyboard plays as' $L 329 124)
+[void](New-Text 'Controllers' $L 332 344 -Bold)
+[void](New-Text 'Keyboard plays as' $L 363 124)
 $kbItems = @(1..8 | ForEach-Object { @{ Value = "$_"; Text = "Player $_" } }) + @(@{ Value = '0'; Text = 'Nobody (no keyboard)' })
-$keyboardBox = New-Choice $kbItems ([string](Get-Number (Get-Setting $padsIni 'general' 'keyboard_player'))) $LC 326 $LW `
+$keyboardBox = New-Choice $kbItems ([string](Get-Number (Get-Setting $padsIni 'general' 'keyboard_player'))) $LC 360 $LW `
     "The keyboard adds to that player's controller."
-$backgroundBox = New-Check 'Controllers work while another window is in front' ((Get-Number (Get-Setting $padsIni 'general' 'background')) -ne 0) $R 328 344 `
+$backgroundBox = New-Check 'Controllers work while another window is in front' ((Get-Number (Get-Setting $padsIni 'general' 'background')) -ne 0) $R 362 344 `
     "Off: controllers work only while the game's window is in front."
 $padsButton = New-Object Windows.Forms.Button
 $padsButton.Text = 'Open controllers.ini'
-[void](Add-Control $padsButton $L 364 170 30 'Pins, layouts and remaps by hand (the game writes the file at its first start).')
-[void](New-Text "Each controller is set up in the game: press Esc, or the controller's Home / PS / Xbox button, and go to Controllers." 196 362 548 40 -Dim)
+[void](Add-Control $padsButton $L 398 170 30 'Pins, layouts and remaps by hand (the game writes the file at its first start).')
+[void](New-Text "Each controller is set up in the game: press Esc, or the controller's Home / PS / Xbox button, and go to Controllers." 196 396 548 40 -Dim)
 $padsButton.Add_Click({
     if (Test-Path -LiteralPath $padsIni) { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$padsIni`"" }
     else { [void][Windows.Forms.MessageBox]::Show($form, "controllers.ini is written at the game's first start.", 'WindowSmash', 'OK', 'Information') }
@@ -506,23 +524,23 @@ $padsButton.Add_Click({
 
 $sep = New-Object Windows.Forms.Label
 $sep.BorderStyle = [Windows.Forms.BorderStyle]::Fixed3D
-[void](Add-Control $sep $L 414 728 2)
+[void](Add-Control $sep $L 448 728 2)
 
-$directStart = New-Check 'Start the game directly next time (hold Shift while starting to see this window again)' (-not (Test-ShowLauncher)) $L 428 728
+$directStart = New-Check 'Start the game directly next time (hold Shift while starting to see this window again)' (-not (Test-ShowLauncher)) $L 462 728
 if (-not $versions.Count) {
-    $none = New-Text 'No game version is built here yet - see docs\VERSIONS.md.' $L 462 728
+    $none = New-Text 'No game version is built here yet - see docs\VERSIONS.md.' $L 496 728
     $none.ForeColor = [Drawing.Color]::Firebrick
 }
 
 $play = New-Object Windows.Forms.Button
 $play.Text = 'Play'
 $play.Font = $boldFont
-[void](Add-Control $play 488 494 150 32)
+[void](Add-Control $play 488 528 150 32)
 $play.Enabled = [bool]$versions.Count
 $close = New-Object Windows.Forms.Button
 $close.Text = 'Close'
 $close.DialogResult = [Windows.Forms.DialogResult]::Cancel
-[void](Add-Control $close 644 494 100 32)
+[void](Add-Control $close 644 528 100 32)
 $form.AcceptButton = $play
 $form.CancelButton = $close
 
@@ -534,7 +552,7 @@ function Get-WindowValues {
     $server = switch ($modeBox.SelectedItem.Value) {
         'offline' { 'off' }
         'public' { $PublicLobby }
-        'private' { "$PublicLobby $(if ($code) { $code } else { 'friends' })" }
+        'private' { "$PublicLobby $code" }
         'custom' { $s = $serverBox.Text.Trim(); if (-not $s) { $s = '127.0.0.1:39420' }; if ($code) { "$s $code" } else { $s } }
     }
     [ordered]@{
@@ -542,6 +560,7 @@ function Get-WindowValues {
         "$displayIni||width" = [string][int]$widthBox.Value
         "$displayIni||height" = [string][int]$heightBox.Value
         "$displayIni||pacing" = $pacingBox.SelectedItem.Value
+        "$displayIni||render_scale" = $scaleBox.SelectedItem.Value
         "$displayIni||gpu" = $gpuBox.SelectedItem.Value
         "$displayIni||hide_cursor" = & $onOff $cursorBox.Checked
         "$displayIni||overlay" = & $onOff $overlayBox.Checked
@@ -583,6 +602,11 @@ function Save-WindowValues($Before, $Now) {
 $before = Get-WindowValues
 $script:played = $null
 $play.Add_Click({
+    if ($modeBox.SelectedItem.Value -eq 'private' -and -not ($codeBox.Text -replace '\s', '')) {
+        [void][Windows.Forms.MessageBox]::Show($form, 'Type a lobby code: a word your friends type too.', 'WindowSmash', 'OK', 'Warning')
+        [void]$codeBox.Focus()
+        return
+    }
     if ($modeBox.SelectedItem.Value -eq 'custom' -and $serverBox.Text.Trim() -and $serverBox.Text.Trim() -notmatch '^\S+:\d+$') {
         [void][Windows.Forms.MessageBox]::Show($form, 'Your own server is host:port, e.g. 192.168.1.20:39420.', 'WindowSmash', 'OK', 'Warning')
         return

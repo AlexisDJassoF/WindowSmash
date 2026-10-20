@@ -1727,6 +1727,18 @@ static void first_draw_done(u64 ns, const Shader *s) {
     if (ms > first_longest_ms) { first_longest_ms = ms; snprintf(first_longest, sizeof first_longest, "%s", s->name); }
 }
 
+/* The programs that ran for the first time lately, for a lost device's report (check_device):
+ * GPU work that hangs is most likely a program's that had never run before. */
+#define RECENT_FIRSTS 64
+static struct { u64 ns; char name[32]; } recent_firsts[RECENT_FIRSTS];
+static u32 recent_first_next;
+
+static void first_used(const Shader *s) {
+    u32 k = recent_first_next++ % RECENT_FIRSTS;
+    recent_firsts[k].ns = rt_clock_ns();
+    snprintf(recent_firsts[k].name, sizeof recent_firsts[k].name, "%s", s->name);
+}
+
 void gfx_status_lines(void) {
     if (!ready || !gfx_stat_first_draws) return;
     EnterCriticalSection(&lock);
@@ -4096,6 +4108,8 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     }
     if (first) {
         first_draw_done(rt_clock_ns() - first_t0, first);
+        if (!vs->drawn) first_used(vs);
+        if (ps && !ps->drawn) first_used(ps);
         vs->drawn = 1;
         if (ps) ps->drawn = 1;
     }
@@ -4514,7 +4528,7 @@ void gfx_dispatch(const u32 *regs, const u32 *q) {
     ID3D11DeviceContext_CSSetShader(ctx, (ID3D11ComputeShader *)cs->obj, NULL, 0);
     u64 first_t0 = cs->drawn ? 0 : rt_clock_ns();
     ID3D11DeviceContext_Dispatch(ctx, grid[0], grid[1], grid[2]);
-    if (!cs->drawn) { first_draw_done(rt_clock_ns() - first_t0, cs); cs->drawn = 1; }
+    if (!cs->drawn) { first_draw_done(rt_clock_ns() - first_t0, cs); first_used(cs); cs->drawn = 1; }
     ID3D11UnorderedAccessView *none[16] = {0};
     ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 16, none, NULL);
     gfx_stat_dispatched++;
@@ -4695,6 +4709,49 @@ static void gpu_timer_frame(void) {
     frame_event_cur = (frame_event_cur + 1) % FRAME_EVENTS;
 }
 
+/* ---- a lost device: Windows reset the GPU (some GPU work ran past its 2-second limit), or the
+ * driver failed, restarted or was updated. Every object of the device is dead from then on and
+ * nothing can be drawn again, so the game stops, saying why. (Before, a player's game stopped 98
+ * minutes in with "reading address 0" on the vsync thread: the back buffer's view came back NULL
+ * and its Release faulted.) */
+static HRESULT device_removed_reason(void) {
+    static double lose_at = -1;   /* SSBU_GFX_LOSE_DEVICE_AT: the second to act as if the GPU hung (tests) */
+    if (lose_at == -1) lose_at = getenv("SSBU_GFX_LOSE_DEVICE_AT") ? atof(getenv("SSBU_GFX_LOSE_DEVICE_AT")) : -2;
+    if (lose_at >= 0 && rt_now_ns() > (u64)(lose_at * 1e9)) return DXGI_ERROR_DEVICE_HUNG;
+    return ID3D11Device_GetDeviceRemovedReason(dev);
+}
+
+static const char *removed_why(HRESULT why) {
+    switch (why) {
+    case DXGI_ERROR_DEVICE_HUNG: return "DXGI_ERROR_DEVICE_HUNG - the GPU took too long over some work, or stopped, and Windows reset it";
+    case DXGI_ERROR_DEVICE_REMOVED: return "DXGI_ERROR_DEVICE_REMOVED - the graphics driver stopped, restarted or was updated, or the GPU went away";
+    case DXGI_ERROR_DEVICE_RESET: return "DXGI_ERROR_DEVICE_RESET - the GPU was reset over bad work";
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR: return "DXGI_ERROR_DRIVER_INTERNAL_ERROR - the graphics driver failed";
+    case DXGI_ERROR_INVALID_CALL: return "DXGI_ERROR_INVALID_CALL - the driver refused the work it was given";
+    default: return "an unknown reason";
+    }
+}
+
+/* After a presenting call failed with hr: if the device is lost, the game stops here, naming the
+ * programs first run in the 10 s before (newest first, with how long before). */
+static void check_device(HRESULT hr, const char *doing) {
+    HRESULT why = device_removed_reason();
+    if (why == S_OK) return;
+    char recent[400] = "none";
+    u64 now = rt_clock_ns();
+    size_t n = 0;
+    for (u32 i = 0; i < RECENT_FIRSTS && i < recent_first_next && n < sizeof recent - 32; i++) {
+        u32 k = (recent_first_next - 1 - i) % RECENT_FIRSTS;
+        if (now - recent_firsts[k].ns > 10000000000ull) break;
+        n += (size_t)snprintf(recent + n, sizeof recent - n, "%s%s (%.1f s)", i ? ", " : "", recent_firsts[k].name, (double)(now - recent_firsts[k].ns) / 1e9);
+    }
+    fprintf(stderr, "[gfx] the graphics device was lost while %s (%#lx): %s (%#lx); programs first run in the 10 s before: %s\n", doing,
+            (unsigned long)hr, removed_why(why), (unsigned long)why, recent);
+    rt_fatal("the graphics device was lost (%s, %#lx). Nothing can be drawn after that: start the game again.\n"
+             "Programs first run in the 10 s before (GPU work that hangs is most likely theirs): %s",
+             removed_why(why), (unsigned long)why, recent);
+}
+
 void watchdog_present(void);   /* debug_watchdog.c */
 void hitch_present(void);      /* debug_profile.c */
 
@@ -4746,12 +4803,21 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         HRESULT hr = IDXGISwapChain1_ResizeBuffers(swapchain, 0, bw, bh, DXGI_FORMAT_UNKNOWN, swapchain_flags);
         if (FAILED(hr)) fprintf(stderr, "[gfx] cannot resize the swap chain to %ux%u (%#lx)\n", bw, bh, (unsigned long)hr);
     }
-    ID3D11Texture2D *back;
-    IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&back);
+    ID3D11Texture2D *back = NULL;
+    ID3D11RenderTargetView *rtv = NULL;
+    HRESULT hr = IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&back);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)back, NULL, &rtv);
+    if (FAILED(hr) || !rtv || device_removed_reason() != S_OK) {   /* nothing to draw the window into */
+        if (rtv) ID3D11RenderTargetView_Release(rtv);
+        if (back) ID3D11Texture2D_Release(back);
+        check_device(hr, "drawing the window");
+        static int told;
+        if (!told++) fprintf(stderr, "[gfx] cannot draw into the window (%#lx): frame not shown\n", (unsigned long)hr);
+        leave();
+        return;
+    }
     D3D11_TEXTURE2D_DESC back_desc;
     ID3D11Texture2D_GetDesc(back, &back_desc);
-    ID3D11RenderTargetView *rtv;
-    ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)back, NULL, &rtv);
     Surface *src = NULL;
     for (u32 i = 0; i < nsurfaces; i++)
         if (surfaces[i].tex && !surfaces[i].depth && surfaces[i].guest == guest) src = &surfaces[i];
@@ -4973,9 +5039,10 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     gpu_times_frame();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
-    IDXGISwapChain1_Present(swapchain, 0, display_present_flags());   /* (blocks while the GPU is frames behind) */
+    hr = IDXGISwapChain1_Present(swapchain, 0, display_present_flags());   /* (blocks while the GPU is frames behind) */
     QueryPerformanceCounter(&p1);
     gfx_stat_present_ticks += (u64)(p1.QuadPart - p0.QuadPart);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) check_device(hr, "showing a frame");
     leave();
 }
 
