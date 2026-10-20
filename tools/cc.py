@@ -1,5 +1,6 @@
 """Host toolchain wrapper: compiles generated C with clang-cl."""
 import glob
+import json
 import os
 import subprocess
 import time
@@ -7,31 +8,64 @@ from concurrent.futures import ThreadPoolExecutor
 
 import codec_libs   # (this folder, which every importer of cc puts on sys.path)
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNTIME = os.path.join(ROOT, "runtime")
+DEPS_LLVM = os.path.join(ROOT, "deps", "llvm")   # tools/msvc_deps.py sets these two up
+DEPS_MSVC = os.path.join(ROOT, "deps", "msvc")
 
-def _find_clang():
-    """clang-cl: SSBU_CLANG if set, else Visual Studio's own (the "C++ Clang tools" component),
-    newest edition first, else a standalone LLVM install, else whatever is on PATH."""
+
+def _deps_record(folder):
+    """A deps folder's windowsmash.json (msvc_deps.py writes it last: no record, not finished)."""
+    try:
+        with open(os.path.join(folder, "windowsmash.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _find_toolchain():
+    """(clang-cl, the /winsysroot folder or None, which toolchain that is, in words):
+    SSBU_CLANG if set; else deps\\llvm's with deps\\msvc as the system root, when tools/msvc_deps.py
+    has set both up (no Visual Studio needed); else Visual Studio's own (the "C++ Clang tools"
+    component), newest edition first, else a standalone LLVM install, else whatever is on PATH.
+    The last three find the C runtime and the Windows SDK themselves, through Visual Studio."""
     if os.environ.get("SSBU_CLANG"):
-        return os.environ["SSBU_CLANG"]
+        return os.environ["SSBU_CLANG"], None, "SSBU_CLANG"
+    llvm, msvc = _deps_record(DEPS_LLVM), _deps_record(DEPS_MSVC)
+    clang = os.path.join(DEPS_LLVM, "bin", "clang-cl.exe")
+    if llvm is not None and msvc is not None and os.path.isfile(clang):
+        return clang, DEPS_MSVC, (f"deps\\llvm (LLVM {llvm.get('version')}) with deps\\msvc (MSVC {msvc.get('msvc')}, "
+                                  f"Windows SDK {msvc.get('sdk')}): no Visual Studio")
     def vs_major(path):   # the folder is a year up to 2022 (2022 = 17), a major version since (18)
         name = path.split(os.sep + "Microsoft Visual Studio" + os.sep)[1].split(os.sep)[0]
         return {"2017": 15, "2019": 16, "2022": 17}.get(name, int(name) if name.isdigit() else 0)
-    found = []
     for root in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
-        found += sorted(glob.glob(os.path.join(root, "Microsoft Visual Studio", "*", "*", "VC", "Tools", "Llvm", "x64", "bin", "clang-cl.exe")),
-                        key=vs_major, reverse=True)
+        found = sorted(glob.glob(os.path.join(root, "Microsoft Visual Studio", "*", "*", "VC", "Tools", "Llvm", "x64", "bin", "clang-cl.exe")),
+                       key=vs_major, reverse=True)
+        if found:
+            return found[0], None, "Visual Studio's C++ Clang tools"
     for root in (os.environ.get("ProgramFiles", r"C:\Program Files"),):
-        found += glob.glob(os.path.join(root, "LLVM", "bin", "clang-cl.exe"))
-    return found[0] if found else "clang-cl"
+        for clang in glob.glob(os.path.join(root, "LLVM", "bin", "clang-cl.exe")):
+            return clang, None, "LLVM's installer (Program Files), with Visual Studio's C runtime and Windows SDK"
+    return "clang-cl", None, "clang-cl on the PATH"
 
 
-CLANG = _find_clang()
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUNTIME = os.path.join(ROOT, "runtime")
+CLANG, WINSYSROOT, TOOLCHAIN = _find_toolchain()
 # Guest FP semantics need IEEE-exact arithmetic: no contraction, no fast-math. (BASE_CFLAGS is
-# also what the codec libraries are compiled with: same instruction set, same C runtime.)
-BASE_CFLAGS = ["/nologo", "/arch:AVX2", "-mfma", "-mf16c", "-fno-strict-aliasing", "/clang:-ffp-contract=off", "-w"]
+# also what the codec libraries are compiled with: same instruction set, same C runtime.) With
+# deps\msvc, /winsysroot is where the C runtime's and the Windows SDK's headers and libraries are.
+BASE_CFLAGS = ["/nologo", "/arch:AVX2", "-mfma", "-mf16c", "-fno-strict-aliasing", "/clang:-ffp-contract=off", "-w",
+               *(["/winsysroot", WINSYSROOT] if WINSYSROOT else [])]
 CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
+# Linking through clang-cl: with lld-link when it is next to clang-cl (else Visual Studio's link.exe),
+# and LINK_OPTIONS after /link. clang-cl hands lld-link the system root's library folders but not
+# the root itself, and lld-link adds those of a Visual Studio it finds on its own: /winsysroot:
+# keeps it to deps\msvc.
+LINK_FLAGS = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(CLANG), "lld-link.exe")) else []
+LINK_OPTIONS = ["/winsysroot:" + WINSYSROOT] if WINSYSROOT else []
+# the Windows libraries the game links (all from the Windows SDK)
+SYSTEM_LIBS = ("winmm.lib", "user32.lib", "gdi32.lib", "d3d11.lib", "dxgi.lib", "d3dcompiler.lib", "dxguid.lib",
+               "ws2_32.lib", "ole32.lib", "oleaut32.lib")
 
 # The audio and video codecs: libopus for the hwopus service (music) and libvpx for the video
 # decode engine's VP9 (movies). Normally built from the sources under third_party/ by
@@ -106,8 +140,8 @@ def link(objs, exe, options=()):
     rsp = exe + ".rsp"
     with open(rsp, "w") as f:
         f.write("\n".join(f'"{o}"' for o in objs))
-    lld = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(CLANG), "lld-link.exe")) else []
-    r = subprocess.run([CLANG, "/nologo", *lld, "@" + rsp, "/Fe" + exe, "/link", "/HIGHENTROPYVA:NO", "/MAP:" + exe[:-4] + ".map", *options, "winmm.lib", "user32.lib", "gdi32.lib", "d3d11.lib", "dxgi.lib", "d3dcompiler.lib", "dxguid.lib", "ws2_32.lib", "ole32.lib", "oleaut32.lib", *EXTRA_LIBS],
+    r = subprocess.run([CLANG, "/nologo", *LINK_FLAGS, "@" + rsp, "/Fe" + exe, "/link", "/HIGHENTROPYVA:NO", "/MAP:" + exe[:-4] + ".map",
+                        *LINK_OPTIONS, *options, *SYSTEM_LIBS, *EXTRA_LIBS],
                        capture_output=True, text=True)
     if r.returncode:
         lines = (r.stdout + r.stderr).splitlines()

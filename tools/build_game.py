@@ -9,7 +9,12 @@ It does the setup guide's steps (docs/BUILDING.md) one after the other and stops
 that fails, saying why. A step whose result is already there is skipped, so running it again
 carries on where it stopped. --check does the first step only (the installer uses it);
 --prepare-only all but the last.
-  1. tools     Python 3.10 or newer, and clang-cl (found by tools/cc.py) building a test program
+  1. tools     Python 3.10 or newer, and clang-cl (found by tools/cc.py: deps\\llvm with deps\\msvc
+               from tools/msvc_deps.py, else Visual Studio's) building and running a test program
+               with the libraries the game links; it says which toolchain that was. With none
+               that works, it gets one that needs no Visual Studio (tools/msvc_deps.py): it asks
+               about Microsoft's license terms here, downloads in the background while steps 3
+               to 8 run (from the end of step 2: the packages), and waits for it at step 9
   2. packages  requirements.txt, installed with pip unless they are already
   3. folders   where the game files, keys and firmware are: asked (the answers are the defaults
                next time, in dump/build_folders.txt) unless --game, --keys, --firmware say
@@ -59,6 +64,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
@@ -190,36 +197,126 @@ def missing_packages(requirements):
 
 
 # ---- the steps ------------------------------------------------------------------------------
-def check_tools():
+def check_tools(fetch=True):
+    """Step 1. On Windows with no working compiler, `fetch` (the build, not --check) gets one that
+    needs no Visual Studio (tools/msvc_deps.py): Microsoft's license terms are asked now, and the
+    CompilerDownload returned downloads it while the game files are prepared (its start() after
+    step 2, its finish() at step 9). Otherwise None."""
     if sys.version_info < (3, 10):
         raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.10 or newer "
                      + ("(Install WindowSmash.command makes deps/venv with one: docs/MACOS.md)." if MACOS else "(setup guide step 3)."))
     log(f"  Python {sys.version.split()[0]}: {sys.executable}")
     if LINUX:
         check_linux_tools()
-        return
+        return None
     if MACOS:
         check_mac_tools()
-        return
+        return None
     import cc
+    problem = windows_compiler_problem(cc)
+    if not problem:
+        return None
+    if not fetch or os.environ.get("SSBU_CLANG"):
+        raise Failed(problem)
+    log(f"  {problem.splitlines()[0]}")
+    return CompilerDownload.ask(broken=bool(cc.WINSYSROOT))
+
+
+def windows_compiler_problem(cc):
+    """Why cc's compiler can't build the game, or None (and its lines logged): it is tried on a
+    test program now, as the generated C is compiled long after the build starts, with every
+    library the game links (cc.link's), and the program is run."""
     clang = cc.CLANG if os.path.isfile(cc.CLANG) else shutil.which(cc.CLANG)
     if not clang:
-        raise Failed("Visual Studio's Clang tools (clang-cl.exe) were not found. Install Visual Studio with "
-                     "Desktop development with C++ and C++ Clang tools for Windows (setup guide step 4).")
-    # the generated C is compiled long after the build starts: try the compiler, the Windows SDK and the linker now
+        return ("No compiler (clang-cl.exe) was found. launchers\\Build WindowSmash.bat gets one by itself (or python "
+                "tools\\msvc_deps.py install), or install Visual Studio with Desktop development with C++ and C++ Clang tools "
+                "for Windows (setup guide step 4).")
+    if cc.WINSYSROOT:
+        fix = "Set it up again: python tools\\msvc_deps.py remove, then python tools\\msvc_deps.py install (setup guide step 4)."
+    else:
+        fix = ("Check that Visual Studio has Desktop development with C++ (with a Windows SDK) and C++ Clang tools "
+               "for Windows (setup guide step 4).")
     with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
-        src = os.path.join(tmp, "check.c")
+        src, exe = os.path.join(tmp, "check.c"), os.path.join(tmp, "check.exe")
         with open(src, "w") as f:
-            f.write("#include <windows.h>\n#include <stdio.h>\n"
-                    "int main(void) { printf(\"%lu\\n\", GetCurrentProcessId()); return 0; }\n")
-        lld = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(clang), "lld-link.exe")) else []
-        r = subprocess.run([clang, *lld, *cc.CFLAGS, src, "/Fo" + os.path.join(tmp, "check.obj"),
-                            "/Fe" + os.path.join(tmp, "check.exe")], capture_output=True, text=True)
+            f.write("#include <windows.h>\n#include <stdio.h>\n#include <d3d11.h>\n#include <d3dcompiler.h>\n"
+                    "int main(void) { printf(\"%lu %d\\n\", GetCurrentProcessId(), D3DCompile != 0); return 0; }\n")
+        r = subprocess.run([clang, *cc.LINK_FLAGS, *cc.CFLAGS, src, "/Fo" + os.path.join(tmp, "check.obj"), "/Fe" + exe,
+                            "/link", *cc.LINK_OPTIONS, *cc.SYSTEM_LIBS], capture_output=True, text=True)
         if r.returncode:
-            raise Failed(f"{clang} could not build a test program. Check that Visual Studio has Desktop development "
-                         f"with C++ (with a Windows SDK) and C++ Clang tools for Windows (setup guide step 4).\n"
-                         + (r.stdout + r.stderr)[-2000:])
-    log(f"  clang-cl: {clang}")
+            return f"{clang} could not build a test program. {fix}\n" + (r.stdout + r.stderr)[-2000:]
+        r = subprocess.run([exe], capture_output=True, text=True)
+        if r.returncode:
+            return f"the test program {clang} built does not run. {fix}\n" + (r.stdout + r.stderr)[-1000:]
+        version = " ".join(subprocess.run([clang, "--version"], capture_output=True, text=True).stdout.split()[:3])   # clang version N
+    log(f"  clang-cl: {clang} ({version})")
+    log(f"  toolchain: {cc.TOOLCHAIN}")
+    return None
+
+
+class CompilerDownload:
+    """The compiler without Visual Studio (tools/msvc_deps.py: LLVM, and Microsoft's C runtime and
+    Windows SDK, into deps\\llvm and deps\\msvc), downloaded in the background while steps 3 to 8
+    prepare the game files, so that step 9 can start compiling at once. Microsoft's license terms
+    are asked first, before anything is downloaded (ask)."""
+
+    def __init__(self, deps, agreed):
+        self.deps, self.agreed = deps, agreed
+        self.lines, self.code, self.error, self.thread, self.started = [], None, None, None, None
+
+    @classmethod
+    def ask(cls, broken=False):
+        import msvc_deps
+        if broken:   # (deps\llvm and deps\msvc there, but no good: set up afresh)
+            log("  the compiler in deps\\llvm and deps\\msvc does not work: downloading it again")
+            msvc_deps.remove()
+        log("  getting a compiler that needs no Visual Studio: LLVM's clang from GitHub, and Microsoft's C runtime and")
+        log("  Windows SDK from Microsoft's servers, into deps\\llvm and deps\\msvc (about 570 MB, while the game files are prepared)")
+        try:
+            agreed = msvc_deps.agree()
+        except msvc_deps.Failed as e:
+            raise Failed(f"{e} Check the internet connection and run this again, or install Visual Studio (setup guide step 4).")
+        if not agreed[0]:
+            raise Failed("Microsoft's license terms were not accepted, so the C runtime and the Windows SDK the game is built with "
+                         "cannot be downloaded (Visual Studio comes under the same terms). Run this again to accept them, or "
+                         "install Visual Studio yourself (setup guide step 4).")
+        return cls(msvc_deps, agreed)
+
+    def start(self):
+        self.started, self.log = time.time(), self.deps.log
+        self.deps.log = self.lines.append   # (its lines are shown at step 9, not among the other steps')
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+        log("  the compiler is being downloaded in the background meanwhile")
+
+    def run(self):
+        try:
+            self.code = self.deps.install(agreed=self.agreed)
+        except Exception as e:   # (shown at step 9)
+            self.error = e
+
+    def finish(self):
+        """At step 9: waits for the download, shows what it did, and checks the compiler again."""
+        if self.thread.is_alive():
+            log("  waiting for the compiler download to finish")
+            while self.thread.is_alive():
+                self.thread.join(30)
+                progress = [l for l in self.lines if "% of" in l]
+                if self.thread.is_alive() and progress:
+                    log(progress[-1])
+        self.deps.log = self.log
+        log(f"  the compiler download ({time.time() - self.started:.0f} s since it started):")
+        for line in self.lines:
+            if "% of" not in line:
+                log(line if line.startswith("  ") else "  " + line)
+        if self.error is not None or self.code != 0:
+            raise Failed(f"The compiler could not be downloaded: {self.error or 'see above'}. Run this again to try again, or "
+                         "install Visual Studio (setup guide step 4).")
+        import cc
+        importlib.reload(cc)   # (it chose its compiler when imported: deps\llvm is there now)
+        problem = windows_compiler_problem(cc)
+        if problem:
+            raise Failed(problem)
 
 
 LINUX_CHECK = r"""#include <SDL.h>
@@ -787,10 +884,12 @@ def in_use(path):
 
 def build(a):
     log("[1/9] Check the tools")
-    check_tools()
+    compiler = check_tools()   # (a CompilerDownload when there is no compiler yet: it downloads during steps 3-8)
 
     log("\n[2/9] Install the Python packages")
     install_packages()
+    if compiler:   # (after the packages: unpacking LLVM needs zstandard before Python 3.14)
+        compiler.start()
 
     cfg, aoc, no_aoc = os.path.join(MODULES, "romfs.cfg"), os.path.join(MODULES, "aoc.cfg"), os.path.join(MODULES, "aoc.none")
     if a.game and os.path.exists(no_aoc):   # (a game folder named now may have DLC that the last one hadn't)
@@ -878,6 +977,8 @@ def build(a):
     if MACOS:   # (the app the program is in)
         exe = os.path.relpath(os.path.dirname(os.path.dirname(os.path.dirname(EXE))), ROOT)
     log(f"\n[9/9] Build the game ({exe})")
+    if compiler:
+        compiler.finish()
     if a.prepare_only:
         log("  not now (--prepare-only): everything the build needs is ready")
         return
@@ -972,7 +1073,7 @@ def main():
     try:
         if a.check:
             log("[1/9] Check the tools")
-            check_tools()
+            check_tools(fetch=False)
             log("\nThe tools are ready.")
         else:
             build(a)

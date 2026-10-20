@@ -282,8 +282,8 @@ class LauncherParityTests(unittest.TestCase):
         src = cls.dir / 'inidriver.c'
         src.write_text(DRIVER % (ROOT / 'runtime' / 'hle_settings.c').as_posix())
         cls.exe = cls.dir / 'inidriver.exe'
-        r = subprocess.run([cc.CLANG, '/nologo', '/O1', *cc.CFLAGS, str(src), '/Fe' + str(cls.exe), '/Fo' + str(cls.dir / 'inidriver.obj')],
-                           capture_output=True, text=True)
+        r = subprocess.run([cc.CLANG, '/nologo', '/O1', *cc.LINK_FLAGS, *cc.CFLAGS, str(src), '/Fe' + str(cls.exe),
+                            '/Fo' + str(cls.dir / 'inidriver.obj'), '/link', *cc.LINK_OPTIONS], capture_output=True, text=True)
         if r.returncode:
             shutil.rmtree(cls.dir, ignore_errors=True)
             raise AssertionError('the C driver did not build:\n' + r.stdout + r.stderr)
