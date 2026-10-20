@@ -72,14 +72,45 @@ def containers(arc):
     return out
 
 
-def find_programs(arc):
-    """Distinct programs: list of [stage, bytes, set of paired vertex program ids]."""
+READ_TRIES = 3          # a read the disk fails is tried this many times (a flaky SD card can manage the next)
+READ_GIVE_UP = 10       # this many files running that the disk can't read: it has stopped answering
+
+
+class DiskGone(Exception):
+    """The disk fails every read (taken out, unmounted, failing): no point going on."""
+
+
+def read_retried(arc, off, size, pause=0.5):
+    """arc.read, tried again after a disk's read error; the error once every try failed."""
+    for attempt in range(READ_TRIES):
+        try:
+            return arc.read(off, size)
+        except OSError:
+            if attempt == READ_TRIES - 1:
+                raise
+            time.sleep(pause)
+
+
+def find_programs(arc, read_errors=None, pause=0.5):
+    """Distinct programs: list of [stage, bytes, set of paired vertex program ids], and how many
+    files could not be read. A file the disk can't read is left out (its shaders compile when the
+    game first uses them, as without this tool); read_errors, a list, gets each such error."""
     programs, ids = [], {}
-    unread = 0
+    unread, failing = 0, 0
     for ext, (off, stored, size, flags) in containers(arc):
         if not stored or not size:   # (an empty file - data.arc has a few, marked compressed: nothing in it)
             continue
-        data = arc.read(off, stored)
+        try:
+            data = read_retried(arc, off, stored, pause)
+            failing = 0
+        except OSError as e:
+            unread += 1
+            failing += 1
+            if read_errors is not None:
+                read_errors.append(e)
+            if failing >= READ_GIVE_UP:
+                raise DiskGone(e) from e
+            continue
         if flags & 3:
             try:
                 data = zstd_decompress(data)
@@ -106,6 +137,23 @@ def find_programs(arc):
         for pid in here[1]:
             programs[pid][2].update(here[0])
     return programs, unread
+
+
+def read_error_text(errors, tree=None):
+    """What to say about the files the disk could not read."""
+    files = list(dict.fromkeys(e.filename for e in errors if getattr(e, "filename", None)))
+    why = errors[0].strerror or str(errors[0])
+    lines = [f"The disk could not read {len(errors)} of the game's files ({why}"
+             + (f", in {', '.join(files)}" if files else "") + "). Their shaders are left out: they compile when the game "
+             "first uses them, as they would without this. The rest go ahead.",
+             "A read error comes from the disk itself: most often an SD card or drive that is failing or not seated "
+             "well, or a damaged copy of that file. The game can stop with the same error when it needs those files."]
+    dump = os.path.join(os.path.abspath(tree or ROOT), "dump") + os.sep
+    if any(os.path.abspath(f).startswith(dump) for f in files):
+        lines.append("That file is a copy WindowSmash made: delete it and run the installer again to make it afresh.")
+    if LINUX:
+        lines.append("The system's own record of the error: sudo dmesg | grep -i error")
+    return "\n".join(lines)
 
 
 def write_pack(programs, path):
@@ -183,10 +231,18 @@ def main():
     tree = os.path.abspath(a.tree)
     t0 = time.time()
     arc = A.Arc(os.path.join(tree, "dump", "modules", "romfs.cfg"))
-    programs, unread = find_programs(arc)
+    read_errors = []
+    try:
+        programs, unread = find_programs(arc, read_errors)
+    except DiskGone as e:
+        raise SystemExit(f"\nThe disk stopped answering: {READ_GIVE_UP} of the game's files running could not be read "
+                         f"({e}). Check that it is still there (an SD card that came loose, a drive that went to sleep), "
+                         "then run this again: what is done stays done.")
     nvs = sum(1 for p in programs if p[0] == 0)
     print(f"{len(programs)} distinct programs ({nvs} vertex, {len(programs) - nvs} pixel) in {time.time() - t0:.0f} s"
           + (f"; {unread} files could not be read" if unread else ""), flush=True)
+    if read_errors:
+        print(read_error_text(read_errors, tree), flush=True)
     work = os.path.join(tree, "dump", "aot")
     os.makedirs(work, exist_ok=True)
     pack = os.path.join(work, "programs.pack")
