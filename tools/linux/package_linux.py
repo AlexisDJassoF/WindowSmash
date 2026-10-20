@@ -6,7 +6,8 @@ Usage: package_linux.py [--port <dir>] [--build <build-linux dir>] [--out <dir>]
 
 <out>/ssbu-linux/ (default <out>: dist-linux in this checkout) gets the program and its DXVK
 libraries, the module images, fonts, the add-on content list and shader cache from the game
-tree's dump/, a copy of its save (unless --no-save), the launchers (run.sh goes online: the
+tree's dump/, the shader index (dump/aot, tools/shader_aot.py --index) with its compiler, which the
+start-up screen uses to compile the shaders missing from the cache, a copy of its save (unless --no-save), the launchers (run.sh goes online: the
 lobby is in online_server.txt), the guides and the unlock tool. <port>
 is the tree the build was made from (its port.txt; see build_linux.py), and a package holds one
 tree's game: package another tree's into another <out> (e.g. dist-linux-11.0.0), or give
@@ -43,7 +44,7 @@ PORT = os.path.abspath(arg("--port") or read_port_stamp(BUILD) or default_port()
 OUT = os.path.abspath(arg("--out", os.path.join(REPO, "dist-linux")))
 BUNDLE = os.path.join(OUT, "ssbu-linux")
 LINK = "--link" in sys.argv
-EXECUTABLE = {"ssbu", "run.sh", "run-offline.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
+EXECUTABLE = {"ssbu", "shaderaot", "run.sh", "run-offline.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
 
 
 def unlink_dst(dst):
@@ -218,6 +219,16 @@ def main():
     else:
         copied += copy_tree(cache, os.path.join(BUNDLE, "dump", "shadercache"),
                             lambda f: f.startswith(f"v{version}_") and os.path.getmtime(os.path.join(cache, f)) >= PLAYED_AFTER)
+    # the shader index and its compiler: the start-up compiles what the cache lacks (runtime/shader_precompile.c)
+    aot = os.path.join(dump, "aot")
+    index = [os.path.join(aot, n) for n in ("programs.pack", f"keys_v{version}.txt")]
+    compiler = os.path.join(os.path.dirname(BUILD), "build-linux-tools", "shaderaot")   # (build_shaderaot.py's, beside the build)
+    if all(os.path.isfile(p) for p in index + [compiler]):
+        copied += place(compiler, os.path.join(BUNDLE, "shaderaot"))
+        for p in index:
+            copied += place(p, os.path.join(BUNDLE, "dump", "aot", os.path.basename(p)))
+    else:
+        print("note: no shader index (python3 tools/shader_aot.py --index): the game compiles each shader when first used")
     os.makedirs(os.path.join(BUNDLE, "dump", "nro"), exist_ok=True)
     os.makedirs(os.path.join(BUNDLE, "build"), exist_ok=True)
     if "--no-save" not in sys.argv and os.path.isdir(os.path.join(PORT, "save")) and not os.path.isdir(os.path.join(BUNDLE, "save")):

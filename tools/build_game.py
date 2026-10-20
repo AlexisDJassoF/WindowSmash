@@ -663,6 +663,27 @@ def jobs_to_use(a):
     return jobs
 
 
+def shader_index():
+    """The game's shaders indexed (tools/shader_aot.py --index: dump/aot/programs.pack and its keys),
+    for the start-up screen that compiles the ones missing from the cache. Made again when the
+    cache's version changed or the game data is newer. Linux only: its compiler runs here."""
+    if not HOST_LINUX:
+        log("  (the shader index is made on Linux: run  python3 tools/shader_aot.py --index  there)")
+        return
+    import shader_aot
+    work = os.path.join(ROOT, "dump", "aot")
+    pack, keys = os.path.join(work, "programs.pack"), os.path.join(work, f"keys_v{shader_aot.cache_version()}.txt")
+    cfg = os.path.join(ROOT, "dump", "modules", "romfs.cfg")
+    if os.path.isfile(keys) and os.path.isfile(pack) and os.path.getmtime(pack) >= os.path.getmtime(cfg):
+        log("  shader index: up to date")
+        return
+    log("  shader index (the game's shaders, for the start-up screen that compiles the missing ones): about a minute")
+    try:
+        run([sys.executable, os.path.join("tools", "shader_aot.py"), "--index"], "")
+    except Failed:   # (not the build's failure: the game plays without it)
+        log("  indexing the game's shaders failed (see above): the game still plays, compiling each shader when first used")
+
+
 def build_linux(a):
     """Step 9 for linux: the C (recomp.py gen-all, as all generates it), vkd3d-shader once, then
     the Linux program (tools/linux/build_linux.py, of this folder's game tree)."""
@@ -687,6 +708,7 @@ def build_linux(a):
                 "vkd3d-shader could not be built (see above).")
         run([sys.executable, os.path.join("tools", "linux", "build_linux.py"), "--port", ROOT, "--jobs", str(jobs)],
             "The Linux build failed (see above). " + retry)
+    shader_index()
     log("\nDone: build-linux/ssbu is ready. To play on this machine:\n"
         "  python3 tools/linux/package_linux.py --link\n"
         "  bash dist-linux/ssbu-linux/run.sh\n"

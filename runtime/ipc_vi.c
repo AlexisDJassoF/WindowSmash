@@ -18,8 +18,14 @@
 #define DISPLAY_ID 1
 #define LAYER_ID 1
 #define BINDER_ID 1
-#define WIDTH 1920
-#define HEIGHT 1080
+/* The screen the game is told of: 1920 x 1080 docked, 1280 x 720 handheld (display.ini's mode) */
+static unsigned screen(int height) {
+    static unsigned w, h;
+    if (!w) display_screen_size(&w, &h);
+    return height ? h : w;
+}
+#define WIDTH screen(0)
+#define HEIGHT screen(1)
 #define SLOTS 64
 
 enum { FREE, DEQUEUED, QUEUED, ACQUIRED };
@@ -29,7 +35,7 @@ enum {   /* IGraphicBufferProducer transactions */
     ALLOCATE_BUFFERS = 13, SET_PREALLOCATED_BUFFER = 14, GET_BUFFER_HISTORY = 17
 };
 
-typedef struct Slot { int state, has_buffer; u8 buffer[0x400]; u32 buffer_size; u64 queued_at; } Slot;
+typedef struct Slot { int state, has_buffer; u8 buffer[0x400]; u32 buffer_size; u64 queued_at; i32 crop[4]; } Slot;
 static struct {
     Slot slots[SLOTS];
     u32 buffer_event, vsync_event;
@@ -70,7 +76,7 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
             for (int i = 0; i < SLOTS; i++) if (queue.slots[i].state == ACQUIRED) queue.slots[i].state = FREE;
             queue.slots[oldest].state = ACQUIRED;
             queue.frames++;
-            present_frame(queue.slots[oldest].buffer, queue.slots[oldest].buffer_size);
+            present_frame(queue.slots[oldest].buffer, queue.slots[oldest].buffer_size, queue.slots[oldest].crop);
             kernel_signal_event(queue.buffer_event);
             WakeAllConditionVariable(&queue.freed);
         }
@@ -171,9 +177,16 @@ static void transact(u32 code, In *in, Out *out, Cpu *c) {
     }
     case QUEUE_BUFFER: {
         u32 slot = rd32(in);
+        /* QueueBufferInput, flattened: { s64 size; s64 timestamp; s32 auto timestamp;
+         * Rect crop (left, top, right, bottom); ... }. The crop is the part of the buffer to
+         * show: a game drawing at less than the buffer's size (handheld: 1280x720 in a
+         * 1920x1080 buffer) names it here; all zeros means the whole buffer. */
+        u32 input[9];
+        for (int i = 0; i < 9; i++) input[i] = rd32(in);
         if (slot < SLOTS) {
             queue.slots[slot].state = QUEUED;
             queue.slots[slot].queued_at = rt_now_ns();
+            memcpy(queue.slots[slot].crop, input + 5, sizeof queue.slots[slot].crop);
         }
         queue_output(out);
         w32(out, 0);

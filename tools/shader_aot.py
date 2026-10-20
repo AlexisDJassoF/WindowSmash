@@ -2,7 +2,7 @@
 """Compile the game's shaders ahead of time, into the renderer's disk cache.
 
 Usage:
-  shader_aot.py [--tree <dir>] [--jobs N] [--dry]
+  shader_aot.py [--tree <dir>] [--jobs N] [--dry | --index]
 
 The game's GPU programs are stored in data.arc as they are uploaded: in the effect files
 (.eff), the shader databases (.nushdb) and nested archives (.arc). This finds every program
@@ -16,6 +16,12 @@ The files are dated 2001-01-01 until the game first uses them, so the start's pr
 makes the shaders the game has used. Programs with indirect branches are left out (their key
 depends on a draw's constant buffers), as are compute programs (on their launch's size).
 --dry translates without compiling and compares the keys with the cache that is there.
+--index compiles nothing either: it writes the pack and, next to it, the list of every key
+(keys_v<SHADER_CACHE_VERSION>.txt), from which the game's start-up finds the shaders missing from
+its cache and has them compiled behind a progress screen (runtime/shader_precompile.c).
+
+On Linux the compiler is tools/linux/build_shaderaot.py's (vkd3d-shader, as the Linux renderer
+compiles); on Windows clang-cl's, with fxc.
 """
 import argparse
 import hashlib
@@ -37,6 +43,7 @@ import arc as A    # noqa: E402
 import cc          # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LINUX = sys.platform.startswith("linux")
 LOW40 = (1 << 40) - 1
 MAX_PROGRAM = 0x40000   # as the renderer reads
 
@@ -112,16 +119,40 @@ def write_pack(programs, path):
             f.write(blob)
 
 
+def tool_path():
+    return os.path.join(ROOT, "build-linux-tools", "shaderaot") if LINUX else os.path.join(ROOT, "build", "shaderaot.exe")
+
+
 def build_tool(exe):
     sources = [os.path.join(ROOT, "tools", "shaderaot.c"), os.path.join(ROOT, "runtime", "gpu_shader.c"),
                os.path.join(ROOT, "runtime", "gpu_shader_cfg.c")]
+    if LINUX:
+        sources.append(os.path.join(ROOT, "runtime", "linux", "d3dcompile_vkd3d.c"))
     headers = [os.path.join(ROOT, "runtime", n) for n in ("gpu_shader.h", "gpu_shader_cache.h", "gpu_shader_cfg.h")]
     if os.path.exists(exe) and os.path.getmtime(exe) > max(os.path.getmtime(p) for p in sources + headers):
         return
-    r = subprocess.run([cc.CLANG, "/nologo", "/O2", *cc.CFLAGS, *sources, "/Fe" + exe, "/link", "d3dcompiler.lib"],
-                       capture_output=True, text=True, cwd=os.path.dirname(exe))
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    if LINUX:
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "linux", "build_shaderaot.py"), "--out", exe],
+                           capture_output=True, text=True)
+    else:
+        r = subprocess.run([cc.CLANG, "/nologo", "/O2", *cc.CFLAGS, *sources, "/Fe" + exe, "/link", "d3dcompiler.lib"],
+                           capture_output=True, text=True, cwd=os.path.dirname(exe))
     if r.returncode:
         raise SystemExit("cannot build shaderaot:\n" + (r.stdout + r.stderr)[-3000:])
+
+
+def write_keys(exe, pack, cache, path):
+    """Every key of the pack (shaderaot --dry), into path (whole or not at all); their count."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as out:
+        r = subprocess.run([exe, pack, cache, "0", "1", "--dry"], stdout=out, stderr=subprocess.PIPE, text=True)
+    if r.returncode:
+        os.remove(tmp)
+        raise SystemExit("shaderaot --dry failed:\n" + r.stderr[-3000:])
+    os.replace(tmp, path)
+    with open(path) as f:
+        return sum(1 for line in f if line.strip())
 
 
 def main():
@@ -129,6 +160,7 @@ def main():
     ap.add_argument("--tree", default=ROOT, help="the game version's folder (default: the port's own)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--index", action="store_true", help="the pack and its list of keys only, for the game's start-up")
     a = ap.parse_args()
     tree = os.path.abspath(a.tree)
     t0 = time.time()
@@ -141,14 +173,19 @@ def main():
     os.makedirs(work, exist_ok=True)
     pack = os.path.join(work, "programs.pack")
     write_pack(programs, pack)
-    exe = os.path.join(ROOT, "build", "shaderaot.exe")
+    exe = tool_path()
     build_tool(exe)
     cache = os.path.join(tree, "dump", "shadercache")
     os.makedirs(cache, exist_ok=True)
+    if a.index:
+        keys = os.path.join(work, f"keys_v{cache_version()}.txt")
+        print(f"{write_keys(exe, pack, cache, keys)} keys in {keys}; done in {time.time() - t0:.0f} s")
+        return
     jobs = 1 if a.dry else a.jobs
     procs = [subprocess.Popen([exe, pack, cache, str(i), str(jobs)] + (["--dry"] if a.dry else []),
                               stdout=subprocess.PIPE if a.dry else subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                              creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+                              creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+                              preexec_fn=(lambda: os.nice(10)) if LINUX else None)
              for i in range(jobs)]
     outs = [p.communicate() for p in procs]
     for _, err in outs:

@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include "../display.h"
+#include "../gpu_precompile.h"
 
 static SDL_Window *window;
 static volatile int focused;
@@ -160,6 +161,7 @@ void rt_window_loop(int every, void (*status)(void)) {
                 break;
             case SDL_KEYDOWN:
                 if (e.key.repeat) break;
+                if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE && precompile_active) precompile_skip = 1;   /* (the start-up's shader screen) */
                 if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F6)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 ||

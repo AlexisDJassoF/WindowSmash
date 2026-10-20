@@ -11,7 +11,7 @@
 #include "gpu_backend.h"
 #include "present.h"
 
-void present_frame(const u8 *graphic_buffer, u32 size) {
+void present_frame(const u8 *graphic_buffer, u32 size, const i32 crop[4]) {
     const u32 *w = (const u32 *)graphic_buffer;
     if (size < 34 * 4 || w[3] != 0x47424652) {
         static int warned;
@@ -20,5 +20,12 @@ void present_frame(const u8 *graphic_buffer, u32 size) {
     }
     u32 handle = w[32], offset = w[33];
     if (!handle || handle >= NVMAP_MAX || !gpu_maps[handle].addr) return;
-    gfx_present(gpu_maps[handle].addr + offset, w[26], w[27]);
+    /* the part to show: the crop, when it is a smaller rectangle inside the buffer; else (no
+     * crop, or the whole buffer) all of it, given as 0 x 0 */
+    u32 width = w[26], height = w[27], cx = 0, cy = 0, cw = 0, ch = 0;
+    if (crop[0] >= 0 && crop[1] >= 0 && crop[2] > crop[0] && crop[3] > crop[1] && (u32)crop[2] <= width && (u32)crop[3] <= height &&
+        (crop[0] || crop[1] || (u32)crop[2] < width || (u32)crop[3] < height)) {
+        cx = (u32)crop[0]; cy = (u32)crop[1]; cw = (u32)(crop[2] - crop[0]); ch = (u32)(crop[3] - crop[1]);
+    }
+    gfx_present(gpu_maps[handle].addr + offset, cx, cy, cw, ch);
 }

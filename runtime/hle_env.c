@@ -2,7 +2,7 @@
  * account, parental controls, add-on content, network status and error reporting.
  *
  * On the console each of these is a session with a system service. Natively the game runs
- * docked (TV output), in focus, for one local user, with the network unavailable - so
+ * docked (TV output) - or handheld, as display.ini's mode says - in focus, for one local user, with the network unavailable - so
  * online features take their offline paths. */
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_RAND_S
@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "display.h"
 #include "host.h"
 #include "net.h"
 
@@ -24,7 +25,9 @@ HLE(_ZN2nn2oe10InitializeEv) {
     u64 event = rt_callsym(c, "_ZN2nn2oe27GetNotificationMessageEventEv", 0);
     rt_callsym(c, CREATE_SYSTEM_EVENT, 3, event, 1 /* auto clear */, 0);
 }
-HLE(_ZN2nn2oe16GetOperationModeEv) { c->x[0] = 1; }                 /* docked: TV output */
+HLE(_ZN2nn2oe16GetOperationModeEv) {   /* 1 docked (TV output), 0 handheld: display.ini's mode */
+    c->x[0] = display_operation_mode() == OP_HANDHELD ? 0 : 1;
+}
 HLE(_ZN2nn2oe20GetCurrentFocusStateEv) { c->x[0] = 1; }             /* in focus */
 HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) { c->x[0] = 0; }       /* no messages */
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) {                             /* a LanguageCode, by value */

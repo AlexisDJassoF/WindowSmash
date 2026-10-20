@@ -27,6 +27,7 @@
 #define COBJMACROS
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "display.h"
 #include "host.h"
@@ -38,7 +39,10 @@ static struct {
     int mode, width, height, latency, hide_cursor;
     Pacing pacing;
     int loaded;
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0};
+    OperationMode operation;
+    Upscale upscale;
+    float sharpness;
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f};
 
 static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
@@ -82,7 +86,18 @@ static const char DEFAULT_INI[] =
     "; latency = 1-3: how many frames the graphics card may work ahead. Lower is more responsive.\n"
     "latency = 3\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
-    "hide_cursor = 1\n";
+    "hide_cursor = 1\n"
+    "\n"
+    "; mode = docked | handheld: the console the game believes it runs on.\n"
+    ";   docked:   on a TV, as it ships: the game draws 1920 x 1080.\n"
+    ";   handheld: in the hands: the game draws 1280 x 720, under half the pixels - for a slower\n"
+    ";             graphics card (it may also simplify some effects, as on the console).\n"
+    "mode = docked\n"
+    "; upscale = linear | fsr: how the picture is enlarged to the window, when the window is larger.\n"
+    ";   fsr: AMD FidelityFX Super Resolution 1, sharper edges than linear (best with mode = handheld).\n"
+    "upscale = linear\n"
+    "; sharpness = 0.0-2.0: fsr's sharpening, 0.0 the most; each 1.0 halves it.\n"
+    "sharpness = 0.2\n";
 
 static void parse_window(const char *v) {
     if (!_stricmp(v, "windowed")) cfg.mode = MODE_WINDOWED;
@@ -96,6 +111,25 @@ static void parse_pacing(const char *v) {
     else if (!_stricmp(v, "vrr")) cfg.pacing = PACING_VRR;
     else if (!_stricmp(v, "display")) cfg.pacing = PACING_DISPLAY;
     else fprintf(stderr, "[display] pacing is clock, vrr or display, not '%s'\n", v);
+}
+
+static void parse_operation(const char *v) {
+    if (!_stricmp(v, "docked")) cfg.operation = OP_DOCKED;
+    else if (!_stricmp(v, "handheld")) cfg.operation = OP_HANDHELD;
+    else fprintf(stderr, "[display] mode is docked or handheld, not '%s'\n", v);
+}
+
+static void parse_upscale(const char *v) {
+    if (!_stricmp(v, "linear")) cfg.upscale = UPSCALE_LINEAR;
+    else if (!_stricmp(v, "fsr")) cfg.upscale = UPSCALE_FSR;
+    else fprintf(stderr, "[display] upscale is linear or fsr, not '%s'\n", v);
+}
+
+static void parse_sharpness(const char *v) {
+    char *end;
+    float f = strtof(v, &end);
+    if (end == v || *end) { fprintf(stderr, "[display] sharpness is a number from 0.0 to 2.0, not '%s'\n", v); return; }
+    cfg.sharpness = f < 0 ? 0 : f > 2 ? 2 : f;
 }
 
 static char *trim(char *s) {
@@ -127,12 +161,20 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "pacing")) parse_pacing(value);
         else if (!_stricmp(key, "latency")) cfg.latency = atoi(value);
         else if (!_stricmp(key, "hide_cursor")) cfg.hide_cursor = atoi(value) != 0;
+        else if (!_stricmp(key, "mode")) parse_operation(value);
+        else if (!_stricmp(key, "upscale")) parse_upscale(value);
+        else if (!_stricmp(key, "sharpness")) parse_sharpness(value);
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
+    if ((env = getenv("SSBU_MODE")) && *env) parse_operation(env);
+    if ((env = getenv("SSBU_UPSCALE")) && *env) parse_upscale(env);
+    if (cfg.operation == OP_HANDHELD || cfg.upscale == UPSCALE_FSR)
+        fprintf(stderr, "[display] %s, upscale %s (sharpness %.1f)\n", cfg.operation == OP_HANDHELD ? "handheld: 1280 x 720" : "docked",
+                cfg.upscale == UPSCALE_FSR ? "fsr" : "linear", cfg.sharpness);
     if (cfg.width < 320) cfg.width = 320;
     if (cfg.height < 180) cfg.height = 180;
     if (cfg.latency < 1) cfg.latency = 1;
@@ -147,6 +189,14 @@ static void load(void) {
 }
 
 int display_latency(void) { load(); return cfg.latency; }
+OperationMode display_operation_mode(void) { load(); return cfg.operation; }
+void display_screen_size(unsigned *w, unsigned *h) {
+    load();
+    *w = cfg.operation == OP_HANDHELD ? 1280 : 1920;
+    *h = cfg.operation == OP_HANDHELD ? 720 : 1080;
+}
+Upscale display_upscale(void) { load(); return cfg.upscale; }
+float display_sharpness(void) { load(); return cfg.sharpness; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
 
 #ifdef _WIN32

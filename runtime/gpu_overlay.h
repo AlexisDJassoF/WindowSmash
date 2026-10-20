@@ -8,3 +8,8 @@
  * '\n', or NULL) goes under the graph. Leaves the pipeline state changed. */
 void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x, unsigned y, unsigned w,
                      unsigned h, int show, const char *detail);
+
+/* The start-up's shader screen: title, a bar (done of total; none while total is 0), a status
+ * line and "Esc: play now", centred in the w x h rtv. Leaves the pipeline state changed. */
+void overlay_progress(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned w, unsigned h,
+                      const char *title, unsigned done, unsigned total, const char *status);

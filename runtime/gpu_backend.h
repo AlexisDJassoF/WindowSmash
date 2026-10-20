@@ -12,8 +12,11 @@ void gfx_clear(const u32 *regs, u32 arg);
 /* A draw has been issued (VERTEX_END_GL), with the 3D engine's state as it stands. */
 void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed);
 
-/* Show the frame whose pixels live at this guest address (a block-linear surface). */
-void gfx_present(u64 guest, u32 width, u32 height);
+/* Show the frame whose pixels live at this guest address (a block-linear surface): the
+ * rectangle at (x, y) of w x h pixels in it, or all of it when w or h is 0. */
+void gfx_present(u64 guest, u32 x, u32 y, u32 w, u32 h);
+/* The start-up's shader screen (gpu_precompile.c): one frame of it. 0 without a device. */
+int gfx_progress(const char *title, unsigned done, unsigned total, const char *status);
 
 /* The 2D engine's scaled copy between surfaces (PIXELS_FROM_MEMORY), with its registers. */
 void gfx_blit2d(const u32 *regs);

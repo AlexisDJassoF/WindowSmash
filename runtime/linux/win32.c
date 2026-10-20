@@ -940,8 +940,11 @@ UINT GetWriteWatch(DWORD flags, PVOID base, SIZE_T size, PVOID *addresses, ULONG
             u64 end;
             long got = scan(at, hi, flags & WRITE_WATCH_FLAG_RESET, vec, 64, cap - n, &end);
             if (got < 0) { last_error = rt_win32_error(errno); return 1; }
+            /* (committed pages only, as on Windows and in the fallback: the scan can also report a
+             * decommitted one - its markers went with MADV_DONTNEED - and a caller reading it would fault) */
             for (long k = 0; k < got; k++)
-                for (u64 pg = vec[k].start; pg < vec[k].end && n < cap; pg += PAGE) addresses[n++] = (void *)(uintptr_t)pg;
+                for (u64 pg = vec[k].start; pg < vec[k].end && n < cap; pg += PAGE)
+                    if (bit(a->committed, (pg - a->base) / PAGE)) addresses[n++] = (void *)(uintptr_t)pg;
             if (end >= hi || end <= at) break;   /* (else the vector filled up: go on from where it stopped) */
             at = end;
         }

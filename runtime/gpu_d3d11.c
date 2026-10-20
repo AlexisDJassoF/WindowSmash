@@ -13,6 +13,7 @@
 #include "debug_profile.h"
 #include "display.h"
 #include "gpu_backend.h"
+#include "gpu_fsr.h"
 #include "gpu_overlay.h"
 #include "net.h"
 #include "pad.h"
@@ -42,6 +43,14 @@ enum { FINAL_W = 1920, FINAL_H = 1080 };
 static ID3D11VertexShader *blit_vs;
 static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps;
 static ID3D11SamplerState *linear_sampler;
+/* display.ini's upscale = fsr (gpu_fsr.c): EASU into fsr_tex, at the picture's size in the
+ * window, then RCAS into the window; none of it if the shaders did not compile */
+static ID3D11PixelShader *easu_ps, *rcas_ps;
+static ID3D11Buffer *fsr_cb;
+static ID3D11Texture2D *fsr_tex;
+static ID3D11RenderTargetView *fsr_rtv;
+static ID3D11ShaderResourceView *fsr_srv;
+static unsigned fsr_w, fsr_h;
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static int ready;
@@ -324,6 +333,19 @@ static const char BLIT_HLSL[] =
     "cbuffer R : register(b1) { float4 src0_step; float4 dst0_inv; };\n"
     "float4 ps2d(V i) : SV_Target { return t.Sample(s, (src0_step.xy + (i.pos.xy - dst0_inv.xy) * src0_step.zw) * dst0_inv.zw); }\n";
 
+/* As compile_hlsl, for what the game can do without: NULL (and why, in the log) if it fails. */
+static ID3D11PixelShader *optional_ps(const char *src, const char *entry, const char *what) {
+    ID3DBlob *code = NULL, *errors = NULL;
+    ID3D11PixelShader *ps = NULL;
+    if (FAILED(D3DCompile(src, strlen(src), what, NULL, NULL, entry, "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors)))
+        fprintf(stderr, "[gfx] %s unavailable: %s: %.400s\n", what, entry, errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "?");
+    else if (FAILED(ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &ps)))
+        fprintf(stderr, "[gfx] %s unavailable: the device refused %s\n", what, entry);
+    if (code) ID3D10Blob_Release(code);
+    if (errors) ID3D10Blob_Release(errors);
+    return ps;
+}
+
 static void start_compilers(void);                 /* (see "shaders") */
 static DWORD WINAPI prewarm_main(void *unused);
 
@@ -424,6 +446,17 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     D3D11_SAMPLER_DESC smp = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
                               D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, {0}, 0, D3D11_FLOAT32_MAX};
     ID3D11Device_CreateSamplerState(dev, &smp, &linear_sampler);
+    if (display_upscale() == UPSCALE_FSR) {
+        D3D11_BUFFER_DESC cbd = {64, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        easu_ps = optional_ps(FSR_HLSL, "ps_easu", "FSR");
+        rcas_ps = easu_ps ? optional_ps(FSR_HLSL, "ps_rcas", "FSR") : NULL;
+        if (rcas_ps && FAILED(ID3D11Device_CreateBuffer(dev, &cbd, NULL, &fsr_cb))) fsr_cb = NULL;
+        if (!easu_ps || !rcas_ps || !fsr_cb) {
+            if (easu_ps) { ID3D11PixelShader_Release(easu_ps); easu_ps = NULL; }
+            if (rcas_ps) { ID3D11PixelShader_Release(rcas_ps); rcas_ps = NULL; }
+            fprintf(stderr, "[gfx] FSR unavailable: the picture is enlarged with the linear filter\n");
+        } else fprintf(stderr, "[gfx] FSR 1 ready (EASU + RCAS, sharpness %.1f)\n", display_sharpness());
+    }
     D3D11_TEXTURE2D_DESC fd = {FINAL_W, FINAL_H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
                                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &fd, NULL, &final_tex)) ||
@@ -3240,8 +3273,25 @@ static void gpu_timer_frame(void) {
 void watchdog_present(void);   /* debug_watchdog.c */
 void hitch_present(void);      /* debug_profile.c */
 
-void gfx_present(u64 guest, u32 width, u32 height) {
-    (void)width; (void)height;
+/* FSR's middle texture at w x h, made again when the picture's size in the window changes; 0 if it cannot be */
+static int fsr_target(unsigned w, unsigned h) {
+    if (fsr_tex && fsr_w == w && fsr_h == h) return 1;
+    if (fsr_srv) { ID3D11ShaderResourceView_Release(fsr_srv); fsr_srv = NULL; }
+    if (fsr_rtv) { ID3D11RenderTargetView_Release(fsr_rtv); fsr_rtv = NULL; }
+    if (fsr_tex) { ID3D11Texture2D_Release(fsr_tex); fsr_tex = NULL; }
+    fsr_w = fsr_h = 0;
+    D3D11_TEXTURE2D_DESC td = {w, h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    if (!w || !h || FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &fsr_tex)) ||
+        FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)fsr_tex, NULL, &fsr_rtv)) ||
+        FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)fsr_tex, NULL, &fsr_srv)))
+        return 0;
+    fsr_w = w;
+    fsr_h = h;
+    return 1;
+}
+
+void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     if (!enter()) return;
     watchdog_present();
     hitch_present();
@@ -3307,6 +3357,13 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     ID3D11ShaderResourceView *none = NULL;
     if (src) {   /* the game's picture at its own size */
         D3D11_VIEWPORT vp = {0, 0, FINAL_W, FINAL_H, 0, 1};
+        if (crop_w && crop_h && crop_x + crop_w <= src->width && crop_y + crop_h <= src->height) {
+            /* a crop (handheld: 1280x720 of a 1920x1080 buffer): the whole surface drawn larger,
+             * placed so that the crop fills the picture; the rest falls outside it */
+            float sx = (float)FINAL_W / crop_w, sy = (float)FINAL_H / crop_h;
+            vp.TopLeftX = -(float)crop_x * sx; vp.TopLeftY = -(float)crop_y * sy;
+            vp.Width = src->width * sx; vp.Height = src->height * sy;
+        }
         ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &final_rtv, NULL);
         ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
         /* the bytes as they are: the display shows them as sRGB, which an sRGB framebuffer's already are */
@@ -3325,11 +3382,52 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     display_fit(back_desc.Width, back_desc.Height, &fit_x, &fit_y, &fit_w, &fit_h);
     D3D11_VIEWPORT wvp = {(float)fit_x, (float)fit_y, (float)fit_w, (float)fit_h, 0, 1};
     ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
-    ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv);
-    ID3D11DeviceContext_Draw(ctx, 3, 0);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+    /* the part of the surface that is the picture (all of it, or the crop) */
+    int cropped = src && crop_w && crop_h && crop_x + crop_w <= src->width && crop_y + crop_h <= src->height;
+    u32 pic_x = cropped ? crop_x : 0, pic_y = cropped ? crop_y : 0;
+    u32 pic_w = src ? (cropped ? crop_w : src->width) : 0, pic_h = src ? (cropped ? crop_h : src->height) : 0;
+    if (src && easu_ps && (pic_w < fit_w || pic_h < fit_h) && fsr_target(fit_w, fit_h)) {
+        /* FSR 1: EASU from the game's surface to the picture's size in the window, RCAS into it */
+        uint32_t con[16];
+        D3D11_MAPPED_SUBRESOURCE m;
+        fsr_easu_constants(con, (float)pic_w, (float)pic_h, (float)src->width, (float)src->height, (float)fit_w, (float)fit_h, (float)pic_x,
+                           (float)pic_y);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)fsr_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, con, sizeof con);
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)fsr_cb, 0);
+        }
+        D3D11_VIEWPORT fvp = {0, 0, (float)fit_w, (float)fit_h, 0, 1};
+        ID3D11ShaderResourceView *raw = surface_srv(src, 0);   /* (the bytes as they are, as the blit above) */
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &fsr_rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &fvp);
+        ID3D11DeviceContext_PSSetShader(ctx, easu_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &fsr_cb);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &raw);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+        fsr_rcas_constants(con, display_sharpness());
+        con[2] = fit_x;   /* (where RCAS's output starts in the window) */
+        con[3] = fit_y;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)fsr_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, con, 16);
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)fsr_cb, 0);
+        }
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
+        ID3D11DeviceContext_PSSetShader(ctx, rcas_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &fsr_srv);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+        ID3D11Buffer *no_cb = NULL;
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &no_cb);
+        ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
+    } else {
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+    }
 
     /* debug keys and the overlay */
     LONG keys = InterlockedExchange(&hotkeys, 0);
@@ -3454,6 +3552,33 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     QueryPerformanceCounter(&p1);
     gfx_stat_present_ticks += (u64)(p1.QuadPart - p0.QuadPart);
     leave();
+}
+
+/* The start-up's shader screen (gpu_precompile.c), before the game draws anything: the device
+ * is made here if the game has not made it yet. 0 if there is no device to draw with. */
+int gfx_progress(const char *title, unsigned done, unsigned total, const char *status) {
+    if (!enter()) return 0;
+    unsigned bw, bh;
+    if (display_take_size(&bw, &bh)) {
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+        ID3D11DeviceContext_Flush(ctx);
+        IDXGISwapChain1_ResizeBuffers(swapchain, 0, bw, bh, DXGI_FORMAT_UNKNOWN, swapchain_flags);
+    }
+    ID3D11Texture2D *back;
+    IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&back);
+    D3D11_TEXTURE2D_DESC back_desc;
+    ID3D11Texture2D_GetDesc(back, &back_desc);
+    ID3D11RenderTargetView *rtv;
+    ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)back, NULL, &rtv);
+    static const float dark[4] = {0.06f, 0.06f, 0.07f, 1};
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, dark);
+    overlay_progress(dev, ctx, rtv, back_desc.Width, back_desc.Height, title, done, total, status);
+    ID3D11RenderTargetView_Release(rtv);
+    ID3D11Texture2D_Release(back);
+    IDXGISwapChain1_Present(swapchain, 1, 0);
+    forget_draw_state();   /* (the overlay changed the pipeline's state) */
+    leave();
+    return 1;
 }
 
 int gfx_window_focused(void) { return window && GetForegroundWindow() == window; }

@@ -2,11 +2,14 @@
  * packs them) into the renderer's disk cache, translated and compiled exactly as the renderer
  * would, so that a program's first use loads its DXBC instead of compiling it.
  *
- * Usage: shaderaot <pack> <cache dir> <part> <parts> [--dry] [--keys <file>]
+ * Usage: shaderaot <pack> <cache dir> <part> <parts> [--dry] [--keys <file>] [--progress] [--die-with-parent]
  *   Every process translates all vertex programs (their outputs are the paired pixel programs'
  *   inputs) and compiles the records whose index is <part> modulo <parts>. --dry translates only
  *   and prints the cache key of each program ("vs <hash>", "ps <hash> <vs outputs>"); --keys
- *   compiles only the keys listed in a file of such lines.
+ *   compiles only the keys listed in a file of such lines. --progress prints a line
+ *   "done <compiled> <already cached> <left out or failed>" to stdout after each key, for the
+ *   game's start-up screen (runtime/shader_precompile.c) to follow; --die-with-parent (Linux)
+ *   has the process killed when the one that started it ends.
  *
  * Pack: "SAOT", u32 count; then per program u32 stage (0 vertex, 1 pixel), u32 length, u32 pairs,
  * u32 pair[pairs] (the vertex programs found before it in its containers), then its bytes
@@ -22,6 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "../runtime/gpu_shader_cache.h"
 
@@ -46,7 +56,11 @@ static char *translate(Program *p, u32 vs_outputs, ShaderInfo *info, int flags) 
     return shader_translate(p->bytes, p->size, p->stage, vs_outputs, NULL, 0, info, zero_cbuf, NULL, flags);
 }
 
+#ifdef _WIN32
 static int exists(const char *path) { return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
+#else
+static int exists(const char *path) { return access(path, F_OK) == 0; }
+#endif
 
 static struct { u32 compiled, existing, tables, failed, translate_failed, keys, fallback; } count;
 
@@ -72,11 +86,16 @@ static void compile_to(Program *p, u32 vs_outputs, const char *hlsl, int structu
         fprintf(stderr, "%s: fxc failed: %.300s\n", name, errors ? (const char *)errors->lpVtbl->GetBufferPointer(errors) : "?");
     } else {
         char tmp[1300];
+#ifdef _WIN32
         snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, GetCurrentProcessId());
+#else
+        snprintf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid());
+#endif
         FILE *f = fopen(tmp, "wb");
         if (f) {
             fwrite(code->lpVtbl->GetBufferPointer(code), 1, code->lpVtbl->GetBufferSize(code), f);
             fclose(f);
+#ifdef _WIN32
             HANDLE h = CreateFileA(tmp, FILE_WRITE_ATTRIBUTES, 0, NULL, OPEN_EXISTING, 0, NULL);
             if (h != INVALID_HANDLE_VALUE) {
                 FILETIME t = {(DWORD)SHADER_CACHE_UNPLAYED, (DWORD)(SHADER_CACHE_UNPLAYED >> 32)};
@@ -84,6 +103,13 @@ static void compile_to(Program *p, u32 vs_outputs, const char *hlsl, int structu
                 CloseHandle(h);
             }
             if (!MoveFileExA(tmp, path, 0)) DeleteFileA(tmp);   /* (another process wrote it first) */
+#else
+            /* the same date (FILETIME counts 100 ns from 1601; Unix time seconds from 1970) */
+            struct timespec t[2] = {{(time_t)(SHADER_CACHE_UNPLAYED / 10000000ull - 11644473600ull), 0}, {0, 0}};
+            t[1] = t[0];
+            utimensat(AT_FDCWD, tmp, t, 0);
+            if (rename(tmp, path)) unlink(tmp);   /* (atomic: no reader sees a partial file) */
+#endif
             count.compiled++;
         }
     }
@@ -112,6 +138,13 @@ static int has_key(const KeySet *ks, u64 key) {
 }
 static int first_time(u64 key) { return add_key(&seen, key) && (!only.slot || has_key(&only, key)); }
 
+static int progress;   /* --progress: a line after each key */
+static void report(void) {
+    if (!progress) return;
+    printf("done %u %u %u\n", count.compiled, count.existing, count.tables + count.failed + count.translate_failed);
+    fflush(stdout);
+}
+
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: shaderaot <pack> <cache dir> <part> <parts> [--dry]\n"); return 2; }
     const char *dir = argv[2];
@@ -119,6 +152,13 @@ int main(int argc, char **argv) {
     int dry = 0;
     for (int a = 5; a < argc; a++) {
         if (!strcmp(argv[a], "--dry")) dry = 1;
+        else if (!strcmp(argv[a], "--progress")) progress = 1;
+        else if (!strcmp(argv[a], "--die-with-parent")) {
+#ifndef _WIN32
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
+            if (getppid() == 1) return 1;   /* (the parent had already gone) */
+#endif
+        }
         else if (!strcmp(argv[a], "--keys") && a + 1 < argc) {
             FILE *k = fopen(argv[++a], "r");
             char kind[4];
@@ -136,9 +176,15 @@ int main(int argc, char **argv) {
     }
     FILE *f = fopen(argv[1], "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
+#ifdef _WIN32
     _fseeki64(f, 0, SEEK_END);
     long long n = _ftelli64(f);
     _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END);
+    long long n = ftello(f);
+    fseeko(f, 0, SEEK_SET);
+#endif
     u8 *pack = malloc((size_t)n);
     if (!pack || fread(pack, 1, (size_t)n, f) != (size_t)n || memcmp(pack, "SAOT", 4)) { fprintf(stderr, "bad pack\n"); return 1; }
     fclose(f);
@@ -179,6 +225,7 @@ int main(int argc, char **argv) {
             else if (info.ntables) count.tables++;
             else if (exists(path)) count.existing++;
             else compile_to(p, 0, hlsl, info.flow == SHADER_FLOW_STRUCTURED, name, path);
+            if (!dry) report();
         }
         free(hlsl);
     }
@@ -210,12 +257,13 @@ int main(int argc, char **argv) {
             snprintf(name, sizeof name, "ps_%016llx", (unsigned long long)p->hash);
             shader_cache_file(path, sizeof path, dir, SHADER_PIXEL, p->hash, masks[m], 0);
             if (dry) { printf("ps %016llx %08x\n", (unsigned long long)p->hash, masks[m]); continue; }
-            if (exists(path)) { count.existing++; continue; }
+            if (exists(path)) { count.existing++; report(); continue; }
             char *hlsl = translate(p, masks[m], &info, 0);
-            if (!hlsl) { count.translate_failed++; continue; }
+            if (!hlsl) { count.translate_failed++; report(); continue; }
             if (info.ntables) count.tables++;
             else compile_to(p, masks[m], hlsl, info.flow == SHADER_FLOW_STRUCTURED, name, path);
             free(hlsl);
+            report();
         }
     }
     fprintf(stderr, "part %u/%u: %u keys; %u compiled (%u as dispatch loops, their structured form failing), %u already cached, "

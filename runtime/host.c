@@ -14,6 +14,7 @@
 
 #include "host.h"
 #include "display.h"
+#include "gpu_precompile.h"
 #ifdef _WIN32
 #include <dbghelp.h>
 #else
@@ -866,6 +867,16 @@ static DWORD WINAPI crash_test(void *seconds) {
     return 0;
 }
 
+#ifndef _WIN32
+static DWORD WINAPI start_game(LPVOID unused) {
+    (void)unused;
+    precompile_run();
+    /* Guest call depth becomes host call depth, so the guest runs on a thread with a large stack. */
+    CloseHandle(CreateThread(NULL, 512ull << 20, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL));
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     if (argc >= 6 && !strcmp(argv[1], "--write-dump")) return write_dump_main(argv);
@@ -916,12 +927,14 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
     rt_window_init();   /* (SDL wants its window and events on the main thread, which then runs them) */
 #endif
+#ifdef _WIN32
     /* Guest call depth becomes host call depth, so the guest runs on a thread with a large stack. */
     HANDLE t = CreateThread(NULL, 512ull << 20, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-#ifdef _WIN32
     while (WaitForSingleObject(t, status_every ? status_every * 1000 : INFINITE) == WAIT_TIMEOUT) print_status();
 #else
-    (void)t;
+    /* the start-up's thread: the shaders the cache lacks first (gpu_precompile.c), then the game's;
+     * the window's events stay on this one meanwhile */
+    CloseHandle(CreateThread(NULL, 0, start_game, NULL, 0, NULL));
     if (status_every > 0) CloseHandle(CreateThread(NULL, 0, status_thread, NULL, 0, NULL));
     rt_window_loop(0, NULL);
 #endif

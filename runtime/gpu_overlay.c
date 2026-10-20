@@ -172,6 +172,40 @@ static int lines_of(const char *s, int *widest) {
     return n;
 }
 
+/* The quads drawn so far, over rtv at (x0, y0, w x h). Leaves the pipeline state changed. */
+static void flush(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    memcpy(m.pData, verts, nverts * sizeof *verts);
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)vbuf, 0);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float inv[4] = {1.0f / (float)w, 1.0f / (float)h, 0, 0};
+        memcpy(m.pData, inv, sizeof inv);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)cbuf, 0);
+    }
+    UINT stride = sizeof(Vertex), offset = 0;
+    D3D11_VIEWPORT vp = {(float)x0, (float)y0, (float)w, (float)h, 0, 1};
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(ctx, raster);
+    ID3D11DeviceContext_OMSetBlendState(ctx, blend, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vbuf, &stride, &offset);
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &cbuf);
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &atlas);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &sampler);
+    ID3D11DeviceContext_Draw(ctx, nverts, 0);
+    ID3D11Buffer *none_buf = NULL;
+    ID3D11ShaderResourceView *none_srv = NULL;
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &none_buf, &stride, &offset);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none_srv);
+}
+
 /* ---- the frame ---------------------------------------------------------------------- */
 static double history[HISTORY];   /* milliseconds per frame, newest at [head - 1] */
 static unsigned head, filled;
@@ -229,35 +263,29 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
     y += gh + 6;
     if (detail) text(x, y, RGBA(210, 225, 255, 255), detail);
 
-    /* draw it all */
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
-    memcpy(m.pData, verts, nverts * sizeof *verts);
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)vbuf, 0);
-    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        float inv[4] = {1.0f / (float)w, 1.0f / (float)h, 0, 0};
-        memcpy(m.pData, inv, sizeof inv);
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)cbuf, 0);
+    flush(ctx, rtv, x0, y0, w, h);
+}
+
+/* The start-up's shader screen (gpu_precompile.c): a title, a bar of done out of total (none
+ * while total is 0), a line under it and the way out, centred in the w x h back buffer. */
+void overlay_progress(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned w, unsigned h,
+                      const char *title, unsigned done, unsigned total, const char *status) {
+    if (!state) state = init(dev) ? 1 : -1;
+    if (state < 0) return;
+    nverts = 0;
+    float bw = w * 0.6f < 360 ? 360 : w * 0.6f, bh = 18, x = (w - bw) / 2, y = h / 2.0f - 2 * CELL_H;
+    if (bw > w - 32.0f) { bw = w - 32.0f; x = 16; }
+    text((w - (float)strlen(title) * CELL_W) / 2, y, RGBA(240, 240, 240, 255), title);
+    y += CELL_H + 12;
+    rect(x, y, bw, bh, RGBA(60, 60, 64, 255));
+    if (total) {
+        float f = done >= total ? 1.0f : (float)done / total;
+        rect(x, y, bw * f, bh, RGBA(90, 200, 110, 255));
     }
-    UINT stride = sizeof(Vertex), offset = 0;
-    D3D11_VIEWPORT vp = {(float)x0, (float)y0, (float)w, (float)h, 0, 1};
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
-    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
-    ID3D11DeviceContext_RSSetState(ctx, raster);
-    ID3D11DeviceContext_OMSetBlendState(ctx, blend, NULL, 0xFFFFFFFF);
-    ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
-    ID3D11DeviceContext_IASetInputLayout(ctx, layout);
-    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vbuf, &stride, &offset);
-    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &cbuf);
-    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &atlas);
-    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &sampler);
-    ID3D11DeviceContext_Draw(ctx, nverts, 0);
-    ID3D11Buffer *none_buf = NULL;
-    ID3D11ShaderResourceView *none_srv = NULL;
-    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &none_buf, &stride, &offset);
-    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none_srv);
+    y += bh + 12;
+    if (status) text((w - (float)strlen(status) * CELL_W) / 2, y, RGBA(210, 210, 210, 255), status);
+    y += CELL_H + 6;
+    static const char hint[] = "Esc: play now";
+    text((w - (float)(sizeof hint - 1) * CELL_W) / 2, y, RGBA(150, 150, 150, 255), hint);
+    flush(ctx, rtv, 0, 0, w, h);
 }

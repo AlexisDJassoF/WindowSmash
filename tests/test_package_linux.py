@@ -68,6 +68,46 @@ class PackageTests(unittest.TestCase):
         (self.build / 'ssbu').write_bytes(b'\x7fELF new')
         self.assertEqual((self.bundle / 'ssbu').read_bytes(), b'\x7fELF new')
 
+    def add_shader_index(self, version):
+        tools = self.build.parent / 'build-linux-tools'
+        tools.mkdir()
+        (tools / 'shaderaot').write_bytes(b'\x7fELF aot')
+        (tools / 'shaderaot').chmod(0o755)   # (as the linker leaves it)
+        aot = self.tree / 'dump/aot'
+        aot.mkdir()
+        (aot / 'programs.pack').write_bytes(b'SAOT' + b'\0' * 4)
+        (aot / f'keys_v{version}.txt').write_text('vs 0123456789abcdef\n')
+        (aot / 'keys_v1.txt').write_text('an older version\n')
+
+    def cache_version(self):
+        import re
+        return int(re.search(r'#define SHADER_CACHE_VERSION (\d+)', (ROOT / 'runtime/gpu_shader_cache.h').read_text()).group(1))
+
+    def test_shader_index_packaged(self):
+        version = self.cache_version()
+        self.add_shader_index(version)
+        r = self.package()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.bundle / 'shaderaot').read_bytes(), b'\x7fELF aot')
+        self.assertTrue(os.access(self.bundle / 'shaderaot', os.X_OK))
+        self.assertEqual((self.bundle / 'dump/aot/programs.pack').read_bytes()[:4], b'SAOT')
+        self.assertTrue((self.bundle / f'dump/aot/keys_v{version}.txt').exists())
+        self.assertFalse((self.bundle / 'dump/aot/keys_v1.txt').exists())   # (only the current version's)
+
+    def test_shader_index_linked(self):
+        self.add_shader_index(self.cache_version())
+        r = self.package('--link')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.bundle / 'shaderaot').is_symlink())
+        self.assertTrue((self.bundle / 'dump/aot/programs.pack').is_symlink())
+        self.assertFalse((self.bundle / 'dump/aot').is_symlink())   # (the folder is the package's: missing.txt goes there)
+
+    def test_no_shader_index(self):
+        r = self.package()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('no shader index', r.stdout)
+        self.assertFalse((self.bundle / 'shaderaot').exists())
+
     def test_romfs_file_named_by_its_linux_folder(self):
         self.assertEqual(self.package('--link').returncode, 0)
         files_line = next(line for line in (self.bundle / 'scripts/common.sh').read_text().splitlines()

@@ -4,6 +4,8 @@
 #include <windows.h>
 
 typedef enum { PACING_CLOCK, PACING_VRR, PACING_DISPLAY } Pacing;
+typedef enum { OP_DOCKED, OP_HANDHELD } OperationMode;   /* display.ini's mode: the console the game sees */
+typedef enum { UPSCALE_LINEAR, UPSCALE_FSR } Upscale;      /* display.ini's upscale */
 
 void display_dpi_aware(void);           /* first thing in main: window sizes in real pixels */
 #ifdef _WIN32
@@ -25,6 +27,10 @@ int display_take_size(unsigned *w, unsigned *h);
 /* The 16:9 picture centred in a w x h back buffer. */
 void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw, unsigned *fh);
 int display_latency(void);              /* frames the GPU may queue ahead: 1-3 */
+OperationMode display_operation_mode(void);               /* docked (as it ships) or handheld */
+void display_screen_size(unsigned *w, unsigned *h);       /* the screen the game is told of: 1920x1080 or 1280x720 */
+Upscale display_upscale(void);
+float display_sharpness(void);                            /* fsr's sharpening in stops: 0.0 (most) to 2.0 */
 Pacing display_pacing(void);
 /* The renderer says whether the swap chain can tear (for VRR); the flags each Present gets. */
 void display_set_tearing(int supported);

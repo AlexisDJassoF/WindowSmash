@@ -180,12 +180,19 @@ log names each pad as it connects, with its type and GUID.
 | `pacing = display` | Follows the monitor's refreshes on Windows; on Linux, it's the clock. |
 | `latency`, `hide_cursor` | As on Windows: 1–3 frames the GPU may work ahead, and hiding the idle mouse pointer. |
 
-**Shaders:** this folder carries the Windows build's compiled shaders that the game has used. Any
-other shader is compiled the first time it's needed, so a new effect can show a moment late once.
+**Shaders:** this folder carries the Windows build's compiled shaders that the game has used, and
+an index of every shader in the game (`dump/aot`, with its compiler `shaderaot`). At start, the
+game compares the two: if shaders are missing from the cache, a **Preparing shaders** screen
+compiles them before the game starts, with a bar and the time left. The first time that is the
+whole game: about 40,000 shaders, half an hour on a 14-core desktop processor (longer with fewer cores); after that only what is new (a game update, or a new
+translator: the screen then shows again). **Esc** starts the game at once: what is compiled is
+kept, and the next start carries on with the rest. The full cache takes about 2 GB of disk.
+`SSBU_PRECOMPILE=0 ./run.sh` starts without the screen. Shaders it can't compile ahead (those
+with jump tables, and compute ones) are still compiled the first time they're needed, as is
+any shader without the index; DXVK also makes each shader's Vulkan pipeline the first time it
+draws, so a new effect can still show a moment late once, if less often.
 The Windows build's start-up shader prewarm is off here: under DXVK it made a Vulkan pipeline for
 every cached shader at once and held up the first frame (`SSBU_SHADER_PREWARM=1` turns it on).
-The Windows build's ahead-of-time shaders (`Prepare Shaders.bat`) aren't in the package (1.5 GB
-for 13.0.5).
 
 ## Other launchers
 
@@ -283,8 +290,10 @@ the WindowSmash folder:
    To take the game to **another machine of yours**, make a folder to copy instead:
    `python3 tools/linux/package_linux.py --tar` writes `dist-linux/ssbu-linux.tar`.
 
-The first time each effect shows, its shader is compiled, so it can show a moment late: a build
-made on Linux has no shader cache from a Windows build to start from.
+The build also indexes the game's shaders (`tools/shader_aot.py --index`, about a minute:
+`dump/aot/programs.pack` and its keys), so the first start shows the **Preparing shaders** screen
+(see [Settings](#settings), **Shaders**) - a build made on Linux has no shader cache from a Windows
+build to start from.
 
 | Commands | What they do |
 | :--- | :--- |
