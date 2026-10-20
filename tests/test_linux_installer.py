@@ -310,7 +310,8 @@ class BuildOnLinuxTests(unittest.TestCase):
             MODULES=str(dump / 'modules'), SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'),
             EXE=str(top / 'port' / 'build-linux' / 'ssbu'), log=lambda msg='': None, check_tools=lambda: None,
             install_packages=lambda: None, ask_folder=lambda key, given, saved: str(top),
-            romfs_cfg_ok=lambda cfg: True, missing_fonts=lambda folder: [], check_same_game=lambda rec: None,
+            romfs_cfg_ok=lambda cfg: True, check_game_data=lambda cfg, game: None, missing_fonts=lambda folder: [],
+            check_same_game=lambda rec: None,
             find_program=lambda game, keys: ('p', 0x01006A800016E000, {}, {'contents': []}),
             installed_ram_gb=lambda: 8.0, linux_toolchain=lambda: fake_tc,
             run=lambda args, failure: self.calls.append([str(a) for a in args]))
@@ -335,6 +336,76 @@ class BuildOnLinuxTests(unittest.TestCase):
         (self.vkd3d / 'linux' / 'libvkd3d-shader.a').write_bytes(b'')
         self.ns['build'](self.args)
         self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_linux.py'])
+
+
+    def test_game_files_not_asked_for_when_read(self):
+        # an update's build: dump/ has everything from the game files, so no folder is asked for
+        asked = []
+        self.ns['ask_folder'] = lambda key, given, saved: asked.append(key) or str(self.vkd3d)
+        self.ns['build'](self.args)
+        self.assertEqual(asked, [])
+        self.assertTrue(self.ns['prepared']())
+
+    def test_no_dlc_is_remembered(self):
+        # without DLC there is no aoc.cfg: the game folder was asked for at every build
+        modules = Path(self.ns['MODULES'])
+        (modules / 'aoc.cfg').unlink()
+        asked = []
+        self.ns['ask_folder'] = lambda key, given, saved: asked.append(key) or self.temp.name
+        self.assertFalse(self.ns['prepared']())
+        self.ns['build'](self.args)
+        self.assertEqual(asked, ['game', 'keys'])
+        self.assertTrue((modules / 'aoc.none').is_file())
+        self.assertTrue(self.ns['prepared']())
+        self.ns['build'](self.args)
+        self.assertEqual(asked, ['game', 'keys'])
+        # a game folder named now is looked at again, and may have DLC
+        self.args.game = self.temp.name
+        self.ns['build'](self.args)
+        self.assertEqual(asked, ['game', 'keys', 'game', 'keys'])
+
+    def test_check_ready(self):
+        modules = Path(self.ns['MODULES'])
+        with unittest.mock.patch.object(sys, 'argv', ['build_game.py', '--check-ready']):
+            self.assertEqual(self.ns['main'](), 0)
+            (modules / 'aoc.cfg').unlink()
+            self.assertEqual(self.ns['main'](), 1)
+            self.ns['missing_fonts'] = lambda folder: ['x.bfttf']
+            (modules / 'aoc.none').write_text('')
+            self.assertEqual(self.ns['main'](), 1)
+
+
+class RebuildTests(unittest.TestCase):
+    """Run again after an update: the game files that were read already are not asked for."""
+
+    def args(self, **kw):
+        return types.SimpleNamespace(**{**dict(game=None, keys=None, firmware=None, dry_run=False, online_name=None, yes=False,
+                                               jobs=None, skip_build=False), **kw})
+
+    def test_not_asked_when_read(self):
+        patches = [unittest.mock.patch.object(il, 'files_ready', return_value=True),
+                   unittest.mock.patch.object(il, 'venv_python', return_value=sys.executable),
+                   unittest.mock.patch.object(il, 'read_text', return_value='Me\n'),
+                   unittest.mock.patch.object(il, 'ask', side_effect=AssertionError('asked'))]
+        with contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO()):
+            for p in patches:
+                stack.enter_context(p)
+            files = il.step_files(self.args())
+        self.assertEqual(files, {'game': None, 'keys': None, 'firmware': None, 'name': 'Me'})
+
+    def test_a_named_game_folder_is_looked_at(self):
+        with unittest.mock.patch.object(il, 'files_ready', side_effect=AssertionError('checked')),                 unittest.mock.patch.object(il, 'venv_python', return_value=sys.executable),                 unittest.mock.patch.object(il, 'check_keys', return_value=(False, 'no')),                 contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(il.Stop):   # (not interactive: the keys folder it was given is no good)
+                il.step_files(self.args(game='/g', keys='/k', firmware='/f', yes=True))
+
+    def test_build_command_has_only_the_folders_given(self):
+        seen = []
+        run = lambda cmd, **kw: seen.append(cmd) or types.SimpleNamespace(returncode=0)   # noqa: E731
+        with unittest.mock.patch.object(il.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()):
+            il.step_build(self.args(), {'game': None, 'keys': None, 'firmware': None})
+            il.step_build(self.args(), {'game': '/g', 'keys': '/k', 'firmware': '/f'})
+        self.assertNotIn('--game', seen[0])
+        self.assertEqual(seen[1][seen[1].index('--game') + 1], '/g')
 
 
 class CheckToolsTests(unittest.TestCase):

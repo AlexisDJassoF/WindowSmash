@@ -123,12 +123,36 @@ The launchers work like the Windows ones: `play-ssbu.sh` at the top of the folde
 | `launchers/play-ssbu-offline.sh` | `Play SSBU Offline.bat` | The game, offline. |
 | `launchers/host-ssbu-netplay.sh`, `launchers/join-ssbu-netplay.sh` | `Host/Join SSBU Netplay.bat` | A private room. |
 | `launchers/unlock-all-fighters.sh` | `Unlock All Fighters.bat` | The unlock tool, on this folder's save. Run it with the game closed. |
+| `launchers/prepare-shaders.sh` | `Prepare Shaders.bat` | Compiles all of the game's shaders in advance ([below](#shaders-and-first-time-stutter)). |
 
 The game reads its data in place from your game folder, or from the decrypted copy in
 `dump/modules` when the game had to be decrypted first. If your game folder is on a disk or shared
 folder that isn't mounted, the launchers say so. The [Controls](#controls), [Settings](#settings) and
 [If something goes wrong](#if-something-goes-wrong) sections below apply here too. The save is in
 `save/`, and the log goes to `build/play.log`.
+
+### Updating
+
+Run `bash install-windowsmash.sh` again whenever you want the newest WindowSmash. It looks at
+what changed and builds only that: your game files aren't asked for again (they are read once,
+into `dump/`), and the game's code is compiled again only when the update changes it. An update
+of the program's own parts (the graphics, the audio, the kernel: the files in `runtime/`) compiles
+those files and links the program again, which takes minutes. An update that changes how the
+game's code is translated (a performance change to the translator, say) compiles the game's code
+again, once: about as long as the first build. To build from other
+game files, name them: `bash install-windowsmash.sh --game <folder>`.
+
+### Shaders and first-time stutter
+
+The game's graphics programs (*shaders*) are made the first time each one is needed, which is why
+a new effect can show a moment late once. To make them all in advance, run
+`bash launchers/prepare-shaders.sh` from a terminal (on a Steam Deck: in Desktop Mode). It shows a
+progress bar with the time left, runs at low priority, and keeps the PC awake meanwhile. A first run
+makes about 40,000 shaders (for 13.0.5): half an hour on a fast desktop, and probably an hour or two on
+a Steam Deck. You can stop it with Ctrl+C and start it again later; what is done stays done. It
+needs the game built first, and the game files where they were. It prepares the first step, the
+shader programs themselves; DXVK and the graphics driver still make their own GPU code from them
+as each shader is first used, and keep it for next time.
 
 The rest of this guide is about the package from Windows, apart from those sections.
 

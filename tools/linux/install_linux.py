@@ -55,7 +55,7 @@ NEED_DISK_GB = 30   # (the C, the objects and the program: 7 GB; the update's da
 MIN_RAM_GB = 7   # (8 GB machines report a little less)
 PYTHON_EXTRA = ["pillow"]   # (the overlay font: tools/linux/make_overlay_font.py)
 LAUNCHERS = ["install-windowsmash.sh", "play-ssbu.sh", "launchers/play-ssbu-offline.sh", "launchers/host-ssbu-netplay.sh",
-             "launchers/join-ssbu-netplay.sh", "launchers/unlock-all-fighters.sh"]   # (as the .bat ones: two at the top)
+             "launchers/join-ssbu-netplay.sh", "launchers/unlock-all-fighters.sh", "launchers/prepare-shaders.sh"]   # (as the .bat ones: two at the top)
 # The third-party parts of the build (tools/linux/toolchain.py): (what, URL, SHA-256, file, where it goes,
 # the archive's folder whose contents go there)
 PARTS = [
@@ -923,8 +923,27 @@ def ask_folder(label, value, check, interactive):
         value = ask(f"{label.capitalize()} folder", value, True)
 
 
+def files_ready():
+    """Whether the build has read everything it needs from the game files already (dump/: the
+    program, fonts, game data, DLC; tools/build_game.py --check-ready): then they are not asked for
+    again - an update only builds what changed."""
+    return subprocess.run([venv_python(), os.path.join(ROOT, "tools", "build_game.py"), "--check-ready"],
+                          cwd=ROOT, capture_output=True).returncode == 0
+
+
 def step_files(a):
     step("[6/8] Your game files")
+    if not (a.game or a.keys or a.firmware) and not a.dry_run and os.path.isfile(venv_python()) and files_ready():
+        info("already read from your game files (dump/): not asking for them again. To build from other game files, "
+             "run: bash install-windowsmash.sh --game <folder>")
+        name_file = os.path.join(ROOT, "online_name.txt")
+        name = a.online_name or read_text(name_file).strip()
+        if name and name != read_text(name_file).strip():
+            with open(name_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(name + "\n")
+        if name:
+            info(f"online name: {name}")
+        return {"game": None, "keys": None, "firmware": None, "name": name}
     found = detected_folders()
     for key in ("game", "keys", "firmware"):
         if getattr(a, key):
@@ -978,7 +997,7 @@ def step_launchers(a):
         os.chmod(entry, 0o755)
         info(f"applications menu: WindowSmash ({entry})")
     info("in this folder: play-ssbu.sh (online); in launchers/: play-ssbu-offline.sh, host-ssbu-netplay.sh, "
-         "join-ssbu-netplay.sh, unlock-all-fighters.sh")
+         "join-ssbu-netplay.sh, unlock-all-fighters.sh, prepare-shaders.sh")
     firewall = None
     if shutil.which("ufw") and "Status: active" in subprocess.run(["ufw", "status"], capture_output=True, text=True).stdout:
         firewall = "sudo ufw allow 39420/udp"
@@ -991,8 +1010,10 @@ def step_launchers(a):
 # ---- step 8: the build --------------------------------------------------------------------------------------
 def step_build(a, files):
     step("[8/8] Build the game")
-    cmd = [venv_python(), os.path.join(ROOT, "tools", "build_game.py"), "--game", files["game"], "--keys", files["keys"],
-           "--firmware", files["firmware"]]
+    cmd = [venv_python(), os.path.join(ROOT, "tools", "build_game.py")]
+    for key in ("game", "keys", "firmware"):
+        if files.get(key):   # (none when the game files were read already: files_ready)
+            cmd += [f"--{key}", files[key]]
     if a.jobs:
         cmd += ["--jobs", str(a.jobs)]
     if a.skip_build:
@@ -1044,6 +1065,8 @@ def main(argv=None):
         built = step_build(a, files)
         print()
         print("Done. Start the game with ./play-ssbu.sh, or WindowSmash in your applications menu." if built else "Setup done.")
+        if built:
+            print("To make the game's shaders in advance (no hitch when an effect shows first): bash launchers/prepare-shaders.sh")
         return 0
     except Stop as e:
         print(f"\nERROR: {e}")
