@@ -25,7 +25,7 @@ void gpu_queue_submit(u32 channel, const u64 *entries, u32 count, u32 syncpoint,
 u64 gpu_queue_mark(void);                                 /* submissions queued so far */
 void gpu_queue_wait(u64 mark);                            /* until that many have run */
 void gpu_queue_drain(void);                               /* until everything queued has run */
-int gpu_memory_overlaps(u64 addr, u64 size);              /* guest memory holding an nvmap allocation (hle_nv.c) */
+void gpu_memory_unmapping(u64 addr, u64 size);            /* guest memory about to be decommitted (hle_nv.c) */
 /* Until sync point `id` reaches `threshold` (or `timeout_ms` passes; ~0u: no limit): 1 reached. */
 int gpu_syncpt_wait(u32 id, u32 threshold, u32 timeout_ms);
 

@@ -13,6 +13,7 @@
   <a href="docs/DLC-AND-UNLOCKS.md"><strong>DLC &amp; unlocks</strong></a> ·
   <a href="docs/UPDATES.md"><strong>Game updates</strong></a> ·
   <a href="docs/LINUX.md"><strong>Linux</strong></a> ·
+  <a href="docs/MACOS.md"><strong>macOS</strong></a> ·
   <a href="docs/TECHNICAL.md"><strong>How it works</strong></a>
 </p>
 
@@ -54,13 +55,14 @@ The game itself still comes from your files. This repository holds only the tran
 - **The game's own Online mode**, new and still being tested: Quickplay against WindowSmash's own game server.
 - **Your DLC fighters**, and a tool that unlocks the base-game roster on your own save.
 - **Any game version**, including 13.0.5 with Kazuya and Sora, and several versions side by side.
-- **An experimental Linux version**, built from the same source.
+- **An experimental Linux version**, built from the same source: `install-windowsmash.sh` sets it up on Linux in one go ([Linux](docs/LINUX.md)).
+- **An experimental macOS version** for Macs with Apple silicon, built from the same source: `Install WindowSmash.command` sets it up on the Mac in one go ([macOS](docs/MACOS.md)).
 
 ## What you need
 
 | | Requirement |
 | :--- | :--- |
-| **Computer** | A Windows 10 or Windows 11 PC, 64-bit. |
+| **Computer** | A Windows 10 or Windows 11 PC, 64-bit. Experimental: a Linux PC ([Linux](docs/LINUX.md)), or a Mac with Apple silicon and macOS 14.5 or newer ([macOS](docs/MACOS.md)). |
 | **Processor** | One with AVX2: an Intel Core i3, i5, i7 or i9 of the 4th generation (2013) or newer, or any AMD Ryzen. Most Pentium and Celeron processors don't have it. |
 | **Graphics** | Any graphics card or chip that supports DirectX 11, with an up-to-date driver. |
 | **Memory** | 16 GB recommended. |
@@ -102,7 +104,7 @@ Compare your PC with [what you need](#what-you-need) above. (**Settings → Syst
 | `D:\MyKeys` | `prod.keys` and `title.keys`, from your Switch. |
 | `D:\MyFirmware` | Your Switch's firmware: a few hundred `.nca` files. WindowSmash takes the game's fonts from them. |
 
-- **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. With an update file next to the game, the installer applies it for you. The game as first released (1.0.0) is the best base for an update.
+- **Any game version should work.** WindowSmash has been tested with **11.0.0** and **13.0.5**. With an update file next to the game, the installer applies it for you. The game as first released (1.0.0) is the best base for an update. Without its update, though, the original release doesn't work yet: WindowSmash can't read its data.
 - **Compressed files** (`.nsz`, `.xcz`) have to be turned back into `.nsp` or `.xci` first.
 - **Leave your game files where they are** after the install: depending on their kind, the game keeps reading its data from them.
 
@@ -153,6 +155,7 @@ Then:
 
 First it prepares your game files, which takes a few minutes: it decrypts the game if needed and applies your update (up to about 17 GB more space). Then it builds the game: your PC translates it into a Windows program, which takes **30 minutes to a few hours**.
 
+- A progress line shows how far the build has got and the time left. The time left appears once the first files are compiled, a few minutes in. The window's title shows it too, so you can follow it from the taskbar.
 - You can keep using the PC, though it will be slower. Set it not to sleep while plugged in (**Settings → System → Power**) until the build is done.
 - If the build stops (a restart, the PC going to sleep, an error you fixed), double-click `Install WindowSmash.bat` again: it carries on where it stopped.
 - It's finished when the window says **Done**. Press a key to close it.
@@ -244,7 +247,8 @@ Looking for people to play with? Ask on the [Discord server](https://discord.gg/
 | [DLC and unlocks](docs/DLC-AND-UNLOCKS.md) | use your DLC, or unlock every base-game fighter on your save. |
 | [Game updates](docs/UPDATES.md) | apply an update file, such as 13.0.5, as a version of its own. |
 | [Several versions](docs/VERSIONS.md) | keep more than one game version and choose one when you start. |
-| [Linux](docs/LINUX.md) | build and run the experimental Linux version. |
+| [Linux](docs/LINUX.md) | install, build and run the experimental Linux version. |
+| [macOS](docs/MACOS.md) | install, build and run the experimental version for Macs with Apple silicon. |
 | [Runtime packages](docs/RUNTIME-SETUP.md) | set up a ready-built runtime package with your own game data. |
 | [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
 | [Third-party notices](NOTICE.md) | see attributions and licenses. |
@@ -263,7 +267,8 @@ WindowSmash is **experimental**. Menus and matches run and Local Wireless connec
 | **Audio and movies** | Music (Opus) and movies (VP9) are decoded by libopus and libvpx, built from the sources that come with WindowSmash. |
 | **DLC** | The DLC fighters your version has: 11.0.0 has them up to Pyra/Mythra; Kazuya came with 12.0.0 and Sora with 13.0.0. |
 | **Multiplayer** | The online lobby (with direct connections) and private rooms work. Complete matches between two PCs, and the whole roster online, haven't been fully verified. |
-| **Linux** | Experimental, cross-compiled from the same source and drawn through DXVK on Vulkan. |
+| **Linux** | Experimental, built from the same source and drawn through DXVK on Vulkan: on Linux itself with `install-windowsmash.sh`, or cross-compiled on Windows. |
+| **macOS** | Experimental: Macs with Apple silicon and macOS 14.5 or newer, built on the Mac itself with `Install WindowSmash.command` and drawn by a Metal renderer of its own. **13.0.5** has been checked through its opening and menus at 60 fps; matches haven't been yet. |
 
 There is no connection to Nintendo's online service, no claim of general Switch compatibility, and no verified performance target.
 
@@ -321,7 +326,7 @@ The game-backed instruction and function tests are in the [technical guide](docs
 | :--- | :--- |
 | `launchers/` | The other launchers: offline play, private rooms, shader preparation, the unlock tool, building without the installer. |
 | `runtime/` | The native runtime: services, graphics, input, audio, networking. |
-| `tools/` | The recompiler, game-file readers and launch helpers; `tools/dev/` holds the developers' analysis and test tools, `tools/linux/` the Linux build. |
+| `tools/` | The recompiler, game-file readers and launch helpers; `tools/dev/` holds the developers' analysis and test tools, `tools/linux/` the Linux build, `tools/mac/` the macOS build, installer and launchers. |
 | `tests/` | Source-only tests. |
 | `third_party/` | The sources of libopus and libvpx's VP9 decoder, built during the build, with their license texts. |
 | `docs/` | These guides. |

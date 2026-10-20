@@ -4,14 +4,15 @@
 Usage: build_vkd3d.py [linux|windows]...   (default: linux)
 
 The parsers come from vkd3d's grammar files through bison and flex, generated once into
-build-vkd3d/gen (tools: SSBU_BISON / SSBU_FLEX, else linux-toolchain/winflexbison). The
-windows build is only for checking shaders on a Windows machine (tools/linux/hlsltest)."""
+build-vkd3d/gen (tools: SSBU_BISON / SSBU_FLEX, else the system's bison and flex on Linux,
+linux-toolchain/winflexbison on Windows). The windows build is only for checking shaders on a
+Windows machine (tools/linux/hlsltest)."""
 import glob
 import os
 import subprocess
 import sys
 
-from toolchain import CLANG, CFLAGS, LLVM, LLVM_AR, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each
+from toolchain import CLANG, CFLAGS, HOST_LINUX, LLVM, LLVM_AR, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each
 
 GEN = os.path.join(VKD3D_BUILD, "gen")
 SPIRV = (glob.glob(os.path.join(TOOLCHAIN, "src", "SPIRV-Headers-*", "include")) or [""])[0]
@@ -68,8 +69,8 @@ def sources():
 
 def generate():
     os.makedirs(GEN, exist_ok=True)
-    bison = os.environ.get("SSBU_BISON") or os.path.join(TOOLCHAIN, "winflexbison", "win_bison.exe")
-    flex = os.environ.get("SSBU_FLEX") or os.path.join(TOOLCHAIN, "winflexbison", "win_flex.exe")
+    bison = os.environ.get("SSBU_BISON") or ("bison" if HOST_LINUX else os.path.join(TOOLCHAIN, "winflexbison", "win_bison.exe"))
+    flex = os.environ.get("SSBU_FLEX") or ("flex" if HOST_LINUX else os.path.join(TOOLCHAIN, "winflexbison", "win_flex.exe"))
     src = os.path.join(VKD3D_SRC, "libs", "vkd3d-shader")
     for name in ("hlsl", "preproc"):
         if not os.path.exists(os.path.join(GEN, name + ".tab.c")):
@@ -127,5 +128,8 @@ def build(target):
 
 
 if __name__ == "__main__":
-    ok = all(build(t) for t in (sys.argv[1:] or ["linux"]))
+    targets = sys.argv[1:] or ["linux"]
+    if HOST_LINUX and targets != ["linux"]:
+        sys.exit("on Linux, only the linux build: the windows one needs Visual Studio's clang-cl")
+    ok = all(build(t) for t in targets)
     sys.exit(0 if ok else 1)

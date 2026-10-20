@@ -113,7 +113,7 @@ rumble = 60
 
 ## Window and display
 
-<kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> switches between a window and full screen at any time. The game draws its picture at 1920 × 1080 and fits it into the window, always at 16:9, with black bars when the window has another shape. Screenshots keep the full 1920 × 1080 picture.
+<kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> switches between a window and full screen at any time. The game draws its picture at 1920 × 1080 and fits it into the window, always at 16:9, with black bars when the window has another shape. `render_scale` (below) draws it bigger for a sharper picture on a bigger screen. Screenshots keep the whole picture at the size it was drawn.
 
 The first start also writes **`display.ini`**, which sets how the game starts:
 
@@ -124,8 +124,10 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 | `pacing` | `clock`: a steady 60 frames a second. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. `unlocked`: no limit at all, see below. | `clock` |
 | `latency` | How many frames the graphics card may work ahead, 1–3. Lower is more responsive. | `3` |
 | `hide_cursor` | `1` hides the mouse pointer after two seconds without movement. | `1` |
+| `gpu` | Which graphics card draws the game. `auto`: the fastest; on a laptop with two, the NVIDIA or AMD one rather than the processor's own. Or part of a card's name, such as `nvidia`, `radeon` or `intel`. `build\play.log` lists the cards found (a `[gfx] graphics cards` line). | `auto` |
+| `render_scale` | How many times bigger than 1920 × 1080 the game draws its picture, in each direction: a number from `0.5` to `4`, or `auto`. `auto` matches the picture to the screen when the game starts, for example 1.33 (2560 × 1440) on a 1440p monitor with `window = borderless`; it never goes below 1. A picture bigger than the window is shrunk to fit, which smooths edges (`2` on a 1440p monitor). Each step up costs the graphics card more: `2` draws four times the pixels and needs about 200 MB more graphics memory. | `1` |
 
-`controllers.ini` and `display.ini` apply to every game version started from the same folder.
+`controllers.ini` and `display.ini` apply to every game version started from the same folder. A `display.ini` written by an older version has no `gpu` or `render_scale` line; the game then uses `auto` and `1`. Add the line yourself to use it, or delete `display.ini` to get a new one with every setting. `render_scale` is read when the game starts: change it, then start the game again.
 
 > [!WARNING]
 > **This is the unlocked-frame-rate test build.** It always starts with the frame rate unlocked, whatever `pacing` says, to measure how fast the port can run. The game counts time in frames, so it plays faster than normal: at 240 frames a second, about four times as fast. <kbd>F7</kbd> switches to the `pacing` in `display.ini` (normal speed) and back. <kbd>F1</kbd> shows the frame rate. To start at normal speed, set `SSBU_PACING=clock` (or `vrr`, `display`) in the environment.
@@ -142,6 +144,7 @@ To prepare them all before playing, double-click **`launchers\Prepare Shaders.ba
 
 If matches run slowly on a PC that should manage them (press <kbd>F1</kbd> for the frame rate), check these first:
 
+- **A laptop is drawing with its processor's graphics.** With two graphics chips, the game takes the NVIDIA or AMD one by itself. Check the `[gfx] drawing with` line near the top of `build\play.log`, and see `gpu` in [`display.ini`](#window-and-display).
 - **Prepare Shaders is still running.** It uses most of the processor; let it finish, or close it while you play.
 - **NVIDIA's shader cache is off.** In NVIDIA Control Panel → *Manage 3D settings*, set **Shader Cache Size** to *Driver default* (not *Disabled*). Without it, the graphics driver redoes its part of every shader each time the game starts.
 - **Windows uses a slow system timer.** Some "gaming tweaks" set Windows to time everything with an old, slow timer (the HPET). WindowSmash notices and works around it, and says so near the top of `build\play.log`: a `[clock]` line ending in *slow*. Other programs stay slower, though; to undo the tweak, run `bcdedit /deletevalue useplatformclock` in a Command Prompt opened as administrator, then restart the PC.

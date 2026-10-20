@@ -32,5 +32,10 @@ void gfx_stream_wrote(u64 va, u64 bytes);
  * bytes 0: somewhere unknown). */
 void gfx_guest_wrote(u64 va, u64 bytes);
 void gfx_stream_end(void);   /* (after each submission) */
+/* Memory taken away (hle_nv.c, once the GPU thread's queued work has run): the GPU mapping of
+ * [va, va + size) changed or went, or guest memory [addr, addr + size) the GPU may read is
+ * about to be decommitted. What the back end made from it and keeps is dropped. */
+void gfx_gpu_unmapped(u64 va, u64 size);
+void gfx_guest_unmapped(u64 addr, u64 size);
 int gfx_draw_logging(void);   /* a frame's draws are being logged (debugging) */
 void *gfx_window_handle(void);   /* the game's window (an HWND), to own dialogs */

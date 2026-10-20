@@ -14,7 +14,14 @@
  * and their documentation when it does not exist.
  *
  * Linux: the program links SDL2 (SSBU_HAVE_SDL2), started by the window (linux/window.c), and
- * the input thread reads its game controllers the same way; there is no XInput. */
+ * the input thread reads its game controllers the same way; there is no XInput.
+ *
+ * macOS: the program links SDL3 (SDL3.framework, in the app's Frameworks). The window starts
+ * SDL's video on the main thread (macos/window.m); the input thread here starts its gamepads and
+ * makes every call to them, as on Windows - it must: SDL's IOKit pads hang on the run loop of the
+ * thread that started them, which only that thread runs (in SDL_UpdateGamepads). The pads of
+ * GameController.framework (Xbox and MFi pads over Bluetooth) come and go through notifications
+ * on the main thread, whose event loop runs for good. No XInput either. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <math.h>
 #include <stdio.h>
@@ -480,6 +487,10 @@ SDL_FUNCS(SDL_DECLARE)
 static int sdl_start(void) {
     const char *backend = getenv("SSBU_PAD_BACKEND");
     if (backend && !_stricmp(backend, "xinput")) return 0;
+#ifdef __APPLE__
+#define SDL_LINK(f) p_##f = f;   /* (linked: the app's own SDL3.framework) */
+    SDL_FUNCS(SDL_LINK)
+#else
     wchar_t path[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
     while (n && path[n - 1] != L'\\') n--;
@@ -491,6 +502,7 @@ static int sdl_start(void) {
 #define SDL_LOAD(f) if (!(p_##f = (__typeof__(f) *)(void *)GetProcAddress(m, #f)) && !missing) missing = #f;
     SDL_FUNCS(SDL_LOAD)
     if (missing) { fprintf(stderr, "[input] SDL3.dll has no %s: XInput pads only\n", missing); return 0; }
+#endif
     p_SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     p_SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* we decide (background = ...) */
     p_SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "auto");       /* PlayStation pads change mode only for rumble */

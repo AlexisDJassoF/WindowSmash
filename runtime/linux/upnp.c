@@ -5,8 +5,11 @@
  * removed again at exit. */
 #define _GNU_SOURCE 1
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +20,20 @@
 
 typedef unsigned short u16;
 
+#ifdef __APPLE__
+/* macOS refuses the local network (EHOSTUNREACH, or EPERM) until the user lets the game reach it,
+ * as for net_relay.c's packets: the first refusal is told, with where. */
+static void refused(const char *where, int err) {
+    static int told;
+    if ((err == EHOSTUNREACH || err == EPERM) && !__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[net] UPnP: macOS keeps the game off your local network (%s: %s): allow WindowSmash in System Settings > "
+                        "Privacy & Security > Local Network\n", where, strerror(err));
+}
+#define REFUSED(where) refused(where, errno)
+#else
+#define REFUSED(where) ((void)0)
+#endif
+
 static char control_host[128], control_path[512], service[128];
 static u16 control_port, mapped_port;
 
@@ -24,6 +41,29 @@ static void timeouts(int s, int ms) {
     struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+/* connect(), for at most ms: a router that does not answer otherwise holds it for TCP's own
+ * timeout (macOS does not apply SO_SNDTIMEO to it: 75 s), and the mapping's removal at exit with
+ * it. 0 connected; else -1, errno saying why. */
+static int connect_within(int s, const struct sockaddr *to, socklen_t len, int ms) {
+    int flags = fcntl(s, F_GETFL);
+    if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK)) return connect(s, to, len);
+    int r = connect(s, to, len);
+    if (r && errno == EINPROGRESS) {
+        struct pollfd p = {s, POLLOUT, 0};
+        while ((r = poll(&p, 1, ms)) < 0 && errno == EINTR) {}
+        int err = 0;
+        socklen_t n = sizeof err;
+        if (!r) err = ETIMEDOUT;
+        else if (r > 0 && getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &n)) err = errno;
+        r = err || r < 0 ? -1 : 0;
+        if (err) errno = err;
+    }
+    int saved = errno;
+    fcntl(s, F_SETFL, flags);   /* (blocking again for send and recv, which keep to SO_SNDTIMEO and SO_RCVTIMEO) */
+    errno = saved;
+    return r;
 }
 
 /* "http://host[:port]/path" */
@@ -51,12 +91,12 @@ static int http(const char *host, u16 port, const char *request, char *out, size
     int s = socket(AF_INET, SOCK_STREAM, 0), status = 0;
     if (s >= 0) {
         timeouts(s, 3000);
-        if (!connect(s, res->ai_addr, res->ai_addrlen) && send(s, request, strlen(request), MSG_NOSIGNAL) == (ssize_t)strlen(request)) {
+        if (!connect_within(s, res->ai_addr, res->ai_addrlen, 3000) && send(s, request, strlen(request), MSG_NOSIGNAL) == (ssize_t)strlen(request)) {
             size_t n = 0;
             for (ssize_t r; n + 1 < cap && (r = recv(s, out + n, cap - 1 - n, 0)) > 0;) n += (size_t)r;
             out[n] = 0;
             sscanf(out, "HTTP/%*s %d", &status);
-        }
+        } else REFUSED(host);
         close(s);
     }
     freeaddrinfo(res);
@@ -108,7 +148,7 @@ static int discover(void) {
     for (unsigned i = 0; i < 3; i++) {
         char m[256];
         snprintf(m, sizeof m, "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nST: %s\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n\r\n", targets[i]);
-        sendto(s, m, strlen(m), 0, (struct sockaddr *)&to, sizeof to);
+        if (sendto(s, m, strlen(m), 0, (struct sockaddr *)&to, sizeof to) < 0) REFUSED("239.255.255.250");
     }
     char location[512] = "";
     for (int tries = 0; tries < 8 && !location[0]; tries++) {
@@ -166,12 +206,12 @@ int rt_upnp_add(u16 port, const char *lan_ip, const char *what, char *public_ip,
              "<NewPortMappingDescription>%s</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration>",
              port, port, lan_ip, what);
     if (soap("AddPortMapping", args, reply, sizeof reply) != 200) return 3;
-    mapped_port = port;
+    __atomic_store_n(&mapped_port, port, __ATOMIC_RELEASE);
     if (soap("GetExternalIPAddress", "", reply, sizeof reply) == 200) element(reply, "NewExternalIPAddress", public_ip, n);
     return 1;
 }
 
-void rt_upnp_remove(void) {
-    if (mapped_port) delete_mapping(mapped_port);
-    mapped_port = 0;
+void rt_upnp_remove(void) {   /* (once: the window's quit and svcExitProcess may both come here) */
+    u16 port = __atomic_exchange_n(&mapped_port, 0, __ATOMIC_ACQ_REL);
+    if (port) delete_mapping(port);
 }

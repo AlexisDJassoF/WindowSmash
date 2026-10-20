@@ -24,6 +24,7 @@
 
 #include "host.h"
 #include "gpu.h"
+#include "gpu_backend.h"   /* (gfx_gpu_unmapped, gfx_guest_unmapped) */
 
 enum { NV_OK = 0, NV_NOT_SUPPORTED = 2, NV_BAD_PARAMETER = 4, NV_TIMEOUT = 5, NV_CONFIG_NOT_FOUND = 0x30006 };
 enum { DEV_NONE, DEV_CTRL, DEV_CTRL_GPU, DEV_AS, DEV_NVMAP, DEV_CHANNEL, DEV_HOST1X };
@@ -38,7 +39,7 @@ static struct { int kind; u32 syncpoint, cls; } files[256];
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static volatile LONG lock_made;
-DWORD nv_lock_owner(void) { return lock_made ? (DWORD)(uintptr_t)lock.OwningThread : 0; }   /* (freeze reports) */
+DWORD nv_lock_owner(void) { return __atomic_load_n(&lock_made, __ATOMIC_ACQUIRE) ? (DWORD)(uintptr_t)lock.OwningThread : 0; }   /* (freeze reports) */
 
 /* ---- shared GPU state ------------------------------------------------------------ */
 NvMap gpu_maps[NVMAP_MAX];
@@ -57,17 +58,26 @@ static u64 next_va = 0x100000000ull;   /* bump allocator for VA requests without
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     (void)o; (void)p; (void)ctx;
     InitializeCriticalSection(&lock);
-    lock_made = 1;
+    __atomic_store_n(&lock_made, 1, __ATOMIC_RELEASE);
     return TRUE;
 }
 
 /* Does guest memory [addr, addr + size) hold any nvmap allocation - memory the GPU (thread) may
- * read? (The kernel asks before decommitting: the game frees ordinary heap pages mid-match too.) */
-int gpu_memory_overlaps(u64 addr, u64 size) {
+ * read? (The game frees ordinary heap pages mid-match too.) */
+static int gpu_memory_overlaps(u64 addr, u64 size) {
     u32 n = next_handle < NVMAP_MAX ? next_handle : NVMAP_MAX;
     for (u32 h = 1; h < n; h++)
         if (gpu_maps[h].addr && gpu_maps[h].size && gpu_maps[h].addr < addr + size && addr < gpu_maps[h].addr + gpu_maps[h].size) return 1;
     return 0;
+}
+
+/* The kernel is about to decommit guest memory [addr, addr + size). If the GPU may read it,
+ * queued GPU work runs first, and the renderer lets go of what it made from it: nothing may
+ * read that memory once it is gone (the graphics driver crashed doing so). */
+void gpu_memory_unmapping(u64 addr, u64 size) {
+    if (!gpu_memory_overlaps(addr, size)) return;
+    gpu_queue_drain();
+    gfx_guest_unmapped(addr, size);
 }
 
 u64 gpu_va_to_guest(u64 va) {   /* 0 when unmapped */
@@ -78,7 +88,13 @@ u64 gpu_va_to_guest(u64 va) {   /* 0 when unmapped */
     return g ? g + (va & ((1u << PAGE_BITS) - 1)) : 0;
 }
 
-static void set_pages(u64 va, u64 size, u64 guest) {   /* guest 0: unmap */
+u64 gpu_stat_drains;   /* (the GPU thread's queue drained for an unmapping) */
+
+/* Point the pages of [va, va + size) at guest memory from `guest` on (0: unmap them). Where a
+ * page mapped other memory before, queued GPU work runs first (it may still read the old), and
+ * the renderer then lets go of what it made from the old mapping. */
+static void set_pages(u64 va, u64 size, u64 guest) {
+    u64 lo = 0, hi = 0;   /* (the pages that mapped other memory) */
     for (u64 off = 0; off < size; off += 1u << PAGE_BITS) {
         u64 page = (va + off) >> PAGE_BITS;
         if (page >> LEAF_BITS >= TOP_COUNT) break;
@@ -87,23 +103,38 @@ static void set_pages(u64 va, u64 size, u64 guest) {   /* guest 0: unmap */
             if (!guest) continue;
             *leaf = calloc(1u << LEAF_BITS, sizeof **leaf);
         }
-        (*leaf)[page & ((1u << LEAF_BITS) - 1)] = guest ? guest + off : 0;
+        u64 *entry = &(*leaf)[page & ((1u << LEAF_BITS) - 1)], now = guest ? guest + off : 0;
+        if (*entry && *entry != now) {
+            if (!hi && gpu_threaded()) { gpu_queue_drain(); gpu_stat_drains++; }
+            if (!hi) lo = va + off;
+            hi = va + off + (1u << PAGE_BITS);
+        }
+        *entry = now;
     }
+    if (hi) gfx_gpu_unmapped(lo, hi - lo);
 }
-
-u64 gpu_stat_drains;   /* (the GPU thread's queue drained for an unmapping) */
 
 static void unmap_range(u64 va) {
     for (u32 i = 0; i < map_count; i++)
         if (map_sizes[i].va == va) {
-            if (gpu_threaded()) { gpu_queue_drain(); gpu_stat_drains++; }   /* (queued work may still read it) */
             set_pages(va, map_sizes[i].size, 0);
             map_sizes[i] = map_sizes[--map_count];
             return;
         }
 }
 
+/* Is [va, va + size) one mapping of guest memory from `guest` on already? */
+static int mapped_as(u64 va, u64 size, u64 guest) {
+    u32 i = 0;
+    while (i < map_count && map_sizes[i].va != va) i++;
+    if (i == map_count || map_sizes[i].size != size) return 0;
+    for (u64 off = 0; off < size; off += 1u << PAGE_BITS)
+        if (gpu_va_to_guest(va + off) != guest + off) return 0;
+    return 1;
+}
+
 static void map_range(u64 va, u64 size, u64 guest) {
+    if (mapped_as(va, size, guest)) return;   /* (the same again: what the renderer made of it stays) */
     unmap_range(va);
     if (map_count == map_cap) map_sizes = realloc(map_sizes, sizeof *map_sizes * (map_cap = map_cap * 2 + 1024));
     map_sizes[map_count].va = va;

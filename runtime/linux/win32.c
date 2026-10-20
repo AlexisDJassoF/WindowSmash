@@ -10,14 +10,22 @@
  * to each protected page itself, with no signal, and a scan reports (and re-protects) the
  * written ones. Older kernels get a fallback that protects pages with mprotect and takes the
  * first write as a SIGSEGV (rt_ww_fault, from the fault handler); system calls cannot write
- * such pages, so I/O into guest memory goes through rt_ww_prepare_write first. */
+ * such pages, so I/O into guest memory goes through rt_ww_prepare_write first.
+ *
+ * macOS builds this file too. There the memory functions and the write watch (16 KiB pages,
+ * protection only) are runtime/macos/memory.c's and the fibers runtime/macos/fiber.c's; what
+ * stays here differs in small ways (__APPLE__): condition variables wait on an address
+ * (runtime/macos/platform.c), thread ids are Mach thread ports, priorities are QoS classes,
+ * and the clock is mach_absolute_time. */
 #define _GNU_SOURCE 1
 #include <dirent.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#ifndef __APPLE__
 #include <linux/futex.h>
 #include <linux/userfaultfd.h>
+#endif
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
@@ -28,6 +36,12 @@
 #include <sys/syscall.h>
 #include <sched.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#include <mach-o/ldsyms.h>
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
+#endif
 
 #include <windows.h>
 
@@ -58,8 +72,10 @@ DWORD rt_win32_error(int err) {
 static BOOL fail_errno(void) { last_error = rt_win32_error(errno); return FALSE; }
 
 /* ---- locks and condition variables ------------------------------------------------------- */
+#ifndef __APPLE__
 _Static_assert(offsetof(CRITICAL_SECTION, OwningThread) == offsetof(pthread_mutex_t, __data.__owner) && sizeof(CRITICAL_SECTION) == sizeof(pthread_mutex_t),
                "CRITICAL_SECTION's OwningThread is glibc's mutex owner");
+#endif
 
 void InitializeCriticalSection(CRITICAL_SECTION *cs) {
     pthread_mutexattr_t a;
@@ -67,8 +83,41 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs) {
     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&cs->m, &a);
     pthread_mutexattr_destroy(&a);
+#ifdef __APPLE__
+    cs->OwningThread = 0;
+    cs->depth = 0;
+#endif
 }
 
+#ifdef __APPLE__
+/* (runtime/macos/platform.c: os_sync_wait_on_address, or __ulock_wait2 before macOS 14.4) */
+int rt_futex_wait(volatile int *addr, int value, DWORD ms);
+void rt_futex_wake(volatile int *addr, int all);
+
+void WakeConditionVariable(CONDITION_VARIABLE *cv) {
+    __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
+    rt_futex_wake(&cv->seq, 0);
+}
+
+void WakeAllConditionVariable(CONDITION_VARIABLE *cv) {
+    __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
+    rt_futex_wake(&cv->seq, 1);
+}
+
+/* Wait for the sequence number to move on from `seq`: 1 woken (or spuriously), 0 timed out. */
+static int cv_wait(CONDITION_VARIABLE *cv, int seq, DWORD ms) { return rt_futex_wait(&cv->seq, seq, ms); }
+
+/* (through Leave and Enter, which keep OwningThread and the recursion depth right: another
+ * thread holds it while this one waits) */
+BOOL SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms) {
+    int seq = __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST);
+    LeaveCriticalSection(cs);
+    int woken = cv_wait(cv, seq, ms);
+    EnterCriticalSection(cs);
+    if (!woken) { last_error = WAIT_TIMEOUT; return FALSE; }
+    return TRUE;
+}
+#else
 static long futex(volatile int *addr, int op, int val, const struct timespec *timeout) {
     return syscall(SYS_futex, addr, op, val, timeout, NULL, 0);
 }
@@ -99,6 +148,7 @@ BOOL SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWOR
     if (!woken) { last_error = WAIT_TIMEOUT; return FALSE; }
     return TRUE;
 }
+#endif
 
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags) {
     int seq = __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST);
@@ -149,7 +199,7 @@ typedef struct Obj {
     pthread_cond_t cv;
     int signaled, manual;          /* events; threads: signaled once finished */
     pthread_t thread;
-    volatile pid_t tid;
+    volatile RtTid tid;
     LPTHREAD_START_ROUTINE fn;
     void *param;
     int fd;                        /* files */
@@ -172,7 +222,9 @@ static Obj *new_obj(int type) {
     pthread_mutex_init(&o->m, NULL);
     pthread_condattr_t a;
     pthread_condattr_init(&a);
+#ifndef __APPLE__   /* (macOS: no choice of clock - its waits are relative, see WaitForSingleObject) */
     pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
     pthread_cond_init(&o->cv, &a);
     pthread_condattr_destroy(&a);
     return o;
@@ -208,6 +260,15 @@ BOOL CloseHandle(HANDLE h) {
     return TRUE;
 }
 
+#ifdef __APPLE__
+/* (runtime/macos/platform.c: mach_absolute_time in nanoseconds, and a timer the system does
+ * not put off) */
+u64 rt_uptime_ns(void);
+u64 rt_uptime_hz(void);
+void rt_sleep_until_ns(u64 t);
+static u64 monotonic_ns(void) { return rt_uptime_ns(); }
+static void sleep_until_ns(u64 t) { rt_sleep_until_ns(t); }
+#else
 static u64 monotonic_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -218,6 +279,7 @@ static void sleep_until_ns(u64 t) {
     struct timespec ts = {(time_t)(t / 1000000000ull), (long)(t % 1000000000ull)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 }
+#endif
 
 /* A timer: sleeps until it is due (then disarms it) or ms have passed. */
 static DWORD wait_timer(Obj *o, DWORD ms) {
@@ -243,6 +305,19 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
     Obj *o = obj_of(h, 0);
     if (o && o->type == H_TIMER) return wait_timer(o, ms);
     if (!o || (o->type != H_THREAD && o->type != H_EVENT)) { last_error = ERROR_INVALID_HANDLE; return WAIT_FAILED; }
+#ifdef __APPLE__   /* (the time left, each time round: a relative wait) */
+    u64 until = ms == INFINITE ? 0 : monotonic_ns() + (u64)ms * 1000000ull;
+    pthread_mutex_lock(&o->m);
+    while (!o->signaled) {
+        if (ms == 0) break;
+        if (ms == INFINITE) { pthread_cond_wait(&o->cv, &o->m); continue; }
+        u64 now = monotonic_ns(), ns = until - now;
+        if (now >= until) break;
+        if (ns > 1000000) ns /= 2;   /* (a timed wait may run late by a share of its length: half the rest at a time) */
+        struct timespec left = {(time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull)};
+        pthread_cond_timedwait_relative_np(&o->cv, &o->m, &left);
+    }
+#else
     struct timespec until;
     if (ms != INFINITE) {
         clock_gettime(CLOCK_MONOTONIC, &until);
@@ -256,6 +331,7 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
         if (ms == INFINITE) pthread_cond_wait(&o->cv, &o->m);
         else if (pthread_cond_timedwait(&o->cv, &o->m, &until) == ETIMEDOUT) break;
     }
+#endif
     int got = o->signaled;
     if (got && o->type == H_EVENT && !o->manual) o->signaled = 0;
     pthread_mutex_unlock(&o->m);
@@ -316,15 +392,21 @@ BOOL ResetEvent(HANDLE h) {
 /* ---- threads ------------------------------------------------------------------------------ */
 /* Full thread descriptions by thread id: the profiler's and backtraces' names. */
 #define DESCS 1024
-static struct { volatile pid_t tid; char text[112]; } descs[DESCS];
+static struct { volatile RtTid tid; char text[112]; } descs[DESCS];
 static pthread_mutex_t descs_lock = PTHREAD_MUTEX_INITIALIZER;
 
-const char *rt_thread_description(pid_t tid) {
+#ifdef __APPLE__
+static RtTid self_tid(void) { return pthread_mach_thread_np(pthread_self()); }   /* (no system call, no thread-local) */
+#else
+static RtTid self_tid(void) { return gettid(); }
+#endif
+
+const char *rt_thread_description(RtTid tid) {
     for (u32 i = 0; i < DESCS; i++) if (descs[i].tid == tid) return descs[i].text;
     return "";
 }
 
-static void set_description(pid_t tid, const char *text) {
+static void set_description(RtTid tid, const char *text) {
     pthread_mutex_lock(&descs_lock);
     int slot = -1;
     for (u32 i = 0; i < DESCS && slot < 0; i++) if (descs[i].tid == tid) slot = (int)i;
@@ -336,13 +418,13 @@ static void set_description(pid_t tid, const char *text) {
     pthread_mutex_unlock(&descs_lock);
 }
 
-static void forget_description(pid_t tid) {
+static void forget_description(RtTid tid) {
     pthread_mutex_lock(&descs_lock);
     for (u32 i = 0; i < DESCS; i++) if (descs[i].tid == tid) descs[i].tid = 0;
     pthread_mutex_unlock(&descs_lock);
 }
 
-DWORD GetCurrentThreadId(void) { return (DWORD)gettid(); }
+DWORD GetCurrentThreadId(void) { return (DWORD)self_tid(); }
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void) { return PSEUDO_THREAD; }
 HANDLE GetCurrentProcess(void) { return PSEUDO_PROCESS; }
@@ -358,7 +440,7 @@ void rt_thread_signal_stack(void) {
 
 static void *thread_start(void *arg) {
     Obj *o = arg;
-    o->tid = gettid();
+    o->tid = self_tid();
     rt_thread_signal_stack();
     DWORD code = o->fn(o->param);
     (void)code;
@@ -380,6 +462,12 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
     if (!stack) stack = 8u << 20;
     stack = (stack + 0xFFFF) & ~(SIZE_T)0xFFFF;
     pthread_attr_setstacksize(&a, stack);
+#ifdef __APPLE__
+    /* The game's threads (the guest's, the renderer, audio, input) keep pace with frames: on
+     * Apple silicon a thread's class decides between the performance and efficiency cores.
+     * Those that may wait lower themselves (SetThreadPriority). */
+    pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     int err = pthread_create(&o->thread, &a, thread_start, o);
     pthread_attr_destroy(&a);
     if (err) { o->refs = 1; obj_release(o); last_error = rt_win32_error(err); return NULL; }
@@ -398,7 +486,7 @@ DWORD GetThreadId(HANDLE thread) {
     return o ? (DWORD)o->tid : 0;
 }
 
-pid_t rt_thread_tid(HANDLE thread) { return (pid_t)GetThreadId(thread); }
+RtTid rt_thread_tid(HANDLE thread) { return (RtTid)GetThreadId(thread); }
 pthread_t rt_thread_pthread(HANDLE thread) {
     if (thread == PSEUDO_THREAD) return pthread_self();
     Obj *o = obj_of(thread, H_THREAD);
@@ -410,7 +498,7 @@ BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process, HANDLE 
     if (src == PSEUDO_THREAD) {   /* a real handle for the calling thread */
         Obj *o = new_obj(H_THREAD);
         o->thread = pthread_self();
-        o->tid = gettid();
+        o->tid = self_tid();
         *dst = o;
         return TRUE;
     }
@@ -421,12 +509,42 @@ BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process, HANDLE 
     return TRUE;
 }
 
+#ifdef __APPLE__
+/* (macOS names, and sets the class of, only the calling thread - every caller's own) */
+static int is_self(HANDLE thread) {
+    pthread_t t = rt_thread_pthread(thread);
+    return t && pthread_equal(t, pthread_self());
+}
+
 HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
     char text[112];
     size_t n = 0;
     for (; description[n] && n + 1 < sizeof text; n++) text[n] = description[n] < 128 ? (char)description[n] : '?';
     text[n] = 0;
-    pid_t tid = thread == PSEUDO_THREAD ? gettid() : rt_thread_tid(thread);
+    RtTid tid = rt_thread_tid(thread);
+    if (!tid) return E_INVALIDARG;
+    set_description(tid, text);
+    if (is_self(thread)) {
+        char name[64];
+        snprintf(name, sizeof name, "%s", text);
+        pthread_setname_np(name);
+    }
+    return S_OK;
+}
+
+BOOL SetThreadPriority(HANDLE thread, int priority) {
+    if (!is_self(thread)) { last_error = ERROR_INVALID_PARAMETER; return FALSE; }
+    qos_class_t qos = priority <= THREAD_PRIORITY_LOWEST ? QOS_CLASS_UTILITY
+                      : priority == THREAD_PRIORITY_BELOW_NORMAL ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE;
+    return pthread_set_qos_class_self_np(qos, 0) == 0;   /* (never setpriority: its "process" would be a thread's port) */
+}
+#else
+HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
+    char text[112];
+    size_t n = 0;
+    for (; description[n] && n + 1 < sizeof text; n++) text[n] = description[n] < 128 ? (char)description[n] : '?';
+    text[n] = 0;
+    RtTid tid = thread == PSEUDO_THREAD ? self_tid() : rt_thread_tid(thread);
     if (!tid) return E_INVALIDARG;
     set_description(tid, text);
     char shortname[16];
@@ -436,23 +554,29 @@ HRESULT SetThreadDescription(HANDLE thread, PCWSTR description) {
 }
 
 BOOL SetThreadPriority(HANDLE thread, int priority) {
-    pid_t tid = thread == PSEUDO_THREAD ? gettid() : rt_thread_tid(thread);
+    RtTid tid = thread == PSEUDO_THREAD ? self_tid() : rt_thread_tid(thread);
     if (!tid) return FALSE;
     int nice = priority <= THREAD_PRIORITY_LOWEST ? 5 : priority == THREAD_PRIORITY_BELOW_NORMAL ? 2 : 0;
     setpriority(PRIO_PROCESS, (id_t)tid, nice);   /* (raising priority needs privileges: left as it is) */
     return TRUE;
 }
+#endif
 
 BOOL SetThreadStackGuarantee(PULONG size) { (void)size; return TRUE; }
 BOOL SwitchToThread(void) { sched_yield(); return TRUE; }
 
 void Sleep(DWORD ms) {
     if (!ms) { sched_yield(); return; }
+#ifdef __APPLE__   /* (on a critical timer, as waitable timers: runtime/macos/platform.c) */
+    sleep_until_ns(monotonic_ns() + (u64)ms * 1000000ull);
+#else
     struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L};
     while (nanosleep(&t, &t) == -1 && errno == EINTR) {}
+#endif
 }
 
 /* ---- fibers ------------------------------------------------------------------------------- */
+#ifndef __APPLE__   /* (macOS: runtime/macos/fiber.c and fiber_arm64.S) */
 typedef struct Fiber {
     void *sp;              /* the stack pointer it stopped at (while not running) */
     void *param;           /* GetFiberData */
@@ -567,8 +691,23 @@ void DeleteFiber(LPVOID fiber) {
 BOOL IsThreadAFiber(void) { return current_fiber != NULL; }
 PVOID GetFiberData(void) { return current_fiber ? current_fiber->param : NULL; }
 PVOID GetCurrentFiber(void) { return current_fiber; }
+#endif
 
 /* ---- time --------------------------------------------------------------------------------- */
+#ifdef __APPLE__
+/* The processor's counter itself (mach_absolute_time, 24 MHz on Apple silicon, a few ns a read),
+ * or its nanoseconds where its rate is not a whole number of ticks a second. */
+BOOL QueryPerformanceCounter(LARGE_INTEGER *t) {
+    t->QuadPart = (LONGLONG)(rt_uptime_hz() ? mach_absolute_time() : rt_uptime_ns());
+    return TRUE;
+}
+BOOL QueryPerformanceFrequency(LARGE_INTEGER *f) {
+    u64 hz = rt_uptime_hz();
+    f->QuadPart = (LONGLONG)(hz ? hz : 1000000000ull);
+    return TRUE;
+}
+ULONGLONG GetTickCount64(void) { return rt_uptime_ns() / 1000000; }
+#else
 BOOL QueryPerformanceCounter(LARGE_INTEGER *t) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -581,6 +720,7 @@ ULONGLONG GetTickCount64(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ULONGLONG)ts.tv_sec * 1000 + (ULONGLONG)ts.tv_nsec / 1000000;
 }
+#endif
 DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
 static void system_time(SYSTEMTIME *out, int local) {
@@ -618,6 +758,7 @@ void GetSystemTimeAsFileTime(FILETIME *t) {
 }
 
 /* ---- memory ------------------------------------------------------------------------------- */
+#ifndef __APPLE__   /* (macOS: runtime/macos/memory.c, with the write watch) */
 #define PAGE 4096ull
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct Reservation { u64 base, size; int watch; } Reservation;
@@ -745,6 +886,7 @@ SIZE_T VirtualQuery(LPCVOID address, MEMORY_BASIC_INFORMATION *info, SIZE_T leng
     info->Protect = PAGE_NOACCESS;
     return sizeof *info;
 }
+#endif
 
 void GetSystemInfo(SYSTEM_INFO *info) {
     memset(info, 0, sizeof *info);
@@ -757,6 +899,7 @@ void GetSystemInfo(SYSTEM_INFO *info) {
 }
 
 /* ---- the write watch ---------------------------------------------------------------------- */
+#ifndef __APPLE__
 #ifndef UFFD_USER_MODE_ONLY
 #define UFFD_USER_MODE_ONLY 1
 #endif
@@ -973,6 +1116,7 @@ UINT ResetWriteWatch(LPVOID base, SIZE_T size) {
     }
     return 0;
 }
+#endif
 
 /* ---- files -------------------------------------------------------------------------------- */
 const char *rt_unix_path(const char *path, char *buf, size_t n) {
@@ -1003,21 +1147,64 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, void *security, DWORD
     }
     struct stat st;
     if (!fstat(fd, &st) && S_ISDIR(st.st_mode)) { close(fd); last_error = ERROR_ACCESS_DENIED; return INVALID_HANDLE_VALUE; }
+#ifdef __APPLE__
+    if (flags & FILE_FLAG_RANDOM_ACCESS) fcntl(fd, F_RDAHEAD, 0);   /* (no read-ahead: macOS's posix_fadvise) */
+#else
     if (flags & FILE_FLAG_RANDOM_ACCESS) posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
     Obj *o = new_obj(H_FILE);
     o->fd = fd;
     return o;
 }
 
-/* A read into memory the fallback write watch may have protected: retried once the pages are
- * opened (a system call writing a protected page fails with EFAULT rather than faulting). */
+#ifdef __APPLE__
+int rt_ww_storable(const void *p, size_t n);   /* (runtime/macos/memory.c) */
+
+/* The read through a host buffer, a megabyte at a time, copied into buf by stores: a store to a
+ * protected page faults, and the fault handler lets it through (rt_ww_fault), however often the
+ * renderer protects the pages again meanwhile. (Opening them first only spares those faults.) */
+static ssize_t read_bounced(int fd, void *buf, size_t n, off_t offset, int positional) {
+    size_t cap = n < (1u << 20) ? n : (1u << 20), done = 0;
+    u8 *tmp = malloc(cap);
+    if (!tmp) { errno = ENOMEM; return -1; }
+    while (done < n) {
+        size_t want = n - done < cap ? n - done : cap;
+        ssize_t r = positional ? pread(fd, tmp, want, offset + (off_t)done) : read(fd, tmp, want);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && !done) { int err = errno; free(tmp); errno = err; return -1; }
+        if (r <= 0) break;
+        rt_ww_prepare_write((u8 *)buf + done, (size_t)r);
+        memcpy((u8 *)buf + done, tmp, (size_t)r);
+        done += (size_t)r;
+        if ((size_t)r < want) break;   /* (the end of the file) */
+    }
+    free(tmp);
+    return (ssize_t)done;
+}
+#endif
+
+/* A read into memory the protecting write watch may have protected: a system call writing a
+ * protected page fails with EFAULT rather than faulting. On Linux the pages are opened and the
+ * read tried again. On macOS that is not enough: the renderer may protect them again before the
+ * call reaches them (a reset of anything sharing their 16 KiB pages), and the call then fails
+ * having filled the pages before (read() moving the file offset on by those) - so the read goes
+ * back to where it started and through a host buffer. */
 static ssize_t read_some(int fd, void *buf, size_t n, off_t offset, int positional) {
+#ifdef __APPLE__   /* (macOS: always the protecting watch) */
+    off_t start = positional ? offset : lseek(fd, 0, SEEK_CUR);
+    ssize_t r = positional ? pread(fd, buf, n, offset) : read(fd, buf, n);
+    if (r >= 0 || errno != EFAULT) return r;
+    if (!positional && start >= 0) lseek(fd, start, SEEK_SET);
+    if (!rt_ww_storable(buf, n)) { errno = EFAULT; return -1; }   /* (memory no store can go to: not the watch's doing) */
+    return read_bounced(fd, buf, n, offset, positional);
+#else
     ssize_t r = positional ? pread(fd, buf, n, offset) : read(fd, buf, n);
     if (r < 0 && errno == EFAULT && ww_mode == WW_PROTECT) {
         rt_ww_prepare_write(buf, n);
         r = positional ? pread(fd, buf, n, offset) : read(fd, buf, n);
     }
     return r;
+#endif
 }
 
 BOOL ReadFile(HANDLE h, LPVOID buffer, DWORD size, LPDWORD read_count, LPOVERLAPPED overlapped) {
@@ -1082,6 +1269,12 @@ BOOL FlushFileBuffers(HANDLE h) {
     Obj *o = obj_of(h, H_FILE);
     return o && !fsync(o->fd) ? TRUE : fail_errno();
 }
+
+#ifdef __APPLE__   /* (stat's times by their Darwin names; macOS keeps a real creation time) */
+#define st_atim st_atimespec
+#define st_mtim st_mtimespec
+#define st_ctim st_birthtimespec
+#endif
 
 /* (Linux keeps no creation time: the change time stands in for it) */
 BOOL GetFileTime(HANDLE h, FILETIME *created, FILETIME *accessed, FILETIME *written) {
@@ -1151,7 +1344,12 @@ static BOOL find_next(Obj *o, WIN32_FIND_DATAA *data) {
             data->dwFileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
             data->nFileSizeHigh = (DWORD)((u64)st.st_size >> 32);
             data->nFileSizeLow = (DWORD)st.st_size;
+#ifdef __APPLE__
+            data->ftCreationTime = filetime_of(st.st_ctim);   /* (the birth time: above) */
+            data->ftLastWriteTime = filetime_of(st.st_mtim);
+#else
             data->ftCreationTime = data->ftLastWriteTime = filetime_of(st.st_mtim);   /* (no birth time in stat) */
+#endif
             data->ftLastAccessTime = filetime_of(st.st_atim);
         } else data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
         return TRUE;
@@ -1183,7 +1381,12 @@ BOOL FindClose(HANDLE h) { return CloseHandle(h); }
 
 /* ---- the process -------------------------------------------------------------------------- */
 errno_t rand_s(unsigned int *value) {
+#ifdef __APPLE__
+    arc4random_buf(value, sizeof *value);
+    return 0;
+#else
     return getrandom(value, sizeof *value, 0) == (ssize_t)sizeof *value ? 0 : EIO;
+#endif
 }
 
 void ExitProcess(UINT code) {
@@ -1191,9 +1394,14 @@ void ExitProcess(UINT code) {
     _exit((int)code);
 }
 
+#ifdef __APPLE__   /* (the program's Mach-O header: where it is loaded) */
+HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
+HMODULE GetModuleHandleA(LPCSTR name) { return name ? NULL : (HMODULE)&_mh_execute_header; }
+#else
 extern char __executable_start[];
 HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : (HMODULE)__executable_start; }
 HMODULE GetModuleHandleA(LPCSTR name) { return name ? NULL : (HMODULE)__executable_start; }
+#endif
 
 USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash) {
     void *all[128];
@@ -1206,6 +1414,15 @@ USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash
 
 void OutputDebugStringA(LPCSTR text) { fputs(text, stderr); }
 
+#ifdef __APPLE__
+BOOL IsDebuggerPresent(void) {   /* (the kernel's flag that something traces the process) */
+    struct kinfo_proc info;
+    size_t size = sizeof info;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    memset(&info, 0, sizeof info);
+    return sysctl(mib, 4, &info, &size, NULL, 0) == 0 && (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+#else
 BOOL IsDebuggerPresent(void) {
     FILE *f = fopen("/proc/self/status", "r");
     char line[256];
@@ -1215,3 +1432,4 @@ BOOL IsDebuggerPresent(void) {
     if (f) fclose(f);
     return tracer != 0;
 }
+#endif

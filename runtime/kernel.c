@@ -17,7 +17,11 @@
 #include <stdlib.h>
 
 #include "host.h"
-#include "gpu.h"   /* (gpu_queue_drain) */
+#include "gpu.h"   /* (gpu_memory_unmapping) */
+
+#ifdef __APPLE__
+void rt_upnp_remove(void);   /* (linux/upnp.c: the netplay relay's port mapping, if it made one) */
+#endif
 
 enum { R_OK = 0, R_TIMEOUT = 0xEA01, R_CANCELLED = 0xEC01, R_INVALID_HANDLE = 0xE401, R_INVALID_STATE = 0xFA01,
        R_INVALID_ADDRESS = 0xCC01, R_INVALID_ENUM = 0xF001, R_OUT_OF_MEMORY = 0xD001 };
@@ -170,7 +174,7 @@ static void query_memory(u64 info, u64 addr) {
 }
 
 static void *commit(u64 at, u64 size, const char *what) {
-    void *p = VirtualAlloc((void *)at, size, MEM_COMMIT, PAGE_READWRITE);
+    void *p = VirtualAlloc(G2H(at), size, MEM_COMMIT, PAGE_READWRITE);
     if (!p) rt_fatal("kernel: cannot commit %llu KiB at %#llx for %s (error %lu)", size >> 10, at, what, (unsigned long)GetLastError());
     return p;
 }
@@ -198,8 +202,9 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 
 }
 
 #ifndef _WIN32
-/* Linux: a thread leaves from wherever it is by jumping back to its start (ExitThread would be
- * pthread_exit, which unwinds every guest frame on the way out). */
+/* Linux and macOS: a thread leaves from wherever it is by jumping back to its start (ExitThread
+ * would be pthread_exit, which unwinds every guest frame on the way out). (RT_SETJMP: recomp.h's,
+ * which on macOS leaves the signal mask alone - nothing changes it on a guest thread.) */
 static __thread jmp_buf *exit_point;
 #endif
 
@@ -210,7 +215,7 @@ static _Noreturn void exit_thread(KThread *t) {
     kwake_handle(t->handle);
     LeaveCriticalSection(&klock);
 #ifndef _WIN32
-    if (exit_point) longjmp(*exit_point, 1);
+    if (exit_point) RT_LONGJMP(*exit_point, 1);
 #endif
     ExitThread(0);
 }
@@ -229,7 +234,7 @@ static DWORD WINAPI thread_main(LPVOID param) {
 #ifndef _WIN32
     jmp_buf out;
     exit_point = &out;
-    if (setjmp(out)) return 0;
+    if (RT_SETJMP(out)) return 0;
 #endif
     rt_call(t->cpu, t->entry);
     exit_thread(t);
@@ -425,18 +430,22 @@ void rt_svc(Cpu *c, u32 n) {
     case 0x10: x[0] = 0; return;                         /* GetCurrentProcessorNumber */
     case 0x1E: x[0] = rt_ticks(); return;                /* GetSystemTick */
     case 0x27:                                           /* OutputDebugString(ptr, len) */
-        fprintf(stderr, "[guest] %.*s%s", (int)x[1], (const char *)x[0], x[1] && ((const char *)x[0])[x[1] - 1] == '\n' ? "" : "\n");
+        fprintf(stderr, "[guest] %.*s%s", (int)x[1], P(const char, x[0]), x[1] && P(const char, x[0])[x[1] - 1] == '\n' ? "" : "\n");
         x[0] = R_OK;
         return;
     case 0x26:                                           /* Break(reason, address, size) */
         if (x[2] == 4 && x[1])   /* the info is a failed result */
             rt_fatal("the guest aborted on result %#x (module %u, description %u)", ld32(x[1]), ld32(x[1]) & 0x1FF, (ld32(x[1]) >> 9) & 0x1FFF);
         rt_fatal("the guest called svcBreak (reason %#llx, info %#llx, size %#llx)", x[0], x[1], x[2]);
+#ifdef __APPLE__   /* (not exit(): atexit handlers and C++ destructors under the threads still running - Metal's, AppKit's - can crash on the way out) */
+    case 0x07: fprintf(stderr, "guest process exited\n"); rt_upnp_remove(); ExitProcess(0);
+#else
     case 0x07: fprintf(stderr, "guest process exited\n"); exit(0);
+#endif
     case 0x0A: exit_thread(me);
     case 0x1F: {   /* ConnectToNamedPort(name) -> session handle */
-        void *s = ipc_connect((const char *)x[1]);
-        if (!s) rt_fatal("svcConnectToNamedPort(\"%s\"): no such port here", (const char *)x[1]);
+        void *s = ipc_connect(P(const char, x[1]));
+        if (!s) rt_fatal("svcConnectToNamedPort(\"%s\"): no such port here", P(const char, x[1]));
         x[0] = R_OK; x[1] = kernel_new_session(s);
         return;
     }
@@ -467,7 +476,7 @@ void rt_svc(Cpu *c, u32 n) {
         while (i < 1024 && maps[i].size) i++;
         if (i == 1024) rt_fatal("kernel: too many memory mappings");
         commit(x[0], x[2], "a memory mapping");
-        memcpy((void *)x[0], (void *)x[1], x[2]);
+        memcpy(G2H(x[0]), G2H(x[1]), x[2]);
         maps[i].dst = x[0]; maps[i].src = x[1]; maps[i].size = x[2];
         kernel_add_region(x[0], x[2], GM_STACK, 3);
         x[0] = R_OK;
@@ -476,9 +485,9 @@ void rt_svc(Cpu *c, u32 n) {
     case 0x05: {   /* UnmapMemory(dst, src, size) */
         for (u32 i = 0; i < 1024; i++)
             if (maps[i].size && maps[i].dst == x[0]) {
-                memcpy((void *)maps[i].src, (void *)maps[i].dst, maps[i].size);
-                if (gpu_memory_overlaps(maps[i].dst, maps[i].size)) gpu_queue_drain();   /* (queued GPU work may read it) */
-                VirtualFree((void *)maps[i].dst, maps[i].size, MEM_DECOMMIT);
+                memcpy(G2H(maps[i].src), G2H(maps[i].dst), maps[i].size);
+                gpu_memory_unmapping(maps[i].dst, maps[i].size);   /* (queued GPU work and the renderer may read it) */
+                VirtualFree(G2H(maps[i].dst), maps[i].size, MEM_DECOMMIT);
                 remove_region(maps[i].dst);
                 maps[i].size = 0;
             }
@@ -578,8 +587,8 @@ void rt_svc(Cpu *c, u32 n) {
         x[0] = R_OK;
         break;
     case 0x2D:     /* UnmapPhysicalMemory(address, size) */
-        if (gpu_memory_overlaps(x[0], x[1])) gpu_queue_drain();   /* (queued GPU work may read it) */
-        VirtualFree((void *)x[0], x[1], MEM_DECOMMIT);
+        gpu_memory_unmapping(x[0], x[1]);   /* (queued GPU work and the renderer may read it) */
+        VirtualFree(G2H(x[0]), x[1], MEM_DECOMMIT);
         unmap_range(x[0], x[1]);
         x[0] = R_OK;
         break;
@@ -685,6 +694,6 @@ void kernel_init(void) {
         {KERNEL_BASE, 0x1000000, "thread-local", 0},
     };
     for (u32 i = 0; i < sizeof areas / sizeof *areas; i++)
-        if (VirtualAlloc((void *)areas[i].base, areas[i].size, MEM_RESERVE | areas[i].flags, PAGE_READWRITE) != (void *)areas[i].base)
+        if (VirtualAlloc(G2H(areas[i].base), areas[i].size, MEM_RESERVE | areas[i].flags, PAGE_READWRITE) != G2H(areas[i].base))
             rt_fatal("kernel: cannot reserve the %s area at %#llx", areas[i].what, areas[i].base);
 }

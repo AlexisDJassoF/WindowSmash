@@ -1,8 +1,9 @@
 /* Runtime contract for statically recompiled AArch64 code.
  *
- * Guest data addresses are host addresses (modules are mapped at their guest base), so
- * memory accesses are plain dereferences. Guest code addresses are only ever looked up
- * (rt_lookup) - recompiled functions are ordinary C functions taking the CPU context. */
+ * Guest data addresses are host addresses offset by RT_MEMBASE (modules are mapped at their
+ * guest base, that far up), so memory accesses are plain dereferences. Guest code addresses
+ * are only ever looked up (rt_lookup) - recompiled functions are ordinary C functions taking
+ * the CPU context. */
 #pragma once
 #ifdef _WIN32
 #include <excpt.h>
@@ -12,8 +13,8 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Linux builds compile the generated files that have exception landing sites as C++ (see
- * rt_eh_filter below); everything here keeps C linkage either way. */
+/* Linux and macOS builds compile the generated files that have exception landing sites as
+ * C++ (see rt_eh_filter below); everything here keeps C linkage either way. */
 #ifdef __cplusplus
 #define _Alignas(n) alignas(n)
 #define _Noreturn __attribute__((noreturn))
@@ -54,6 +55,17 @@ static inline GuestFn *rt_target(u64 guest_addr, RtCache *cache) {
     return (cache->key ^ RT_CACHE_MIX(fn)) == guest_addr ? fn : rt_lookup_cached(guest_addr, cache);
 }
 jmp_buf *rt_setjmp(Cpu *c);   /* a guest setjmp(X0): its host buffer, the guest registers saved */
+/* The host setjmp a guest setjmp becomes (tools/lift.py) and the longjmp back to it
+ * (hle_setjmp.c). macOS's pair saves and restores the signal mask, a system call each (a
+ * hundred times the cost, and every Lua pcall is a setjmp): _setjmp/_longjmp leave it be,
+ * as glibc's setjmp does. Always used as a pair. */
+#ifdef __APPLE__
+#define RT_SETJMP(env) _setjmp(env)
+#define RT_LONGJMP(env, value) _longjmp(env, value)
+#else
+#define RT_SETJMP(env) setjmp(env)
+#define RT_LONGJMP(env, value) longjmp(env, value)
+#endif
 /* C++ exceptions: a call that may unwind into landing pad `lp` of its function catches the
  * host exception rt_unwind_jumpto raises for that pad and this frame's stack pointer. */
 #ifdef _WIN32
@@ -63,9 +75,10 @@ int rt_eh_filter(struct _EXCEPTION_POINTERS *e, u64 sp, u64 lp);
 #define GetExceptionInformation() ((struct _EXCEPTION_POINTERS *)_exception_info())
 #endif
 #else
-/* Linux has no structured exception handling in C: the landing sites' __try / __except become
- * a C++ try and a catch of the exception rt_unwind_jumpto throws (runtime/linux/eh.cpp), which
- * goes on unwinding unless the filter matches this frame - the same test, the same result. */
+/* Linux and macOS have no structured exception handling in C: the landing sites' __try /
+ * __except become a C++ try and a catch of the exception rt_unwind_jumpto throws
+ * (runtime/linux/eh.cpp), which goes on unwinding unless the filter matches this frame - the
+ * same test, the same result. */
 typedef struct RtEhSignal { u64 lp, sp; } RtEhSignal;
 int rt_eh_filter(const RtEhSignal *e, u64 sp, u64 lp);
 #ifdef __cplusplus
@@ -85,25 +98,45 @@ u64 rt_ticks(void);                /* the 19.2 MHz system counter */
 #define TAIL(f) { __attribute__((musttail)) return f(c); }
 
 /* ---- memory -------------------------------------------------------------------- */
+/* Guest address a is host address a + RT_MEMBASE. Windows and Linux map the guest at its own
+ * addresses; on macOS the system holds that range (a kernel guard below 0x7000000000, malloc's
+ * and Metal's reservations above), so there the guest lives 1 TiB up - the layout it sees is
+ * the same everywhere. (Macros, which elsewhere add nothing: the files built at -O0 compile as
+ * before.) */
+#ifdef __APPLE__
+#define RT_MEMBASE 0x10000000000ull
+#define RT_HOST(a) ((void *)(uintptr_t)((u64)(a) + RT_MEMBASE))
+#else
+#define RT_MEMBASE 0ull
+#define RT_HOST(a) ((void *)(uintptr_t)(a))
+#endif
+
+/* lda: a load-acquire (ldar, ldaxr). AArch64's never moves ahead of an earlier store-release
+ * (stlr: sta) either - which C's seq_cst load promises and its acquire does not (arm64
+ * compilers make an acquire the weaker ldapr). On x86 both are a plain load. */
 #define RT_MEM(T, N) \
-    static inline T ld##N(u64 a) { T v; memcpy(&v, (const void *)a, sizeof v); return v; } \
-    static inline void st##N(u64 a, T v) { memcpy((void *)a, &v, sizeof v); } \
+    static inline T ld##N(u64 a) { T v; memcpy(&v, RT_HOST(a), sizeof v); return v; } \
+    static inline void st##N(u64 a, T v) { memcpy(RT_HOST(a), &v, sizeof v); } \
     static inline u32 cas##N(u64 a, u64 expect, u64 val) { \
         T e = (T)expect; \
-        return __atomic_compare_exchange_n((T *)a, &e, (T)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); } \
-    static inline void sta##N(u64 a, T v) { __atomic_store_n((T *)a, v, __ATOMIC_SEQ_CST); }
+        return __atomic_compare_exchange_n((T *)RT_HOST(a), &e, (T)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); } \
+    static inline void sta##N(u64 a, T v) { __atomic_store_n((T *)RT_HOST(a), v, __ATOMIC_SEQ_CST); } \
+    static inline T lda##N(u64 a) { return __atomic_load_n((T *)RT_HOST(a), __ATOMIC_SEQ_CST); }
 RT_MEM(u8, 8) RT_MEM(u16, 16) RT_MEM(u32, 32) RT_MEM(u64, 64)
+
+/* dc zva: zero the 64-byte block holding the address (DCZID_EL0 reads 4: tools/lift.py). */
+static inline void rt_zva(u64 a) { memset(RT_HOST(a & ~63ull), 0, 64); }
 
 static inline void ldv8(Cpu *c, int n, u64 a)   { c->v[n].d[0] = ld8(a);  c->v[n].d[1] = 0; }
 static inline void ldv16(Cpu *c, int n, u64 a)  { c->v[n].d[0] = ld16(a); c->v[n].d[1] = 0; }
 static inline void ldv32(Cpu *c, int n, u64 a)  { c->v[n].d[0] = ld32(a); c->v[n].d[1] = 0; }
 static inline void ldv64(Cpu *c, int n, u64 a)  { c->v[n].d[0] = ld64(a); c->v[n].d[1] = 0; }
-static inline void ldv128(Cpu *c, int n, u64 a) { memcpy(&c->v[n], (const void *)a, 16); }
+static inline void ldv128(Cpu *c, int n, u64 a) { memcpy(&c->v[n], RT_HOST(a), 16); }
 static inline void stv8(Cpu *c, int n, u64 a)   { st8(a, c->v[n].b[0]); }
 static inline void stv16(Cpu *c, int n, u64 a)  { st16(a, c->v[n].h[0]); }
 static inline void stv32(Cpu *c, int n, u64 a)  { st32(a, c->v[n].s[0]); }
 static inline void stv64(Cpu *c, int n, u64 a)  { st64(a, c->v[n].d[0]); }
-static inline void stv128(Cpu *c, int n, u64 a) { memcpy((void *)a, &c->v[n], 16); }
+static inline void stv128(Cpu *c, int n, u64 a) { memcpy(RT_HOST(a), &c->v[n], 16); }
 
 /* Scalar FP writes clear the rest of the vector register, as on AArch64. */
 static inline void wS(Cpu *c, int n, f32 v) { u32 b; memcpy(&b, &v, 4); c->v[n].d[0] = b; c->v[n].d[1] = 0; }
@@ -294,8 +327,8 @@ static inline void rt_ldst_multi(Cpu *c, int load, int rt, int rpt, int selem, i
         for (int e = 0; e < elements; e++)
             for (int s = 0; s < selem; s++, addr += ebytes) {
                 u8 *lane = c->v[(rt + r + s) & 31].b + e * ebytes;
-                if (load) memcpy(lane, (const void *)addr, ebytes);
-                else memcpy((void *)addr, lane, ebytes);
+                if (load) memcpy(lane, RT_HOST(addr), ebytes);
+                else memcpy(RT_HOST(addr), lane, ebytes);
             }
     if (load && !q)
         for (int k = 0; k < rpt * selem; k++) c->v[(rt + k) & 31].d[1] = 0;
@@ -308,10 +341,10 @@ static inline void rt_ldst_single(Cpu *c, int load, int replicate, int rt, int s
         V128 *v = &c->v[(rt + s) & 31];
         if (replicate) {
             V128 r = {0};
-            for (int e = 0; e < (8 << q) / ebytes; e++) memcpy(r.b + e * ebytes, (const void *)addr, ebytes);
+            for (int e = 0; e < (8 << q) / ebytes; e++) memcpy(r.b + e * ebytes, RT_HOST(addr), ebytes);
             *v = r;
-        } else if (load) memcpy(v->b + index * ebytes, (const void *)addr, ebytes);
-        else memcpy((void *)addr, v->b + index * ebytes, ebytes);
+        } else if (load) memcpy(v->b + index * ebytes, RT_HOST(addr), ebytes);
+        else memcpy(RT_HOST(addr), v->b + index * ebytes, ebytes);
     }
 }
 

@@ -83,13 +83,15 @@ HLE(_ZN2nn4bcat17DeliveryCacheFileD1Ev) NOTHING
 HLE(_ZN2nn7friends10InitializeEv) NOTHING
 /* The notification queue: its event exists (the game polls it) but nothing ever arrives. */
 static u64 notification_event(Cpu *c) {
-    static u64 event;
+    static u64 event;   /* (published once it is made: another thread may take it and use it) */
     static const u8 zero[0x80];
-    if (!event) {
-        event = rt_guest_copy(zero, sizeof zero);
-        rt_callsym(c, "_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb", 3, event, 0, 0);
+    u64 e = __atomic_load_n(&event, __ATOMIC_ACQUIRE);
+    if (!e) {
+        e = rt_guest_copy(zero, sizeof zero);
+        rt_callsym(c, "_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb", 3, e, 0, 0);
+        __atomic_store_n(&event, e, __ATOMIC_RELEASE);
     }
-    return event;
+    return e;
 }
 HLE(_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE) { notification_event(c); c->x[0] = 0; }
 HLE(_ZN2nn7friends17NotificationQueue14GetSystemEventEv) { c->x[0] = notification_event(c); }

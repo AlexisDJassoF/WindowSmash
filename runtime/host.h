@@ -27,7 +27,12 @@
 /* `HLE_WRAP(address) { ... }` wraps a guest function no module exports, at that (hex) address:
  * the recompiler keeps it as f_<address>_orig and sends every caller here instead. */
 #define HLE_WRAP(addr) GuestFn f_##addr##_orig; void hle_wrap_##addr(Cpu *c)
-#define P(T, addr) ((T *)(uintptr_t)(addr))        /* guest pointer -> host pointer (identity) */
+/* Guest memory is mapped RT_MEMBASE above the guest's addresses (recomp.h: 0 but on macOS), so
+ * a guest address handed to the host - as a pointer, to the C library, to the OS - goes through
+ * these, as recomp.h's ld and st helpers do. */
+#define P(T, addr) ((T *)RT_HOST(addr))                     /* guest pointer -> host pointer */
+#define G2H(addr) RT_HOST(addr)                              /* guest address -> host pointer (void *) */
+#define H2G(ptr) ((u64)(uintptr_t)(ptr) - RT_MEMBASE)        /* host pointer -> guest address */
 #define RESULT(module, desc) ((u32)(module) | ((u32)(desc) << 9))
 typedef struct HleEntry { const char *name; GuestFn *fn; } HleEntry;
 extern const HleEntry hle_table[];

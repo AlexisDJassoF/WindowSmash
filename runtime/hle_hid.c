@@ -38,8 +38,9 @@ static const char *const BUTTON_NAMES[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK
  * push the left stick. */
 static u64 scripted_buttons(i32 *lx, i32 *ly) {
     static struct { double at, hold; int button; } presses[128];
-    static int count = -1;
+    static int ready = -1;   /* the count, published once the list is complete (for every thread) */
     static const char *const STICK[] = {"SLEFT", "SUP", "SRIGHT", "SDOWN"};
+    int count = __atomic_load_n(&ready, __ATOMIC_ACQUIRE);
     if (count < 0) {
         count = 0;
         const char *s = getenv("SSBU_INPUT");
@@ -56,6 +57,7 @@ static u64 scripted_buttons(i32 *lx, i32 *ly) {
                 if (!strcmp(name, STICK[k])) { presses[count].at = at; presses[count].hold = hold; presses[count++].button = 100 + k; }
             if (*s == ',') s++;
         }
+        __atomic_store_n(&ready, count, __ATOMIC_RELEASE);
     }
     double now = rt_now_ns() / 1e9;
     u64 buttons = 0;

@@ -23,6 +23,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#ifndef _WIN32   /* (Linux: windows.h is the runtime's own, for the types; the files go through POSIX) */
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#endif
 
 #include "../runtime/gpu_shader_cache.h"
 
@@ -51,7 +60,32 @@ static char *translate(Program *p, u32 vs_outputs, ShaderInfo *info) {
     return shader_hlsl_ex(p->bytes, p->size, p->stage, vs_outputs, info, zero_cbuf, NULL);
 }
 
+#ifdef _WIN32
 static int exists(const char *path) { return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
+static unsigned long process_id(void) { return GetCurrentProcessId(); }
+
+/* A file written just now, dated as not yet used (SHADER_CACHE_UNPLAYED), then given its name. */
+static void publish(const char *tmp, const char *path) {
+    HANDLE h = CreateFileA(tmp, FILE_WRITE_ATTRIBUTES, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        FILETIME t = {(DWORD)SHADER_CACHE_UNPLAYED, (DWORD)(SHADER_CACHE_UNPLAYED >> 32)};
+        SetFileTime(h, NULL, NULL, &t);
+        CloseHandle(h);
+    }
+    if (!MoveFileExA(tmp, path, 0)) DeleteFileA(tmp);   /* (another process wrote it first) */
+}
+#else
+static int exists(const char *path) { return access(path, F_OK) == 0; }
+static unsigned long process_id(void) { return (unsigned long)getpid(); }
+
+static void publish(const char *tmp, const char *path) {
+    /* the same date as a Windows FILETIME gives (the renderer reads both alike) */
+    struct timespec t[2] = {{0, UTIME_OMIT}, {(time_t)((SHADER_CACHE_UNPLAYED - 116444736000000000ull) / 10000000ull), 0}};
+    utimensat(AT_FDCWD, tmp, t, 0);
+    if (link(tmp, path) && errno != EEXIST) rename(tmp, path);   /* (a disk without links: renamed over a file another wrote) */
+    unlink(tmp);                                                   /* (if another process wrote it first, its file stays) */
+}
+#endif
 
 /* The distinct output masks of a pixel program's paired vertex programs (at most 16), into p->masks. */
 static u32 pixel_masks(Program *p, const Program *prog, u32 total) {
@@ -84,21 +118,15 @@ static void compile_to(const char *hlsl, const char *name, int stage, const char
     HRESULT hr = shader_cache_compile(hlsl, name, stage, &code, &errors);
     if (FAILED(hr)) {
         count.failed++;
-        fprintf(stderr, "%s: fxc failed: %.300s\n", name, errors ? (const char *)errors->lpVtbl->GetBufferPointer(errors) : "?");
+        fprintf(stderr, "%s: shader compiler failed: %.300s\n", name, errors ? (const char *)errors->lpVtbl->GetBufferPointer(errors) : "?");
     } else {
         char tmp[1300];
-        snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, GetCurrentProcessId());
+        snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, process_id());
         FILE *f = fopen(tmp, "wb");
         if (f) {
             fwrite(code->lpVtbl->GetBufferPointer(code), 1, code->lpVtbl->GetBufferSize(code), f);
             fclose(f);
-            HANDLE h = CreateFileA(tmp, FILE_WRITE_ATTRIBUTES, 0, NULL, OPEN_EXISTING, 0, NULL);
-            if (h != INVALID_HANDLE_VALUE) {
-                FILETIME t = {(DWORD)SHADER_CACHE_UNPLAYED, (DWORD)(SHADER_CACHE_UNPLAYED >> 32)};
-                SetFileTime(h, NULL, NULL, &t);
-                CloseHandle(h);
-            }
-            if (!MoveFileExA(tmp, path, 0)) DeleteFileA(tmp);   /* (another process wrote it first) */
+            publish(tmp, path);
             count.compiled++;
         }
     }
@@ -183,7 +211,7 @@ int main(int argc, char **argv) {
         if (setjmp(on_fatal)) { count.translate_failed++; continue; }
         p->size = shader_size(p->bytes, p->length);
         if (p->size <= 0x50) continue;
-        p->hash = shader_program_hash(p->bytes, p->size);
+        p->hash = shader_cache_hash(shader_program_hash(p->bytes, p->size), p->bytes, p->size, SHADER_VERTEX);
         char *hlsl = translate(p, 0, &info);
         if (!hlsl) { count.translate_failed++; continue; }
         free(hlsl);
@@ -200,7 +228,7 @@ int main(int argc, char **argv) {
         if (setjmp(on_fatal)) { count.translate_failed++; continue; }
         p->size = shader_size(p->bytes, p->length);
         if (p->size <= 0x50) continue;
-        p->hash = shader_program_hash(p->bytes, p->size);
+        p->hash = shader_cache_hash(shader_program_hash(p->bytes, p->size), p->bytes, p->size, SHADER_PIXEL);
         p->nmasks = pixel_masks(p, prog, total);
         for (u32 m = 0; m < p->nmasks; m++) progress_of += to_count(p->hash * 5 ^ p->masks[m]);
         if (!p->nmasks) progress_of++;   /* (its one key: what it reads, found when it is compiled) */

@@ -78,6 +78,7 @@ $ScriptBound = $PSBoundParameters   # (this script's own arguments, to start the
 $Root = Split-Path -Parent $PSScriptRoot
 $Script:Python = $null            # the Python command: @(exe) or @('py', '-3')
 $Script:WizardSnapshot = $null    # set to a .png path to have the wizard save a picture of itself and accept (tests)
+$Script:Kernel32 = $null          # the type Test-CpuFeature declares IsProcessorFeaturePresent on (made once)
 
 # ---- what to fetch, and from where -----------------------------------------------------------
 $PythonMinor = '3.14'
@@ -333,6 +334,29 @@ function Test-Avx2ByName {
     if ($m.Success) { return ([int]$m.Groups[1].Value -ge 4000) }
     if ($Name -match 'Core\(TM\)2|Core\(TM\)\s+i[3579]\s+\d{3}\b|Phenom|Athlon\s+(64|II|X[24])\b|Atom|A[468]-\d{4}|A10-\d{4}') { return $false }
     return $null
+}
+
+function Test-CpuFeature {
+    <# Windows' IsProcessorFeaturePresent(feature): $true, $false, or $null when it cannot be asked.
+       The call is declared with Reflection.Emit, not Add-Type -MemberDefinition: Add-Type runs the
+       .NET Framework C# compiler (csc.exe), which fails on some PCs ("Unable to find messages file
+       'cscui.dll'", e.g. while a .NET update waits for a restart). #>
+    param([int]$Feature)
+    try {
+        if (-not $Script:Kernel32) {
+            $name = New-Object Reflection.AssemblyName 'WindowSmashSetup.Native'
+            $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+            $type = $assembly.DefineDynamicModule('WindowSmashSetup.Native').DefineType('WindowSmashSetup.Kernel32', 'Public, Class')
+            $method = $type.DefinePInvokeMethod('IsProcessorFeaturePresent', 'kernel32.dll',
+                [Reflection.MethodAttributes]'Public, Static, PinvokeImpl', [Reflection.CallingConventions]::Standard,
+                [bool], [Type[]]@([int]), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+            $method.SetImplementationFlags($method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)
+            $Script:Kernel32 = $type.CreateType()
+        }
+        return [bool]$Script:Kernel32::IsProcessorFeaturePresent($Feature)
+    } catch {
+        return $null
+    }
 }
 
 function Get-FirewallRuleCommand {
@@ -631,13 +655,8 @@ function Step-CheckPc {
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
     $name = ($cpu.Name -replace '\s+', ' ').Trim()
     $avx2 = $null
-    if ($build -ge 19041) {   # Windows 10 version 2004 and later can be asked about AVX2 (feature 40)
-        $sig = '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(int feature);'
-        $k = Add-Type -MemberDefinition $sig -Name 'Cpu' -Namespace 'WindowSmashSetup' -PassThru
-        $avx2 = [bool]$k::IsProcessorFeaturePresent(40)
-    } else {
-        $avx2 = Test-Avx2ByName $name
-    }
+    if ($build -ge 19041) { $avx2 = Test-CpuFeature 40 }   # Windows 10 version 2004 and later can be asked about AVX2 (feature 40)
+    if ($null -eq $avx2) { $avx2 = Test-Avx2ByName $name }
     if ($avx2 -eq $true) { Write-Info "$name - has AVX2" }
     elseif ($avx2 -eq $false) { throw "The processor ($name) has no AVX2, which the game needs: WindowSmash cannot run on it." }
     else { Write-Warn "$name - whether it has AVX2 is unknown; the game will only start if it does (the setup guide's step 1 says which do)" }

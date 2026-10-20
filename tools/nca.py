@@ -332,6 +332,10 @@ class RomfsImage:
             self.f = open(lines[0], "rb")
             self.base = int(lines[1])
 
+    def close(self):
+        for f in self.sources if self.entries is not None else [self.f]:
+            f.close()
+
     def read(self, off, size):
         if self.entries is None:
             self.f.seek(self.base + off)
