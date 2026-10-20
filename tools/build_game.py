@@ -24,7 +24,9 @@ carries on where it stopped. --check does the first step only (the installer use
                tools/Configure-Game-Data.ps1; without one, the program NCA's own RomFS, read in
                place when it is decrypted (tools/nca.py romfs-cfg), else decrypted first into
                dump/modules (tools/nca.py decrypt); an update's, which is a patch, is applied
-               over the base's next to it (tools/update.py apply: a layered romfs.cfg)
+               over the base's next to it (tools/update.py apply: a layered romfs.cfg); then
+               data.arc's file table is checked (tools/arc.py table_form): an early release's,
+               without a newer update, can't be read yet, and the update is the way on
   7. dlc       dump/modules/aoc.cfg from the game folder's dlc folder (DLC .nsp files, or
                installed content), or from the DLC installed next to the game (an emulator's)
   8. fighters  the fighter modules in data.arc into dump/nro (tools/arc.py nro, which skips the
@@ -38,6 +40,7 @@ import importlib.util
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -355,6 +358,31 @@ def missing_fonts(folder):
     return [n for n in FONT_FILES if not os.path.isfile(os.path.join(folder, n))]
 
 
+def early_release(game, form):
+    """What to do about game data whose data.arc tools/arc.py can't read (arc.table_form): an
+    early release's. Step 4 has set this folder up for that release already (game_source.txt), so
+    the build with the update goes in a fresh folder."""
+    where = game or "your game folder"
+    by_hand = os.path.isfile(os.path.join(game, "romfs.bin")) if game else False
+    return (f"The game in {where} is an early release, without a newer update: WindowSmash can't read its data "
+            f"yet ({form}).\n"
+            f"  1. Put the game's update (an .nsp file; the newest you have) in {where}, next to the game."
+            + (" Make romfs.bin again too, with the update applied (setup guide part 2)." if by_hand else "") + "\n"
+            "  2. This WindowSmash folder is set up for that early release now and would refuse the update: extract "
+            "a fresh WindowSmash folder and run Install WindowSmash.bat there.")
+
+
+def check_game_data(cfg, game):
+    """The game data step 6 connected has a data.arc that tools/arc.py (step 8) reads."""
+    import arc
+    try:
+        form, layout, _size = arc.game_data_form(cfg)
+    except (SystemExit, OSError, ValueError, struct.error) as e:
+        raise Failed(f"The game data in {cfg} can't be read: {e}")
+    if not arc.readable(form, layout):
+        raise Failed(early_release(game, arc.form_text(form, layout)))
+
+
 def write_romfs_cfg(game, keys, the_program):
     romfs_bin = os.path.join(game, "romfs.bin")
     if os.path.isfile(romfs_bin):
@@ -364,8 +392,12 @@ def write_romfs_cfg(game, keys, the_program):
             f"{romfs_bin} could not be used (see above): it must be the game's data, unencrypted and with "
             "your update applied (setup guide part 2).")
         return
+    import arc
     import gamefiles
     path, _title, program, result = the_program()
+    form = program.get("data_arc")   # (told by the scan: no decrypting a release whose data can't be used)
+    if form and not arc.readable(*form):
+        raise Failed(early_release(game, arc.form_text(*form)))
     cfg = os.path.join("dump", "modules", "romfs.cfg")
     state = program["romfs"]
     if state == "plain":   # readable in place
@@ -423,7 +455,7 @@ def write_version():
         data = f"{v >> 16}.{(v >> 8) & 0xFF}.{v & 0xFF}"
         text = (f"{data}\n# game version of this folder (tools/build_game.py): the version, then what it is made of\n"
                 f"main {Module(os.path.join(EXEFS, 'main')).build_id}\ndata.arc {data}\n")
-    except Exception as e:
+    except (SystemExit, Exception) as e:   # (arc.py says what it can't read with SystemExit)
         log(f"  (the game version could not be read for the launchers: {e})")
         return
     with open(path, "w", newline="\n") as f:
@@ -530,6 +562,7 @@ def build(a):
         if os.path.exists(cfg):
             log(f"  {cfg} reads a file that is not there any more: setting it again")
         write_romfs_cfg(game, keys, the_program)
+    check_game_data(cfg, game or saved.get("game"))
 
     log("\n[7/9] Turn on your DLC (dump\\modules\\aoc.cfg)")
     if os.path.exists(aoc):

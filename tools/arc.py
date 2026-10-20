@@ -19,7 +19,9 @@ stores only hashes of names, so `nro` knows a module by the names in NRO_NAMES.
 Layout (smash-arc's naming): a header, then a zstd-compressed file system table; a path's
 hash40 (crc32 of the lowercase path | length << 32) picks a bucket, a binary search in the
 bucket gives the path, and path -> file info index -> file info -> info-to-data -> folder
-offset + file data locate the bytes.
+offset + file data locate the bytes. Early releases of the game (the original 1.0.0, and others
+before the table's version field) store the table in other forms and layouts (table_form); those
+are refused, with the advice to add the game's update, whose data.arc is the newer kind.
 """
 import argparse
 import os
@@ -27,9 +29,10 @@ import struct
 import sys
 import zlib
 try:
-    from compression.zstd import decompress as zstd_decompress   # Python 3.14
-except ImportError:                                               # 3.10 to 3.13: the zstandard package
+    from compression.zstd import ZstdError, decompress as zstd_decompress   # Python 3.14
+except ImportError:                                                          # 3.10 to 3.13: the zstandard package
     import zstandard
+    from zstandard import ZstdError
 
     def zstd_decompress(data):
         return zstandard.ZstdDecompressor().decompressobj().decompress(data)
@@ -52,11 +55,57 @@ NRO_NAMES = ("bayonetta brave buddy captain chrom cloud common daisy dedede demo
              "younglink zelda").split()
 MAGIC = 0xABCDEF9876543210
 LOW40 = (1 << 40) - 1
+# the file system table's forms (ArcCross's rules: github.com/Ploaj/ArcCross, ArcCross/ARC.cs)
+ZSTD_TABLE = 0x10             # the table header's first field when the table is zstd-compressed
+V1_FILE_DATA = 0x8824AF68     # file data starting before this: the original release's layout (1.0.0)
+V3_TABLE_SIZE = 0x2992DD4     # a table this long or longer has the version field (11.0.0's is 0x30434DC)
+EARLY_RELEASE = ("This copy of the game is an early release, whose data.arc WindowSmash can't read yet ({}). "
+                 "Add the game's update (the newest you have) to the game files.")
+DAMAGED = "This copy of the game looks damaged or incomplete ({}). Copy the game's files again."
 
 
 def hash40(path):
     s = path.lower().encode()
     return zlib.crc32(s) | (len(s) << 32)
+
+
+def table_form(read):
+    """How data.arc's file system table is stored, from `read(offset, size)` over data.arc:
+    (form, layout, size). form: "zstd", or "uncompressed" or "raw" (early releases); layout:
+    "v3" (with the version field: later releases, 11.0.0 and 13.0.5 among them), "v2" (an early
+    release's, without it) or "v1" (the original release's, other structures altogether); size:
+    the table's, uncompressed. Only zstd and v3 is read here (readable)."""
+    hdr = struct.unpack("<7Q", read(0, 0x38))
+    if hdr[0] != MAGIC:
+        raise SystemExit(DAMAGED.format("data.arc does not begin as the game's does"))
+    data_offset, decompressed, compressed, _ = struct.unpack("<4I", read(hdr[4], 16))
+    if data_offset == ZSTD_TABLE:
+        form, size = "zstd", decompressed
+    elif data_offset > ZSTD_TABLE:
+        form, size = "uncompressed", data_offset   # (the table itself, whose first field is its size)
+    elif compressed:
+        form, size = "raw", compressed
+    else:   # (zeros: a copy cut short)
+        raise SystemExit(DAMAGED.format("data.arc's file table is not there"))
+    layout = "v1" if hdr[2] < V1_FILE_DATA else "v3" if size >= V3_TABLE_SIZE else "v2"
+    return form, layout, size
+
+
+def readable(form, layout):
+    return form == "zstd" and layout == "v3"
+
+
+def form_text(form, layout):
+    """A table form for a person (what a bug report should quote)."""
+    return f"data.arc: {form} file table, {layout} layout"
+
+
+def unzstd(data, what):
+    """zstd_decompress; data that is not zstd is a damaged copy, said plainly."""
+    try:
+        return zstd_decompress(data)
+    except ZstdError as e:
+        raise SystemExit(DAMAGED.format(f"{what} could not be decompressed: {e}"))
 
 
 def data_arc_offset(image):
@@ -65,6 +114,16 @@ def data_arc_offset(image):
     if not found:
         raise SystemExit("no data.arc in the game's RomFS")
     return found[0]
+
+
+def game_data_form(cfg):
+    """table_form of data.arc in the RomFS a romfs.cfg reads (its files closed again)."""
+    image = RomfsImage(cfg)
+    try:
+        base = data_arc_offset(image)
+        return table_form(lambda off, size: image.read(base + off, size))
+    finally:
+        image.close()
 
 
 class Arc:
@@ -76,14 +135,15 @@ class Arc:
             self.read = lambda off, size: image.read(base + off, size)
         else:
             self.read = source
+        form, layout, _size = table_form(self.read)
+        if not readable(form, layout):
+            raise SystemExit(EARLY_RELEASE.format(form_text(form, layout)))
         hdr = self.header = struct.unpack("<7Q", self.read(0, 0x38))
-        if hdr[0] != MAGIC:
-            raise SystemExit("data.arc: bad magic")
         self.file_section = hdr[2]
         data_start, decomp, comp, _ = struct.unpack("<4I", self.read(hdr[4], 16))
-        t = self.t = zstd_decompress(self.read(hdr[4] + data_start, comp))
+        t = self.t = unzstd(self.read(hdr[4] + data_start, comp), "data.arc's file table")
         if len(t) != decomp:
-            raise SystemExit("data.arc: file system table did not decompress whole")
+            raise SystemExit(DAMAGED.format("data.arc's file table did not decompress whole"))
 
         (_size, paths, info_indices, folders, offsets_1, child_hashes, infos, info_to_datas, datas,
          offsets_2, datas_2) = struct.unpack_from("<11I", t, 0)
@@ -194,7 +254,7 @@ class Arc:
         off, stored, size, compressed = where
         data = self.read(off, stored)
         if compressed:
-            data = zstd_decompress(data)
+            data = unzstd(data, path)
         if len(data) != size:
             raise SystemExit(f"{path}: {len(data)} bytes, the table says {size}")
         return data
