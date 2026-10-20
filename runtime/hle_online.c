@@ -48,7 +48,7 @@ static int online_server(char *host, size_t n, u16 *port) {
     const char *v = getenv("SSBU_ONLINE_SERVER");
     if (v && !strcmp(v, "off")) return 0;
     if (!v || !*v) {
-        if (!net_configured() || !getenv("SSBU_NET_RELAY")) return 0;
+        if (!net_configured() || !net_relay_address()) return 0;
         snprintf(host, n, "%s", DEFAULT_HOST);
         *port = DEFAULT_PORT;
         return 1;
@@ -223,9 +223,9 @@ static void changed(void) {
     net_wake();
 }
 
-/* The lobby's real address: SSBU_NET_RELAY = host[:port]. */
+/* The lobby's real address: host[:port], from SSBU_NET_RELAY or online_server.txt (net_relay.c). */
 static int lobby_address(struct sockaddr_in *out) {
-    const char *v = getenv("SSBU_NET_RELAY");
+    const char *v = net_relay_address();
     char host[256];
     if (!v || !*v) return 0;
     snprintf(host, sizeof host, "%s", v);
