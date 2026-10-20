@@ -1540,6 +1540,7 @@ static int run_kernel(Kernel *k) {
     DrawParams params;
     ShaderBinds binds;
     memset(&params, 0, sizeof params);
+    params.base[2] = params.base[3] = 0x3F800000u;   /* 1 / the render scale (ps_input): 1, as the renderer's */
     memset(&binds, 0, sizeof binds);
     NSMutableArray *keep = [NSMutableArray array];
     for (u32 b = 0; b < 18; b++) {
@@ -2021,6 +2022,7 @@ static int gpu_points(void) {
         DrawParams params;
         ShaderBinds binds;
         memset(&params, 0, sizeof params);
+        params.base[2] = params.base[3] = 0x3F800000u;   /* 1 / the render scale (ps_input): 1, as the renderer's */
         memset(&binds, 0, sizeof binds);
         params.attr[0][0] = 0x01 << 21 | 7u << 27; params.attr[0][1] = 16; params.attr[0][3] = 1;
         params.attr[1][0] = fmt; params.attr[1][1] = 20; params.attr[1][3] = 1;
@@ -2101,6 +2103,7 @@ static int gpu_triangle(void) {
         DrawParams params;
         ShaderBinds binds;
         memset(&params, 0, sizeof params);
+        params.base[2] = params.base[3] = 0x3F800000u;   /* 1 / the render scale (ps_input): 1, as the renderer's */
         memset(&binds, 0, sizeof binds);
         params.attr[0][0] = 0x01 << 21 | 7u << 27; params.attr[0][1] = 16; params.attr[0][3] = 1;
         params.fix[0] = params.fix[1] = params.fix[2] = 1;
@@ -2205,6 +2208,7 @@ static int gpu_dual(void) {
         DrawParams params;
         ShaderBinds binds;
         memset(&params, 0, sizeof params);
+        params.base[2] = params.base[3] = 0x3F800000u;   /* 1 / the render scale (ps_input): 1, as the renderer's */
         memset(&binds, 0, sizeof binds);
         params.attr[0][0] = 0x01 << 21 | 7u << 27; params.attr[0][1] = 16; params.attr[0][3] = 1;
         params.fix[0] = params.fix[1] = params.fix[2] = 1;
@@ -2280,6 +2284,7 @@ static int gpu_lod_bias(void) {
         DrawParams params;
         ShaderBinds binds;
         memset(&params, 0, sizeof params);
+        params.base[2] = params.base[3] = 0x3F800000u;   /* 1 / the render scale (ps_input): 1, as the renderer's */
         memset(&binds, 0, sizeof binds);
         params.attr[0][0] = 0x01 << 21 | 7u << 27; params.attr[0][1] = 16; params.attr[0][3] = 1;
         params.fix[0] = params.fix[1] = params.fix[2] = 1;

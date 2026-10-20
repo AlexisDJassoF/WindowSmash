@@ -3488,6 +3488,9 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     }
     params.base[0] = regs[M_GLOBAL_BASE_VERTEX];
     params.base[1] = regs[M_GLOBAL_BASE_INSTANCE] + instance_counter;
+    /* 1 / the render scale (a float's bits): the fragment position is the game's pixel (the
+     * translator's ps_input). This renderer draws at the game's own size: 1. */
+    params.base[2] = params.base[3] = 0x3F800000u;
 
     bind_resources(regs, cb, SHADER_VERTEX, vs, &params, vbind);
     if (ps) bind_resources(regs, cb, SHADER_PIXEL, ps, &params, pbind);
@@ -4573,6 +4576,8 @@ static WINDOWS_BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
         if (!prewarm || atoi(prewarm) != 0) CloseHandle(CreateThread(NULL, 0, prewarm_main, NULL, 0, NULL));
         ready = 1;
         fprintf(stderr, "[gfx] Metal ready on %s (%u-frame latency)\n", dev.name.UTF8String, latency);
+        if (display_render_scale() != 1.0f)   /* (display.ini's, or SSBU_RENDER_SCALE: Direct3D's renderer alone has it) */
+            fprintf(stderr, "[gfx] render_scale is not supported on a Mac yet: the game draws at its own 1920x1080\n");
     }
     return TRUE;
 }

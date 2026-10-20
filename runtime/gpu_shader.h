@@ -154,3 +154,6 @@ typedef struct DrawParams {
 
 /* Bytes of a program up to its end (header included), reading at most `max`. */
 u32 shader_size(const u8 *program, u32 max);
+/* Does the program read its pixel's position or step in texels (its translation then takes the
+ * render scale into account)? */
+int shader_uses_pixels(const u8 *program, u32 size, int stage);

@@ -89,6 +89,7 @@ void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw,
     *y = (h - *fh) / 2;
 }
 int display_latency(void) { return 2; }
+float display_render_scale(void) { return 1.0f; }
 void display_set_tearing(int supported) { (void)supported; }
 unsigned display_present_flags(void) { return 0; }
 
