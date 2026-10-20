@@ -167,6 +167,29 @@ class InstallerDecisionTests(unittest.TestCase):
         for name, want in cases.items():
             self.assertEqual(got[name], want, name)
 
+    def test_pc_check_without_csharp_compiler(self):
+        # a PC whose .NET C# compiler is broken: Add-Type -MemberDefinition stopped step 2 with
+        # "Unable to find messages file 'cscui.dll'"; the AVX2 question must not need the compiler
+        mocks = ("function Add-Type { throw '(0) : Unable to find messages file ''cscui.dll''' }; "
+                 "function Get-PSDrive { $null }; "
+                 "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName) switch ($ClassName) { "
+                 "'Win32_OperatingSystem' { [pscustomobject]@{ Caption = 'Microsoft Windows 10 Home'; Version = '10.0.19045'; "
+                 "BuildNumber = '19045'; OSArchitecture = '64-bit' } } "
+                 "'Win32_Processor' { [pscustomobject]@{ Name = 'AMD Ryzen 7 3700X 8-Core Processor' } } "
+                 "'Win32_ComputerSystem' { [pscustomobject]@{ TotalPhysicalMemory = 40GB } } } }; ")
+        step = "try { Step-CheckPc } catch { 'STOPPED: ' + $_.Exception.Message }"
+        got = ps(mocks + "@{ sse2 = (Test-CpuFeature 10); avx2 = (Test-CpuFeature 40) }")
+        self.assertIs(got['sse2'], True)              # every x64 processor: Windows answered
+        self.assertIn(got['avx2'], (True, False))
+        out = ps_text(mocks + step)
+        self.assertNotIn('cscui', out)
+        self.assertIn('AMD Ryzen 7 3700X 8-Core Processor - has', out)
+        out = ps_text(mocks + "function Test-CpuFeature { $null }; " + step)   # Windows cannot be asked: the name
+        self.assertIn('AMD Ryzen 7 3700X 8-Core Processor - has AVX2', out)
+        self.assertNotIn('STOPPED', out)
+        out = ps_text(mocks + "function Test-CpuFeature { $false }; " + step)
+        self.assertIn('STOPPED: The processor (AMD Ryzen 7 3700X 8-Core Processor) has no AVX2', out)
+
     def test_source_version(self):
         sha = '9fdc8fd21b3fde86c3e58a1e634a7e76a87220c7'
         got = ps(f"@{{ zip = (Read-SourceVersion '{sha.upper()} 2026-10-19'); git = (Read-SourceVersion '$Format:%H %cs$'); "
