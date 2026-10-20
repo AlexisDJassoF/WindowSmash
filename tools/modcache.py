@@ -16,9 +16,15 @@ Modules must not share a 16 MB dispatch slot (runtime/host.c SLOT_SHIFT), and NR
 between subsdk/sdk's slots and the heap: [0x7200000000, 0x7400000000), 512 slots.
 
 Module build dirs: each holds a stamp, module.txt: "<build id> <base> <name> <tools
-fingerprint>", written once its C is generated and compiled. A tree that lacks a module's dir
-takes the files of another tree's dir for the same build id and base: hard links when the
-volume allows (instant, no space), else copies, with their times, so objects stay up to date.
+fingerprint>", written once its C is generated and compiled (by a build that compiles it
+elsewhere - Linux, macOS: recomp.py all --generate-only - once it is generated). A tree that lacks
+a module's dir takes the files of another tree's dir for the same build id and base: hard links
+when the volume allows (instant, no space), else copies, with their times, so objects stay up to
+date; a dir with its objects is taken before one without. A dir with only its C is taken on
+macOS alone (ADOPT_C_ONLY): its C keeps the other tree's (older) times, and tools/mac/build_mac.py
+compiles an object again when its C is another file than the one it was compiled from, where
+tools/linux/build_linux.py goes by the times only - it would keep and link the objects of the
+module the tree had before.
 recomp.py replaces a file rather than writing into it (write_if_changed, compile_dir), so a
 tree never changes another's files through a link. With the same tools fingerprint (the
 generator's sources and the runtime's native-function set) the C is not generated again.
@@ -27,6 +33,7 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
@@ -35,6 +42,9 @@ NRO_BASE, NRO_LIMIT, SLOT = 0x7200000000, 0x7400000000, 0x1000000
 FIXED = ("main", "subsdk0", "sdk")
 # the sources whose output is the generated C (a change in any of them generates it again)
 GENERATOR = ("recomp.py", "lift.py", "lift_simd.py", "a64.py", "funcs.py", "eh.py", "nso.py")
+# whether a module dir with only its C (no objects: recomp.py all --generate-only) is lent to other
+# trees: on macOS, whose build tracks the C each object was compiled from (see above)
+ADOPT_C_ONLY = sys.platform == "darwin"
 
 
 def trees():
@@ -180,7 +190,10 @@ _built = None
 
 def find_built(build_id, base, skip, fp):
     """Another tree's build dir of the module with this build id at this base, or None: one
-    generated with the same tools first, else the most recently generated."""
+    generated with the same tools first, then one with its objects, else the most recently
+    generated. A dir counts once it is complete: compiled (g_module.obj), or on macOS
+    (ADOPT_C_ONLY) also stamped with only its C (module.txt, from a build that compiles it
+    elsewhere)."""
     global _built
     if _built is None:
         _built = {}
@@ -188,10 +201,12 @@ def find_built(build_id, base, skip, fp):
             for d in module_dirs(t):
                 info = build_info(d)
                 manifest = os.path.join(d, "manifest.tsv")
-                if info and os.path.exists(manifest) and os.path.exists(os.path.join(d, "g_module.obj")):
-                    _built.setdefault((info[0], info[1]), []).append((info[3] == fp, os.path.getmtime(manifest), d))
-    found = [c for c in _built.get((build_id, base), []) if not same_path(c[2], skip)]
-    return max(found)[2] if found else None
+                compiled = os.path.exists(os.path.join(d, "g_module.obj"))
+                c_only = ADOPT_C_ONLY and os.path.exists(os.path.join(d, "module.txt"))
+                if info and os.path.exists(manifest) and (compiled or c_only):
+                    _built.setdefault((info[0], info[1]), []).append((info[3] == fp, compiled, os.path.getmtime(manifest), d))
+    found = [c for c in _built.get((build_id, base), []) if not same_path(c[3], skip)]
+    return max(found)[3] if found else None
 
 
 def adopt(src, dst):
@@ -203,7 +218,7 @@ def adopt(src, dst):
             os.remove(os.path.join(dst, n))
     linked = copied = 0
     for n in os.listdir(src):
-        if not n.endswith((".c", ".obj", ".tsv", ".txt")):
+        if not n.endswith((".c", ".obj", ".tsv", ".txt")) or n.startswith("._"):   # (not macOS's ._* files on exFAT)
             continue
         s, d = os.path.join(src, n), os.path.join(dst, n)
         try:
