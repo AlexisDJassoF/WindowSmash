@@ -54,7 +54,7 @@ static void guest_longjmp(Cpu *c) {
     c->sp = r->sp;
     memcpy(&c->v[8], r->v, sizeof r->v);
     c->x[0] = (u32)value;
-    longjmp(r->host, value);
+    RT_LONGJMP(r->host, value);   /* (the host setjmp's own pair: recomp.h) */
 }
 
 HLE(longjmp) { guest_longjmp(c); }

@@ -26,7 +26,8 @@ link      compile the host runtime and link module build directories into an exe
 all       image + build + compile every module of an ExeFS, then link; a module another game
           version tree already built (same build id) is reused, not built again (modcache.py);
           --generate-only stops before compiling (the Linux build compiles the C itself:
-          tools/linux/build_linux.py)
+          tools/linux/build_linux.py; so does the macOS one, tools/mac/build_mac.py, and on
+          macOS all always stops there)
 check     list each module's imports that no module exports and the runtime does not implement
 wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
 
@@ -117,7 +118,7 @@ def hle_names():
     names = set()
     runtime = os.path.join(ROOT, "runtime")
     for name in os.listdir(runtime):
-        if name.endswith(".c"):
+        if name.endswith(".c") and not name.startswith("._"):   # (not macOS's ._* files on exFAT)
             with open(os.path.join(runtime, name), encoding="utf-8") as f:
                 names |= set(re.findall(r"^HLE\((\w+)\)", f.read(), re.M))
     return names
@@ -133,7 +134,7 @@ def hle_wraps():
     found = {}
     runtime = os.path.join(ROOT, "runtime")
     for name in os.listdir(runtime):
-        if name.endswith(".c"):
+        if name.endswith(".c") and not name.startswith("._"):
             with open(os.path.join(runtime, name), encoding="utf-8") as f:
                 for sig, a in re.findall(r"^(?:/\* signature: ([0-9a-f. ]+) \*/\r?\n)?HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M):
                     found[int(a, 16)] = sig.split() or None
@@ -706,12 +707,16 @@ if __name__ == "__main__":
         image(nso, arg("--out"))
     elif cmd == "build":
         build(nso, arg("--out"), int(arg("--jobs", "20")), int(arg("--per-file", "40000")))
+    elif cmd in ("compile", "link") and sys.platform == "darwin":
+        sys.exit(f"recomp.py {cmd} builds with clang-cl, for Windows: on macOS, tools/mac/build_mac.py compiles and links")
     elif cmd == "compile":
         sys.exit(0 if compile_dir(nso, int(arg("--jobs", "16"))) else 1)
     elif cmd == "link":
         sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
-        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), "--generate-only" not in sys.argv) else 1)
+        # (on macOS the C is compiled by tools/mac/build_mac.py, the compiling and linking here being clang-cl's)
+        compile_c = "--generate-only" not in sys.argv and sys.platform != "darwin"
+        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), compile_c) else 1)
     elif cmd == "check":
         check(nso)
     elif cmd == "wrap-sig":

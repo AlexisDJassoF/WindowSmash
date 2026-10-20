@@ -39,12 +39,21 @@ On Linux (what install-windowsmash.sh runs), step 1 checks clang, lld, bison and
 tools/linux/toolchain.py names, and a test link with SDL2, libopus and libvpx; step 9 builds
 build-linux/ssbu: the C generated into build/ (tools/recomp.py all --generate-only), compiled and
 linked for Linux (tools/linux/build_vkd3d.py once, then tools/linux/build_linux.py).
+
+On macOS (what Install WindowSmash.command runs), step 1 checks the Command Line Tools
+(tools/mac/toolchain.py), SDL3.framework in deps/SDL3 and the codecs' sources, and builds and runs
+a test program as the game is built: C++ exceptions through C, SDL3, a Metal device, then compiles
+the runtime's sources for their errors against the SDK (an older SDK lacks parts of them); step 9
+builds build-mac/WindowSmash.app: the C generated into build/ (tools/recomp.py all
+--generate-only), compiled and linked for macOS (tools/mac/build_mac.py), with the Mac kept awake
+meanwhile.
 """
 import argparse
 import errno
 import importlib.util
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -54,12 +63,15 @@ import tempfile
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
 ROOT = os.path.dirname(TOOLS)
-LINUX = sys.platform.startswith("linux")   # (the game built for Linux, on Linux: tools/linux)
+# the system the game is built for, on it: Windows, Linux (tools/linux) or macOS (tools/mac)
+HOST = "linux" if sys.platform.startswith("linux") else "macos" if sys.platform == "darwin" else "windows"
+LINUX, MACOS = HOST == "linux", HOST == "macos"
 DUMP = os.path.join(ROOT, "dump")
 EXEFS = os.path.join(DUMP, "exefs")
 FONTS = os.path.join(DUMP, "fonts")
 MODULES = os.path.join(DUMP, "modules")
-EXE = os.path.join(ROOT, "build-linux", "ssbu") if LINUX else os.path.join(ROOT, "build", "ssbu.exe")
+EXE = os.path.join(ROOT, "build-linux", "ssbu") if LINUX else \
+    os.path.join(ROOT, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu") if MACOS else os.path.join(ROOT, "build", "ssbu.exe")
 SAVED = os.path.join(DUMP, "build_folders.txt")
 SOURCE = os.path.join(DUMP, "game_source.txt")   # which game and version dump/ was set up from
 EXEFS_FILES = ("main", "main.npdm", "rtld", "sdk", "subsdk0")
@@ -79,7 +91,7 @@ def log(msg=""):
 
 def shown(path):
     """A path as this system writes it (the messages name them the Windows way)."""
-    return path.replace("\\", "/") if LINUX else path
+    return path.replace("\\", "/") if LINUX or MACOS else path
 
 
 def run(args, failure):
@@ -180,10 +192,14 @@ def missing_packages(requirements):
 # ---- the steps ------------------------------------------------------------------------------
 def check_tools():
     if sys.version_info < (3, 10):
-        raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.10 or newer (setup guide step 3).")
+        raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.10 or newer "
+                     + ("(Install WindowSmash.command makes deps/venv with one: docs/MACOS.md)." if MACOS else "(setup guide step 3)."))
     log(f"  Python {sys.version.split()[0]}: {sys.executable}")
     if LINUX:
         check_linux_tools()
+        return
+    if MACOS:
+        check_mac_tools()
         return
     import cc
     clang = cc.CLANG if os.path.isfile(cc.CLANG) else shutil.which(cc.CLANG)
@@ -263,6 +279,114 @@ def check_linux_tools():
     log(f"  clang: {tc.CLANG}; {r.stdout.strip()}")
 
 
+# A C++ exception thrown through a C function's frame (the generated C's landing sites), SDL3, a
+# Metal device, and the codecs' headers: what the game's build and the game itself need of the Mac.
+MAC_CHECK = {
+    "check.cpp": r"""#include <SDL3/SDL.h>
+#include <stdio.h>
+#include "opus.h"
+#include <vpx/vp8dx.h>
+#include <vpx/vpx_decoder.h>
+extern "C" void check_through_c(void (*f)(void));
+extern "C" const char *check_metal(void);
+static void thrower(void) { throw 42; }
+int main(void) {
+    int caught = 0;
+    try { check_through_c(thrower); } catch (int v) { caught = v; }
+    if (caught != 42) { puts("a C++ exception did not pass through a C function"); return 1; }
+    const char *gpu = check_metal();
+    if (!gpu) { puts("no Metal device"); return 1; }
+    int v = SDL_GetVersion();
+    (void)OPUS_OK;
+    printf("SDL %d.%d.%d, Metal on the %s, the codecs' headers (VP9 decoder ABI %d)\n", SDL_VERSIONNUM_MAJOR(v),
+           SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v), gpu, VPX_DECODER_ABI_VERSION);
+    return 0;
+}
+""",
+    "check_c.c": "void check_through_c(void (*f)(void)) { f(); }\n",
+    "check_metal.m": r"""#import <Metal/Metal.h>
+#include <string.h>
+const char *check_metal(void) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    return device ? strdup(device.name.UTF8String) : NULL;
+}
+""",
+}
+
+
+def mac_toolchain():
+    """tools/mac/toolchain.py, or Failed saying what is missing."""
+    sys.path.insert(0, os.path.join(TOOLS, "mac"))
+    try:
+        import toolchain
+    except SystemExit as e:
+        raise Failed(f"{e}.")
+    return toolchain
+
+
+def check_mac_runtime(tc, tmp):
+    """The runtime's sources compiled for their errors only (-fsyntax-only), as build_mac.py
+    compiles them, against this SDK: what an older one lacks shows now rather than after the
+    hours of turning the game into C."""
+    import build_mac
+    with open(os.path.join(tmp, "overlay_font.h"), "w") as f:   # (build_mac.py makes it: its fallback)
+        f.write("static const unsigned char overlay_font[%d] = {0};\n" % (12 * 16 * 24 * 6))
+    flags = build_mac.RUNTIME_INCLUDES + ["-I", tmp] + build_mac.RUNTIME_DEFINES
+    jobs = [(src, os.path.join(tmp, "syntax.o"), "-O0", flags) for src, _obj in build_mac.runtime_sources()
+            if not src.endswith(".S")]
+    failures = tc.compile_each(jobs, max(4, os.cpu_count() or 4), extra=("-fsyntax-only",))
+    if failures:
+        src, err = failures[0]
+        version = ".".join(map(str, tc.SDK_VERSION or ())) or "?"
+        raise Failed(f"The Command Line Tools (macOS SDK {version}: {tc.SDK}) cannot compile the game's runtime: "
+                     f"{os.path.relpath(src, ROOT)} (below){' and ' + str(len(failures) - 1) + ' more' if len(failures) > 1 else ''}. "
+                     "A newer SDK may be needed: update the Command Line Tools in System Settings > General > Software "
+                     "Update, or install the newest Command Line Tools for Xcode from https://developer.apple.com/download/all/, "
+                     "then run this again.\n" + err[-2000:])
+
+
+def check_mac_tools():
+    """The Command Line Tools (clang, the macOS SDK), SDL3.framework in deps/SDL3 (Install
+    WindowSmash.command downloads it), the codecs' sources, a test program built as the game
+    is - C with C++ exceptions, Objective-C, SDL3, Metal - that runs, and the runtime's sources
+    compiled for their errors against the SDK."""
+    tc = mac_toolchain()
+    if not os.path.isfile(os.path.join(tc.SDL3_FRAMEWORK, "Headers", "SDL.h")):
+        raise Failed(f"SDL3.framework is not in {tc.SDL3_DIR}. Run Install WindowSmash.command: it downloads it.")
+    import codec_libs
+    if not codec_libs.have_opus() or not codec_libs.have_vpx("config-arm64"):
+        raise Failed("third_party/opus or third_party/libvpx is missing: this WindowSmash folder is incomplete. "
+                     "Download it again.")
+    includes = ["-F", tc.SDL3_DIR, "-I", os.path.join(codec_libs.OPUS, "include"), "-I", codec_libs.VPX]
+    with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
+        jobs = []
+        for name, text in MAC_CHECK.items():
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write(text)
+            jobs.append((os.path.join(tmp, name), os.path.join(tmp, name.rsplit(".", 1)[0] + ".o"), "-O2", includes))
+        failures = tc.compile_each(jobs, len(jobs))
+        exe = os.path.join(tmp, "check")
+        if not failures:
+            code, out = tc.run([tc.CLANG, *tc.TARGET, *[j[1] for j in jobs], "-o", exe, "-F", tc.SDL3_DIR,
+                                "-framework", "SDL3", "-framework", "Metal", "-framework", "Foundation", "-lc++",
+                                "-Wl,-rpath," + tc.SDL3_DIR])
+            failures = [("the link", out)] if code else []
+        if failures and "license" in failures[0][1].lower():
+            raise Failed(tc.LICENCE + ".")
+        if failures:
+            raise Failed(f"{tc.CLANG} could not build a test program with SDL3 and Metal. Run Install "
+                         "WindowSmash.command: it installs what is missing.\n" + failures[0][1][-2000:])
+        try:
+            r = subprocess.run([exe], capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            raise Failed("the test program built with the Command Line Tools did not finish.")
+        if r.returncode:
+            raise Failed(f"the test program built with {tc.CLANG} does not run:\n" + (r.stdout + r.stderr)[-2000:])
+        check_mac_runtime(tc, tmp)
+    log(f"  clang: {tc.CLANG}; macOS SDK {'.'.join(map(str, tc.SDK_VERSION or ())) or '?'}: {tc.SDK}")
+    log(f"  {r.stdout.strip()}")
+
+
 def install_packages():
     requirements = os.path.join(ROOT, "requirements.txt")
     missing = missing_packages(requirements)
@@ -271,19 +395,35 @@ def install_packages():
         return
     run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
         "pip could not install " + ", ".join(missing) + " (see above)."
-        + (" On Linux, install-windowsmash.sh installs them in a Python of WindowSmash's own (deps/venv)." if LINUX else ""))
+        + (" On Linux, install-windowsmash.sh installs them in a Python of WindowSmash's own (deps/venv)." if LINUX else
+           " On macOS, Install WindowSmash.command installs them in a Python of WindowSmash's own (deps/venv)." if MACOS
+           else ""))
     importlib.invalidate_caches()
 
 
 FOLDERS = {
-    "game": ("Folder with your game files", "~/MyDump" if LINUX else r"D:\MyDump",
+    "game": ("Folder with your game files", "~/MyDump" if LINUX or MACOS else r"D:\MyDump",
              lambda p: None if os.path.isdir(p) else f"There is no folder {p}."),
-    "keys": ("Folder with your keys", "~/MyKeys" if LINUX else r"D:\MyKeys",
+    "keys": ("Folder with your keys", "~/MyKeys" if LINUX or MACOS else r"D:\MyKeys",
              lambda p: None if os.path.isfile(os.path.join(p, "prod.keys")) else f"There is no prod.keys in {p}."),
-    "firmware": ("Folder with your firmware", "~/MyFirmware" if LINUX else r"D:\MyFirmware",
+    "firmware": ("Folder with your firmware", "~/MyFirmware" if LINUX or MACOS else r"D:\MyFirmware",
                  lambda p: None if os.path.isdir(p) and any(f.lower().endswith(".nca") for f in os.listdir(p))
                  else f"There are no .nca files in {p}."),
 }
+
+
+def typed_folder(text):
+    """A folder as typed, or dragged into the window: Windows puts a dragged folder in quotes; a
+    Mac's Terminal (and most Linux ones) escapes it as the shell would (My\\ Games, or in 'quotes')."""
+    text = text.strip()
+    if (LINUX or MACOS) and text and not os.path.exists(os.path.expanduser(text)):
+        try:
+            words = shlex.split(text)
+        except ValueError:   # (an apostrophe of a name, not a quote)
+            words = []
+        if len(words) == 1:
+            return words[0]
+    return text.strip('"')
 
 
 def ask_folder(key, given, saved):
@@ -298,7 +438,7 @@ def ask_folder(key, given, saved):
                 log("  Press Enter to keep the folder in [brackets], or type another.")
                 saved["hinted"] = True
             try:
-                answer = input(f"  {label} [{default}]: ").strip().strip('"') or default
+                answer = typed_folder(input(f"  {label} [{default}]: ")) or default
             except EOFError:   # nobody to answer: the default
                 log()
                 answer = given = default
@@ -472,7 +612,7 @@ def check_game_data(cfg, game):
 
 def write_romfs_cfg(game, keys, the_program):
     romfs_bin = os.path.join(game, "romfs.bin")
-    if os.path.isfile(romfs_bin) and LINUX:   # (Configure-Game-Data.ps1's checks are Windows-only: the format's here)
+    if os.path.isfile(romfs_bin) and (LINUX or MACOS):   # (Configure-Game-Data.ps1's checks are Windows-only: the format's here)
         from nca import is_plain_romfs
         if not is_plain_romfs(romfs_bin):
             raise Failed(f"{romfs_bin} is not the game's data as a plain RomFS image (unencrypted, with your update "
@@ -563,10 +703,13 @@ def write_version():
 def build_is_current():
     """build/ssbu.exe is newer than the runtime, the tools and the modules it is built from, and
     has SDL3.dll beside it if SDL3 is there to build with (on Linux: build-linux/ssbu, also newer
-    than the Linux runtime and tools)."""
+    than the Linux runtime and tools; on macOS: build-mac/WindowSmash.app's program, also newer
+    than the platform layers it is made with and the macOS tools, with SDL3.framework in the app)."""
     if not os.path.isfile(EXE):
         return False
-    if not LINUX:
+    if MACOS and not os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(EXE)), "Frameworks", "SDL3.framework", "SDL3")):
+        return False
+    if not LINUX and not MACOS:
         import cc
         if cc.SDL3_DLL and not os.path.isfile(os.path.join(ROOT, "build", "SDL3.dll")):
             return False
@@ -575,6 +718,11 @@ def build_is_current():
     if LINUX:
         inputs += [os.path.join(ROOT, "runtime", "linux", n) for n in os.listdir(os.path.join(ROOT, "runtime", "linux"))]
         inputs += [os.path.join(TOOLS, "linux", n) for n in os.listdir(os.path.join(TOOLS, "linux")) if n.endswith(".py")]
+    elif MACOS:
+        for folder in ("linux", os.path.join("linux", "include"), "macos", os.path.join("macos", "include")):
+            d = os.path.join(ROOT, "runtime", folder)
+            inputs += [os.path.join(d, n) for n in os.listdir(d)] if os.path.isdir(d) else []
+        inputs += [os.path.join(TOOLS, "mac", n) for n in os.listdir(os.path.join(TOOLS, "mac")) if n.endswith((".py", ".m"))]
     inputs += [os.path.join(EXEFS, n) for n in os.listdir(EXEFS)]
     nro = os.path.join(DUMP, "nro")
     inputs += [os.path.join(nro, n) for n in os.listdir(nro) if n.endswith(".nro")] if os.path.isdir(nro) else []
@@ -582,7 +730,7 @@ def build_is_current():
 
 
 def installed_ram_gb():
-    if LINUX:
+    if LINUX or MACOS:
         try:
             return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30)
         except (ValueError, OSError):
@@ -594,8 +742,38 @@ def installed_ram_gb():
     return kb.value / (1 << 20)
 
 
+def running_from(path):
+    """Whether a process runs the program at `path` (macOS: libproc's processes and the file each
+    one runs; without libproc, whether any process has the program's name)."""
+    import ctypes
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        count = libproc.proc_listallpids(None, 0)
+    except (OSError, AttributeError):
+        libproc, count = None, -1
+    if count < 0:
+        return subprocess.run(["pgrep", "-x", os.path.basename(path)], capture_output=True).returncode == 0
+    pids = (ctypes.c_int * (count + 256))()
+    count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+    want = os.path.realpath(path)
+    buf = ctypes.create_string_buffer(4096)
+    for pid in pids[:max(count, 0)]:
+        if pid <= 0 or libproc.proc_pidpath(pid, buf, len(buf)) <= 0:
+            continue   # (another user's: not this folder's game)
+        running = os.fsdecode(buf.value)
+        try:
+            if running == want or os.path.samefile(running, path):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def in_use(path):
-    """A running program's file can't be opened for writing (on Linux: "text file busy")."""
+    """A running program's file can't be opened for writing (on Linux: "text file busy"; on
+    macOS it can, so: whether a process runs it)."""
+    if MACOS:
+        return os.path.isfile(path) and running_from(path)
     try:
         with open(path, "r+b"):
             return False
@@ -697,6 +875,8 @@ def build(a):
     write_version()
 
     exe = os.path.relpath(EXE, ROOT)
+    if MACOS:   # (the app the program is in)
+        exe = os.path.relpath(os.path.dirname(os.path.dirname(os.path.dirname(EXE))), ROOT)
     log(f"\n[9/9] Build the game ({exe})")
     if a.prepare_only:
         log("  not now (--prepare-only): everything the build needs is ready")
@@ -713,6 +893,8 @@ def build(a):
             log(f"  {jobs} jobs at a time, for {gb:.0f} GB of RAM" if gb else f"  {jobs} jobs at a time (the RAM size is unknown)")
         if LINUX:
             build_linux_program(jobs)
+        elif MACOS:
+            build_mac_program(jobs)
         else:
             import cc
             if not cc.SDL3_DLL:
@@ -724,6 +906,8 @@ def build(a):
                 "PowerShell in this folder and run  & \".\\launchers\\Build WindowSmash.bat\" --jobs 4")
     if LINUX:
         log(f"\nDone: {exe} is ready. Start the game with ./play-ssbu.sh, or WindowSmash in your applications menu.")
+    elif MACOS:
+        log(f"\nDone: {exe} is ready. Start the game with Play SSBU.command, or Play SSBU in ~/Applications (Spotlight finds it).")
     else:
         log("\nDone: build\\ssbu.exe is ready. Start the game with Play SSBU.bat.")
 
@@ -748,11 +932,35 @@ def build_linux_program(jobs):
         "The build failed (see above). " + retry)
 
 
+def build_mac_program(jobs):
+    """build-mac/WindowSmash.app: the game's C generated into build/, then compiled and linked for
+    macOS, with the Mac kept from sleeping while this runs (an idle Mac would stop the build)."""
+    rebuild = '"launchers/Build WindowSmash.command"'
+    if not os.path.isfile(os.path.join(ROOT, "launchers", "Build WindowSmash.command")):
+        rebuild = (os.path.relpath(sys.executable, ROOT) if sys.executable.startswith(ROOT + os.sep) else sys.executable) + \
+            " tools/build_game.py"
+    retry = (f"If the Mac ran out of memory, build with fewer jobs at a time: in Terminal, in this folder, run  "
+             f"{rebuild} --jobs {max(1, jobs // 2)}")
+    try:
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    log("  the first build takes one to a few hours, later ones minutes; if it stops, run this again to carry on")
+    log("  the game's code, as C:")
+    run([sys.executable, os.path.join("tools", "recomp.py"), "all", os.path.join("dump", "exefs"), "--out", "build",
+         "--jobs", str(jobs), "--generate-only"],
+        "The game's code could not be turned into C (see above). " + retry)
+    log("  compiling it for macOS:")
+    run([sys.executable, os.path.join("tools", "mac", "build_mac.py"), "--port", ROOT, "--jobs", str(jobs)],
+        "The build failed (see above). " + retry)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Build the game from your own files (launchers\\Build WindowSmash.bat).")
-    ap.add_argument("--game", help=r"the folder with the game's files (asked; default D:\MyDump)")
-    ap.add_argument("--keys", help=r"the folder with prod.keys and title.keys (asked; default D:\MyKeys)")
-    ap.add_argument("--firmware", help=r"the folder with the firmware's .nca files (asked; default D:\MyFirmware)")
+    launcher = "Install WindowSmash.command" if MACOS else "launchers\\Build WindowSmash.bat"
+    ap = argparse.ArgumentParser(description=f"Build the game from your own files ({launcher}).")
+    ap.add_argument("--game", help=f"the folder with the game's files (asked; default {FOLDERS['game'][1]})")
+    ap.add_argument("--keys", help=f"the folder with prod.keys and title.keys (asked; default {FOLDERS['keys'][1]})")
+    ap.add_argument("--firmware", help=f"the folder with the firmware's .nca files (asked; default {FOLDERS['firmware'][1]})")
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
     ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
     ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")

@@ -72,7 +72,7 @@ class RegcacheTests(unittest.TestCase):
         self.assertRegex(out[1], r"^if \(zf\) \{ c->x\[3\] = x_3; +TAIL\(f_7100003000\) \}$")
 
     def test_setjmp_spills_all_and_reloads_after_longjmp(self):
-        _decl, out = run([(0, "X(19) = 0x9ull;", True), (4, "if (!setjmp(*rt_setjmp(c))) X(0) = 0;", True), (8, "return;", False)])
+        _decl, out = run([(0, "X(19) = 0x9ull;", True), (4, "if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0;", True), (8, "return;", False)])
         self.assertIn("c->x[19] = x_19;", out[1])
         self.assertIn("else { x_0 = c->x[0]; x_19 = c->x[19];", out[1])
 

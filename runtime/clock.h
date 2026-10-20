@@ -11,6 +11,10 @@
  * at start, and again after a few seconds, half a minute and ten minutes, each time from
  * where the clock stands then (it never steps back). SSBU_CLOCK=qpc or tsc picks one.
  *
+ * On arm64 (the macOS port) there is nothing to switch to: the system timer is the processor's
+ * own counter there (mach_absolute_time, a few nanoseconds a read, at a constant rate), so it
+ * is always the one, and only x64 builds have the time stamp counter's part.
+ *
  * Needs <windows.h> (or the Linux port's) first. */
 #ifndef SSBU_CLOCK_H
 #define SSBU_CLOCK_H
@@ -18,21 +22,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#define CLOCK_TSC 1
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
 #include <cpuid.h>
 #include <x86intrin.h>
 #endif
+#else
+#define CLOCK_TSC 0
+#endif
 
 typedef struct ClockScale { uint64_t tsc0, ns0, mul; } ClockScale;   /* ns = ns0 + (tsc - tsc0) * mul / 2^32 */
 static const ClockScale *volatile clock_scale;   /* NULL: the system timer */
 static INIT_ONCE clock_once = INIT_ONCE_STATIC_INIT;
-static volatile LONG clock_ready, clock_refining;
-static uint64_t qpc_hz, clock_start_ns, cal_tsc, cal_ns, next_refine;   /* (cal_*: the first measurement) */
-static int clock_refines, clock_steady, clock_has_rdtscp;
+static volatile LONG clock_ready;
+static uint64_t qpc_hz, clock_start_ns;
+/* clock_steady: the CPU has a counter of its own that may stand in for the system timer (never
+ * on arm64, where the system timer is that counter) */
+static int clock_refines, clock_steady;
 static double clock_read_ns;   /* what a system timer read took, at start */
+#if CLOCK_TSC
+static volatile LONG clock_refining;
+static uint64_t cal_tsc, cal_ns, next_refine;   /* (cal_*: the first measurement) */
+static int clock_has_rdtscp;
+#endif
 
+#if CLOCK_TSC
 /* The CPU's counter, read in order (plain RDTSC may run ahead of earlier loads: a thread could
  * then see a time before one it had just read from another thread - as the system timer never does). */
 static inline uint64_t clock_tsc(void) {
@@ -44,6 +61,8 @@ static inline uint64_t clock_tsc(void) {
     return __rdtsc();
 }
 
+#endif
+
 static uint64_t qpc_ns(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
@@ -51,6 +70,7 @@ static uint64_t qpc_ns(void) {
     return q / qpc_hz * 1000000000ull + q % qpc_hz * 1000000000ull / qpc_hz;
 }
 
+#if CLOCK_TSC
 /* CPUID's extended leaf's EDX (0 where there is none) */
 static unsigned cpuid_ext_edx(unsigned leaf) {
 #ifdef _MSC_VER
@@ -90,6 +110,7 @@ static void clock_rescale(void) {
     n->ns0 = old ? clock_scaled(old, tsc) : ns;
     __atomic_store_n(&clock_scale, n, __ATOMIC_RELEASE);   /* (the old one stays: another thread may be reading it) */
 }
+#endif
 
 static BOOL CALLBACK clock_setup(PINIT_ONCE once, PVOID param, PVOID *context) {
     (void)once; (void)param; (void)context;
@@ -102,26 +123,37 @@ static BOOL CALLBACK clock_setup(PINIT_ONCE once, PVOID param, PVOID *context) {
     clock_read_ns = (double)(b.QuadPart - a.QuadPart) * 1e9 / (double)qpc_hz / 257;
     const char *want = getenv("SSBU_CLOCK");
     int slow = clock_read_ns > 250;
+#if CLOCK_TSC
     clock_steady = cpuid_ext_edx(0x80000007) >> 8 & 1;    /* invariant TSC */
     clock_has_rdtscp = cpuid_ext_edx(0x80000001) >> 27 & 1;
     int tsc = want && !strcmp(want, "tsc") ? clock_steady : want && !strcmp(want, "qpc") ? 0 : slow && clock_steady;
+#endif
     clock_start_ns = qpc_ns();
+#if CLOCK_TSC
     if (tsc) {   /* a first scale over 20 ms */
         clock_pair(&cal_tsc, &cal_ns);
         while (qpc_ns() - cal_ns < 20000000) {}
         clock_rescale();
         next_refine = cal_tsc + (uint64_t)((double)(clock_tsc() - cal_tsc) * 100);   /* after some 2 s */
     }
+#endif
 #ifdef _WIN32
 #define CLOCK_SLOW_WHY "Windows set to use the HPET? \"bcdedit /deletevalue useplatformclock\" undoes that"
+#elif defined(__APPLE__)   /* (the macOS port: mach_absolute_time, the processor's counter itself) */
+#define CLOCK_SLOW_WHY "on a Mac it is the processor's own counter: was the machine very busy as the game started?"
 #else   /* (the Linux port: clock_gettime, slow when the kernel's clock source is) */
 #define CLOCK_SLOW_WHY "the kernel's clock source, in /sys/devices/system/clocksource/clocksource0/current_clocksource, hpet or acpi_pm?"
 #endif
+#if CLOCK_TSC
     fprintf(stderr, "[clock] system timer %.2f MHz, %.0f ns a read%s\n", qpc_hz / 1e6, clock_read_ns,
             tsc ? (slow ? ": slow (" CLOCK_SLOW_WHY ") - timing from the CPU's counter instead"
                         : ": timing from the CPU's counter (SSBU_CLOCK=tsc)")
                 : slow ? (clock_steady ? " (SSBU_CLOCK=qpc)" : ": slow, and this CPU's counter does not run at a constant rate - expect a lower frame rate")
                        : want && !strcmp(want, "tsc") ? " (SSBU_CLOCK=tsc, but this CPU's counter does not run at a constant rate)" : "");
+#else   /* (the system timer is the counter: nothing faster to take) */
+    fprintf(stderr, "[clock] system timer %.2f MHz, %.0f ns a read%s\n", qpc_hz / 1e6, clock_read_ns,
+            slow ? ": slow (" CLOCK_SLOW_WHY ")" : want && !strcmp(want, "tsc") ? " (SSBU_CLOCK=tsc: here the system timer is the processor's counter)" : "");
+#endif
     __atomic_store_n(&clock_ready, 1, __ATOMIC_RELEASE);   /* (after all of the above, for readers that skip InitOnce) */
     return TRUE;
 }
@@ -129,6 +161,9 @@ static BOOL CALLBACK clock_setup(PINIT_ONCE once, PVOID param, PVOID *context) {
 /* Nanoseconds on the system timer's time line (since the PC started), cheaply. */
 static uint64_t clock_now_ns(void) {
     if (!__atomic_load_n(&clock_ready, __ATOMIC_ACQUIRE)) InitOnceExecuteOnce(&clock_once, clock_setup, NULL, NULL);
+#if !CLOCK_TSC
+    return qpc_ns();
+#else
     const ClockScale *s = __atomic_load_n(&clock_scale, __ATOMIC_ACQUIRE);
     if (!s) return qpc_ns();
     uint64_t tsc = clock_tsc();
@@ -143,6 +178,7 @@ static uint64_t clock_now_ns(void) {
         s = __atomic_load_n(&clock_scale, __ATOMIC_ACQUIRE);
     }
     return clock_scaled(s, tsc);
+#endif
 }
 
 #endif

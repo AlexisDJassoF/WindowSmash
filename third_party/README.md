@@ -56,10 +56,15 @@ configure run is needed:
   `vpx_scale/vpx_scale_rtcd.pl`).
 - `vpx_version.h`: `build/make/version.sh <source dir> vpx_version.h`.
 
+`config-arm64/` is the same for the macOS build (arm64, plain C): see its `README.md`. On arm64,
+`tools/codec_libs.py` (`build_static`) compiles opus without the `x86` folders and the
+`OPUS_X86_*` defines, and libvpx with `config-arm64/` in place of `config/`.
+
 ## Updating a library
 
 Take the new release's archive, repeat the selection above (the file lists come from the
 makefiles; the header set from `clang-cl /showIncludes` over the selected sources), regenerate
-`libvpx/config/`, replace the folder, update the table above and the versions in
-`tools/codec_libs.py` (`PACKAGE_VERSION`) and `NOTICE.md`, then build: `python tools/codec_libs.py
---force` compiles both in a few seconds, and `tests/test_codec_libs.py` checks the layout.
+`libvpx/config/` and `libvpx/config-arm64/` (its `README.md` says how), replace the folder, update
+the table above and the versions in `tools/codec_libs.py` (`PACKAGE_VERSION`) and `NOTICE.md`, then
+build: `python tools/codec_libs.py --force` compiles both in a few seconds, and
+`tests/test_codec_libs.py` checks the layout.

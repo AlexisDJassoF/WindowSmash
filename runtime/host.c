@@ -69,7 +69,7 @@ const char *rt_describe(u64 addr, char *buf, size_t n) {
             snprintf(buf, n, "%s+%#llx", modules[m]->name, addr - modules[m]->base);
             return buf;
         }
-    if (addr - NATIVE_BASE < (u64)native_count * 16) snprintf(buf, n, "native:%s", natives[(addr - NATIVE_BASE) >> 4].name);
+    if (addr - NATIVE_BASE < (u64)__atomic_load_n(&native_count, __ATOMIC_ACQUIRE) * 16) snprintf(buf, n, "native:%s", natives[(addr - NATIVE_BASE) >> 4].name);
     else snprintf(buf, n, "%#llx", addr);
     return buf;
 }
@@ -398,15 +398,18 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     crash_report(e, fault.tid);
 }
 #else
-/* ---- Linux: faults and other threads' stacks come through signals ---------------------- */
+/* ---- Linux and macOS: faults come through signals; other threads' stacks through a signal
+ * (Linux) or by stopping the thread (macOS) ------------------------------------------------ */
 #include <dlfcn.h>
 #include <execinfo.h>
-#include <semaphore.h>
 #include <signal.h>
+#ifndef __APPLE__
+#include <semaphore.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
+#endif
 
-int rt_ww_fault(void *address);        /* (linux/win32.c) a write the fallback write watch takes */
+int rt_ww_fault(void *address);        /* (linux/win32.c; macos/memory.c) a write the protecting write watch takes */
 void rt_thread_signal_stack(void);
 
 static void host_frame(const char *indent, void *pc) {   /* "[module +offset]" */
@@ -418,6 +421,43 @@ static void host_frame(const char *indent, void *pc) {   /* "[module +offset]" *
     } else out("%s[%#llx]\n", indent, (u64)pc);
 }
 
+#ifdef __APPLE__
+/* A frame walk's second frame is the link register when the innermost function had not saved it:
+ * not a frame of its own when it points back into that same (recompiled) function. (Allocates
+ * and locks nothing: also for a stopped thread.) */
+static int walk_frames(u64 pc, u64 lr, u64 fp, void **frames, int max) {
+    int n = rt_frame_walk(pc, lr, fp, frames, max);
+    if (n > 1 && (u64)frames[1] == lr && guest_of(pc) && guest_of(lr) == guest_of(pc)) {
+        memmove(frames + 1, frames + 2, sizeof *frames * (size_t)(n - 2));
+        n--;
+    }
+    return n;
+}
+
+/* Another thread's frames: it is stopped, its registers read and its frame pointers followed,
+ * then it goes on (rt_frame_walk: no signal, nothing taken that it might hold). */
+void rt_backtrace_thread(HANDLE thread, int max_frames) {
+    RtTid tid = rt_thread_tid(thread);
+    if (!tid) return;
+    void *frames[96];
+    int n;
+    u64 pc = 0, lr = 0;
+    if (tid == pthread_mach_thread_np(pthread_self())) n = CaptureStackBackTrace(0, 96, frames, NULL);
+    else if ((n = rt_thread_frames(tid, frames, 96, &pc, &lr)) > 1 && (u64)frames[1] == lr && guest_of(pc) && guest_of(lr) == guest_of(pc)) {
+        memmove(frames + 1, frames + 2, sizeof *frames * (size_t)(n - 2));   /* (as walk_frames) */
+        n--;
+    }
+    static int host_frames = -1;
+    if (host_frames < 0) host_frames = getenv("SSBU_HOST_FRAMES") != NULL;
+    char name[96];
+    for (int i = 0, shown = 0; i < n && shown < max_frames; i++) {
+        u64 guest = guest_of((u64)frames[i]);
+        if (!guest) { if (host_frames) host_frame("      ", frames[i]); continue; }
+        fprintf(stderr, "      %s\n", rt_describe(guest, name, sizeof name));
+        shown++;
+    }
+}
+#else
 /* Another thread's frames: it is interrupted and records its own stack. */
 #define SIG_BACKTRACE (SIGRTMIN + 2)
 static void *bt_frames[96];
@@ -456,33 +496,65 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
     }
     pthread_mutex_unlock(&lock);
 }
+#endif
 
 /* A host fault inside recompiled code is a guest fault: report where, and what it touched.
- * (Writes to pages the fallback write watch protects are not faults: they are noted and go on.) */
+ * (Writes to pages the protecting write watch guards are not faults: they are noted and go on.)
+ * macOS: a protection fault is SIGBUS, and whether it was a write is the exception syndrome's
+ * (ESR: a data abort, with WnR); the address it touched is the host's, the guest's RT_MEMBASE
+ * below it. Nothing here touches a thread-local: Mach-O's first use of one on a thread
+ * allocates. */
 static void on_fault(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
-    if (sig == SIGSEGV && (uc->uc_mcontext.gregs[REG_ERR] & 2) && rt_ww_fault(si->si_addr)) return;
+#ifdef __APPLE__
+    u64 esr = uc->uc_mcontext->__es.__esr, addr = uc->uc_mcontext->__es.__far, pc = uc->uc_mcontext->__ss.__pc;
+    int writing = ((esr >> 26) == 0x24 || (esr >> 26) == 0x25) && (esr >> 6 & 1);
+    if ((sig == SIGSEGV || sig == SIGBUS) && writing && rt_ww_fault((void *)(uintptr_t)addr)) return;
+    static volatile RtTid reporter;
+    RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
+    (void)si;
+#else
+    int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+    if (sig == SIGSEGV && writing && rt_ww_fault(si->si_addr)) return;
+    u64 addr = (u64)si->si_addr, pc = (u64)uc->uc_mcontext.gregs[REG_RIP];
     static volatile pid_t reporter;
     pid_t me = gettid(), none = 0;
+#endif
     if (reporter == me) _exit(6);   /* (a fault while reporting one) */
     if (!__atomic_compare_exchange_n(&reporter, &none, me, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) for (;;) pause();   /* (one report at a time) */
     char name[96], report[MAX_PATH];
     fflush(stdout);
     report_open("crash", report, sizeof report);
-    /* a fault right at the stack pointer: the thread's stack ran out (this runs on its signal stack) */
+    /* a fault right at the stack pointer: the thread's stack ran out (this runs on its signal stack;
+     * on macOS a stack's guard page faults as a protection fault, SIGBUS) */
+#ifdef __APPLE__
+    u64 sp = uc->uc_mcontext->__ss.__sp;
+    int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
+#else
     u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
-    int overflow = sig == SIGSEGV && (u64)si->si_addr + 65536 > sp && (u64)si->si_addr < sp + 65536;
+    int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
+#endif
     out("\n*** host exception (signal %d: %s%s) during %s", sig, sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error" :
-        sig == SIGILL ? "illegal instruction" : sig == SIGFPE ? "arithmetic" : "?", overflow ? ", stack overflow" : "", phase);
-    if (sig == SIGSEGV || sig == SIGBUS)
-        out(": %s address %s", uc->uc_mcontext.gregs[REG_ERR] & 2 ? "writing" : "reading", rt_describe((u64)si->si_addr, name, sizeof name));
+        sig == SIGILL ? "illegal instruction" : sig == SIGFPE ? "arithmetic" : sig == SIGTRAP ? "trap" : sig == SIGABRT ? "abort" : "?",
+        overflow ? ", stack overflow" : "", phase);
+#ifdef __APPLE__
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        if (addr - RT_MEMBASE < ASPACE_BASE + ASPACE_SIZE) out(": %s address %s", writing ? "writing" : "reading", rt_describe(H2G(addr), name, sizeof name));
+        else out(": %s host address %#llx (outside the guest's)", writing ? "writing" : "reading", addr);
+    }
+#else
+    if (sig == SIGSEGV || sig == SIGBUS) out(": %s address %s", writing ? "writing" : "reading", rt_describe(addr, name, sizeof name));
+#endif
     out("\n");
-    u64 pc = (u64)uc->uc_mcontext.gregs[REG_RIP];
-    out("host pc %#llx (thread %d %s):\n", pc, (int)gettid(), rt_thread_description(gettid()));
+    out("host pc %#llx (thread %d %s):\n", pc, (int)me, rt_thread_description(me));
     host_frame("  ", (void *)pc);
     void *frames[64];
+#ifdef __APPLE__   /* (from the faulting context: a leaf function's caller is in the link register) */
+    int n = walk_frames(pc, uc->uc_mcontext->__ss.__lr, uc->uc_mcontext->__ss.__fp, frames, 64), from = 0;
+#else
     int n = backtrace(frames, 64), from = 0;
     for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; break; }   /* (the faulting frame onwards) */
+#endif
     for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
     gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
     print_frames(frames + from, n - from);
@@ -501,13 +573,20 @@ static void install_signals(void) {
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
+#ifdef __APPLE__   /* (arm64's traps - brk: __builtin_trap, the C++ library's checks - and abort: Metal's validation, a C++ terminate) */
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+#else
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_backtrace_signal;
     sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIG_BACKTRACE, &sa, NULL);
+#endif
     signal(SIGPIPE, SIG_IGN);
+#ifndef __APPLE__
     sem_init(&bt_done, 0, 0);
+#endif
     rt_thread_signal_stack();
     void *warm[4];
     backtrace(warm, 4);   /* (its first call loads the unwinder: not inside a signal handler) */
@@ -555,8 +634,9 @@ GuestFn *rt_lookup(u64 addr) {
     GuestFn *hit = lookup_cache[h].fn;
     if ((lookup_cache[h].key ^ LOOKUP_MIX(hit)) == addr && hit) return hit;
     u64 slot = (addr - SLOT_BASE) >> SLOT_SHIFT;
-    if (slot < SLOT_COUNT && slot_module[slot]) {
-        u32 m = slot_module[slot] - 1u;
+    u16 slot_m = slot < SLOT_COUNT ? __atomic_load_n(&slot_module[slot], __ATOMIC_ACQUIRE) : 0;   /* (map_module publishes it last) */
+    if (slot_m) {
+        u32 m = slot_m - 1u;
         u64 off = addr - modules[m]->base;
         if (off < modules[m]->text_size) {
             GuestFn *fn = off & 3 ? NULL : code[m][off >> 2];
@@ -569,7 +649,7 @@ GuestFn *rt_lookup(u64 addr) {
         }
     }
     u64 off = addr - NATIVE_BASE;
-    if (off < (u64)native_count * 16 && !(off & 15)) {
+    if (off < (u64)__atomic_load_n(&native_count, __ATOMIC_ACQUIRE) * 16 && !(off & 15)) {
         last_native = (u32)(off >> 4);
         return natives[off >> 4].fn;
     }
@@ -622,10 +702,16 @@ u64 rt_guest_copy(const void *data, size_t size) {
     return at;
 }
 
+/* (one at a time; the count goes up only once the entry is written, for rt_lookup on other threads) */
 u64 rt_native(GuestFn *fn, const char *name) {
-    if (native_count == sizeof natives / sizeof *natives) rt_fatal("too many native functions");
-    natives[native_count] = (struct Native){fn, name};
-    return NATIVE_BASE + 16ull * native_count++;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    u32 i = native_count;
+    if (i == sizeof natives / sizeof *natives) { ReleaseSRWLockExclusive(&lock); rt_fatal("too many native functions"); }
+    natives[i] = (struct Native){fn, name};
+    __atomic_store_n(&native_count, i + 1, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&lock);
+    return NATIVE_BASE + 16ull * i;
 }
 
 /* ---- symbols --------------------------------------------------------------------- */
@@ -694,9 +780,9 @@ static void map_module(u32 m, const char *dir) {
     FILE *f = fopen(path, "rb");
     if (!f) rt_fatal("cannot open %s", path);
     u64 size = (mod->image_size + 0xFFFF) & ~0xFFFFull, text = (mod->text_size + 0xFFF) & ~0xFFFull;
-    u8 *image = VirtualAlloc((void *)mod->base, size, MEM_COMMIT, PAGE_READWRITE);   /* inside its reservation (NROs) */
-    if (image != (u8 *)mod->base) image = VirtualAlloc((void *)mod->base, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (image != (u8 *)mod->base) rt_fatal("cannot map %s at %#llx", mod->name, mod->base);
+    u8 *image = VirtualAlloc(G2H(mod->base), size, MEM_COMMIT, PAGE_READWRITE);   /* inside its reservation (NROs) */
+    if (image != G2H(mod->base)) image = VirtualAlloc(G2H(mod->base), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (image != G2H(mod->base)) rt_fatal("cannot map %s at %#llx", mod->name, mod->base);
     if (fread(image, 1, mod->image_size, f) < mod->text_size) rt_fatal("%s is truncated", path);
     fclose(f);
     kernel_add_region(mod->base, text, 3, 5);                        /* code */
@@ -706,7 +792,6 @@ static void map_module(u32 m, const char *dir) {
         u64 slot = (a - SLOT_BASE) >> SLOT_SHIFT;
         if (slot >= SLOT_COUNT || (slot_module[slot] && slot_module[slot] != m + 1))
             rt_fatal("%s at %#llx overlaps another module's dispatch slot", mod->name, mod->base);
-        slot_module[slot] = (u16)(m + 1);
     }
     code[m] = VirtualAlloc(NULL, mod->text_size * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (by_host_count + mod->func_count > by_host_cap) {
@@ -717,6 +802,10 @@ static void map_module(u32 m, const char *dir) {
         code[m][(mod->funcs[i].addr - mod->base) >> 2] = mod->funcs[i].fn;
         by_host[by_host_count++] = (struct HostFn){(u64)mod->funcs[i].fn, mod->funcs[i].addr};
     }
+    /* reachable last, its table filled: rt_lookup finds a module through its slots without the
+     * loader's lock, on any thread (release, for a weakly ordered processor) */
+    for (u64 a = mod->base; a < mod->base + size; a += 1ull << SLOT_SHIFT)
+        __atomic_store_n(&slot_module[(a - SLOT_BASE) >> SLOT_SHIFT], (u16)(m + 1), __ATOMIC_RELEASE);
 }
 
 /* Publish module m's exports. The first module to define a name wins, except over a name
@@ -778,7 +867,7 @@ static void load(const char *dir) {
     for (u32 k = 0; k < rt_nro_count; k++) {
         const RtModule *nro = rt_nro_modules[k];
         u64 size = (nro->image_size + 0xFFFF) & ~0xFFFFull;
-        if (VirtualAlloc((void *)nro->base, size, MEM_RESERVE, PAGE_NOACCESS) != (void *)nro->base)
+        if (VirtualAlloc(G2H(nro->base), size, MEM_RESERVE, PAGE_NOACCESS) != G2H(nro->base))
             fprintf(stderr, "[ro] warning: cannot reserve %s's range at %#llx (error %lu)\n", nro->name, nro->base, (unsigned long)GetLastError());
     }
     GuestFn *own[] = {(GuestFn *)rt_call, (GuestFn *)rt_lookup, (GuestFn *)rt_backtrace, (GuestFn *)rt_fatal,
@@ -793,7 +882,7 @@ static void load(const char *dir) {
     sym_slot("nninitStartup")->addr = rt_native(wrap_startup, "nninitStartup");
     sym_slot("nnMain")->addr = rt_native(wrap_main, "nnMain");
 
-    if (VirtualAlloc((void *)NATIVE_BASE, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != (void *)NATIVE_BASE) {
+    if (VirtualAlloc(G2H(NATIVE_BASE), 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != G2H(NATIVE_BASE)) {
         fprintf(stderr, "cannot map the native-function region\n");
         exit(2);
     }
@@ -886,7 +975,7 @@ static void print_status(void) {
 }
 
 #ifndef _WIN32
-int rt_window_init(void);                                  /* (linux/window.c) */
+int rt_window_init(void);                                  /* (linux/window.c; macos/window.m) */
 _Noreturn void rt_window_loop(int every, void (*status)(void));
 
 /* (the main thread runs the window's events: the status dumps, which stop every thread a
@@ -901,6 +990,75 @@ static DWORD WINAPI status_thread(LPVOID unused) {
 }
 #endif
 
+#ifdef __APPLE__
+#include <limits.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+
+/* macOS, before anything else: the guest's address space (rt_guest_window: first, before the
+ * system's allocations can take any of it - after only the log, which maps nothing), more open
+ * files than macOS's 256 by default (the game's own, RomFS sources, sockets), and what a start
+ * from Finder or `open` needs - no terminal and / as the working folder: SSBU_LOG=<file> takes
+ * stdout and stderr, SSBU_CWD=<dir> the working folder. Run as the app
+ * (<tree>/build-mac/WindowSmash.app/Contents/MacOS/ssbu) with no directory given, the tree's
+ * dump/modules is the one, and (without SSBU_CWD) the port's root - the nearest folder up from
+ * the tree with tools/recomp.py - the working folder, where reports/ goes as everywhere. *dir
+ * and *options: the directory, and where options start. */
+static void mac_start(int argc, char **argv, const char **dir, int *options) {
+    /* (the log first, so that a window that cannot be had is told there: started from Finder
+     * or `open`, stderr goes nowhere) */
+    const char *log = getenv("SSBU_LOG"), *cwd = getenv("SSBU_CWD");
+    int log_failed = 0;
+    if (log && *log) {
+        int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        else log_failed = errno;
+    }
+    if (!rt_guest_window()) {
+        fprintf(stderr, "cannot reserve the guest's memory (512 GiB of address space at %#llx): see above\n", RT_MEMBASE);
+        ExitProcess(2);
+    }
+    if (log_failed) fprintf(stderr, "[boot] cannot write the log %s (errno %d)\n", log, log_failed);
+    int max_files = 0;
+    size_t len = sizeof max_files;
+    struct rlimit rl;
+    if (sysctlbyname("kern.maxfilesperproc", &max_files, &len, NULL, 0) || max_files <= 0) max_files = 10240;
+    if (!getrlimit(RLIMIT_NOFILE, &rl)) {
+        rlim_t want = max_files < 10240 ? (rlim_t)max_files : 10240;
+        if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
+        if (rl.rlim_cur < want) { rl.rlim_cur = want; setrlimit(RLIMIT_NOFILE, &rl); }
+    }
+    if (cwd && *cwd && chdir(cwd)) fprintf(stderr, "[boot] cannot work in %s (errno %d)\n", cwd, errno);
+    if (argc >= 2 && argv[1][0] != '-') return;
+    static char tree[PATH_MAX], modules[PATH_MAX + 16];
+    snprintf(tree, sizeof tree, "%s", rt_exe_path());
+    char *slash;
+    for (int up = 0; up < 3; up++) {   /* ssbu, MacOS, Contents: the app */
+        if (!(slash = strrchr(tree, '/'))) return;
+        *slash = 0;
+    }
+    size_t n = strlen(tree);
+    if (n < 4 || strcmp(tree + n - 4, ".app")) return;   /* (not an app: the directory must be given) */
+    for (int up = 0; up < 2; up++) {   /* the app, build-mac: the tree */
+        if (!(slash = strrchr(tree, '/')) || slash == tree) return;
+        *slash = 0;
+    }
+    snprintf(modules, sizeof modules, "%s/dump/modules", tree);
+    *dir = modules;
+    *options = 1;
+    if (cwd && *cwd) return;
+    char root[PATH_MAX], probe[PATH_MAX + 32];
+    snprintf(root, sizeof root, "%s", tree);
+    for (;;) {
+        struct stat st;
+        snprintf(probe, sizeof probe, "%s/tools/recomp.py", root);
+        if (!stat(probe, &st)) { if (chdir(root)) fprintf(stderr, "[boot] cannot work in %s (errno %d)\n", root, errno); return; }
+        if (!(slash = strrchr(root, '/')) || slash == root) return;
+        *slash = 0;
+    }
+}
+#endif
+
 /* SSBU_CRASH_TEST=<seconds>: a deliberate fault then (to try the crash report and minidump). */
 static DWORD WINAPI crash_test(void *seconds) {
     Sleep((DWORD)(uintptr_t)seconds * 1000);
@@ -910,10 +1068,15 @@ static DWORD WINAPI crash_test(void *seconds) {
 }
 
 int main(int argc, char **argv) {
+    const char *dir = argc >= 2 ? argv[1] : NULL;
+    int options = 2;   /* (where the options after it start) */
 #ifdef _WIN32
     if (argc >= 6 && !strcmp(argv[1], "--write-dump")) return write_dump_main(argv);
 #endif
-    if (argc < 2) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
+#ifdef __APPLE__
+    mac_start(argc, argv, &dir, &options);
+#endif
+    if (!dir) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
     display_dpi_aware();
 #ifdef _WIN32
     {   /* which build this is, for reports */
@@ -931,7 +1094,12 @@ int main(int argc, char **argv) {
 #else
     {   /* which build this is, for reports (and the time zone read now, not first in a crash report) */
         char exe[4096];
+#ifdef __APPLE__
+        snprintf(exe, sizeof exe, "%s", rt_exe_path());
+        ssize_t len = (ssize_t)strlen(exe);
+#else
         ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+#endif
         exe[len > 0 ? len : 0] = 0;
         struct stat st;
         struct tm tm = {0};
@@ -940,7 +1108,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[boot] %s, built %04d-%02d-%02d %02d:%02d\n", exe, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
     }
 #endif
-    for (int i = 2; i < argc; i++) {
+    for (int i = options; i < argc; i++) {
         if (!strcmp(argv[i], "--trace")) rt_trace = 1;
         if (!strcmp(argv[i], "--status") && i + 1 < argc) status_every = atoi(argv[++i]);
     }
@@ -955,9 +1123,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[mem] write watch: %s\n", rt_ww_mode());
 #endif
     if (getenv("SSBU_CRASH_TEST")) CloseHandle(CreateThread(NULL, 0, crash_test, (void *)(uintptr_t)atoi(getenv("SSBU_CRASH_TEST")), 0, NULL));
-    rt_data_dir = argv[1];
+    rt_data_dir = dir;
     kernel_init();
-    load(argv[1]);
+    load(dir);
 #ifndef _WIN32
     rt_window_init();   /* (SDL wants its window and events on the main thread, which then runs them) */
 #endif
