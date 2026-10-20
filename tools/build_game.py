@@ -146,6 +146,19 @@ def romfs_cfg_ok(cfg):
     return bool(files) and all(os.path.isfile(p) for p in files)
 
 
+def aoc_done(modules=None):
+    """The DLC step is done: aoc.cfg is there, or step 7 found no DLC (aoc.none)."""
+    modules = modules or MODULES
+    return os.path.exists(os.path.join(modules, "aoc.cfg")) or os.path.exists(os.path.join(modules, "aoc.none"))
+
+
+def prepared():
+    """Everything step 3 to 8 make from the game files is there: the program, the fonts, the game
+    data's cfg (and the files it reads) and the DLC step. Then the game files are not asked for."""
+    return (not [n for n in EXEFS_FILES if not os.path.isfile(os.path.join(EXEFS, n))]
+            and not missing_fonts(FONTS) and romfs_cfg_ok(os.path.join(MODULES, "romfs.cfg")) and aoc_done())
+
+
 def missing_packages(requirements):
     """The packages of a requirements file that are not installed."""
     from importlib import metadata
@@ -601,7 +614,9 @@ def build(a):
     log("\n[2/9] Install the Python packages")
     install_packages()
 
-    cfg, aoc = os.path.join(MODULES, "romfs.cfg"), os.path.join(MODULES, "aoc.cfg")
+    cfg, aoc, no_aoc = os.path.join(MODULES, "romfs.cfg"), os.path.join(MODULES, "aoc.cfg"), os.path.join(MODULES, "aoc.none")
+    if a.game and os.path.exists(no_aoc):   # (a game folder named now may have DLC that the last one hadn't)
+        os.remove(no_aoc)
     exefs_done = not [n for n in EXEFS_FILES if not os.path.isfile(os.path.join(EXEFS, n))]
     romfs_done = romfs_cfg_ok(cfg)
     log("\n[3/9] Your folders")
@@ -609,7 +624,7 @@ def build(a):
     saved = load_saved()
     game = keys = firmware = fonts_from = None
     # (a game folder named on the command line is always looked at: it may hold another version now)
-    if a.game or not (exefs_done and romfs_done and os.path.exists(aoc)):
+    if a.game or not (exefs_done and romfs_done and aoc_done()):
         game = ask_folder("game", a.game, saved)
     if missing_fonts(FONTS):
         fonts_from = "game" if game and not missing_fonts(os.path.join(game, "fonts")) else "firmware"
@@ -661,13 +676,15 @@ def build(a):
     check_game_data(cfg, game or saved.get("game"))
 
     log(shown("\n[7/9] Turn on your DLC (dump\\modules\\aoc.cfg)"))
-    if os.path.exists(aoc):
+    if aoc_done():
         log("  already done")
     else:
         _path, title, rec, result = the_program()
         dlc = dlc_folder(game, rec, result["contents"])
         if not dlc:
             log(f"  no dlc folder in {game}, and no DLC among its files: no DLC")
+            with open(no_aoc, "w", newline="\n") as f:   # (so that the game files are not asked for again for this)
+                f.write("no DLC was found in the game files; give --game to look again\n")
         else:
             run([sys.executable, os.path.join("tools", "nca.py"), "aoc-cfg", dlc, "--keys", keys,
                  "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{title & ~0xFFF:016X}"],
@@ -739,7 +756,11 @@ def main():
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
     ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
     ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")
+    ap.add_argument("--check-ready", action="store_true",
+                    help="only say (exit status 0) whether steps 3 to 8 are done, so that no game files are needed")
     a = ap.parse_args()
+    if a.check_ready:
+        return 0 if prepared() else 1
     try:
         if a.check:
             log("[1/9] Check the tools")
