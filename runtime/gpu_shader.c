@@ -1756,12 +1756,11 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
             if ((target >> (rt * 4)) & 15) put(&out, "  float4 c%u : SV_Target%u;\n", rt, rt);
         if (flags & 2) put(&out, "  float depth : SV_Depth;\n");
         put(&out, "};\n");
-        if (c->alpha_test)   /* (the comparison as D3D11_COMPARISON_FUNC: 1 never .. 8 always) */
+        if (c->alpha_test)   /* (the passing outcomes as bits: alpha_test_mask. Selects, not a switch on the
+                              * comparison: with the switch, Intel graphics showed none of the alpha-tested draws) */
             put(&out, "bool alpha_pass(float a) {\n"
                       "  float r = params.frag.w;\n"
-                      "  switch ((uint)params.frag.z) {\n"
-                      "  case 1u: return false;\n  case 2u: return a < r;\n  case 3u: return a == r;\n  case 4u: return a <= r;\n"
-                      "  case 5u: return a > r;\n  case 6u: return a != r;\n  case 7u: return a >= r;\n  default: return true;\n  }\n}\n");
+                      "  return (asuint(params.frag.z) & (a < r ? 1u : a == r ? 2u : a > r ? 4u : 8u)) != 0u;\n}\n");
         put(&out, "PSOut main(VSOut i, bool front : SV_IsFrontFace) {\n");
     }
     for (u32 r = 0; r < 255; r++) if (c->reg_used[r]) put(&out, "  uint r%u = 0u;\n", r);

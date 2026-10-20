@@ -23,7 +23,10 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <ctype.h>
+#include <dxgi1_6.h>
+#else
 #include <errno.h>
 #include <sys/uio.h>   /* process_vm_readv */
 #include <unistd.h>
@@ -405,6 +408,103 @@ static void driver_stacks(void) {
             GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
     if (!reg || reg(0, on_dll_loaded, NULL, &cookie) < 0) fprintf(stderr, "[gfx] note: the driver's threads keep their own stack size\n");
 }
+
+/* ---- the graphics card ---------------------------------------------------------------------
+ * Laptops with two graphics chips make the processor's own (Intel's) the system's default, and
+ * the game used to draw with that. display.ini's gpu: "auto" takes the card Windows calls
+ * high-performance (the NVIDIA or AMD chip beside it; on a PC with one card, that card), any
+ * other text the first card whose name contains it ("intel", "radeon", "4060"), "warp" Windows'
+ * software renderer (slow: for tests). The two exports ask the NVIDIA and AMD drivers of such
+ * laptops for their chip too, for whatever else would take the default. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
+static void adapter_name(const DXGI_ADAPTER_DESC1 *d, char *out, size_t size) {
+    size_t i = 0;
+    for (; i + 1 < size && d->Description[i]; i++) out[i] = d->Description[i] < 128 ? (char)d->Description[i] : '?';
+    out[i] = 0;
+}
+
+/* The adapter to create the device on (referenced), or NULL for the system's default; *warp:
+ * the software renderer was asked for. */
+static IDXGIAdapter1 *pick_adapter(int *warp) {
+    const char *want = display_gpu();
+    *warp = !_stricmp(want, "warp");
+    if (*warp) return NULL;
+    int any = !*want || !_stricmp(want, "auto");
+    IDXGIFactory1 *f1;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return NULL;
+    IDXGIFactory6 *f6 = NULL;
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;   /* (before Windows 10 1803: the system's order) */
+    char w[64];
+    size_t k = 0;
+    for (; k + 1 < sizeof w && want[k]; k++) w[k] = (char)tolower((unsigned char)want[k]);
+    w[k] = 0;
+    IDXGIAdapter1 *fastest = NULL, *named = NULL;   /* (fastest first) */
+    char list[1024] = "";
+    DXGI_ADAPTER_DESC1 seen[8];
+    UINT nseen = 0;
+    for (UINT i = 0;; i++) {
+        IDXGIAdapter1 *a = NULL;
+        HRESULT hr = f6 ? IDXGIFactory6_EnumAdapterByGpuPreference(f6, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_IDXGIAdapter1, (void **)&a)
+                        : IDXGIFactory1_EnumAdapters1(f1, i, &a);
+        if (FAILED(hr)) break;
+        DXGI_ADAPTER_DESC1 d;
+        if (FAILED(IDXGIAdapter1_GetDesc1(a, &d))) { IDXGIAdapter1_Release(a); continue; }
+        int again = 0;   /* (a card can be listed twice, e.g. once more for a virtual display) */
+        for (UINT j = 0; j < nseen; j++)
+            again |= seen[j].VendorId == d.VendorId && seen[j].DeviceId == d.DeviceId && seen[j].SubSysId == d.SubSysId &&
+                     seen[j].DedicatedVideoMemory == d.DedicatedVideoMemory && !wcscmp(seen[j].Description, d.Description);
+        if (again) { IDXGIAdapter1_Release(a); continue; }
+        if (nseen < 8) seen[nseen++] = d;
+        char name[128], lower[128];
+        adapter_name(&d, name, sizeof name);
+        for (k = 0; k < sizeof lower; k++) lower[k] = (char)tolower((unsigned char)name[k]);
+        int software = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        size_t l = strlen(list);
+        snprintf(list + l, sizeof list - l, "%s%s (vendor %#x, %.1f GB%s)", l ? "; " : "", name, d.VendorId,
+                 (double)d.DedicatedVideoMemory / (1 << 30), software ? ", software" : "");
+        if (!software && !any && !named && strstr(lower, w)) { named = a; IDXGIAdapter1_AddRef(a); }
+        if (!software && !fastest) fastest = a;
+        else IDXGIAdapter1_Release(a);
+    }
+    if (f6) IDXGIFactory6_Release(f6);
+    IDXGIFactory1_Release(f1);
+    fprintf(stderr, "[gfx] graphics cards: %s\n", list[0] ? list : "none listed");
+    if (any) return fastest;
+    if (!named) { fprintf(stderr, "[gfx] display.ini: no graphics card's name contains '%s': using the fastest\n", want); return fastest; }
+    if (fastest) IDXGIAdapter1_Release(fastest);
+    return named;
+}
+
+/* SSBU_D3D_DEBUG=1: Direct3D's debug layer (Windows' optional "Graphics Tools" feature) checks
+ * every call; its complaints go to the log at each present - each kind the first 3 times, then
+ * every 1000th - as uses of the API one driver forgives and another does not. */
+static ID3D11InfoQueue *debug_queue;
+
+static void debug_messages(void) {
+    if (!debug_queue) return;
+    static struct { D3D11_MESSAGE_ID id; u32 count; } seen[512];
+    UINT64 n = ID3D11InfoQueue_GetNumStoredMessages(debug_queue);
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        if (FAILED(ID3D11InfoQueue_GetMessage(debug_queue, i, NULL, &len)) || !len) continue;
+        D3D11_MESSAGE *m = malloc(len);
+        if (m && SUCCEEDED(ID3D11InfoQueue_GetMessage(debug_queue, i, m, &len))) {
+            u32 h = (u32)m->ID % 512, probe = 0;
+            while (seen[h].count && seen[h].id != m->ID && probe++ < 512) h = (h + 1) % 512;
+            seen[h].id = m->ID;
+            u32 c = ++seen[h].count;
+            if (c <= 3 || c % 1000 == 0)
+                fprintf(stderr, "[d3d debug] %s #%d (%u so far): %.*s\n", m->Severity <= D3D11_MESSAGE_SEVERITY_ERROR ? "ERROR" : "warning",
+                        (int)m->ID, c, (int)m->DescriptionByteLength, m->pDescription);
+        }
+        free(m);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(debug_queue);
+}
+#else
+static void debug_messages(void) {}
 #endif
 
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
@@ -427,10 +527,32 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
      * and Intel's mostly do) - for measuring what the renderer costs such a driver */
     UINT render_flags = getenv("SSBU_D3D_DRIVER_THREADS") && !atoi(getenv("SSBU_D3D_DRIVER_THREADS"))
                         ? D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS : 0;
-    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx))) {
-        fprintf(stderr, "[gfx] cannot create a Direct3D 11 device\n");
+    IDXGIAdapter1 *chosen = NULL;
+    int warp = 0;
+#ifdef _WIN32
+    chosen = pick_adapter(&warp);
+#endif
+    HRESULT made = D3D11CreateDevice((IDXGIAdapter *)chosen, chosen ? D3D_DRIVER_TYPE_UNKNOWN : warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+                                     NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+    if (chosen) IDXGIAdapter1_Release(chosen);
+    if (FAILED(made) && (chosen || warp))   /* (then the system's default) */
+        made = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags | render_flags, levels, 2, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+    if (FAILED(made)) {
+        fprintf(stderr, "[gfx] cannot create a Direct3D 11 device (%#lx)%s\n", (unsigned long)made,
+                flags & D3D11_CREATE_DEVICE_DEBUG ? ": SSBU_D3D_DEBUG needs Windows' optional Graphics Tools feature" : "");
         return TRUE;
     }
+#ifdef _WIN32
+    if ((flags & D3D11_CREATE_DEVICE_DEBUG) && SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D11InfoQueue, (void **)&debug_queue))) {
+        D3D11_MESSAGE_SEVERITY quiet[] = {D3D11_MESSAGE_SEVERITY_INFO, D3D11_MESSAGE_SEVERITY_MESSAGE};
+        D3D11_INFO_QUEUE_FILTER filter;
+        memset(&filter, 0, sizeof filter);
+        filter.DenyList.NumSeverities = 2;
+        filter.DenyList.pSeverityList = quiet;
+        ID3D11InfoQueue_AddStorageFilterEntries(debug_queue, &filter);
+        ID3D11InfoQueue_SetMessageCountLimit(debug_queue, 4096);
+    }
+#endif
     IDXGIDevice *dxgi_dev; IDXGIAdapter *adapter; IDXGIFactory2 *factory;
     ID3D11Device_QueryInterface(dev, &IID_IDXGIDevice, (void **)&dxgi_dev);
     IDXGIDevice_GetAdapter(dxgi_dev, &adapter);
@@ -438,13 +560,30 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     /* NVIDIA's: a second device, with the driver's internal threading off, that compiles each
      * shader first on our compiler threads (see "shaders"). SSBU_COMPILE_DEVICE=0/1 overrides. */
     DXGI_ADAPTER_DESC ad;
+    memset(&ad, 0, sizeof ad);
     int nvidia = SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)) && ad.VendorId == 0x10DE;
-#ifndef _WIN32
-    {   /* (DXVK: which Vulkan device it chose) */
-        char name[128];
+    char name[128];
+    {
         size_t i = 0;
         for (; i < 127 && ad.Description[i]; i++) name[i] = ad.Description[i] < 128 ? (char)ad.Description[i] : '?';
         name[i] = 0;
+    }
+#ifdef _WIN32
+    {   /* (and what its driver says it can do: for reports from other cards) */
+        LARGE_INTEGER umd;
+        D3D11_FEATURE_DATA_THREADING th;
+        memset(&umd, 0, sizeof umd);
+        memset(&th, 0, sizeof th);
+        ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_THREADING, &th, sizeof th);
+        IDXGIAdapter_CheckInterfaceSupport(adapter, &IID_IDXGIDevice, &umd);
+        unsigned fl = (unsigned)ID3D11Device_GetFeatureLevel(dev);
+        fprintf(stderr, "[gfx] drawing with %s (vendor %#x, driver %u.%u.%u.%u, feature level %u.%u, concurrent creates %s, command lists %s)\n",
+                name, ad.VendorId, (unsigned)(umd.HighPart >> 16), (unsigned)(umd.HighPart & 0xFFFF), (unsigned)((u32)umd.LowPart >> 16),
+                (unsigned)(umd.LowPart & 0xFFFF), fl >> 12 & 15, fl >> 8 & 15, th.DriverConcurrentCreates ? "yes" : "no",
+                th.DriverCommandLists ? "yes" : "no");
+    }
+#else
+    {   /* (DXVK: which Vulkan device it chose) */
         fprintf(stderr, "[gfx] Direct3D 11 through DXVK on %s (vendor %#x)\n", name, ad.VendorId);
         if (ad.VendorId == 0x10005 || strstr(name, "llvmpipe") || strstr(name, "lavapipe"))
             fprintf(stderr, "[gfx] note: this is a software renderer (no Vulkan GPU driver found): expect a low frame rate\n");
@@ -1091,7 +1230,8 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     u64 h = shader_program_hash(p + skip, size - skip);
     if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
     u64 program_hash = h;
-    if (alpha_tested) h = (h ^ 0x616C706861746573ull) * 1099511628211ull;
+    /* (the salt changes with the alpha test's code, so cache files of an older form are not used) */
+    if (alpha_tested) h = (h ^ 0x616C706861743032ull) * 1099511628211ull;
     CbufSource src = {stage_cb};
     for (u32 i = 0; i < shader_count; i++) {
         Shader *s = shader_cache[i];
@@ -2873,7 +3013,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.fix[3] = minus_one ? 0.5f : 0.0f;
     params.frag[0] = lower_left ? 1.0f : 0.0f;
     params.frag[1] = (float)rt_h;
-    if (pa_e && ps == pa_e) { params.frag[2] = (float)alpha_func; params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
+    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * D3D judges the winding as seen on the target, which after the fix-up above is the window
@@ -3731,6 +3871,7 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     gfx_stat_presented++;
     release_graves();
     note_writes();
+    debug_messages();
     static int logged, frames_logged, frames_to_log;
     static const char *after_compute = (const char *)1;
     if (after_compute == (const char *)1) after_compute = getenv("SSBU_GFX_LOG_AFTER_COMPUTE");
