@@ -6,6 +6,8 @@ whole programs (the 0x50-byte header, then code in groups of three after a sched
 
 Operations: mov32i d imm | iadd32i d a imm | isetp p a b cmp | ald d offset count | ast d offset count
 | bra label [pred] | ssy label | pbk label | sync [pred] | brk [pred] | exit [pred] | brx reg label...
+| ipa d attribute (a pixel shader's input, e.g. 0x70 / 0x74 the window position)
+| tlds d a b handle encoding (a texel load: a, b the coordinates' registers, as gpu_shader.c's emit_tlds)
 (a BRX's table is not encoded: a jump table comes from a constant buffer). A predicate is "P0".."P6"
 or "!P0"; none means PT. A label is a 1-tuple ending in ':'."""
 import struct
@@ -23,6 +25,7 @@ TOPS = {
     "sync": top("1111000011111---"), "brk": top("111000110100----"), "exit": top("111000110000----"),
     "brx": top("111000100101----"), "mov32i": top("000000010000----"), "iadd32i": top("0001110---------"),
     "isetp": top("010110110110----"), "ald": top("1110111111011---"), "ast": top("1110111111110---"),
+    "ipa": top("11100000--------"), "tlds": top("1101-01---------"),
 }
 
 
@@ -64,6 +67,10 @@ def assemble(lines, header=b""):
             w |= args[0] | args[1] << 8 | (args[2] & 0xFFFFFFFF) << 20 | PT << 16
         elif op == "isetp":   # P<p> = a <cmp> b (signed), the second destination PT
             w |= PT | args[0] << 3 | args[1] << 8 | args[2] << 20 | PT << 39 | 1 << 48 | CMP[args[3]] << 49 | PT << 16
+        elif op == "ipa":   # d, attribute byte offset; pass-through mode, unsaturated, A = RZ
+            w |= args[0] | 0xFF << 8 | (args[1] // 4) << 30 | PT << 16
+        elif op == "tlds":   # d (two registers), a, b, handle byte offset, encoding; 32-bit results, all four components
+            w |= args[0] | args[1] << 8 | args[2] << 20 | 0xFF << 28 | (args[3] // 4) << 36 | 4 << 50 | args[4] << 53 | 1 << 59 | PT << 16
         elif op in ("ald", "ast"):
             w |= args[0] | 0xFF << 8 | args[1] << 20 | (args[2] - 1) << 47 | PT << 16
         words.append(w)

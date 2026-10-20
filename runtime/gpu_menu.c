@@ -1,7 +1,7 @@
 /* The start-up settings menu.
  *
  * Every start (unless display.ini's menu = 0 or SSBU_MENU=0), before the shaders' screen
- * (gpu_precompile.c) and the game: Mode, Upscaling (and Sharpness with FSR), VSync and Window,
+ * (gpu_precompile.c) and the game: Mode, Resolution scale, Upscaling (and Sharpness with FSR), VSync and Window,
  * as display.ini has them, then Play. Up/down picks a row, left/right changes it, Enter / the
  * controller's south button plays, Esc / east starts with display.ini as it was; a click picks a
  * row, its value's left or right half steps it, Play plays. Untouched for 10 s, it starts as
@@ -17,6 +17,7 @@
 
 #include "gpu_backend.h"
 #include "gpu_menu.h"
+#include "gpu_scale.h"
 
 #define WAIT_S 10.0
 
@@ -24,8 +25,9 @@ volatile int menu_active;
 
 /* ---- the model ------------------------------------------------------------------------------ */
 static const Pacing VSYNC_ORDER[] = {PACING_VSYNC, PACING_CLOCK, PACING_VRR};
-static const unsigned ROW_LOCK[ROWS] = {LOCK_MODE, LOCK_UPSCALE, LOCK_UPSCALE, LOCK_PACING, LOCK_WINDOW, 0};
-static const char *const ROW_VAR[ROWS] = {"SSBU_MODE", "SSBU_UPSCALE", "SSBU_UPSCALE", "SSBU_PACING", "SSBU_WINDOW", ""};
+static const int SCALES[] = {50, 75, 100, 150, 200};
+static const unsigned ROW_LOCK[ROWS] = {LOCK_MODE, LOCK_SCALE, LOCK_UPSCALE, LOCK_UPSCALE, LOCK_PACING, LOCK_WINDOW, 0};
+static const char *const ROW_VAR[ROWS] = {"SSBU_MODE", "SSBU_SCALE", "SSBU_UPSCALE", "SSBU_UPSCALE", "SSBU_PACING", "SSBU_WINDOW", ""};
 
 void menu_init(Menu *m, const DisplaySettings *now, unsigned locked, double now_s) {
     memset(m, 0, sizeof *m);
@@ -39,15 +41,22 @@ void menu_init(Menu *m, const DisplaySettings *now, unsigned locked, double now_
 int menu_visible(const Menu *m, int row) { return row != ROW_SHARPNESS || m->s.upscale == UPSCALE_FSR; }
 
 const char *menu_label(int row) {
-    static const char *const L[ROWS] = {"Mode", "Upscaling", "Sharpness", "VSync", "Window", "Play"};
+    static const char *const L[ROWS] = {"Mode", "Resolution scale", "Upscaling", "Sharpness", "VSync", "Window", "Play"};
     return row >= 0 && row < ROWS ? L[row] : "";
 }
 
 void menu_value(const Menu *m, int row, char *out, unsigned n) {
     const char *v = "";
-    char num[16];
+    char num[32];
     switch (row) {
     case ROW_MODE: v = m->s.operation == OP_HANDHELD ? "Handheld (720p)" : "Docked (1080p)"; break;
+    case ROW_SCALE: {   /* the percentage, and what it draws in the chosen mode */
+        unsigned w = m->s.operation == OP_HANDHELD ? 1280 : 1920, h = m->s.operation == OP_HANDHELD ? 720 : 1080;
+        float f = m->s.scale / 100.0f;
+        snprintf(num, sizeof num, "%d%% (%u x %u)", m->s.scale, scaled_size(w, f), scaled_size(h, f));
+        v = num;
+        break;
+    }
     case ROW_UPSCALE: v = m->s.upscale == UPSCALE_FSR ? "FSR" : "Linear"; break;
     case ROW_SHARPNESS: snprintf(num, sizeof num, "%.1f", m->s.sharpness); v = num; break;
     case ROW_VSYNC:
@@ -77,8 +86,18 @@ static void step(Menu *m, int dir) {
         break;
     }
     case ROW_WINDOW: m->s.window = m->s.window == 0 ? 2 : 0; break;
+    case ROW_SCALE: {
+        int i = 0, n = (int)(sizeof SCALES / sizeof SCALES[0]);
+        while (i < n && SCALES[i] != m->s.scale) i++;
+        if (i == n) i = 2;   /* (100) */
+        i += dir;
+        m->s.scale = SCALES[i < 0 ? 0 : i >= n ? n - 1 : i];   /* (no wrapping: 50 to 200) */
+        break;
+    }
     }
 }
+
+int menu_recommends_fsr(const Menu *m) { return m->s.scale < 100 && m->s.upscale != UPSCALE_FSR; }
 
 static void move(Menu *m, int dir) {
     do m->row = (m->row + dir + ROWS) % ROWS; while (!menu_visible(m, m->row));
@@ -164,6 +183,7 @@ void menu_run(void) {
             shown[r] = menu_visible(&m, r);
         }
         if (!m.touched) snprintf(footer, sizeof footer, "Starting in %.0f s - press any key to change settings", m.deadline - seconds() + 0.5);
+        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "FSR recommended below 100%%   -   Enter: play   Esc: no changes");
         else snprintf(footer, sizeof footer, "Enter: play    Esc: play without changes");
         const char *vp[ROWS];
         for (int r = 0; r < ROWS; r++) vp[r] = values[r];
@@ -175,7 +195,8 @@ void menu_run(void) {
         display_save(&m.s);
         display_apply(&m.s);
     }
-    fprintf(stderr, "[menu] %s: %s, upscale %s, pacing %d, window %d\n", m.state == MENU_PLAY ? "play" : "as display.ini was",
-            m.s.operation == OP_HANDHELD ? "handheld" : "docked", m.s.upscale == UPSCALE_FSR ? "fsr" : "linear", (int)m.s.pacing, m.s.window);
+    fprintf(stderr, "[menu] %s: %s at %d%%, upscale %s, pacing %d, window %d\n", m.state == MENU_PLAY ? "play" : "as display.ini was",
+            m.s.operation == OP_HANDHELD ? "handheld" : "docked", m.s.scale, m.s.upscale == UPSCALE_FSR ? "fsr" : "linear", (int)m.s.pacing,
+            m.s.window);
 #endif
 }

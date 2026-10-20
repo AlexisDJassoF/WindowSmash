@@ -302,9 +302,10 @@ void overlay_menu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTarge
     nverts = 0;
     int rows = 0;
     for (int i = 0; i < n; i++) rows += shown[i] != 0;
-    float row_h = CELL_H + 14, pw = 34 * CELL_W + 48, ph = (rows + 1) * row_h + 3 * CELL_H + 40;
+    /* (labels up to 17 characters, values up to 26: "<  75% (1440 x 810)  >", "(set by SSBU_...)") */
+    float row_h = CELL_H + 14, pw = 46 * CELL_W + 48, ph = (rows + 1) * row_h + 3 * CELL_H + 40;
     if (pw > w - 16.0f) pw = w - 16.0f;
-    float px = (w - pw) / 2, py = (h - ph) / 2, lx = px + 24, vx = px + 24 + 12 * CELL_W;
+    float px = (w - pw) / 2, py = (h - ph) / 2, lx = px + 24, vx = px + 24 + 18 * CELL_W;
     rect(px, py, pw, ph, RGBA(24, 24, 28, 235));
     text((w - (float)strlen(title) * CELL_W) / 2, py + 14, RGBA(240, 240, 240, 255), title);
     float y = py + 14 + CELL_H + 18;

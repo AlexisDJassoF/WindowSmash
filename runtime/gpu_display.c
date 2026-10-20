@@ -43,7 +43,8 @@ static struct {
     Upscale upscale;
     float sharpness;
     int menu;
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, 1};
+    int scale;   /* percent */
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, 1, 100};
 
 /* What the start-up menu shows and may write (gpu_menu.c): the file's own values (before the
  * environment's), and which of them a variable fixes */
@@ -106,6 +107,10 @@ static const char DEFAULT_INI[] =
     "upscale = linear\n"
     "; sharpness = 0.0-2.0: fsr's sharpening, 0.0 the most; each 1.0 halves it.\n"
     "sharpness = 0.2\n"
+    "; scale = 50 | 75 | 100 | 150 | 200: the game drawn at this percentage of the mode's resolution in\n"
+    ";   each direction - 75 in handheld: 960 x 540 - its picture and menus as they are; less is lighter\n"
+    ";   on the graphics card (best with upscale = fsr), more is sharper on a fast one.\n"
+    "scale = 100\n"
     "\n"
     "; menu = 1: the settings menu at every start (mode, upscale, vsync, window); 0: straight to the game.\n"
     "menu = 1\n";
@@ -144,6 +149,12 @@ static void parse_sharpness(const char *v) {
     cfg.sharpness = f < 0 ? 0 : f > 2 ? 2 : f;
 }
 
+static void parse_scale(const char *v) {
+    int n = atoi(v);
+    if (n == 50 || n == 75 || n == 100 || n == 150 || n == 200) cfg.scale = n;
+    else fprintf(stderr, "[display] scale is 50, 75, 100, 150 or 200, not '%s'\n", v);
+}
+
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
     char *e = s + strlen(s);
@@ -177,16 +188,18 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "upscale")) parse_upscale(value);
         else if (!_stricmp(key, "sharpness")) parse_sharpness(value);
         else if (!_stricmp(key, "menu")) cfg.menu = atoi(value) != 0;
+        else if (!_stricmp(key, "scale")) parse_scale(value);
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
     snprintf(ini_path, sizeof ini_path, "%s", path);
-    from_file = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing};
+    from_file = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing, cfg.scale};
     if ((env = getenv("SSBU_WINDOW")) && *env) locked |= LOCK_WINDOW;
     if ((env = getenv("SSBU_PACING")) && *env) locked |= LOCK_PACING;
     if ((env = getenv("SSBU_MODE")) && *env) locked |= LOCK_MODE;
     if ((env = getenv("SSBU_UPSCALE")) && *env) locked |= LOCK_UPSCALE;
     if ((env = getenv("SSBU_MENU")) && *env) cfg.menu = atoi(env) != 0;
+    if ((env = getenv("SSBU_SCALE")) && *env) { locked |= LOCK_SCALE; parse_scale(env); }
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
@@ -241,13 +254,14 @@ int display_notice(char *out, unsigned n) {
     return 1;
 }
 
+float display_scale(void) { load(); return cfg.scale / 100.0f; }
 unsigned display_sync_interval(void) { load(); return cfg.pacing == PACING_VSYNC ? 1 : 0; }
 int display_menu_enabled(void) { load(); return cfg.menu; }
 
 /* ---- the start-up menu's settings (gpu_menu.c) ----------------------------------------- */
 void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed) {
     load();
-    *now = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing};
+    *now = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing, cfg.scale};
     if (file) *file = from_file;
     if (fixed) *fixed = locked;
 }
@@ -265,6 +279,7 @@ void display_apply(const DisplaySettings *s) {
     cfg.upscale = s->upscale;
     cfg.sharpness = s->sharpness < 0 ? 0 : s->sharpness > 2 ? 2 : s->sharpness;
     cfg.pacing = s->pacing;
+    cfg.scale = s->scale;
 }
 
 char *display_ini_rewrite(const char *text, const char *defaults, int n, const char *const keys[], const char *const values[]);
@@ -275,8 +290,8 @@ char *display_ini_rewrite(const char *text, const char *defaults, int n, const c
 int display_save(const DisplaySettings *s) {
     load();
     static const char *const WINDOW[] = {"windowed", "borderless", "fullscreen"}, *const PACE[] = {"clock", "vrr", "display", "vsync"};
-    const char *keys[5], *values[5];
-    char sharp[16];
+    const char *keys[6], *values[6];
+    char sharp[16], scale[8];
     int n = 0;
     if (!(locked & LOCK_WINDOW) && s->window != from_file.window) keys[n] = "window", values[n++] = WINDOW[s->window];
     if (!(locked & LOCK_MODE) && s->operation != from_file.operation) keys[n] = "mode", values[n++] = s->operation == OP_HANDHELD ? "handheld" : "docked";
@@ -286,6 +301,10 @@ int display_save(const DisplaySettings *s) {
         keys[n] = "sharpness", values[n++] = sharp;
     }
     if (!(locked & LOCK_PACING) && s->pacing != from_file.pacing) keys[n] = "pacing", values[n++] = PACE[s->pacing];
+    if (!(locked & LOCK_SCALE) && s->scale != from_file.scale) {
+        snprintf(scale, sizeof scale, "%d", s->scale);
+        keys[n] = "scale", values[n++] = scale;
+    }
     if (!n) return 1;
     char *old = NULL;
     FILE *f = fopen(ini_path, "rb");

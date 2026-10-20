@@ -13,7 +13,7 @@ extern volatile int menu_active;
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */
 
 /* ---- the model, without a window (tests/test_gpu_menu.py drives it) ---------------------- */
-enum { ROW_MODE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_PLAY, ROWS };
+enum { ROW_MODE, ROW_SCALE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_PLAY, ROWS };
 enum { MENU_OPEN, MENU_PLAY, MENU_KEEP };   /* MENU_KEEP: started as display.ini was (Esc, or no input in time) */
 typedef struct Menu {
     DisplaySettings s, initial;
@@ -26,7 +26,8 @@ typedef struct MenuRect { float x, y, w, h; } MenuRect;   /* a row's place on sc
 void menu_init(Menu *m, const DisplaySettings *now, unsigned locked, double now_s);
 int menu_visible(const Menu *m, int row);                     /* Sharpness only with FSR */
 const char *menu_label(int row);
-void menu_value(const Menu *m, int row, char *out, unsigned n);   /* "Handheld (720p)", "0.2", "(set by SSBU_MODE)" ... */
+void menu_value(const Menu *m, int row, char *out, unsigned n);   /* "Handheld (720p)", "75% (960 x 540)", "(set by SSBU_MODE)" ... */
+int menu_recommends_fsr(const Menu *m);                      /* below 100% with linear upscaling */
 void menu_event(Menu *m, int event, double now_s);
 /* A click at (x, y) against the rows drawn (rects[row], value_x: where values start): the events it is */
 void menu_click(Menu *m, const MenuRect rects[ROWS], float value_x, float x, float y, double now_s);

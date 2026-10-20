@@ -111,7 +111,7 @@ rumble = 60
 
 ## Window and display
 
-<kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> switches between a window and full screen at any time. The game draws its picture at 1920 × 1080 and fits it into the window, always at 16:9, with black bars when the window has another shape. Screenshots keep the full 1920 × 1080 picture.
+<kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> switches between a window and full screen at any time. The game draws its picture at 1920 × 1080 (1280 × 720 with `mode = handheld`) and fits it into the window, always at 16:9, with black bars when the window has another shape. Screenshots keep a 1920 × 1080 picture.
 
 The first start also writes **`display.ini`**, which sets how the game starts:
 
@@ -119,9 +119,14 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 | :--- | :--- | :--- |
 | `window` | `windowed`: a window that keeps 16:9 as you resize it. `borderless`: covers its whole monitor. `fullscreen`: borderless and always on top; the monitor keeps its resolution. | `windowed` |
 | `width`, `height` | The window's inside size at 100% display scaling. | `1280`, `720` |
-| `pacing` | `clock`: a steady 60 frames a second. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. | `clock` |
+| `pacing` | `clock`: a steady 60 frames a second. `vsync`: the same, each frame shown at the monitor's next refresh, never torn. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. | `clock` |
 | `latency` | How many frames the graphics card may work ahead, 1–3. Lower is more responsive. | `3` |
 | `hide_cursor` | `1` hides the mouse pointer after two seconds without movement. | `1` |
+| `mode` | `docked`: the game believes it is on a TV and draws 1920 × 1080, as it ships. `handheld`: it believes it is in the hands and draws 1280 × 720, under half the pixels, for a slower graphics card (it may also simplify some effects, as on the console). | `docked` |
+| `upscale` | How the picture is enlarged to a larger window: `linear`, or `fsr` (AMD FidelityFX Super Resolution 1), which keeps edges sharp. Best with `mode = handheld` in a 1080p or larger full screen. | `linear` |
+| `sharpness` | FSR's sharpening, `0.0` (the most) to `2.0`; each `1.0` halves it. | `0.2` |
+| `scale` | `50`, `75`, `100`, `150` or `200`: the game drawn at this percentage of the mode's resolution in each direction (75 in handheld: 960 × 540), its picture and menus as they are. Below 100 is lighter on the graphics card, best with `upscale = fsr`; above it is sharper on a fast one. | `100` |
+| `menu` | The Linux build's start-up settings menu (`0`: none). The menu, and <kbd>F7</kbd> to switch between docked and handheld while playing, are the Linux build's for now ([README-LINUX.md](../README-LINUX.md)). | `1` |
 
 `controllers.ini` and `display.ini` apply to every game version started from the same folder.
 

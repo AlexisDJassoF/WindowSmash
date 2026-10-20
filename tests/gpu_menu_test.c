@@ -1,7 +1,7 @@
 /* runtime/gpu_menu.c's model without a window: tests/test_gpu_menu.py builds this with it.
  *   gpu_menu_test <script>   events, one letter each: u d l r a b (up down left right accept back),
  *                            t<seconds> (time passes), c<x>,<y> (a click; the rows are 40 px tall
- *                            from y = 100, values from x = 300). Prints the state, row and settings, '|' between them. */
+ *                            from y = 100 - Mode, Resolution scale, Upscaling... Play at 340 - values from x = 300). Prints the state, row and settings, '|' between them. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +21,8 @@ int gfx_menu(const char *t, int n, const char *const l[], const char *const v[],
 }
 
 int main(int argc, char **argv) {
-    DisplaySettings s = {0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, PACING_CLOCK};
+    DisplaySettings s = {0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, PACING_CLOCK, 100};
+    if (getenv("TEST_SCALE")) s.scale = atoi(getenv("TEST_SCALE"));
     unsigned locked = getenv("TEST_LOCKED") ? (unsigned)atoi(getenv("TEST_LOCKED")) : 0;
     if (getenv("TEST_PACING")) s.pacing = (Pacing)atoi(getenv("TEST_PACING"));
     Menu m;
@@ -50,7 +51,8 @@ int main(int argc, char **argv) {
     }
     char v[ROWS][80];
     for (int r = 0; r < ROWS; r++) menu_value(&m, r, v[r], sizeof v[r]);
-    printf("state=%d|row=%s|mode=%s|upscale=%s|sharpness=%s|vsync=%s|window=%s|sharp_shown=%d\n", m.state, menu_label(m.row), v[ROW_MODE],
-           v[ROW_UPSCALE], v[ROW_SHARPNESS], v[ROW_VSYNC], v[ROW_WINDOW], menu_visible(&m, ROW_SHARPNESS));
+    printf("state=%d|row=%s|mode=%s|scale=%s|upscale=%s|sharpness=%s|vsync=%s|window=%s|sharp_shown=%d|fsr_hint=%d\n", m.state,
+           menu_label(m.row), v[ROW_MODE], v[ROW_SCALE], v[ROW_UPSCALE], v[ROW_SHARPNESS], v[ROW_VSYNC], v[ROW_WINDOW],
+           menu_visible(&m, ROW_SHARPNESS), menu_recommends_fsr(&m));
     return 0;
 }

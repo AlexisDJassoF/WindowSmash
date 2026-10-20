@@ -88,6 +88,11 @@ typedef struct DrawParams {
     u32 base[4];           /* base vertex, base instance */
     u32 swz[2][32];        /* per texture of each stage (vertex, pixel): component sources, 3 bits each */
     u32 sb[2][16][4];      /* per storage buffer of each stage: GPU address low, high, size */
+    /* The render resolution scale (render-resolution-scale), each as the factor less 1, so that
+     * all zeros - as a dispatch leaves them - is no scale: the bound render target's
+     * physical-to-logical factor (z, w: 1 / scale - 1), and each texture's logical-to-physical one. */
+    float rtscale[4];
+    float texscale[2][32];
 } DrawParams;
 
 /* Bytes of a program up to its end (header included), reading at most `max`. */

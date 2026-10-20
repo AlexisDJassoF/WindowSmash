@@ -13,7 +13,7 @@
 #include "gpu_shader.h"
 
 /* Bump when the translator changes what it generates: older files are then ignored. */
-#define SHADER_CACHE_VERSION 12
+#define SHADER_CACHE_VERSION 13
 #define SHADER_CACHE_UNPLAYED 0x01C07385C89DC000ull   /* FILETIME 2001-01-01 */
 #define SHADER_CACHE_PLAYED   0x01C1925741648000ull   /* written after 2002-01-01: the game used it */
 

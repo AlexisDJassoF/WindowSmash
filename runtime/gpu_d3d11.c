@@ -14,6 +14,7 @@
 #include "display.h"
 #include "gpu_backend.h"
 #include "gpu_fsr.h"
+#include "gpu_scale.h"
 #include "gpu_overlay.h"
 #include "net.h"
 #include "pad.h"
@@ -60,7 +61,9 @@ u64 gfx_stat_clears, gfx_stat_presented;
 /* ---- surfaces: render targets on the host ------------------------------------------- */
 typedef struct Surface {
     u64 guest;
-    u32 width, height, format, depth;
+    u32 width, height, format, depth;     /* (width x height: the size the game sees) */
+    u32 pw, ph;                           /* the texture's size: width x height times scale */
+    float scale;                          /* the render resolution scale it was made with (1: none) */
     DXGI_FORMAT storage, view;            /* the texture's format, and how it is rendered to and sampled */
     ID3D11Texture2D *tex;
     ID3D11RenderTargetView *rtv;
@@ -230,6 +233,30 @@ static void warn_format(const char *what, u32 f) {
     fprintf(stderr, "[gfx] unsupported %s format %#x\n", what, f);
 }
 
+/* The render resolution scale (render-resolution-scale): display.ini's scale, for the render
+ * targets made from the first draw on (the start-up menu has set it by then). */
+static float render_scale(void) {
+    static float s = -1;
+    if (s < 0) {
+        s = display_scale();
+        if (s != 1.0f) {
+            unsigned sw, sh;
+            display_screen_size(&sw, &sh);
+            fprintf(stderr, "[gfx] render scale %.0f%%: %u x %u drawn at %u x %u\n", s * 100, sw, sh, scaled_size(sw, s), scaled_size(sh, s));
+        }
+    }
+    return s;
+}
+
+/* The scale a render target is made with: the render scale for one at least the screen's size
+ * (the game's scene and its full-screen passes), none for a smaller one (shadow maps, bloom
+ * levels, lookup tables: their pixels are data the game addresses as they are). */
+static float surface_scale(u32 width, u32 height) {
+    unsigned sw, sh;
+    display_screen_size(&sw, &sh);
+    return scale_for(width, height, sw, sh, render_scale());
+}
+
 /* The host texture standing for the render target at `guest`, created on first use. */
 static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth) {
     if (!guest || !width || !height || width > 16384 || height > 16384) return NULL;
@@ -266,9 +293,12 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
             release_surface(s);
         }
     }
-    D3D11_TEXTURE2D_DESC td = {width, height, 1, 1, storage, {1, 0}, D3D11_USAGE_DEFAULT,
+    float scale = surface_scale(width, height);
+    u32 pw = scaled_size(width, scale), ph = scaled_size(height, scale);
+    D3D11_TEXTURE2D_DESC td = {pw, ph, 1, 1, storage, {1, 0}, D3D11_USAGE_DEFAULT,
                                D3D11_BIND_SHADER_RESOURCE | (depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET), 0, 0};
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->tex))) { s->tex = NULL; return NULL; }
+    s->pw = pw; s->ph = ph; s->scale = scale;
     s->depth = depth;
     s->storage = storage;
     make_views(s, view);
@@ -1792,7 +1822,8 @@ static void texture_index_add(Texture *t) {
 
 static int depth_sampling = -1;   /* depth buffers as textures (shadow maps, ...); SSBU_NO_DEPTH_SAMPLING or F5: off */
 
-static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
+static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, float *scale) {
+    *scale = 1.0f;
     TextureDesc d;
     int ok = tic_decode(tic, &d);
     u64 g = gpu_va_to_guest(d.address);
@@ -1810,7 +1841,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
         if (!rt || s->used > rt->used) rt = s;
     }
     if (rt && draw_logging) note_sampled(rt);
-    if (rt) return surface_srv(rt, (int)d.srgb);
+    if (rt) { *scale = rt->scale; return surface_srv(rt, (int)d.srgb); }
     if (!ok || d.type == TIC_1D_BUFFER || d.bytes == 0) { warn_texture(&d); return NULL; }
     u32 layers = d.type == TIC_CUBE ? 6 : d.type == TIC_CUBE_ARRAY ? 6 * d.depth : d.type == TIC_2D_ARRAY || d.type == TIC_1D_ARRAY ? d.depth : 1;
     if (d.type == TIC_3D) layers = 1;
@@ -2349,7 +2380,9 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
         u32 tic_index = handle & 0xFFFFF, tsc_index = regs[M_SAMPLER_BINDING] & 1 ? tic_index : (handle >> 20) & 0xFFF;
         read_gpu(tic_pool + tic_index * 32ull, 32, tic);
         read_gpu(tsc_pool + tsc_index * 32ull, 32, tsc);
-        tex[k] = get_texture(tic, s->info.tex[k].type);
+        float tscale;
+        tex[k] = get_texture(tic, s->info.tex[k].type, &tscale);
+        params->texscale[stage == SHADER_VERTEX ? 0 : 1][k] = tscale - 1.0f;   /* (the factor less 1: 0 unscaled) */
         if (k < 16) smp[k] = get_sampler(tsc);
         params->swz[stage][k] = (tic[0] >> 19) & 0xFFF;
         if (draw_logging) {
@@ -2403,17 +2436,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     ID3D11RenderTargetView *rtv[8] = {0};
     ID3D11DepthStencilView *dsv = NULL;
     u32 sel = regs[M_CT_SELECT], count = sel & 15, rt_w = 0, rt_h = 0;
+    float rts = 1.0f;   /* the render targets' scale: the game's pixels to the textures' */
     for (u32 i = 0; i < count && i < 8; i++) {
         u32 ct = (sel >> (4 + 3 * i)) & 7;
         u64 va = (u64)regs[M_CT(ct)] << 32 | regs[M_CT(ct) + 1];
         if (!va || !regs[M_CT(ct) + 4]) continue;
         Surface *sf = surface(gpu_va_to_guest(va), regs[M_CT(ct) + 2], regs[M_CT(ct) + 3], regs[M_CT(ct) + 4], 0);
-        if (sf) { rtv[i] = sf->rtv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; } }
+        if (sf) { rtv[i] = sf->rtv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; rts = sf->scale; } }
     }
     if (regs[M_ZT_SELECT] & 1) {
         u64 va = (u64)regs[M_ZT_A] << 32 | regs[M_ZT_A + 1];
         Surface *sf = surface(gpu_va_to_guest(va), regs[M_ZT_SIZE], regs[M_ZT_SIZE + 1], regs[M_ZT_A + 2], 1);
-        if (sf) { dsv = sf->dsv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; } }
+        if (sf) { dsv = sf->dsv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; rts = sf->scale; } }
     }
     if (!rt_w) { gfx_stat_skipped++; gfx_skip_target++; leave(); return; }
     /* (a render target bound as a texture of the same draw is unbound by D3D: fine) */
@@ -2443,6 +2477,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     D3D11_VIEWPORT vp = {ox - fabsf(sx), oy - fabsf(sy), 2 * fabsf(sx), 2 * fabsf(sy), zmin, zmax};
     if (vp.Width < 1) { vp.TopLeftX = 0; vp.Width = (float)rt_w; }
     if (vp.Height < 1) { vp.TopLeftY = 0; vp.Height = (float)rt_h; }
+    if (rts != 1.0f) { vp.TopLeftX *= rts; vp.TopLeftY *= rts; vp.Width *= rts; vp.Height *= rts; }   /* (in the textures' pixels) */
     if (memcmp(&cur.vp, &vp, sizeof vp)) { ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp); cur.vp = vp; }
     params.fix[0] = sx < 0 ? -1.0f : 1.0f;
     params.fix[1] = sy < 0 ? 1.0f : -1.0f;
@@ -2450,6 +2485,8 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.fix[3] = minus_one ? 0.5f : 0.0f;
     params.frag[0] = lower_left ? 1.0f : 0.0f;
     params.frag[1] = (float)rt_h;
+    params.rtscale[0] = params.rtscale[1] = rts - 1.0f;
+    params.rtscale[2] = params.rtscale[3] = 1.0f / rts - 1.0f;
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * D3D judges the winding as seen on the target, which after the fix-up above is the window
@@ -2462,6 +2499,11 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
             u32 h = regs[M_SCISSOR(0) + 1], v = regs[M_SCISSOR(0) + 2];
             r = (D3D11_RECT){(LONG)(h & 0xFFFF), (LONG)(v & 0xFFFF), (LONG)(h >> 16), (LONG)(v >> 16)};
             if (lower_left) { LONG t = (LONG)rt_h - r.bottom; r.bottom = (LONG)rt_h - r.top; r.top = t; }
+            if (rts != 1.0f) {   /* (the same logical pixels: outwards) */
+                long q[4] = {r.left, r.top, r.right, r.bottom};
+                scale_rect(q, rts);
+                r = (D3D11_RECT){(LONG)q[0], (LONG)q[1], (LONG)q[2], (LONG)q[3]};
+            }
         }
         if (memcmp(&cur.scissor, &r, sizeof r)) { ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &r); cur.scissor = r; }
     }
@@ -2767,7 +2809,7 @@ static void save_surface_bmp(Surface *s, ID3D11PixelShader *ps, const char *path
     ID3D11RenderTargetView *rtv;
     if (!ps || FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tmp))) return;
     ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tmp, NULL, &rtv);
-    D3D11_VIEWPORT vp = {0, 0, (float)s->width, (float)s->height, 0, 1};
+    D3D11_VIEWPORT vp = {0, 0, (float)s->width, (float)s->height, 0, 1};   /* (at the game's size: a scaled one is resampled) */
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     D3D11_RASTERIZER_DESC rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE};
@@ -3140,7 +3182,7 @@ static void clear_channels(Surface *s, const float color[4], u32 mask) {
     ID3D11ShaderResourceView *none[96] = {0};
     ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 96, none);
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &s->rtv, NULL);
-    D3D11_VIEWPORT vp = {0, 0, (float)s->width, (float)s->height, 0, 1};
+    D3D11_VIEWPORT vp = {0, 0, (float)s->pw, (float)s->ph, 0, 1};
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     D3D11_RECT all = {0, 0, 16384, 16384};
     ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &all);
@@ -3190,7 +3232,10 @@ void gfx_blit2d(const u32 *regs) {
     ID3D11ShaderResourceView *none[96] = {0};
     ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 96, none);
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &dst->rtv, NULL);
-    D3D11_VIEWPORT vp = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1};
+    /* (a scaled destination: its rectangle and the step in its texture's pixels; the source is
+     * sampled normalized by its logical size, so either may be scaled) */
+    float ds = dst->scale;
+    D3D11_VIEWPORT vp = {(float)dx * ds, (float)dy * ds, (float)dw * ds, (float)dh * ds, 0, 1};
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     D3D11_RECT all = {0, 0, 16384, 16384};
     ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &all);
@@ -3202,7 +3247,8 @@ void gfx_blit2d(const u32 *regs) {
     }
     D3D11_MAPPED_SUBRESOURCE m;
     if (rect_cb && SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)rect_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        float r[8] = {(float)sx, (float)sy, (float)du, (float)dv, (float)dx, (float)dy, 1.0f / (float)src->width, 1.0f / (float)src->height};
+        float r[8] = {(float)sx, (float)sy, (float)(du / ds), (float)(dv / ds), (float)dx * ds, (float)dy * ds, 1.0f / (float)src->width,
+                      1.0f / (float)src->height};
         memcpy(m.pData, r, sizeof r);
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)rect_cb, 0);
     }
@@ -3364,14 +3410,18 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xFFFFFFFF);
     ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
     ID3D11ShaderResourceView *none = NULL;
+    if (src && src->scale != 1.0f && crop_w && crop_h) {   /* (the crop is in the game's pixels: the texture's are scaled) */
+        crop_x = (u32)(crop_x * src->scale + 0.5f); crop_y = (u32)(crop_y * src->scale + 0.5f);
+        crop_w = (u32)(crop_w * src->scale + 0.5f); crop_h = (u32)(crop_h * src->scale + 0.5f);
+    }
     if (src) {   /* the game's picture at its own size */
         D3D11_VIEWPORT vp = {0, 0, FINAL_W, FINAL_H, 0, 1};
-        if (crop_w && crop_h && crop_x + crop_w <= src->width && crop_y + crop_h <= src->height) {
+        if (crop_w && crop_h && crop_x + crop_w <= src->pw && crop_y + crop_h <= src->ph) {
             /* a crop (handheld: 1280x720 of a 1920x1080 buffer): the whole surface drawn larger,
              * placed so that the crop fills the picture; the rest falls outside it */
             float sx = (float)FINAL_W / crop_w, sy = (float)FINAL_H / crop_h;
             vp.TopLeftX = -(float)crop_x * sx; vp.TopLeftY = -(float)crop_y * sy;
-            vp.Width = src->width * sx; vp.Height = src->height * sy;
+            vp.Width = src->pw * sx; vp.Height = src->ph * sy;
         }
         ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &final_rtv, NULL);
         ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
@@ -3392,14 +3442,14 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     D3D11_VIEWPORT wvp = {(float)fit_x, (float)fit_y, (float)fit_w, (float)fit_h, 0, 1};
     ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
     /* the part of the surface that is the picture (all of it, or the crop) */
-    int cropped = src && crop_w && crop_h && crop_x + crop_w <= src->width && crop_y + crop_h <= src->height;
+    int cropped = src && crop_w && crop_h && crop_x + crop_w <= src->pw && crop_y + crop_h <= src->ph;
     u32 pic_x = cropped ? crop_x : 0, pic_y = cropped ? crop_y : 0;
-    u32 pic_w = src ? (cropped ? crop_w : src->width) : 0, pic_h = src ? (cropped ? crop_h : src->height) : 0;
+    u32 pic_w = src ? (cropped ? crop_w : src->pw) : 0, pic_h = src ? (cropped ? crop_h : src->ph) : 0;
     if (src && display_upscale() == UPSCALE_FSR && (pic_w < fit_w || pic_h < fit_h) && fsr_ready() && fsr_target(fit_w, fit_h)) {
         /* FSR 1: EASU from the game's surface to the picture's size in the window, RCAS into it */
         uint32_t con[16];
         D3D11_MAPPED_SUBRESOURCE m;
-        fsr_easu_constants(con, (float)pic_w, (float)pic_h, (float)src->width, (float)src->height, (float)fit_w, (float)fit_h, (float)pic_x,
+        fsr_easu_constants(con, (float)pic_w, (float)pic_h, (float)src->pw, (float)src->ph, (float)fit_w, (float)fit_h, (float)pic_x,
                            (float)pic_y);
         if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)fsr_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             memcpy(m.pData, con, sizeof con);

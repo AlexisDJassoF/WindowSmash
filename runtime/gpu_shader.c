@@ -547,21 +547,22 @@ static void emit_tlds(Ctx *c, const Insn *in) {
     int f16 = !BITS(w, 59, 1);
     static const u8 RG[8] = {1, 2, 4, 8, 3, 9, 10, 12}, RGBA[8] = {7, 11, 13, 14, 15, 15, 15, 15};
     u32 mask = db == RZ ? RG[swz] : RGBA[swz];
-    u32 type = TEX_2D;
+    u32 type = enc <= 1 ? TEX_1D : enc == 7 ? TEX_3D : enc == 8 ? TEX_ARRAY_2D : TEX_2D;
+    if (enc == 3 || enc == 6 || (enc > 8 && enc != 12)) { unsupported(c, in, "TLDS encoding"); return; }
+    u32 k = texture_slot(c, handle, type, 0);
     const char *load;
     const char *ia = tmp("asint(%s)", R(c, a));
+    /* 2D texel coordinates go through tsxy_ (a scaled render target read as a texture) */
     switch (enc) {
-    case 0: type = TEX_1D; load = tmp("int2(%s, 0)", ia); break;
-    case 1: type = TEX_1D; load = tmp("int2(%s, asint(%s))", ia, R(c, b)); break;
-    case 2: load = tmp("int3(%s, asint(%s), 0)", ia, R(c, b)); break;
-    case 4: load = tmp("int3(%s, asint(%s), 0)", ia, R(c, a + 1)); break;   /* offset ignored */
-    case 5: load = tmp("int3(%s, asint(%s), asint(%s))", ia, R(c, a + 1), R(c, b)); break;
-    case 7: type = TEX_3D; load = tmp("int4(%s, asint(%s), asint(%s), 0)", ia, R(c, a + 1), R(c, b)); break;
-    case 8: type = TEX_ARRAY_2D; load = tmp("int4(asint(%s), asint(%s), (int)(%s & 0xFFFFu), 0)", R(c, b), R(c, b + 1), R(c, a)); break;
-    case 12: load = tmp("int3(%s, asint(%s), asint(%s))", ia, R(c, a + 1), R(c, b)); break;
-    default: unsupported(c, in, "TLDS encoding"); return;
+    case 0: load = tmp("int2(%s, 0)", ia); break;
+    case 1: load = tmp("int2(%s, asint(%s))", ia, R(c, b)); break;
+    case 2: load = tmp("int3(tsxy_(int2(%s, asint(%s)), %uu), 0)", ia, R(c, b), k); break;
+    case 4: load = tmp("int3(tsxy_(int2(%s, asint(%s)), %uu), 0)", ia, R(c, a + 1), k); break;   /* offset ignored */
+    case 5: load = tmp("int3(tsxy_(int2(%s, asint(%s)), %uu), asint(%s))", ia, R(c, a + 1), k, R(c, b)); break;
+    case 7: load = tmp("int4(%s, asint(%s), asint(%s), 0)", ia, R(c, a + 1), R(c, b)); break;
+    case 8: load = tmp("int4(tsxy_(int2(asint(%s), asint(%s)), %uu), (int)(%s & 0xFFFFu), 0)", R(c, b), R(c, b + 1), k, R(c, a)); break;
+    default: load = tmp("int3(tsxy_(int2(%s, asint(%s)), %uu), asint(%s))", ia, R(c, a + 1), k, R(c, b)); break;   /* 12 */
     }
-    u32 k = texture_slot(c, handle, type, 0);
     const char *v = tmp("t%u", tex_counter++);
     line(c, "{ float4 %s = swz(tex%u.Load(%s), %uu);", v, k, load, k);
     c->indent++;
@@ -607,8 +608,9 @@ static const char *ps_input(Ctx *c, u32 addr, int *perspective) {
         return tmp("i.a%u.%s", n, XYZW[comp]);
     }
     switch (addr) {
-    case 0x70: return "i.pos.x";
-    case 0x74: return "(params.frag[0] != 0 ? params.frag[1] - i.pos.y : i.pos.y)";
+    /* (the window position in the render target's logical pixels: its physical ones scaled back) */
+    case 0x70: return "(i.pos.x * (1.0f + params.rtscale.z))";
+    case 0x74: return "(params.frag[0] != 0 ? params.frag[1] - i.pos.y * (1.0f + params.rtscale.w) : i.pos.y * (1.0f + params.rtscale.w))";
     case 0x78: return "i.pos.z";
     case 0x7C: return "(1.0f / i.clipw)";
     case 0x3FC: return "asfloat(front ? 0xFFFFFFFFu : 0u)";
@@ -1837,11 +1839,16 @@ char *shader_translate(const u8 *program, u32 size, int stage, u32 vs_outputs, c
 
     Str out = {0};
     put(&out, "// Maxwell %s shader, %u instructions\n", stage == SHADER_VERTEX ? "vertex" : stage == SHADER_PIXEL ? "pixel" : "compute", c->n);
-    put(&out, "cbuffer Params : register(b0) { struct { uint4 attr[32]; float4 fix; float4 frag; uint4 base; uint4 swz[16]; uint4 sb[32]; } params; };\n");
+    put(&out, "cbuffer Params : register(b0) { struct { uint4 attr[32]; float4 fix; float4 frag; uint4 base; uint4 swz[16]; uint4 sb[32]; "
+              "float4 rtscale; float4 texscale[16]; } params; };\n");
     put(&out, "float comp_(float4 v, uint s) { return s == 2u ? v.x : s == 3u ? v.y : s == 4u ? v.z : s == 5u ? v.w : s >= 6u ? 1.0f : 0.0f; }\n"
               "float4 swz(float4 v, uint k) { uint s = params.swz[%u + (k >> 2)][k & 3u];\n"
-              "  return float4(comp_(v, s & 7u), comp_(v, (s >> 3) & 7u), comp_(v, (s >> 6) & 7u), comp_(v, (s >> 9) & 7u)); }\n",
-        stage == SHADER_VERTEX ? 0 : 8);
+              "  return float4(comp_(v, s & 7u), comp_(v, (s >> 3) & 7u), comp_(v, (s >> 6) & 7u), comp_(v, (s >> 9) & 7u)); }\n"
+              /* a texel of texture k at the logical (x, y) the program asks for: the physical one of a
+               * scaled render target read as a texture (render-resolution-scale); exact unscaled */
+              "int2 tsxy_(int2 p, uint k) { float d = params.texscale[%u + (k >> 2)][k & 3u];\n"
+              "  return d == 0.0f ? p : int2(floor((float2(p) + 0.5f) * (1.0f + d))); }\n",
+        stage == SHADER_VERTEX ? 0 : 8, stage == SHADER_VERTEX ? 0 : 8);
     for (u32 b = 0; b < 18; b++)
         if (info->cbuf_mask >> b & 1) put(&out, "ByteAddressBuffer cb%u : register(t%u);\n", b, b);
     for (u32 k = 0; k < info->ntex; k++) {

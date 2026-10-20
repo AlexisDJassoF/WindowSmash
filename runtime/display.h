@@ -31,13 +31,14 @@ OperationMode display_operation_mode(void);               /* docked (as it ships
 void display_screen_size(unsigned *w, unsigned *h);       /* the screen the game is told of: 1920x1080 or 1280x720 */
 Upscale display_upscale(void);
 float display_sharpness(void);                            /* fsr's sharpening in stops: 0.0 (most) to 2.0 */
+float display_scale(void);                                /* the render resolution scale: 0.5 to 2 (display.ini's scale %) */
 unsigned display_sync_interval(void);                     /* Present's: 1 with pacing = vsync, else 0 */
 int display_menu_enabled(void);                           /* display.ini's menu (SSBU_MENU overrides) */
 
 /* The start-up menu's settings (gpu_menu.c): window is the window mode (0 windowed, 1 borderless,
  * 2 fullscreen). LOCK_*: set by an environment variable, not the menu's to change. */
-typedef struct DisplaySettings { int window; OperationMode operation; Upscale upscale; float sharpness; Pacing pacing; } DisplaySettings;
-enum { LOCK_WINDOW = 1, LOCK_MODE = 2, LOCK_UPSCALE = 4, LOCK_PACING = 8 };
+typedef struct DisplaySettings { int window; OperationMode operation; Upscale upscale; float sharpness; Pacing pacing; int scale; } DisplaySettings;
+enum { LOCK_WINDOW = 1, LOCK_MODE = 2, LOCK_UPSCALE = 4, LOCK_PACING = 8, LOCK_SCALE = 16 };
 void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed);
 void display_apply(const DisplaySettings *s);             /* before the game starts */
 int display_save(const DisplaySettings *s);               /* what changed from the file, into display.ini */

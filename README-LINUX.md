@@ -155,11 +155,34 @@ SDL mappings for pads SDL doesn't know.
 | F4 | Log one frame's drawing |
 | F5 | Depth sampling on or off |
 | F6 | 10-second profile (`build/profile_*.txt`) |
+| F7 | Switch between docked (1080p) and handheld (720p) while playing; the new mode shows on screen for 2 seconds |
 | F11 or Alt+Enter | Switch between a window and full screen |
+
+In a window, a bar above the picture shows the mode: click it to switch, as F7 does. It isn't
+there in full screen.
 
 When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 
 ## Settings
+
+**At every start**, before the game, a **Settings** menu shows the main display settings:
+
+| Setting | Values |
+| :--- | :--- |
+| Mode | **Docked (1080p)**, as the game ships, or **Handheld (720p)**: the game believes it is in the hands and draws under half the pixels. For a slower graphics card (an integrated one); the game may also simplify some effects, as on the console. |
+| Resolution scale | **50%**, **75%**, **100%**, **150%** or **200%** of the mode's resolution in each direction, shown with what it draws (`75% (960 x 540)` in handheld). The game's picture and menus stay as they are; only the number of pixels changes. Below 100% is lighter on the graphics card (the menu then recommends FSR); above it is sharper on a fast one. |
+| Upscaling | **Linear** or **FSR** (AMD FidelityFX Super Resolution 1): how the picture is enlarged to a larger window. FSR keeps edges sharp; it is meant for Handheld in a 1080p (or larger) full screen. |
+| Sharpness | FSR's sharpening, 0.0 (the most) to 2.0. Only with FSR. |
+| VSync | **On**: every frame at the monitor's next refresh, no tearing. **Off**: shown the moment it's ready (less latency; may tear in full screen). **VRR**: for FreeSync / G-Sync monitors. |
+| Window | **Windowed** or **Fullscreen**. |
+
+Arrows or a pad's D-pad / left stick move and change; **Enter** or the pad's bottom button
+plays; **Esc** or the right one starts without changes; the mouse works too (a value's left or
+right half steps it). Untouched for 10 seconds, the game starts with what was saved. Play writes
+what changed into `display.ini`, keeping your own comments and other settings (the first time,
+the file as it was is kept as `display.ini.bak`). `menu = 0` in `display.ini`, or
+`SSBU_MENU=0 ./run.sh`, starts straight away. A setting an environment variable fixes
+(`SSBU_MODE`, `SSBU_UPSCALE`, `SSBU_PACING`, `SSBU_WINDOW`) is shown but can't be changed.
 
 Two files in this folder, each written with its defaults and explanations the first time the game
 starts (delete one to get the defaults back). They mean the same as on Windows
@@ -175,12 +198,17 @@ log names each pad as it connects, with its type and GUID.
 | Setting | On Linux |
 | :--- | :--- |
 | `window`, `width`, `height` | `borderless` and `fullscreen` are both the desktop's full screen on the window's monitor, which keeps its resolution. The picture stays 16:9, with black bars when the window has another shape. Unlike on Windows, the window isn't held to 16:9 while you resize it. |
+| `mode = docked` (default) or `handheld` | What the menu's Mode sets; F7 switches while playing (not saved). `SSBU_MODE` overrides it. |
+| `upscale = linear` (default) or `fsr`, `sharpness = 0.2` | What the menu's Upscaling and Sharpness set. FSR is used only when the window is larger than the game's picture; `SSBU_UPSCALE` overrides it. |
+| `menu = 1` (default) | The start-up menu; `0` starts straight away. |
+| `scale = 100` (default) | What the menu's Resolution scale sets: `50`, `75`, `100`, `150` or `200`. It holds for both modes, F7 included. `SSBU_SCALE` overrides it. |
+| `pacing = vsync` | The menu's VSync On: the 60-a-second clock, each frame presented at the monitor's next refresh. |
 | `pacing = clock` (default) | A steady 60 frames a second. DXVK presents each frame the moment it's ready; a compositing desktop shows it at its next refresh, and full screen without one may tear. To prevent that, start the game with `DXVK_CONFIG="dxgi.tearFree = True" ./run.sh`. |
 | `pacing = vrr` | The same clock, for FreeSync / G-Sync monitors with VRR turned on in the desktop or the driver. Best with `window = fullscreen`. |
 | `pacing = display` | Follows the monitor's refreshes on Windows; on Linux, it's the clock. |
 | `latency`, `hide_cursor` | As on Windows: 1–3 frames the GPU may work ahead, and hiding the idle mouse pointer. |
 
-**Shaders:** this folder carries the Windows build's compiled shaders that the game has used, and
+**Shaders:** after the menu, before the game. This folder carries the Windows build's compiled shaders that the game has used, and
 an index of every shader in the game (`dump/aot`, with its compiler `shaderaot`). At start, the
 game compares the two: if shaders are missing from the cache, a **Preparing shaders** screen
 compiles them before the game starts, with a bar and the time left. The first time that is the
@@ -221,6 +249,7 @@ back.
 | No sound | SDL uses PulseAudio or PipeWire. Check the log for `[audio]` lines. |
 | A crash | It writes `reports/crash_<date>_<time>.txt`: the guest function and host frames (`*** host exception`), also at the end of the log. Send it with `build/play.log`. When the port stops the game itself (something it can't do yet), it writes `reports/stopped_*.txt`. |
 | A freeze (no new picture for 5 seconds) | It writes `reports/freeze_*.txt`, again at 30 and 120 seconds: every thread's stack and who holds the renderer's locks. `SSBU_WATCHDOG=0` turns that off. Windows also writes minidumps; Linux doesn't, so a core dump, if your system keeps them, is the closest thing. |
+| A low frame rate on an integrated graphics card (the GPU at 100%: `DXVK_HUD=fps,gpuload ./run.sh` shows it) | In the start-up menu, Mode **Handheld (720p)** and Upscaling **FSR**, and play in full screen (F11): the game draws under half the pixels, and FSR enlarges them to the screen. Still too slow: Resolution scale **75%** (or 50%). |
 | Stutter | `SSBU_HITCH=40 ./run.sh` logs every frame over 40 ms with what the game's main, vsync and renderer threads spent it on (`[hitch]` lines in the log). |
 | Suspected trouble with write tracking | `SSBU_WRITE_WATCH=protect` makes the renderer track CPU writes with page protection instead of the kernel's write tracking (`userfaultfd` + `PAGEMAP_SCAN`, Linux 6.7 and later). Use it only to rule that out. The log's first lines say which one is in use. |
 
