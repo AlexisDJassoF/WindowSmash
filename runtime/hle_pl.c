@@ -25,7 +25,7 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK load_fonts(INIT_ONCE *o, void *p, void **ctx) {
     (void)o; (void)p; (void)ctx;
-    if (VirtualAlloc((void *)SHARED_BASE, AREA_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != (void *)SHARED_BASE)
+    if (VirtualAlloc(G2H(SHARED_BASE), AREA_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != G2H(SHARED_BASE))
         rt_fatal("cannot map the shared font area");
     kernel_add_region(SHARED_BASE, AREA_SIZE, 6 /* shared */, 1 /* read */);
     u64 at = SHARED_BASE;

@@ -22,7 +22,15 @@
  * (display_window_mode ...); borderless and fullscreen are both SDL's desktop full screen.
  * DXVK presents at once at sync interval 0 (Vulkan's immediate mode) whatever the pacing, so
  * clock and vrr differ only in the flag; display falls back to the clock (DXVK's WaitForVBlank
- * only sleeps a refresh). */
+ * only sleeps a refresh).
+ *
+ * macOS: the window is SDL's too, made and run by macos/window.m; its size is in points (a
+ * Retina display has 2 x 2 pixels a point), and borderless and fullscreen are both macOS's own
+ * full screen, a space of its own. vrr asks the renderer to show each frame at once rather than
+ * at the display's next refresh (the flag), and display waits for the display's refreshes with
+ * a display link (rt_window_wait_vblank). The clock sleeps on the shim's waitable timer, as on
+ * Linux: a kqueue timer marked critical (macos/platform.c's rt_sleep_until_ns), which the system
+ * does not put off to wake with others (mach_wait_until's sleeps come a millisecond or more late). */
 #define _WIN32_WINNT 0x0A00
 #define COBJMACROS
 #define _CRT_SECURE_NO_WARNINGS
@@ -30,7 +38,9 @@
 
 #include "display.h"
 #include "host.h"
+#ifndef __APPLE__
 #include <dxgi.h>
+#endif
 
 enum { MODE_WINDOWED, MODE_BORDERLESS, MODE_FULLSCREEN };
 
@@ -51,14 +61,24 @@ static const char DEFAULT_INI[] =
     ";   windowed:   a normal window, kept 16:9 while you resize it.\n"
     ";   borderless: no frame, covering the monitor the window is on.\n"
     ";   fullscreen: borderless and always on top (the monitor keeps its resolution).\n"
+#elif defined __APPLE__
+    ";   windowed:   a normal window, kept 16:9 while you resize it.\n"
+    ";   borderless, fullscreen: macOS's full screen, a space of its own on the window's display (it keeps\n"
+    ";               its resolution, and Game Mode turns on): what the window's green button does.\n"
+    "; Option+Return or Ctrl+Cmd+F (also fn+F, and F11 if macOS leaves it to the game) switches between\n"
+    "; the window and full screen while playing.\n"
 #else
     ";   windowed:   a normal window; the picture stays 16:9 inside it, with black bars.\n"
     ";   borderless, fullscreen: the desktop's full screen on the window's monitor (it keeps its resolution).\n"
 #endif
+#ifndef __APPLE__
     "; F11 or Alt+Enter switches between the window and full screen while playing.\n"
+#endif
     "window = windowed\n"
 #ifdef _WIN32
     "; width, height: the window's inside, at 100% display scaling (scaled with Windows' setting).\n"
+#elif defined __APPLE__
+    "; width, height: the window's inside in points (macOS's screen units: 2 x 2 pixels on a Retina display).\n"
 #else
     "; width, height: the window's inside, in the desktop's units (scaled ones on a scaled Wayland desktop).\n"
 #endif
@@ -72,6 +92,13 @@ static const char DEFAULT_INI[] =
     ";            frame stays on screen exactly 16.7 ms. Best with window = borderless. Tears without VRR.\n"
     ";   display: follow the monitor's refreshes (60, 120 or 240 Hz only; else as clock). The game then\n"
     ";            runs at the monitor's exact rate, e.g. 59.94 frames a second.\n"
+#elif defined __APPLE__
+    ";   clock:   a steady 60 frames a second; each is shown at the display's next refresh.\n"
+    ";   vrr:     the same clock, and each frame is shown the moment it is ready: in full screen on a ProMotion\n"
+    ";            or Adaptive-Sync display every frame stays on screen exactly 16.7 ms (without one it may\n"
+    ";            tear). A window is still shown at the desktop's refreshes.\n"
+    ";   display: follow the display's refreshes (60, 120 or 240 Hz only; else as clock). The game then\n"
+    ";            runs at the display's exact rate, e.g. 59.94 frames a second.\n"
 #else
     ";   clock:   a steady 60 frames a second, each presented the moment it is ready. A compositing\n"
     ";            desktop shows it at its next refresh; in full screen without one it may tear\n"
@@ -85,6 +112,7 @@ static const char DEFAULT_INI[] =
     "latency = 3\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
     "hide_cursor = 1\n"
+#ifndef __APPLE__   /* (the Metal renderer draws at the game's own size) */
     "\n"
     "; render_scale = 1 | auto | a number from 0.5 to 4\n"
     ";   The game draws its pictures at 1920x1080. render_scale draws them this many times as wide and\n"
@@ -92,6 +120,7 @@ static const char DEFAULT_INI[] =
     ";   auto: as many pixels as the picture has in the window when the game starts (1.33 on a 2560x1440\n"
     ";   monitor with window = borderless), at least 1. A bigger picture than the window is shrunk to fit.\n"
     "render_scale = 1\n"
+#endif
 #ifdef _WIN32
     "\n"
     "; gpu = auto, or part of a graphics card's name (e.g. nvidia, radeon, intel)\n"
@@ -374,7 +403,8 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
     return 0;
 }
 #else
-/* Linux: linux/window.c makes the window with SDL, on the main thread, and asks here. */
+/* Linux and macOS: linux/window.c or macos/window.m makes the window with SDL, on the main
+ * thread, and asks here. */
 static volatile LONG refresh_hz;
 
 int display_window_mode(void) { load(); return cfg.mode; }
@@ -437,6 +467,28 @@ static int vblank_tick(void) {
     if (!failed && (t1.QuadPart - t0.QuadPart) * 1000 / freq.QuadPart > 50 * divisor) failed = 1;
     if (failed) fprintf(stderr, "[display] waiting for the monitor's refresh failed: clock pacing from now on\n");
     return !failed;
+}
+#elif defined __APPLE__
+int rt_window_wait_vblank(int n, int timeout_ms);   /* (macos/window.m) */
+
+static int monitor_hz(void) { return (int)refresh_hz; }
+
+/* `display` pacing: the next refresh the game should see - every 1st/2nd/4th of a 60/120/240 Hz
+ * display's (a display link's) - or 0 to use the clock this time: at other rates, and for a
+ * second after the display stopped refreshing (asleep). */
+static int vblank_tick(void) {
+    static int logged_hz = -1, quiet;
+    static ULONGLONG retry_at;
+    int hz = monitor_hz(), divisor = hz >= 58 && hz <= 61 ? 1 : hz >= 118 && hz <= 121 ? 2 : hz >= 238 && hz <= 241 ? 4 : 0;
+    if (hz != logged_hz) {
+        logged_hz = hz;
+        fprintf(stderr, "[display] %d Hz display: %s\n", hz, divisor ? "display pacing" : "clock pacing (display pacing needs 60, 120 or 240 Hz)");
+    }
+    if (!divisor || GetTickCount64() < retry_at) return 0;
+    if (rt_window_wait_vblank(divisor, 3000 * divisor / hz + 5)) return 1;   /* (3 refreshes' time) */
+    if (!quiet++) fprintf(stderr, "[display] the display did not refresh: clock pacing until it does\n");
+    retry_at = GetTickCount64() + 1000;
+    return 0;
 }
 #else
 static int monitor_hz(void) { return (int)refresh_hz; }

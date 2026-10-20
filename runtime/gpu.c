@@ -44,13 +44,17 @@ static void write64(u64 va, u64 value) { u64 g = guest(va); if (g) st64(g, value
 
 static u64 timestamp(void) { return rt_now_ns() * 384 / 625; }   /* GPU timer ticks at 19.2 MHz * 32 / 1.6 */
 
-/* A semaphore release: one word, or four words (payload, padding, 64-bit timestamp). */
+/* A semaphore release: one word, or four words (payload, padding, 64-bit timestamp). The
+ * payload goes last, after a release fence: a guest thread that sees it reads what the work
+ * before it wrote (copies, the timestamp), which a weakly ordered host (arm64) would otherwise
+ * let it see later. */
 static void release(u64 va, u32 payload, int four_words) {
     if (four_words) {
         write64(va + 8, timestamp());
-        write32(va, payload);
         write32(va + 4, 0);
-    } else write32(va, payload);
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    write32(va, payload);
     gfx_guest_wrote(va, four_words ? 16 : 4);
 }
 

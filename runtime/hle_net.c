@@ -1041,9 +1041,10 @@ HLE(_ZN2nn6socket8FinalizeEv) { c->x[0] = 0; }
 HLE(_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_) { st64(c->x[3], 0); c->x[0] = 4; }   /* EAI_FAIL */
 HLE(_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_) { st64(c->x[3], 0); c->x[0] = 4; }
 HLE(_ZN2nn6socket11GAIStrErrorENS0_7AiErrnoE) {
-    static u64 text;
-    if (!text) text = rt_guest_copy("Name resolution failed (no servers)", 36);
-    c->x[0] = text;
+    static u64 text;   /* (published after the copy: another thread may take it and read it) */
+    u64 t = __atomic_load_n(&text, __ATOMIC_ACQUIRE);
+    if (!t) __atomic_store_n(&text, t = rt_guest_copy("Name resolution failed (no servers)", 36), __ATOMIC_RELEASE);
+    c->x[0] = t;
 }
 HLE(nnsocketGetHostByNameWithOptions) { c->x[0] = 0; }
 HLE(nnsocketResolverGetOption) { c->x[0] = 0; }
