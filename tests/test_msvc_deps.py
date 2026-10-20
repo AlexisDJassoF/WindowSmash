@@ -229,6 +229,49 @@ class LayoutTests(unittest.TestCase):
             msvc_deps.unpack_vsix([headers], os.path.join(self.tmp, 'msvc'))
 
 
+class DownloadTests(unittest.TestCase):
+    """download(): the SHA-256 decides (Microsoft's manifest lists some .vsix files with a size
+    they don't have, while their SHA-256 is right); a bad file is tried three times, then Failed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='msvc-deps-test-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def fetch(self, body, sha256=None, size=None):
+        import hashlib
+
+        class Response(io.BytesIO):
+            headers = {}
+        dest = os.path.join(self.tmp, 'f.vsix')
+        if os.path.exists(dest):
+            os.remove(dest)
+        seen = []
+        with mock.patch('urllib.request.urlopen', side_effect=lambda req, timeout: Response(body)), \
+                mock.patch.object(msvc_deps.time, 'sleep'), mock.patch.object(msvc_deps, 'log'):
+            got = msvc_deps.download('https://download.example/f.vsix', dest, sha256 and hashlib.sha256(sha256).hexdigest(),
+                                     size, progress=seen.append)
+        return got, Path(dest).read_bytes(), sum(seen)
+
+    def test_sha_decides_over_a_wrong_size(self):
+        self.assertEqual(self.fetch(b'payload', sha256=b'payload', size=12_345), (7, b'payload', 7))
+        with self.assertRaisesRegex(msvc_deps.Failed, 'does not match its SHA-256'):
+            self.fetch(b'tampered', sha256=b'payload', size=8)
+
+    def test_size_without_a_sha(self):
+        self.assertEqual(self.fetch(b'abc', size=3)[:2], (3, b'abc'))
+        with self.assertRaisesRegex(msvc_deps.Failed, '2 bytes downloaded, 3 expected'):
+            self.fetch(b'ab', size=3)
+
+    def test_a_file_there_already_is_kept(self):
+        import hashlib
+        dest = os.path.join(self.tmp, 'f.vsix')
+        Path(dest).write_bytes(b'payload')
+        seen = []
+        with mock.patch('urllib.request.urlopen', side_effect=AssertionError('downloaded')):
+            self.assertEqual(msvc_deps.download('https://x/f.vsix', dest, hashlib.sha256(b'payload').hexdigest(), progress=seen.append), 0)
+        self.assertEqual(seen, [7])
+
+
 class InstallFlowTests(unittest.TestCase):
     """install(): Microsoft's license is asked first; no yes, nothing downloaded (exit status 2)."""
     CHANNEL = {'license': 'https://example/buildtools-license', 'version': '18.11.0', 'manifest': {}}

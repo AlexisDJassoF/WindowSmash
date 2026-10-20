@@ -334,10 +334,12 @@ def download(url, dest, sha256=None, size=None, what=None, progress=None):
                     got += len(block)
                     if progress:
                         progress(len(block))
-            if size and got != size:
-                raise Failed(f"{os.path.basename(dest)}: {got} bytes downloaded, {size} expected")
+            # (the SHA-256 decides: Microsoft's manifest gives some .vsix files a size they don't
+            # have, its SHA-256 for them being right; the size is for the progress then)
             if sha256 and h.hexdigest() != sha256.lower():
                 raise Failed(f"{os.path.basename(dest)} does not match its SHA-256")
+            if not sha256 and size and got != size:
+                raise Failed(f"{os.path.basename(dest)}: {got} bytes downloaded, {size} expected")
             os.replace(partial, dest)
             return got
         except (OSError, Failed) as e:
@@ -685,6 +687,11 @@ def install(accept=False, keep_downloads=False, agreed=None):
         llvm = llvm.result()
     if not channel:
         log(f"  deps\\msvc: MSVC {msvc['msvc']}, Windows SDK {msvc['sdk']}, already there")
+    if not keep_downloads:
+        try:
+            os.rmdir(DOWNLOADS)   # (emptied: each part removes its own downloads)
+        except OSError:
+            pass
     log("  trying them on a test program")
     test_build()
     log(f"Done in {time.time() - t0:.0f} s: {(llvm['disk_bytes'] + msvc['disk_bytes']) / 1e6:.0f} MB in deps\\llvm and deps\\msvc "
