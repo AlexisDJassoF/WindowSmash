@@ -1464,12 +1464,73 @@ typedef struct Resident {
     u8 *edge;
     u32 head, tail;
     u64 checked;   /* the submission it was last checked against the write watch in */
+    u64 seen;      /* (the write watch's clock then: watch_written) */
 } Resident;
 static Resident residents[512];
 static u32 nresidents;
 u64 gfx_stat_residents, gfx_stat_resident_pages;
 extern u64 gpu_stat_batches;
 static int watched(u64 g, u64 size);
+
+/* The write watch keeps one bit a page of the alias area, and a query that resets it takes the
+ * news from everyone else watching that page. Textures, kept constant buffers, compute inputs
+ * and resident regions share pages - memory a scene gives up is handed out again for something
+ * else - and whoever asked first kept the news for good: the No Contest screen skinned the
+ * fighters' arms from inputs never taken again (stretched over the screen). So every question
+ * goes through here: pages found written get the next stamp, kept per page, and each user keeps
+ * the clock as it was when it last asked ("seen"): its data is current unless one of its pages
+ * has a newer stamp. */
+#define WATCH_CHUNK 512   /* pages a chunk: 2 MB */
+typedef struct WatchChunk { u64 newest, page[WATCH_CHUNK]; } WatchChunk;
+static WatchChunk *watch_chunks[ALIAS_SIZE / (WATCH_CHUNK * 0x1000ull)];
+static u64 watch_clock;   /* stamps given so far */
+
+/* Take the write watch's news for guest pages [lo, hi) (page aligned, watched): resetting the
+ * bits as they are read, so a write after this is news next time. */
+static void watch_take(u64 lo, u64 hi) {
+    static void *pages[65536];   /* (256 MB: the largest range asked about, in one call) */
+    void *first;
+    ULONG_PTR count = 1;
+    ULONG granularity;
+    /* (asking is cheap, resetting is not - even where nothing was written: so ask first) */
+    if (GetWriteWatch(0, (void *)lo, hi - lo, &first, &count, &granularity) != 0 || !count) return;
+    for (u64 at = (u64)first; at < hi;) {
+        count = 65536;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)at, hi - at, pages, &count, &granularity) != 0 || !count) return;
+        u64 stamp = ++watch_clock;
+        for (ULONG_PTR k = 0; k < count; k++) {
+            u64 p = ((u64)pages[k] - ALIAS_BASE) >> 12;
+            WatchChunk **c = &watch_chunks[p / WATCH_CHUNK];
+            if (!*c && !(*c = calloc(1, sizeof **c))) continue;
+            (*c)->page[p % WATCH_CHUNK] = (*c)->newest = stamp;
+        }
+        if (count < 65536) return;
+        at = (u64)pages[count - 1] + 0x1000;
+    }
+}
+
+/* The first page in [p, hi) stamped after `seen` (hi if none). */
+static u64 watch_next(u64 p, u64 hi, u64 seen) {
+    while (p < hi) {
+        u64 i = (p - ALIAS_BASE) >> 12, end = (i / WATCH_CHUNK + 1) * WATCH_CHUNK;
+        const WatchChunk *c = watch_chunks[i / WATCH_CHUNK];
+        if (c && c->newest > seen)
+            for (; i < end && ALIAS_BASE + (i << 12) < hi; i++)
+                if (c->page[i % WATCH_CHUNK] > seen) return ALIAS_BASE + (i << 12);
+        p = ALIAS_BASE + (end << 12);
+    }
+    return hi;
+}
+
+/* Has guest memory [g, g + size) been written since *seen? (*seen moves on to now.) Ask before
+ * reading the memory, so that a write meanwhile is news next time. */
+static int watch_written(u64 g, u64 size, u64 *seen) {
+    u64 lo = g & ~0xFFFull, hi = (g + size + 0xFFF) & ~0xFFFull;
+    watch_take(lo, hi);
+    int written = watch_next(lo, hi, *seen) < hi;
+    *seen = watch_clock;
+    return written;
+}
 
 /* Views and buffers given up during a frame may still be in this frame's bindings (or the
  * arrays they are being collected in): they are released after the present. */
@@ -1548,10 +1609,11 @@ static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
 }
 
 /* The write watch over the region's whole pages starts over (after its GPU copy took guest
- * memory). Not over its partial pages: their bits belong to whatever shares them as well. */
+ * memory). Not over its partial pages: they are compared by content instead. */
 static void resident_watch_reset(Resident *r) {
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;
-    if (lo < hi) ResetWriteWatch((void *)lo, hi - lo);
+    if (lo < hi) watch_take(lo, hi);
+    r->seen = watch_clock;
 }
 
 /* Has the CPU written guest memory inside the region since its GPU copy last took it? Pages
@@ -1565,7 +1627,6 @@ static void resident_watch_reset(Resident *r) {
  * which drew effect meshes at a stale size over the whole screen (the white-outs). Checked
  * when a draw or dispatch uses the region (once a submission) and once a frame for all. */
 static void resident_sync(Resident *r, int every_frame) {
-    static void *pages[16384];
     static int no_pages = -1;   /* debug: leave resident regions alone */
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
     if (no_pages || (!every_frame && r->checked == gpu_stat_batches) || !r->edge || !watched(r->guest, r->size)) return;
@@ -1574,13 +1635,11 @@ static void resident_sync(Resident *r, int every_frame) {
         return;   /* (its memory is gone: left alone; once mapped again its bytes differ, and are taken) */
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;   /* the whole pages */
     if (lo >= hi) return;
-    ULONG_PTR count = 16384;
-    ULONG granularity;
-    if (GetWriteWatch(0, (void *)lo, hi - lo, pages, &count, &granularity) != 0 || !count) return;
-    ResetWriteWatch((void *)lo, hi - lo);   /* (before taking them: what the CPU writes meanwhile is seen next time) */
-    for (ULONG_PTR k = 0; k < count; k++) {
-        u64 pg = (u64)pages[k];
-        D3D11_BOX box = {(UINT)(pg - r->guest), 0, 0, (UINT)(pg + granularity - r->guest), 1, 1};
+    u64 seen = r->seen;
+    watch_take(lo, hi);   /* (before taking them: what the CPU writes meanwhile is news next time) */
+    r->seen = watch_clock;
+    for (u64 pg = watch_next(lo, hi, seen); pg < hi; pg = watch_next(pg + 0x1000, hi, seen)) {
+        D3D11_BOX box = {(UINT)(pg - r->guest), 0, 0, (UINT)(pg + 0x1000 - r->guest), 1, 1};
         ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, P(void, pg), 0, 0);
         gfx_stat_resident_pages++;
     }
@@ -1860,6 +1919,7 @@ typedef struct Texture {
     u32 tic[8];
     u64 sample_hash;
     int watched, stale;    /* in the write-watched alias area; written since it was read */
+    u64 seen;              /* (the write watch's clock when it was read: watch_written) */
     ID3D11ShaderResourceView *srv;
     ID3D11Texture2D *tex;
     u64 used, asked;       /* (asked: the frame the write watch was last asked about it, gfx_stat_presented) */
@@ -1877,30 +1937,19 @@ static void watch_time(u64 ns) {   /* (to gfx_stat_watch_us, in microseconds) */
 }
 
 /* Which textures has the CPU (or a copy) written since they were read? The alias area is
- * reserved with MEM_WRITE_WATCH, so Windows tracks the pages written. A texture's range is
- * asked about the first time a frame draws with it - not every texture every frame: the
- * system's cost goes by the pages asked about, and a match keeps thousands of textures from
- * earlier screens it never draws (a player's 8-fighter match: about 4,000, some 0.7 ms a
- * frame). Pages found written start over at once (before the texture is read again, so what
- * the CPU writes meanwhile is seen next time), and as one bit a page belongs to every texture
- * on it, each of those is taken again at its next use. */
+ * reserved with MEM_WRITE_WATCH, so Windows tracks the pages written (watch_written). A
+ * texture's range is asked about the first time a frame draws with it - not every texture
+ * every frame: the system's cost goes by the pages asked about, and a match keeps thousands of
+ * textures from earlier screens it never draws (a player's 8-fighter match: about 4,000, some
+ * 0.7 ms a frame). A write is news to every texture on its pages, each taken again at its
+ * next use. */
 static int watched(u64 g, u64 size) { return g >= ALIAS_BASE && g + size <= ALIAS_BASE + ALIAS_SIZE; }
 
 static void texture_ask(Texture *t) {
     if (!t->watched || t->stale || t->asked == gfx_stat_presented) return;
     t->asked = gfx_stat_presented;
     u64 t0 = rt_clock_ns();
-    void *page;
-    ULONG_PTR count = 1;
-    ULONG granularity;
-    if (GetWriteWatch(0, (void *)t->guest, t->size, &page, &count, &granularity) == 0 && count) {
-        ResetWriteWatch((void *)t->guest, t->size);
-        u64 lo = t->guest & ~0xFFFull, hi = (t->guest + t->size + 0xFFF) & ~0xFFFull;
-        for (u32 i = 0; i < ntextures; i++) {   /* (t among them) */
-            Texture *o = &textures[i];
-            if (o->srv && o->watched && (o->guest & ~0xFFFull) < hi && ((o->guest + o->size + 0xFFF) & ~0xFFFull) > lo) o->stale = 1;
-        }
-    }
+    if (watch_written(t->guest, t->size, &t->seen)) t->stale = 1;
     watch_time(rt_clock_ns() - t0);
 }
 
@@ -2077,6 +2126,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
     if (!t) t = ntextures < 4096 ? &textures[ntextures++] : lru;
     if (t->srv) { ID3D11ShaderResourceView_Release(t->srv); ID3D11Texture2D_Release(t->tex); t->srv = NULL; }
     if (t != hit) { t->guest = g; memcpy(t->tic, tic, 32); texture_index_add(t); }
+    if (watch) watch_written(g, size, &t->seen);   /* (before reading: a write meanwhile is news next frame) */
     if (d.type == TIC_3D) {   /* level 0 only, which is all a lookup table has */
         D3D11_TEXTURE3D_DESC td = {d.width, d.height, d.depth, 1, d.dxgi, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
         u32 rowb = DIV_UP_(d.width, d.bw) * d.bytes, rows = DIV_UP_(d.height, d.bh);
@@ -2344,7 +2394,7 @@ static D3D11_PRIMITIVE_TOPOLOGY topology(u32 t) {
  * and copy-engine writes - the HUD's positions change between draws that way) are applied to
  * them in order, and what the CPU wrote is found by the write watch, asked at a buffer's first
  * use in each submission; memory outside the watched area is never kept. */
-typedef struct KeptCb { u64 va, guest, used, checked; u32 size, mapped; int stale; ID3D11Buffer *buf; ID3D11ShaderResourceView *srv; u8 *shadow; } KeptCb;
+typedef struct KeptCb { u64 va, guest, used, checked, seen; u32 size, mapped; int stale; ID3D11Buffer *buf; ID3D11ShaderResourceView *srv; u8 *shadow; } KeptCb;
 extern u64 gpu_stat_batches;   /* (gpu.c: submissions so far) */
 #define KEPT_SETS 256
 #define KEPT_WAYS 4
@@ -2412,13 +2462,7 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
     u64 g = gpu_va_to_guest(va);
     if (e && e->guest == g) {
         if (e->checked != gpu_stat_batches) {   /* first use in this submission: has the CPU written it since? */
-            void *page;
-            ULONG_PTR count = 1;
-            ULONG granularity;
-            if (GetWriteWatch(0, (void *)g, e->mapped, &page, &count, &granularity) == 0 && count) {
-                e->stale = 1;
-                ResetWriteWatch((void *)g, e->mapped);
-            }
+            if (watch_written(g, e->mapped, &e->seen)) e->stale = 1;
             e->checked = gpu_stat_batches;
         }
         if (e->stale) {   /* take it all again */
@@ -2455,6 +2499,7 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
     u32 cap = (size + 15) & ~15u;
     D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
     u8 *init = calloc(1, cap);
+    watch_written(g, mapped, &e->seen);   /* (before reading: a write meanwhile is news next submission) */
     memcpy(init, P(void, g), mapped);
     D3D11_SUBRESOURCE_DATA sd = {init, 0, 0};
     HRESULT hr = ID3D11Device_CreateBuffer(dev, &bd, &sd, &e->buf);
@@ -3349,11 +3394,13 @@ static RwBuf *rw_upload(u32 k, const u8 *data, u32 size) {
 /* Storage buffers a compute program only reads (the fighters' bind pose and skin weights,
  * the whole model's for every part skinned): kept on the GPU for as long as guest memory under
  * them goes unwritten (the write watch says), instead of uploaded in full for every dispatch. */
-typedef struct InputBuf { u64 va, guest; u32 size; ID3D11Buffer *buf; ID3D11UnorderedAccessView *uav; u64 used; } InputBuf;
+typedef struct InputBuf { u64 va, guest; u32 size; ID3D11Buffer *buf; ID3D11UnorderedAccessView *uav; u64 used, seen; u8 *shadow; } InputBuf;
 static InputBuf inputs[128];
 static u64 input_clock;
 
 static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
+    static int verify = -1;   /* SSBU_INPUT_VERIFY (debugging): keep a copy of what each holds, and report uses that find memory different */
+    if (verify < 0) verify = getenv("SSBU_INPUT_VERIFY") != NULL;
     u64 g = gpu_va_to_guest(va);
     if (!g || !size || !watched(g, size) || gpu_va_to_guest(va + size - 1) != g + size - 1) return NULL;   /* one watched piece only */
     InputBuf *b = NULL, *lru = &inputs[0];
@@ -3363,14 +3410,19 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     }
     u32 cap = (size + 15) & ~15u;
     if (b) {
-        void *page;
-        ULONG_PTR count = 1;
-        ULONG granularity;
-        if (GetWriteWatch(0, (void *)g, size, &page, &count, &granularity) == 0 && count) {   /* written since: take it again */
+        if (watch_written(g, size, &b->seen)) {   /* written since: take it again */
             D3D11_BOX box = {0, 0, 0, size, 1, 1};
             ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)b->buf, 0, &box, P(void, g), 0, 0);
             gfx_stat_upload_bytes += size;
-            ResetWriteWatch((void *)g, size);
+            if (b->shadow) memcpy(b->shadow, P(void, g), size);
+        } else if (b->shadow && memcmp(b->shadow, P(void, g), size)) {
+            static int reported;
+            u32 o = 0;
+            while (o < size && b->shadow[o] == P(u8, g)[o]) o++;
+            if (reported++ < 200)
+                fprintf(stderr, "[input] va %#llx (%#x bytes) +%#x: kept %02x, memory %02x (submission %llu)\n", va, size, o, b->shadow[o], P(u8, g)[o],
+                        gpu_stat_batches);
+            memcpy(b->shadow, P(void, g), size);
         }
         b->used = ++input_clock;
         return b->uav;
@@ -3378,10 +3430,13 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     b = lru;
     bury(b->uav);   /* (may be bound still) */
     bury(b->buf);
+    free(b->shadow);
     memset(b, 0, sizeof *b);
     D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
     u8 *init = calloc(1, cap);
+    watch_written(g, size, &b->seen);   /* (before reading: a write meanwhile is news next time) */
     read_gpu(va, size, init);
+    if (verify && (b->shadow = malloc(size))) memcpy(b->shadow, init, size);
     D3D11_SUBRESOURCE_DATA sd = {init, 0, 0};
     HRESULT hr = ID3D11Device_CreateBuffer(dev, &bd, &sd, &b->buf);
     free(init);
@@ -3395,7 +3450,6 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
     if (FAILED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)b->buf, &ud, &b->uav))) { ID3D11Buffer_Release(b->buf); b->buf = NULL; return NULL; }
     b->va = va; b->guest = g; b->size = size; b->used = ++input_clock;
-    ResetWriteWatch((void *)g, size);
     return b->uav;
 }
 
