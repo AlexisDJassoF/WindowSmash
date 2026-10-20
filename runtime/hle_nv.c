@@ -61,6 +61,15 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     return TRUE;
 }
 
+/* Does guest memory [addr, addr + size) hold any nvmap allocation - memory the GPU (thread) may
+ * read? (The kernel asks before decommitting: the game frees ordinary heap pages mid-match too.) */
+int gpu_memory_overlaps(u64 addr, u64 size) {
+    u32 n = next_handle < NVMAP_MAX ? next_handle : NVMAP_MAX;
+    for (u32 h = 1; h < n; h++)
+        if (gpu_maps[h].addr && gpu_maps[h].size && gpu_maps[h].addr < addr + size && addr < gpu_maps[h].addr + gpu_maps[h].size) return 1;
+    return 0;
+}
+
 u64 gpu_va_to_guest(u64 va) {   /* 0 when unmapped */
     u64 page = va >> PAGE_BITS;
     if (page >> LEAF_BITS >= TOP_COUNT) return 0;

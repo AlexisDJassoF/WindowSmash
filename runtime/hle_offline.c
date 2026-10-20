@@ -33,9 +33,12 @@ HLE(_ZN2nn8settingseqERKNS0_8LanguageERKNS0_12LanguageCodeE) { c->x[0] = ld64(c-
 /* ---- nn::crypto: the secure random source ----------------------------------------- */
 HLE(_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm) {
     u8 *p = P(u8, c->x[0]);
+    static u64 fixed = ~0ull;   /* SSBU_FIXED_TIME (benchmarks): the same bytes every run */
+    if (fixed == ~0ull) fixed = getenv("SSBU_FIXED_TIME") ? 0x2545F4914F6CDD1Dull : 0;
     for (u64 i = 0; i < c->x[1]; i++) {
         unsigned int r;
-        rand_s(&r);
+        if (fixed) { fixed ^= fixed << 13; fixed ^= fixed >> 7; fixed ^= fixed << 17; r = (unsigned int)(fixed >> 32); }
+        else rand_s(&r);
         p[i] = (u8)r;
     }
 }

@@ -304,7 +304,7 @@ static u32 get_info(Cpu *c, u32 id, u64 sub, u64 *out) {
     case 6: case 21: *out = 0xCD500000ull; break;       /* memory an application gets on the console */
     case 7: case 22: *out = image + heap_size; break;
     case 8: *out = 0; break;                            /* no debugger */
-    case 11: *out = 0x9E3779B97F4A7C15ull * (sub + 1) ^ now_ns(); break;   /* entropy */
+    case 11: *out = 0x9E3779B97F4A7C15ull * (sub + 1) ^ (getenv("SSBU_FIXED_TIME") ? 0 : now_ns()); break;   /* entropy (none with the clock stopped: benchmarks) */
     case 12: *out = ASPACE_BASE; break;
     case 13: *out = ASPACE_SIZE; break;
     case 14: *out = STACK_BASE; break;
@@ -477,7 +477,7 @@ void rt_svc(Cpu *c, u32 n) {
         for (u32 i = 0; i < 1024; i++)
             if (maps[i].size && maps[i].dst == x[0]) {
                 memcpy((void *)maps[i].src, (void *)maps[i].dst, maps[i].size);
-                gpu_queue_drain();   /* (work queued on the GPU thread may still read it) */
+                if (gpu_memory_overlaps(maps[i].dst, maps[i].size)) gpu_queue_drain();   /* (queued GPU work may read it) */
                 VirtualFree((void *)maps[i].dst, maps[i].size, MEM_DECOMMIT);
                 remove_region(maps[i].dst);
                 maps[i].size = 0;
@@ -578,7 +578,7 @@ void rt_svc(Cpu *c, u32 n) {
         x[0] = R_OK;
         break;
     case 0x2D:     /* UnmapPhysicalMemory(address, size) */
-        gpu_queue_drain();   /* (work queued on the GPU thread may still read it) */
+        if (gpu_memory_overlaps(x[0], x[1])) gpu_queue_drain();   /* (queued GPU work may read it) */
         VirtualFree((void *)x[0], x[1], MEM_DECOMMIT);
         unmap_range(x[0], x[1]);
         x[0] = R_OK;
