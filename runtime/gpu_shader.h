@@ -1,6 +1,7 @@
-/* Maxwell shader programs translated to HLSL (Shader Model 5) for the D3D11 back end.
+/* Maxwell shader programs translated to HLSL (Shader Model 5) for the D3D11 back end, or to
+ * Metal Shading Language for the Metal one (its layout: SHADER_MSL below).
  *
- * Resource layout the generated code expects:
+ * Resource layout the generated HLSL expects:
  *   t0..t17    constant buffers 0..17 of the stage, as raw buffers
  *   t18..t49   vertex streams 0..31 (vertex shaders), as raw buffers
  *   t64+i      texture i of the shader's texture table, s0+i its sampler
@@ -59,13 +60,82 @@ char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, Sha
  * addresses line up with those of the other stages), its workgroup size and shared memory. */
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user);
 
+/* Output languages: HLSL for fxc (Windows), HLSL within what vkd3d-shader compiles (Linux, or
+ * SSBU_HLSL_FOR_VKD3D; shader_hlsl* write the build's), Metal Shading Language (macOS). */
+enum { SHADER_HLSL_FXC, SHADER_HLSL_VKD3D, SHADER_MSL };
+
+/* Any stage in any of them: `local` and `shared` are a compute program's (as shader_hlsl_cs
+ * takes them; otherwise ignored), `vs_outputs` a pixel program's. Safe to call from several
+ * threads at once in MSL (HLSL names texture results by a count shared by every program). */
+char *shader_translate(int lang, const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared,
+                       ShaderInfo *info, CbufReader *read, void *user);
+
+/* ---- Metal (SHADER_MSL) -------------------------------------------------------------------
+ * Entry points vs_main, ps_main, cs_main, each with, in its stage's argument tables:
+ *   buffer(0)     DrawParams (set*Bytes)
+ *   buffer(1)     ShaderBinds: the stage's raw buffers by GPU address and size (set*Bytes, its first
+ *                 shader_binds_size(stage) bytes); each buffer made resident (useResource, a
+ *                 residency set or a heap). Words past a size read 0, and are not written.
+ *   texture(k)    texture k of ShaderInfo.tex, of the type shader_msl_texture says
+ *   sampler(k)    its sampler, for k < shader_msl_samplers(info)
+ * A pixel shader's outputs are typed by function constant SHADER_MSL_RT_TYPES (a uint, 2 bits a
+ * render target: 0 float, 1 uint, 2 int - the attachment's format's kind - and SHADER_MSL_DUAL_SOURCE
+ * when blending takes source 1: target 1's output, or 0 without one, is then attachment 0's second
+ * source, and a program writing no target 0 writes 0 as its first - so any program takes it): ps_main
+ * must always be specialised (newFunctionWithName:constantValues:), with 0 for float targets alone.
+ * Metal's pipeline validation, which aborts the process even without MTL_DEBUG_LAYER, has two rules
+ * for source 1: a pipeline whose blending takes it has no colour attachment but 0, and Source1
+ * factors are attachment 0's alone. So macos/gpu_metal.m's dual_source() sets SHADER_MSL_DUAL_SOURCE
+ * only when target 0's blend takes source 1 and the program writes target 1; such a draw goes into
+ * target 0 (and depth) alone, in a render pass of its own. Any other Source1 factor is read with
+ * source 1 as 0 (Source1* becomes Zero, OneMinusSource1* One).
+ * vs_main writes [[point_size]] (1): its pipelines' inputPrimitiveTopology must stay unspecified
+ * (or be points). Compile with MTLMathModeSafe (fastMathEnabled = NO before macOS 15) and
+ * preserveInvariance. tools/mac/msltest.m binds and runs programs so, as an example. */
+#define SHADER_MSL_PARAMS 0
+#define SHADER_MSL_BINDS 1
+#define SHADER_MSL_SAMPLERS 16
+#define SHADER_MSL_RT_TYPES 0
+#define SHADER_MSL_DUAL_SOURCE 0x10000u
+typedef struct ShaderBind {
+    u64 address;           /* MTLBuffer.gpuAddress + offset, a multiple of 4 (0 with size 0: none) */
+    u32 size, pad;         /* bytes the shader may read (compute storage buffers: and write) */
+} ShaderBind;
+typedef struct ShaderBinds {
+    ShaderBind cb[18];     /* constant buffers 0..17 */
+    ShaderBind gm[16];     /* storage buffers (ShaderInfo.sb_offset; compute: writable) */
+    ShaderBind vb[32];     /* vertex shaders: each generic attribute's vertex stream */
+} ShaderBinds;
+static inline u32 shader_binds_size(int stage) { return stage == SHADER_VERTEX ? (u32)sizeof(ShaderBinds) : 34 * (u32)sizeof(ShaderBind); }
+
+/* How many of a program's textures have a sampler argument (texture k < this: sampler(k)): all of
+ * them up to Metal's 16. With more, the rest share default samplers declared in the shader
+ * (linear, clamping to the edge; a comparing one for shadow textures, comparing never, as
+ * Direct3D's default) - which count against the 16, so fewer arguments then. */
+static inline u32 shader_msl_samplers(const ShaderInfo *info) {
+    if (info->ntex <= SHADER_MSL_SAMPLERS) return info->ntex;
+    for (u32 n = SHADER_MSL_SAMPLERS - 1;; n--) {
+        u32 kinds = 0;
+        for (u32 k = n; k < info->ntex; k++) kinds |= info->tex[k].shadow ? 2u : 1u;
+        if (n + (kinds & 1) + (kinds >> 1) <= SHADER_MSL_SAMPLERS) return n;
+    }
+}
+
+/* The type texture k is declared with: TEX_2D, TEX_ARRAY_2D, TEX_3D, TEX_CUBE or TEX_ARRAY_CUBE
+ * (1D textures are 2D ones: Metal's 1D textures have no mips), a depth texture (depth2d...) when
+ * it is a shadow one, but for 3D (none in Metal: compares on it fail to compile, as in HLSL). */
+static inline int shader_msl_texture(const ShaderTexture *t) {
+    static const signed char type[8] = {TEX_2D, TEX_ARRAY_2D, TEX_2D, TEX_ARRAY_2D, TEX_3D, TEX_2D, TEX_CUBE, TEX_ARRAY_CUBE};
+    return type[t->type & 7];
+}
+
 /* Per-draw parameters (cbuffer b0), shared by both stages. */
 typedef struct DrawParams {
     u32 attr[32][4];       /* vertex attribute: format word, stream stride, instance divisor (0: per vertex), stream bound */
     float fix[4];          /* clip-space fix-up: x sign, y sign, z scale, z offset */
     float frag[4];         /* fragment y: flip (nonzero), render target height */
     u32 base[4];           /* base vertex, base instance */
-    u32 swz[2][32];        /* per texture of each stage (vertex, pixel): component sources, 3 bits each */
+    u32 swz[2][32];        /* per texture of each stage (vertex, pixel): component sources, 3 bits each (MSL: bits 12-24 the sampler's LOD bias) */
     u32 sb[2][16][4];      /* per storage buffer of each stage: GPU address low, high, size */
 } DrawParams;
 

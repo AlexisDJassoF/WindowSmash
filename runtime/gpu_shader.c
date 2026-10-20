@@ -13,12 +13,22 @@
  * become cases of a switch inside a loop driven by a `pc` variable, with the SSY/PBK
  * reconvergence targets on small per-thread stacks - per-thread execution makes SYNC and
  * BRK plain jumps to the saved target. Pixel shaders in that form sample with explicit LOD
- * zero (gradients are unavailable inside a loop). */
+ * zero (gradients are unavailable inside a loop).
+ *
+ * The same text is also Metal Shading Language, for the macOS renderer: a prelude gives MSL
+ * HLSL's names (asfloat, f16tof32, raw buffers' Load, textures' Sample and Gather...), and
+ * as MSL has no global resources, the program and its helpers become member functions of a
+ * struct holding the resources, which the entry point (vs_main/ps_main/cs_main) fills from
+ * its arguments. Only what neither language can say the other's way is written per language
+ * (see msl_out and the c->msl tests); gpu_shader.h has the layout the Metal renderer binds. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 #include "gpu_shader.h"
 
@@ -26,9 +36,9 @@
  * (CalculateLevelOfDetail, RWByteAddressBuffer.Load, gathers with four offsets): for it the
  * translator writes those the long way. SSBU_HLSL_FOR_VKD3D does the same on Windows, to test. */
 #if !defined(_WIN32) || defined(SSBU_HLSL_FOR_VKD3D)
-#define VKD3D_FORMS 1
+#define HLSL_DEFAULT SHADER_HLSL_VKD3D
 #else
-#define VKD3D_FORMS 0
+#define HLSL_DEFAULT SHADER_HLSL_FXC
 #endif
 
 #define BITS(w, pos, n) ((u32)(((w) >> (pos)) & ((1ull << (n)) - 1)))
@@ -104,8 +114,7 @@ static int by_specificity(const void *a, const void *b) {
     return (int)((const __typeof__(table[0]) *)b)->bits - (int)((const __typeof__(table[0]) *)a)->bits;
 }
 
-static void init_table(void) {
-    if (table_size) return;
+static void build_table(void) {
     for (u32 i = 1; i < OP_COUNT; i++) {
         u16 mask = 0, value = 0;
         for (int b = 0; b < 16; b++) {
@@ -117,6 +126,20 @@ static void init_table(void) {
     }
     qsort(table, table_size, sizeof table[0], by_specificity);
 }
+
+/* Built once, whichever thread translates first (the Metal renderer translates on several). */
+#ifdef _WIN32
+static INIT_ONCE table_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK table_once_fn(PINIT_ONCE once, PVOID param, PVOID *context) {
+    (void)once; (void)param; (void)context;
+    build_table();
+    return TRUE;
+}
+static void init_table(void) { InitOnceExecuteOnce(&table_once, table_once_fn, NULL, NULL); }
+#else
+static pthread_once_t table_once = PTHREAD_ONCE_INIT;
+static void init_table(void) { pthread_once(&table_once, build_table); }
+#endif
 
 static u32 decode(u64 w) {
     u16 top = (u16)(w >> 48);
@@ -178,6 +201,13 @@ typedef struct Ctx {
     CbufReader *read_cbuf;        /* optional: constant buffer contents, for jump tables */
     void *read_user;
     int indent;
+    int brx_checked, brx_ok;      /* every indirect branch's table resolved (asked once) */
+    /* the output language (SHADER_HLSL_FXC, ...), and what it has */
+    int lang, msl;
+    int four_gathers;             /* a gather with an offset per texel as four gathers (vkd3d-shader, MSL) */
+    int lod_long;                 /* TMML from the coordinates' derivatives (vkd3d-shader) */
+    int sb_words;                 /* compute storage buffers as structured buffers of words (vkd3d-shader) */
+    u32 tex_counter;              /* MSL: texture results' names (HLSL's count on across programs) */
 } Ctx;
 
 static void line(Ctx *c, const char *fmt, ...) {
@@ -350,11 +380,21 @@ static const char *sample(Ctx *c, u32 k, u32 type, const char *coord, int lod_mo
     const char *t = tmp("tex%u", k), *s = tmp("smp%u", k);
     if ((lod_mode == 0 || lod_mode == 2) && !gradients(c)) lod_mode = 1;
     const char *off = offset ? tmp(", %s", offset) : "";
+    /* MSL: the sampler's LOD bias, where Metal's has none (before macOS 26): lodb_, added to
+     * every LOD a sample takes - level 0's and compares' too, as Direct3D, Vulkan and Metal's
+     * own lodBias add it (a compare's LOD is HLSL's: implicit, or 0) */
+    const char *b = c->msl ? tmp("lodb_(%uu)", k) : NULL;
     if (dref) {   /* depth compare: one value */
+        if (b) return tmp("%s.%s(%s, %s, %s, %s%s).xxxx", t, lod_mode == 0 || lod_mode == 2 ? "SampleCmpBias" : "SampleCmpLevel", s, coord, dref, b, off);
         if (lod_mode == 0 || lod_mode == 2) return tmp("%s.SampleCmp(%s, %s, %s%s).xxxx", t, s, coord, dref, off);
         return tmp("%s.SampleCmpLevelZero(%s, %s, %s%s).xxxx", t, s, coord, dref, off);
     }
     (void)type;
+    if (b) {
+        if (lod_mode == 0) return tmp("%s.SampleBias(%s, %s, %s%s)", t, s, coord, b, off);
+        if (lod_mode == 1) return tmp("%s.SampleLevel(%s, %s, %s%s)", t, s, coord, b, off);
+        return tmp("%s.%s(%s, %s, (%s) + %s%s)", t, lod_mode == 2 ? "SampleBias" : "SampleLevel", s, coord, lod, b, off);
+    }
     switch (lod_mode) {
     case 0: return tmp("%s.Sample(%s, %s%s)", t, s, coord, off);
     case 2: return tmp("%s.SampleBias(%s, %s, %s%s)", t, s, coord, lod, off);
@@ -388,7 +428,11 @@ static void store_seq(Ctx *c, const char *v, u32 mask, u32 d) {
 
 static const char *layer_of(Ctx *c, u32 r) { return tmp("(float)(%s & 0xFFFFu)", R(c, r)); }
 
+/* Names for texture results: in HLSL counted on from program to program (as they always were);
+ * in MSL from 0 in each, so that a program's text - the key of Metal's own cache - is always
+ * the same, and translating on several threads at once is safe. */
 static u32 tex_counter;
+static u32 next_tex(Ctx *c) { return c->msl ? c->tex_counter++ : tex_counter++; }
 
 static void emit_texs(Ctx *c, const Insn *in) {
     u64 w = in->w;
@@ -416,7 +460,7 @@ static void emit_texs(Ctx *c, const Insn *in) {
     default: unsupported(c, in, "TEXS encoding"); return;
     }
     u32 k = texture_slot(c, handle, type, dref != NULL);
-    const char *v = tmp("t%u", tex_counter++);
+    const char *v = tmp("t%u", next_tex(c));
     line(c, dref ? "{ float4 %s = %s;" : "{ float4 %s = swz(%s, %uu);", v, sample(c, k, type, coord, lod, lodx, dref, NULL), k);
     if (dref) line(c, "%s.w = 1.0f;", v);
     c->indent++;
@@ -449,8 +493,10 @@ static void emit_tex(Ctx *c, const Insn *in) {
     if (dc) dref = F(c, m++);
     u32 k = texture_slot(c, handle, type, dc);
     const char *coord = coord_of(type, x, y, z, layer);
-    const char *v = tmp("t%u", tex_counter++);
-    if (offset) {   /* Sample needs constant offsets: shift the coordinates instead */
+    const char *v = tmp("t%u", next_tex(c));
+    /* HLSL's Sample needs constant offsets: shift the coordinates instead (MSL's sample takes
+     * any offset, in -8..7 as these are, except on cube maps) */
+    if (offset && !(c->msl && type != TEX_CUBE && type != TEX_ARRAY_CUBE)) {
         line(c, "{ float tw_, th_, tl_; tex%u.GetDimensions(0, tw_, th_, tl_);", k);
         coord = coord_of(type, tmp("(%s + float(%s.x) / tw_)", x, offset), y ? tmp("(%s + float(%s.y) / th_)", y, offset) : 0, z, layer);
         offset = NULL;
@@ -472,7 +518,7 @@ static const char *gather(Ctx *c, u32 k, u32 comp, const char *coord, const char
 
 static void emit_tld4(Ctx *c, const Insn *in, int scalar) {
     u64 w = in->w;
-    const char *v = tmp("t%u", tex_counter++);
+    const char *v = tmp("t%u", next_tex(c));
     if (scalar) {   /* TLD4S: 2D only */
         u32 da = BITS(w, 0, 8), a = BITS(w, 8, 8), b = BITS(w, 20, 8), db = BITS(w, 28, 8), handle = BITS(w, 36, 13) * 4;
         u32 dc = BITS(w, 50, 1), aoffi = BITS(w, 51, 1), comp = BITS(w, 52, 2), f16 = BITS(w, 55, 1);
@@ -516,7 +562,7 @@ static void emit_tld4(Ctx *c, const Insn *in, int scalar) {
     }
     if (dc) dref = F(c, m);
     u32 k = texture_slot(c, handle, type, dc);
-    if (offmode == 2 && VKD3D_FORMS) {   /* four gathers, each with its own offset, one component of each (what the four-offset form returns) */
+    if (offmode == 2 && c->four_gathers) {   /* four gathers, each with its own offset, one component of each (what the four-offset form returns) */
         const char *o0 = R(c, m - 2), *o1 = R(c, m - 1);   /* (the two offset registers read above) */
         static const char *const part[4][2] = {{"<< 26", "<< 18"}, {"<< 10", "<< 2"}, {"<< 26", "<< 18"}, {"<< 10", "<< 2"}};
         static const char *const xyzw[4] = {"x", "y", "z", "w"};
@@ -556,7 +602,7 @@ static void emit_tlds(Ctx *c, const Insn *in) {
     default: unsupported(c, in, "TLDS encoding"); return;
     }
     u32 k = texture_slot(c, handle, type, 0);
-    const char *v = tmp("t%u", tex_counter++);
+    const char *v = tmp("t%u", next_tex(c));
     line(c, "{ float4 %s = swz(tex%u.Load(%s), %uu);", v, k, load, k);
     c->indent++;
     store_split(c, v, mask, da, db, f16);
@@ -622,7 +668,7 @@ static void emit_exit(Ctx *c) {
     }
     const u8 *h = c->prog;
     u32 target = *(const u32 *)(h + 0x48), flags = *(const u32 *)(h + 0x4C), reg = 0;
-    line(c, "{ PSOut o = (PSOut)0;");
+    line(c, c->msl ? "{ PSOut o = {};" : "{ PSOut o = (PSOut)0;");
     for (u32 rt = 0; rt < 8; rt++) {
         u32 m = (target >> (rt * 4)) & 15;
         if (!m) continue;
@@ -674,6 +720,10 @@ static int flow_true(Ctx *c, const Insn *in, const char **cond) {
 static void goto_pc(Ctx *c, u32 target) { line(c, "npc_ = 0x%xu; break;", target); }
 
 /* ---- instructions ------------------------------------------------------------------- */
+/* A constant shift count: Direct3D's shifts use its low 5 bits, MSL's (C++'s) by 32 or more
+ * are undefined. */
+static u32 shift(Ctx *c, u32 n) { return c->msl ? n & 31 : n; }
+
 static const char *half(const char *x, u32 swizzle, int hi) {   /* one half of a packed pair, as float */
     switch (swizzle) {
     case 0: return tmp(hi ? "f16tof32(%s >> 16)" : "f16tof32(%s)", x);   /* H1_H0 */
@@ -926,7 +976,7 @@ static void emit_insn(Ctx *c, const Insn *in) {
         x = absneg(x, BITS(w, 49, 1), BITS(w, 45, 1));
         if (src == dst) {
             switch (rop) {
-            case 8: x = tmp("round(%s)", x); break;
+            case 8: x = tmp(c->msl ? "rint(%s)" : "round(%s)", x); break;   /* to nearest even (MSL's round: away from 0) */
             case 9: x = tmp("floor(%s)", x); break;
             case 10: x = tmp("ceil(%s)", x); break;
             case 11: x = tmp("trunc(%s)", x); break;
@@ -942,18 +992,19 @@ static void emit_insn(Ctx *c, const Insn *in) {
         const char *x = src == 1 ? tmp(BITS(w, 41, 1) ? "f16tof32(%s >> 16)" : "f16tof32(%s)", b_u(c, w, form)) : b_f(c, w, form);
         x = absneg(x, BITS(w, 45, 1), BITS(w, 49, 1));
         static const char *const rf[4] = {"round", "floor", "ceil", "trunc"};
-        x = tmp("%s(%s)", rf[rnd], x);
+        x = tmp("%s(%s)", rnd == 0 && c->msl ? "rint" : rf[rnd], x);
         if (dst == 1) x = is_signed ? tmp("clamp(%s, -32768.0f, 32767.0f)", x) : tmp("clamp(%s, 0.0f, 65535.0f)", x);
-        set_u(c, d, is_signed ? tmp("asuint((int)%s)", x) : tmp("(uint)%s", x));
+        if (c->msl) set_u(c, d, is_signed ? tmp("asuint(f2i_(%s))", x) : tmp("f2u_(%s)", x));   /* (saturating: see MSL_PRELUDE) */
+        else set_u(c, d, is_signed ? tmp("asuint((int)%s)", x) : tmp("(uint)%s", x));
         break;
     }
     case OP_I2F_reg: case OP_I2F_cbuf: case OP_I2F_imm: {
         u32 ff = BITS(w, 8, 2), fmt = BITS(w, 10, 2), is_signed = BITS(w, 13, 1), sel = BITS(w, 41, 2);
         const char *x = b_u(c, w, form);
-        if (fmt == 0) x = is_signed ? tmp("(((int)(%s << %u)) >> 24)", x, 24 - sel * 8) : tmp("((%s >> %u) & 0xFFu)", x, sel * 8);
-        else if (fmt == 1) x = is_signed ? tmp("(((int)(%s << %u)) >> 16)", x, 16 - sel * 8) : tmp("((%s >> %u) & 0xFFFFu)", x, sel * 8);
+        if (fmt == 0) x = is_signed ? tmp("(((int)(%s << %u)) >> 24)", x, shift(c, 24 - sel * 8)) : tmp("((%s >> %u) & 0xFFu)", x, sel * 8);
+        else if (fmt == 1) x = is_signed ? tmp("(((int)(%s << %u)) >> 16)", x, shift(c, 16 - sel * 8)) : tmp("((%s >> %u) & 0xFFFFu)", x, sel * 8);
         else if (is_signed) x = tmp("asint(%s)", x);
-        if (BITS(w, 49, 1)) x = is_signed ? tmp("abs(%s)", x) : x;
+        if (BITS(w, 49, 1)) x = is_signed ? tmp(c->msl ? "asint(iabs_(asuint(%s)))" : "abs(%s)", x) : x;
         const char *f = tmp("(float)(%s)", x);
         if (BITS(w, 45, 1)) f = tmp("(-%s)", f);
         if (ff == 1) set_u(c, d, tmp("f32tof16(%s)", f));
@@ -964,9 +1015,11 @@ static void emit_insn(Ctx *c, const Insn *in) {
         u32 dfmt = BITS(w, 8, 2), sfmt = BITS(w, 10, 2), dsig = BITS(w, 12, 1), ssig = BITS(w, 13, 1), sel = BITS(w, 41, 3);
         const char *x = b_u(c, w, form);
         u32 bits = sfmt == 0 ? 8 : sfmt == 1 ? 16 : 32;
-        if (bits < 32) x = ssig ? tmp("asuint(((int)(%s << %u)) >> %u)", x, 32 - bits - sel * 8, 32 - bits) : tmp("((%s >> %u) & 0x%xu)", x, sel * 8, (1u << bits) - 1);
-        if (BITS(w, 49, 1)) x = tmp("asuint(abs(asint(%s)))", x);
-        if (BITS(w, 45, 1)) x = tmp("asuint(-asint(%s))", x);
+        if (bits < 32)
+            x = ssig ? tmp("asuint(((int)(%s << %u)) >> %u)", x, shift(c, 32 - bits - sel * 8), 32 - bits)
+                     : tmp("((%s >> %u) & 0x%xu)", x, shift(c, sel * 8), (1u << bits) - 1);
+        if (BITS(w, 49, 1)) x = tmp(c->msl ? "iabs_(%s)" : "asuint(abs(asint(%s)))", x);
+        if (BITS(w, 45, 1)) x = tmp(c->msl ? "(0u - %s)" : "asuint(-asint(%s))", x);
         u32 dbits = dfmt == 0 ? 8 : dfmt == 1 ? 16 : 32;
         if (BITS(w, 50, 1) && dbits < 32)
             x = dsig ? tmp("asuint(clamp(asint(%s), %d, %d))", x, -(1 << (dbits - 1)), (1 << (dbits - 1)) - 1)
@@ -1138,8 +1191,8 @@ static void emit_insn(Ctx *c, const Insn *in) {
         default: unsupported(c, in, "TMML type"); return;
         }
         u32 k = texture_slot(c, handle, type, 0);
-        const char *v = tmp("t%u", tex_counter++);
-        if (gradients(c) && VKD3D_FORMS) {
+        const char *v = tmp("t%u", next_tex(c));
+        if (gradients(c) && c->lod_long) {
             /* the level from the texel-space derivatives of the coordinates, as for isotropic
              * filtering (cube maps: on the face the direction points at), clamped to the mips */
             switch (type) {
@@ -1326,8 +1379,9 @@ static void emit_insn(Ctx *c, const Insn *in) {
         const char *cond;
         if (flow_true(c, in, &cond)) {
             c->info->kills = 1;
-            if (!strcmp(cond, "true")) line(c, "discard;");
-            else line(c, "if (%s) discard;", cond);
+            const char *discard = c->msl ? "discard_fragment();" : "discard;";
+            if (!strcmp(cond, "true")) line(c, "%s", discard);
+            else line(c, "if (%s) %s", cond, discard);
         }
         break;
     }
@@ -1479,11 +1533,10 @@ static int brx_resolved(Ctx *c) {
     return all;
 }
 
-static int brx_checked, brx_ok;
 static int brx_targets(Ctx *c, u32 i) {
     (void)i;
-    if (!brx_checked) { brx_checked = 1; brx_ok = brx_resolved(c); }
-    return brx_ok;
+    if (!c->brx_checked) { c->brx_checked = 1; c->brx_ok = brx_resolved(c); }
+    return c->brx_ok;
 }
 
 static void emit_body(Ctx *c) {
@@ -1503,7 +1556,7 @@ static void emit_body(Ctx *c) {
     c->leader = calloc(c->n + 1, 1);
     u8 *ssy_target = calloc(c->n + 1, 1), *pbk_target = calloc(c->n + 1, 1);
     c->leader[0] = 1;
-    brx_checked = 0;
+    c->brx_checked = 0;
     for (u32 i = 0; i < c->n; i++) {
         const Insn *in = &c->ins[i];
         if (brx && !brx_targets(c, i)) c->leader[i] = 1;
@@ -1519,7 +1572,7 @@ static void emit_body(Ctx *c) {
             c->leader[i + 1] = 1;
     }
     line(c, "uint pc_ = 0x%xu; uint ssy_[16], pbk_[16]; uint ssp_ = 0u, psp_ = 0u;", c->ins[0].addr);
-    line(c, "[loop] for (uint guard_ = 0u; guard_ < 1000000u; guard_++) {");
+    line(c, "%sfor (uint guard_ = 0u; guard_ < 1000000u; guard_++) {", c->msl ? "" : "[loop] ");
     c->indent++;
     line(c, "uint npc_ = pc_;");
     line(c, "switch (pc_) {");
@@ -1561,8 +1614,9 @@ static void emit_body(Ctx *c) {
     free(pbk_target);
 }
 
+/* (a format: the buffer's type, then a loop attribute) */
 static const char VERTEX_FETCH[] =
-    "uint4 decode_attr(ByteAddressBuffer b, uint addr, uint fmt) {\n"
+    "uint4 decode_attr(%s b, uint addr, uint fmt) {\n"
     "  uint size = (fmt >> 21) & 0x3Fu, type = (fmt >> 27) & 7u, n = 4u, bits = 32u;\n"
     "  bool packed = false;\n"
     "  switch (size) {\n"
@@ -1581,7 +1635,7 @@ static const char VERTEX_FETCH[] =
     "  uint words[5] = {w.x, w.y, w.z, w.w, w4};\n"
     "  bool is_float = type == 7u || type == 1u || type == 2u || type == 5u || type == 6u;\n"
     "  uint4 o = uint4(0u, 0u, 0u, is_float ? 0x3F800000u : 1u);\n"
-    "  [unroll] for (uint i = 0u; i < 4u; i++) {\n"
+    "  %sfor (uint i = 0u; i < 4u; i++) {\n"
     "    if (i >= n) break;\n"
     "    uint cb = packed && i == 3u ? 2u : bits;\n"
     "    uint bo = sh + (packed ? i * 10u : i * bits), wi = bo >> 5, s = bo & 31u;\n"
@@ -1615,6 +1669,82 @@ static const char LOP3[] =
     "  return r;\n"
     "}\n";
 
+/* ---- the text around the body, shared by both languages ---------------------------------- */
+static void put_swz(Str *out, int stage) {
+    put(out, "float comp_(float4 v, uint s) { return s == 2u ? v.x : s == 3u ? v.y : s == 4u ? v.z : s == 5u ? v.w : s >= 6u ? 1.0f : 0.0f; }\n"
+             "float4 swz(float4 v, uint k) { uint s = params.swz[%u + (k >> 2)][k & 3u];\n"
+             "  return float4(comp_(v, s & 7u), comp_(v, (s >> 3) & 7u), comp_(v, (s >> 6) & 7u), comp_(v, (s >> 9) & 7u)); }\n",
+        stage == SHADER_VERTEX ? 0 : 8);
+}
+
+/* Global memory: a global address is looked up in each storage buffer in turn; outside them, 0. */
+static void put_gmem(Ctx *c, Str *out) {
+    ShaderInfo *info = c->info;
+    u32 first = c->stage == SHADER_PIXEL ? 16 : 0;
+    /* (vkd3d-shader cannot read a RWByteAddressBuffer: there, the same words as a structured buffer) */
+    int words = c->stage == SHADER_COMPUTE && c->sb_words;
+    put(out, "uint gload_(uint lo, uint hi) {\n");
+    for (u32 k = 0; k < info->sb_count; k++)
+        put(out, words ? "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u[d >> 2u]; }\n"
+                       : "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u.Load(d); }\n",
+            first + k, k);
+    put(out, "  return 0u;\n}\n");
+    if (c->stage == SHADER_COMPUTE) {
+        put(out, "void gstore_(uint lo, uint hi, uint v) {\n");
+        for (u32 k = 0; k < info->sb_count; k++)
+            put(out, words ? "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u[d >> 2u] = v; return; } }\n"
+                           : "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u.Store(d, v); return; } }\n",
+                first + k, k);
+        put(out, "}\n");
+        put(out, "void gstore_part_(uint lo, uint hi, uint v, uint bits) {\n"
+                 "  uint m = (1u << bits) - 1u, sh = (lo & 3u) * 8u, w = gload_(lo & ~3u, hi);\n"
+                 "  gstore_(lo & ~3u, hi, (w & ~(m << sh)) | ((v & m) << sh));\n}\n");
+    }
+}
+
+static void put_fetch(Str *out, u32 n) {
+    put(out, "uint4 fetch%u(uint vid, uint iid) {\n"
+             "  uint4 a = params.attr[%u];\n"
+             "  if ((a.x & 0x40u) != 0u || a.w == 0u) return uint4(0u, 0u, 0u, 0x3F800000u);\n"
+             "  uint index = a.z != 0u ? params.base.y + iid / a.z : vid;\n"
+             "  return decode_attr(vb%u, index * a.y + ((a.x >> 7) & 0x3FFFu), a.x);\n"
+             "}\n", n, n, n);
+}
+
+static void put_finish(Str *out, int msl) {
+    put(out, "VSOut finish(VSOut o) {\n"
+             "  o.clipw = o.pos.w;\n"
+             "  o.pos = float4(o.pos.x * params.fix.x, o.pos.y * params.fix.y, o.pos.z * params.fix.z + o.pos.w * params.fix.w, o.pos.w);\n"
+             "%s"
+             "  return o;\n}\n", msl ? "  o.psize_ = 1.0f;\n" : "");
+}
+
+static void put_registers(Ctx *c, Str *out) {
+    for (u32 r = 0; r < 255; r++) if (c->reg_used[r]) put(out, "  uint r%u = 0u;\n", r);
+    for (u32 p = 0; p < 7; p++) if (c->pred_used[p]) put(out, "  bool p%u = false;\n", p);
+    if (c->uses_cc) put(out, "  uint cc_c = 0u; bool cc_z = false, cc_s = false;\n");
+}
+
+/* A pixel shader input's interpolation, from the program header: 1 flat, 2 perspective, 3 linear. */
+static u32 interp_mode(const u8 *program, u32 n) {
+    u8 m = program[0x18 + n];
+    u32 mode = 0;
+    for (u32 k = 0; k < 4 && !mode; k++) mode = (m >> (k * 2)) & 3;
+    return mode;
+}
+
+/* What the text around the body tells: the same in every language. */
+static void finish_info(Ctx *c) {
+    ShaderInfo *info = c->info;
+    if (!c->uses_gmem) info->sb_count = 0;
+    if (c->stage == SHADER_COMPUTE) return;
+    info->outputs = c->stage == SHADER_VERTEX ? c->out_attr_mask : 0;
+    if (c->stage == SHADER_PIXEL)
+        for (u32 n = 0; n < 32; n++)
+            if (c->vs_outputs >> n & 1) info->interp[n] = (u8)interp_mode(c->prog, n);
+}
+
+/* ---- HLSL ------------------------------------------------------------------------------ */
 static const char *texture_decl(u32 type, int shadow) {
     switch (type) {
     case TEX_1D: return "Texture1D<float4>";
@@ -1628,16 +1758,386 @@ static const char *texture_decl(u32 type, int shadow) {
     return "Texture2D<float4>";
 }
 
-char *shader_hlsl(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info) {
-    return shader_hlsl_ex(program, size, stage, vs_outputs, info, NULL, NULL);
+static void hlsl_out(Ctx *c, Str *out) {
+    ShaderInfo *info = c->info;
+    int stage = c->stage;
+    put(out, "cbuffer Params : register(b0) { struct { uint4 attr[32]; float4 fix; float4 frag; uint4 base; uint4 swz[16]; uint4 sb[32]; } params; };\n");
+    put_swz(out, stage);
+    for (u32 b = 0; b < 18; b++)
+        if (info->cbuf_mask >> b & 1) put(out, "ByteAddressBuffer cb%u : register(t%u);\n", b, b);
+    for (u32 k = 0; k < info->ntex; k++) {
+        put(out, "%s tex%u : register(t%u);\n", texture_decl(info->tex[k].type, info->tex[k].shadow), k, 64 + k);
+        put(out, "%s smp%u : register(s%u);\n", info->tex[k].shadow ? "SamplerComparisonState" : "SamplerState", k, k);
+    }
+    if (strstr(c->body.s ? c->body.s : "", "lop3(")) put(out, "%s", LOP3);
+    if (c->uses_gmem) {
+        int words = stage == SHADER_COMPUTE && c->sb_words;
+        for (u32 k = 0; k < info->sb_count; k++)
+            put(out, stage != SHADER_COMPUTE ? "ByteAddressBuffer gm%u : register(t%u);\n" : words ? "RWStructuredBuffer<uint> gm%u : register(u%u);\n"
+                     : "RWByteAddressBuffer gm%u : register(u%u);\n", k, stage == SHADER_COMPUTE ? k : 96 + k);
+        put_gmem(c, out);
+    }
+    if (stage == SHADER_COMPUTE) {
+        u32 words = c->shared / 4 ? c->shared / 4 : 1;
+        put(out, "#define SMEM_WORDS %uu\n", words);
+        if (c->uses_smem) put(out, "groupshared uint smem_[%u];\n", words);
+        put(out, "#define LMEM_WORDS 256u\n");
+        put(out, "[numthreads(%u, %u, %u)]\nvoid main(uint3 tid_ : SV_GroupThreadID, uint3 cta_ : SV_GroupID) {\n",
+            c->local[0] ? c->local[0] : 1, c->local[1] ? c->local[1] : 1, c->local[2] ? c->local[2] : 1);
+        put_registers(c, out);
+        if (c->uses_lmem) put(out, "  uint lmem_[LMEM_WORDS];\n");
+        put(out, "%s}\n", c->body.s ? c->body.s : "");
+        return;
+    }
+
+    /* the interface between the stages: identical on both sides */
+    u32 outputs = stage == SHADER_VERTEX ? c->out_attr_mask : c->vs_outputs;
+    put(out, "struct VSOut {\n  float4 pos : SV_Position;\n  float clipw : CLIPW;\n");
+    for (u32 n = 0; n < 32; n++) {
+        if (!(outputs >> n & 1)) continue;
+        const char *interp = "";
+        if (stage == SHADER_PIXEL) {
+            u32 mode = interp_mode(c->prog, n);
+            interp = mode == 1 ? "nointerpolation " : mode == 3 ? "noperspective " : "";
+        }
+        put(out, "  %sfloat4 a%u : ATTR%u;\n", interp, n, n);
+    }
+    put(out, "};\n");
+
+    if (stage == SHADER_VERTEX) {
+        put(out, VERTEX_FETCH, "ByteAddressBuffer", "[unroll] ");
+        for (u32 n = 0; n < 32; n++) {
+            if (!(info->inputs >> n & 1)) continue;
+            put(out, "ByteAddressBuffer vb%u : register(t%u);\n", n, 18 + n);
+            put_fetch(out, n);
+        }
+        put_finish(out, 0);
+        put(out, "VSOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID) {\n");
+        put(out, "  VSOut o = (VSOut)0; o.pos.w = 1.0f;\n");
+        for (u32 n = 0; n < 32; n++)
+            if (info->inputs >> n & 1) put(out, "  uint4 va%u = fetch%u(vid, iid);\n", n, n);
+    } else {
+        u32 target = *(const u32 *)(c->prog + 0x48), flags = *(const u32 *)(c->prog + 0x4C);
+        put(out, "struct PSOut {\n");
+        for (u32 rt = 0; rt < 8; rt++)
+            if ((target >> (rt * 4)) & 15) put(out, "  float4 c%u : SV_Target%u;\n", rt, rt);
+        if (flags & 2) put(out, "  float depth : SV_Depth;\n");
+        put(out, "};\n");
+        put(out, "PSOut main(VSOut i, bool front : SV_IsFrontFace) {\n");
+    }
+    put_registers(c, out);
+    put(out, "%s}\n", c->body.s ? c->body.s : "");
 }
 
-static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user,
+/* ---- Metal Shading Language ------------------------------------------------------------- */
+static const char MSL_PRELUDE[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "inline float asfloat(uint x) { return as_type<float>(x); }\n"
+    "inline float asfloat(int x) { return as_type<float>(x); }\n"
+    "inline float asfloat(float x) { return x; }\n"
+    "inline uint asuint(float x) { return as_type<uint>(x); }\n"
+    "inline uint asuint(int x) { return as_type<uint>(x); }\n"
+    "inline uint asuint(uint x) { return x; }\n"
+    "inline int asint(uint x) { return as_type<int>(x); }\n"
+    "inline int asint(float x) { return as_type<int>(x); }\n"
+    "inline int asint(int x) { return x; }\n"
+    "inline float f16tof32(uint x) { return float(as_type<half>(ushort(x & 0xFFFFu))); }\n"
+    "inline uint f32tof16(float x) { return uint(as_type<ushort>(half(x))); }\n"
+    "inline float mad(float a, float b, float c) { return fma(a, b, c); }\n"
+    "inline uint reversebits(uint x) { return reverse_bits(x); }\n"
+    "inline uint iabs_(uint x) { return as_type<int>(x) < 0 ? 0u - x : x; }\n"
+    "/* float to integer saturating, as Direct3D's (NaN: 0). A plain conversion out of range is\n"
+    " * undefined in MSL: Metal saturates it at run time, but folds a constant one to poison */\n"
+    "inline int f2i_(float x) { return isnan(x) ? 0 : x >= 2147483648.0f ? 2147483647 : x <= -2147483648.0f ? -2147483647 - 1 : int(x); }\n"
+    "inline uint f2u_(float x) { return !(x > 0.0f) ? 0u : x >= 4294967296.0f ? 0xFFFFFFFFu : uint(x); }\n"
+    "/* raw buffers, as Direct3D's: words out of range read 0, and are not written */\n"
+    "struct RawBuf {\n"
+    "  device const uint *p; uint bytes;\n"
+    "  uint word_(uint i) const { return i < (bytes >> 2) ? p[i] : 0u; }\n"
+    "  uint Load(uint a) const { return word_(a >> 2); }\n"
+    "  uint4 Load4(uint a) const { uint i = a >> 2; return uint4(word_(i), word_(i + 1u), word_(i + 2u), word_(i + 3u)); }\n"
+    "};\n"
+    "struct RWRawBuf {\n"
+    "  device uint *p; uint bytes;\n"
+    "  uint Load(uint a) const { return (a >> 2) < (bytes >> 2) ? p[a >> 2] : 0u; }\n"
+    "  void Store(uint a, uint v) const { if ((a >> 2) < (bytes >> 2)) p[a >> 2] = v; }\n"
+    "};\n"
+    "struct Bind_ { device uint *p; uint bytes, pad_; };\n"
+    "struct Params { uint4 attr[32]; float4 fix; float4 frag; uint4 base; uint4 swz[16]; uint4 sb[32]; };\n";
+
+static const char MSL_TEXTURES[] =
+    "inline uint layer_(float l, uint n) { return min(uint(max(rint(l), 0.0f)), n - 1u); }   /* rounded and clamped, as Direct3D's */\n"
+    "inline int2 near_(int2 o) { return clamp(o, int2(-8), int2(7)); }   /* the part of a gather's offset Metal applies */\n";
+
+/* Wrappers giving Metal's textures the methods the code calls by HLSL's names, one for each
+ * kind of texture declared (msl_kind). Coordinates come packed as for HLSL (the layer last, a
+ * float); Metal takes the layer apart, as a uint. 1D textures are 2D ones (Metal's 1D ones
+ * have no mips) sampled along the middle of their one row; Loads out of range read 0, as
+ * Direct3D's do; gather offsets past Metal's -8..7 move the coordinates. */
+static const struct MslTexture {
+    const char *name, *type;
+    const char *ct, *cx, *layer, *offset;   /* HLSL's coordinates, Metal's, its layer argument, a texel offset (NULL: none) */
+    const char *lod_ct, *lod_cx;            /* TMML's coordinates (NULL: no TMML) */
+    const char *load;                       /* Load (NULL: none) */
+    u8 gathers, shadow, dims;               /* gathers 1: with offsets, 2: without; dims: GetDimensions */
+} MSL_TEX[] = {
+    {"Tex1D_", "texture2d<float>", "float", "float2(c, 0.5f)", "", "int2(o.x, 0)", "float", "float2(c, 0.5f)",
+     "  float4 Load(int2 c) const { uint l = uint(c.y);\n"
+     "    return l < t.get_num_mip_levels() && uint(c.x) < t.get_width(l) ? t.read(uint2(uint(c.x), 0u), l) : float4(0.0f); }\n", 0, 0, 0},
+    {"Tex1DArray_", "texture2d_array<float>", "float2", "float2(c.x, 0.5f)", ", layer_(c.y, t.get_array_size())", "int2(o.x, 0)",
+     NULL, NULL, NULL, 0, 0, 0},
+    {"Tex2D_", "texture2d<float>", "float2", "c", "", "o", "float2", "c",
+     "  float4 Load(int3 c) const { uint l = uint(c.z);\n"
+     "    return l < t.get_num_mip_levels() && uint(c.x) < t.get_width(l) && uint(c.y) < t.get_height(l) ? t.read(uint2(c.xy), l) : float4(0.0f); }\n",
+     1, 0, 0},
+    {"Tex2DArray_", "texture2d_array<float>", "float3", "c.xy", ", layer_(c.z, t.get_array_size())", "o", "float2", "c",
+     "  float4 Load(int4 c) const { uint l = uint(c.w);\n"
+     "    return l < t.get_num_mip_levels() && uint(c.x) < t.get_width(l) && uint(c.y) < t.get_height(l) && uint(c.z) < t.get_array_size()\n"
+     "      ? t.read(uint2(c.xy), uint(c.z), l) : float4(0.0f); }\n", 1, 0, 0},
+    {"Tex3D_", "texture3d<float>", "float3", "c", "", "int3(o, 0)", "float3", "c",
+     "  float4 Load(int4 c) const { uint l = uint(c.w);\n"
+     "    return l < t.get_num_mip_levels() && uint(c.x) < t.get_width(l) && uint(c.y) < t.get_height(l) && uint(c.z) < t.get_depth(l)\n"
+     "      ? t.read(uint3(c.xyz), l) : float4(0.0f); }\n", 0, 0, 0},
+    {"TexCube_", "texturecube<float>", "float3", "c", "", NULL, "float3", "c", NULL, 2, 0, 1},
+    {"TexCubeArray_", "texturecube_array<float>", "float4", "c.xyz", ", layer_(c.w, t.get_array_size())", NULL, NULL, NULL, NULL, 2, 0, 1},
+    {"Shadow1D_", "depth2d<float>", "float", "float2(c, 0.5f)", "", "int2(o.x, 0)", NULL, NULL, NULL, 0, 1, 0},
+    {"Shadow1DArray_", "depth2d_array<float>", "float2", "float2(c.x, 0.5f)", ", layer_(c.y, t.get_array_size())", "int2(o.x, 0)",
+     NULL, NULL, NULL, 0, 1, 0},
+    {"Shadow2D_", "depth2d<float>", "float2", "c", "", "o", NULL, NULL, NULL, 1, 1, 0},
+    {"Shadow2DArray_", "depth2d_array<float>", "float3", "c.xy", ", layer_(c.z, t.get_array_size())", "o", NULL, NULL, NULL, 1, 1, 0},
+    {"ShadowCube_", "depthcube<float>", "float3", "c", "", NULL, NULL, NULL, NULL, 2, 1, 1},
+    {"ShadowCubeArray_", "depthcube_array<float>", "float4", "c.xyz", ", layer_(c.w, t.get_array_size())", NULL, NULL, NULL, NULL, 2, 1, 1},
+};
+
+/* The wrapper for a declared texture: the type HLSL declares (TEX_ARRAY_3D: a 2D texture; a
+ * shadow 3D texture has no compare, as in HLSL). */
+static u32 msl_kind(u32 type, int shadow) {
+    static const u8 plain[8] = {0, 1, 2, 3, 4, 2, 5, 6}, depth[8] = {7, 8, 9, 10, 4, 9, 11, 12};
+    return (shadow ? depth : plain)[type & 7];
+}
+
+static void msl_texture(Str *out, const struct MslTexture *t, int pixel) {
+    static const char *const comp[4][2] = {{"Red", "x"}, {"Green", "y"}, {"Blue", "z"}, {"Alpha", "w"}};
+    const char *ct = t->ct, *cx = t->cx, *ly = t->layer, *ox = t->offset;
+    put(out, "struct %s {\n  %s t;\n", t->name, t->type);
+    if (t->gathers == 1)
+        put(out, "  float2 at_(float2 c, int2 o) const { return c + float2(o - near_(o)) / float2(t.get_width(), t.get_height()); }\n");
+    if (!t->shadow) {
+        put(out, "  float4 SampleLevel(sampler s, %s c, float l) const { return t.sample(s, %s%s, level(l)); }\n", ct, cx, ly);
+        if (ox) put(out, "  float4 SampleLevel(sampler s, %s c, float l, int2 o) const { return t.sample(s, %s%s, level(l), %s); }\n", ct, cx, ly, ox);
+        if (pixel) {
+            put(out, "  float4 Sample(sampler s, %s c) const { return t.sample(s, %s%s); }\n", ct, cx, ly);
+            if (ox) put(out, "  float4 Sample(sampler s, %s c, int2 o) const { return t.sample(s, %s%s, %s); }\n", ct, cx, ly, ox);
+            put(out, "  float4 SampleBias(sampler s, %s c, float b) const { return t.sample(s, %s%s, bias(b)); }\n", ct, cx, ly);
+            if (ox) put(out, "  float4 SampleBias(sampler s, %s c, float b, int2 o) const { return t.sample(s, %s%s, bias(b), %s); }\n", ct, cx, ly, ox);
+            if (t->lod_ct) {
+                put(out, "  float CalculateLevelOfDetail(sampler s, %s c) const { return t.calculate_clamped_lod(s, %s); }\n", t->lod_ct, t->lod_cx);
+                put(out, "  float CalculateLevelOfDetailUnclamped(sampler s, %s c) const { return t.calculate_unclamped_lod(s, %s); }\n", t->lod_ct, t->lod_cx);
+            }
+        }
+        for (u32 i = 0; i < 4 && t->gathers; i++) {
+            if (t->gathers == 1) {
+                put(out, "  float4 Gather%s(sampler s, %s c) const { return t.gather(s, %s%s, int2(0), component::%s); }\n", comp[i][0], ct, cx, ly, comp[i][1]);
+                put(out, "  float4 Gather%s(sampler s, %s c, int2 o) const { return t.gather(s, at_(%s, o)%s, near_(o), component::%s); }\n",
+                    comp[i][0], ct, cx, ly, comp[i][1]);
+            } else put(out, "  float4 Gather%s(sampler s, %s c) const { return t.gather(s, %s%s, component::%s); }\n", comp[i][0], ct, cx, ly, comp[i][1]);
+        }
+        if (t->load) put(out, "%s", t->load);
+    } else {
+        /* (HLSL's SampleCmpLevelZero and SampleCmp, with the sampler's LOD bias: lodb_) */
+        put(out, "  float4 SampleCmpLevel(sampler s, %s c, float r, float l) const { return float4(t.sample_compare(s, %s%s, r, level(l))); }\n",
+            ct, cx, ly);
+        if (ox) put(out, "  float4 SampleCmpLevel(sampler s, %s c, float r, float l, int2 o) const { return float4(t.sample_compare(s, %s%s, r, level(l), %s)); }\n",
+                    ct, cx, ly, ox);
+        if (pixel) {
+            put(out, "  float4 SampleCmpBias(sampler s, %s c, float r, float b) const { return float4(t.sample_compare(s, %s%s, r, bias(b))); }\n",
+                ct, cx, ly);
+            if (ox) put(out, "  float4 SampleCmpBias(sampler s, %s c, float r, float b, int2 o) const { return float4(t.sample_compare(s, %s%s, r, bias(b), %s)); }\n",
+                        ct, cx, ly, ox);
+        }
+        if (t->gathers) put(out, "  float4 GatherCmp(sampler s, %s c, float r) const { return t.gather_compare(s, %s%s, r); }\n", ct, cx, ly);
+        if (t->gathers == 1)
+            put(out, "  float4 GatherCmp(sampler s, %s c, float r, int2 o) const { return t.gather_compare(s, at_(%s, o)%s, r, near_(o)); }\n", ct, cx, ly);
+    }
+    if (t->dims)
+        put(out, "  void GetDimensions(uint m, thread float &w, thread float &h, thread float &l) const {\n"
+                 "    w = t.get_width(m); h = t.get_height(m); l = t.get_num_mip_levels(); }\n");
+    put(out, "};\n");
+}
+
+/* MSL has no global resources: the program and its helpers are member functions of Shader_,
+ * whose members are the resources; the entry point fills it from its arguments (the layout
+ * gpu_shader.h gives) and runs it. Buffers are found by their GPU addresses in a table. */
+static void msl_out(Ctx *c, Str *out) {
+    ShaderInfo *info = c->info;
+    int stage = c->stage;
+    const char *body = c->body.s ? c->body.s : "";
+    put(out, "%s", MSL_PRELUDE);
+    put(out, "struct Binds_ { Bind_ cb[18]; Bind_ gm[16];%s };\n", stage == SHADER_VERTEX ? " Bind_ vb[32];" : "");
+    if (info->ntex) put(out, "%s", MSL_TEXTURES);
+    u32 kinds = 0;
+    for (u32 k = 0; k < info->ntex; k++) {
+        u32 kind = msl_kind(info->tex[k].type, info->tex[k].shadow);
+        if (!(kinds >> kind & 1)) msl_texture(out, &MSL_TEX[kind], stage == SHADER_PIXEL);
+        kinds |= 1u << kind;
+    }
+    u32 nsmp = shader_msl_samplers(info), defaults = 0;   /* (Metal has 16 samplers: past them, Direct3D's default sampler) */
+    for (u32 k = nsmp; k < info->ntex; k++) defaults |= info->tex[k].shadow ? 2u : 1u;
+    if (defaults & 1) put(out, "constexpr sampler smp_default_(address::clamp_to_edge, filter::linear, mip_filter::linear);\n");
+    if (defaults & 2) put(out, "constexpr sampler smp_default_cmp_(address::clamp_to_edge, filter::linear, mip_filter::linear, compare_func::never);\n");
+    if (strstr(body, "lop3(")) put(out, "%s", LOP3);
+    if (stage == SHADER_VERTEX) put(out, VERTEX_FETCH, "RawBuf", "");
+    if (stage == SHADER_COMPUTE) put(out, "#define SMEM_WORDS %uu\n", c->shared / 4 ? c->shared / 4 : 1);
+    if (stage == SHADER_COMPUTE || c->uses_lmem) put(out, "#define LMEM_WORDS 256u\n");
+
+    /* the interface between the stages: the vertex shader's outputs, of which the pixel shader
+     * declares those it reads (Metal matches them by name) */
+    u32 target = 0, flags = 0, ps_inputs = info->inputs & c->vs_outputs;
+    if (stage == SHADER_VERTEX) {
+        put(out, "struct VSOut {\n  float4 pos [[position, invariant]];\n  float clipw [[user(clipw)]];\n");
+        for (u32 n = 0; n < 32; n++)
+            if (c->out_attr_mask >> n & 1) put(out, "  float4 a%u [[user(attr%u)]];\n", n, n);
+        put(out, "  float psize_ [[point_size]];\n};\n");
+    } else if (stage == SHADER_PIXEL) {
+        target = *(const u32 *)(c->prog + 0x48);
+        flags = *(const u32 *)(c->prog + 0x4C);
+        put(out, "struct PSIn {\n  float4 pos [[position]];\n  float clipw [[user(clipw)]];\n");
+        for (u32 n = 0; n < 32; n++) {
+            if (!(ps_inputs >> n & 1)) continue;
+            u32 mode = interp_mode(c->prog, n);
+            put(out, "  float4 a%u [[user(attr%u)%s]];\n", n, n, mode == 1 ? ", flat" : mode == 3 ? ", center_no_perspective" : "");
+        }
+        put(out, "};\n");
+        put(out, "struct PSOut {\n");
+        for (u32 rt = 0; rt < 8; rt++)
+            if ((target >> (rt * 4)) & 15) put(out, "  float4 c%u;\n", rt);
+        if (flags & 2) put(out, "  float depth;\n");
+        put(out, "};\n");
+        /* what is written: each render target's output typed as the renderer's attachment is;
+         * with dual-source blending (which the renderer asks for from its blend state alone),
+         * target 1's output as target 0's second source - 0 when the program writes no target
+         * 1, and 0 as target 0's first when it writes no target 0, since Metal refuses a pipeline
+         * blending with Source1 whose program does not write both (D3D draws, reading undefined
+         * values: 0 in practice) */
+        put(out, "constant uint rt_types_ [[function_constant(%u)]];   /* 2 bits a render target: float (0), uint (1), int (2) */\n"
+                 "constant uint rtt_ = is_function_constant_defined(rt_types_) ? rt_types_ : 0u;\n"
+                 "constant bool dual_ = (rtt_ & 0x%xu) != 0u;\n", SHADER_MSL_RT_TYPES, SHADER_MSL_DUAL_SOURCE);
+        for (u32 rt = 0; rt < 8; rt++)
+            if ((target >> (rt * 4)) & 15) {
+                const char *d = rt == 1 ? "!dual_ && " : "";
+                put(out, "constant bool c%uf_ = %s(rtt_ >> %u & 3u) == 0u, c%uu_ = %s(rtt_ >> %u & 3u) == 1u, c%ui_ = %s(rtt_ >> %u & 3u) == 2u;\n",
+                    rt, d, 2 * rt, rt, d, 2 * rt, rt, d, 2 * rt);
+            }
+        put(out, "struct PSOut_ {\n");
+        for (u32 rt = 0; rt < 8; rt++)
+            if ((target >> (rt * 4)) & 15)
+                put(out, "  float4 c%uf [[color(%u), function_constant(c%uf_)]];\n  uint4 c%uu [[color(%u), function_constant(c%uu_)]];\n"
+                         "  int4 c%ui [[color(%u), function_constant(c%ui_)]];\n", rt, rt, rt, rt, rt, rt, rt, rt, rt);
+        if (!(target & 15)) put(out, "  float4 c0s [[color(0), function_constant(dual_)]];\n");   /* (only a float target blends) */
+        put(out, "  float4 c1s [[color(0), index(1), function_constant(dual_)]];\n");
+        if (flags & 2) put(out, "  float depth [[depth(any)]];\n");
+        put(out, "};\n");
+    }
+
+    /* the program, with its resources */
+    Str init = {0};   /* (the entry point's initialiser for them, in the same order) */
+    int binds = 0;
+    put(out, "struct Shader_ {\n  constant Params &params;\n");
+    put(&init, "  Shader_ s_ = {params");
+    for (u32 b = 0; b < 18; b++)
+        if (info->cbuf_mask >> b & 1) {
+            put(out, "  RawBuf cb%u;\n", b);
+            put(&init, ", {bt.cb[%u].p, bt.cb[%u].bytes}", b, b);
+            binds = 1;
+        }
+    for (u32 k = 0; k < info->sb_count; k++) {
+        put(out, "  %s gm%u;\n", stage == SHADER_COMPUTE ? "RWRawBuf" : "RawBuf", k);
+        put(&init, ", {bt.gm[%u].p, bt.gm[%u].bytes}", k, k);
+        binds = 1;
+    }
+    for (u32 n = 0; n < 32 && stage == SHADER_VERTEX; n++)
+        if (info->inputs >> n & 1) {
+            put(out, "  RawBuf vb%u;\n", n);
+            put(&init, ", {bt.vb[%u].p, bt.vb[%u].bytes}", n, n);
+            binds = 1;
+        }
+    for (u32 k = 0; k < info->ntex; k++) {
+        put(out, "  %s tex%u; sampler smp%u;\n", MSL_TEX[msl_kind(info->tex[k].type, info->tex[k].shadow)].name, k, k);
+        if (k < nsmp) put(&init, ", {tex%u}, smp%u", k, k);
+        else put(&init, ", {tex%u}, %s", k, info->tex[k].shadow ? "smp_default_cmp_" : "smp_default_");
+    }
+    if (c->uses_smem) {
+        put(out, "  threadgroup uint *smem_;\n");
+        put(&init, ", smem_");
+    }
+    put(&init, "};\n");
+    put_swz(out, stage);
+    /* A sampler's LOD bias, in the bits above a texture's swizzle (13, signed, in 1/256ths: the
+     * TSC's): the renderer's, where Metal's samplers have none. sample() adds it to every LOD a
+     * sample or compare takes - implicit, biased, explicit and level 0 alike, as Direct3D's
+     * MipLODBias and Metal's lodBias (macOS 26) are - not to gathers'; so 0 changes nothing. */
+    if (info->ntex)
+        put(out, "float lodb_(uint k) { return float(as_type<int>(params.swz[%u + (k >> 2)][k & 3u] << 7) >> 19) / 256.0f; }\n",
+            stage == SHADER_VERTEX ? 0 : 8);
+    if (c->uses_gmem) put_gmem(c, out);
+    if (stage == SHADER_VERTEX) {
+        for (u32 n = 0; n < 32; n++)
+            if (info->inputs >> n & 1) put_fetch(out, n);
+        put_finish(out, 1);
+        put(out, "VSOut run(uint vid, uint iid) {\n  VSOut o = {}; o.pos.w = 1.0f;\n");
+        for (u32 n = 0; n < 32; n++)
+            if (info->inputs >> n & 1) put(out, "  uint4 va%u = fetch%u(vid, iid);\n", n, n);
+    } else if (stage == SHADER_PIXEL) put(out, "PSOut run(PSIn i, bool front) {\n");
+    else put(out, "void run(uint3 tid_, uint3 cta_) {\n");
+    put_registers(c, out);
+    if (c->uses_lmem) put(out, "  uint lmem_[LMEM_WORDS];\n");   /* (in every stage: HLSL's has it in compute alone) */
+    put(out, "%s}\n};\n", body);
+
+    /* the entry point */
+    Str args = {0};
+    put(&args, "constant Params &params [[buffer(%u)]]", SHADER_MSL_PARAMS);
+    if (binds) put(&args, ", constant Binds_ &bt [[buffer(%u)]]", SHADER_MSL_BINDS);
+    for (u32 k = 0; k < info->ntex; k++) {
+        put(&args, ", %s tex%u [[texture(%u)]]", MSL_TEX[msl_kind(info->tex[k].type, info->tex[k].shadow)].type, k, k);
+        if (k < nsmp) put(&args, ", sampler smp%u [[sampler(%u)]]", k, k);
+    }
+    if (stage == SHADER_VERTEX) {
+        put(out, "vertex VSOut vs_main(uint vid [[vertex_id]], uint iid [[instance_id]], %s) {\n%s  return s_.run(vid, iid);\n}\n", args.s, init.s);
+    } else if (stage == SHADER_PIXEL) {
+        put(out, "fragment PSOut_ ps_main(PSIn i [[stage_in]], bool front [[front_facing]], %s) {\n%s  PSOut o = s_.run(i, front);\n  PSOut_ r;\n",
+            args.s, init.s);
+        for (u32 rt = 0; rt < 8; rt++)
+            if ((target >> (rt * 4)) & 15)
+                put(out, "  if (c%uf_) r.c%uf = o.c%u;\n  if (c%uu_) r.c%uu = as_type<uint4>(o.c%u);\n  if (c%ui_) r.c%ui = as_type<int4>(o.c%u);\n",
+                    rt, rt, rt, rt, rt, rt, rt, rt, rt);
+        if (!(target & 15)) put(out, "  if (dual_) r.c0s = float4(0.0f);\n");
+        put(out, target >> 4 & 15 ? "  if (dual_) r.c1s = o.c1;\n" : "  if (dual_) r.c1s = float4(0.0f);\n");
+        if (flags & 2) put(out, "  r.depth = o.depth;\n");
+        put(out, "  return r;\n}\n");
+    } else {
+        u32 lx = c->local[0] ? c->local[0] : 1, ly = c->local[1] ? c->local[1] : 1, lz = c->local[2] ? c->local[2] : 1;
+        put(out, "[[max_total_threads_per_threadgroup(%u)]]\n"
+                 "kernel void cs_main(uint3 tid_ [[thread_position_in_threadgroup]], uint3 cta_ [[threadgroup_position_in_grid]], %s) {\n",
+            lx * ly * lz, args.s);
+        if (c->uses_smem) put(out, "  threadgroup uint smem_[SMEM_WORDS];\n");
+        put(out, "%s  s_.run(tid_, cta_);\n}\n", init.s);
+    }
+    free(init.s);
+    free(args.s);
+}
+
+/* ---- translation ----------------------------------------------------------------------------- */
+static char *translate(int lang, const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user,
                        const u32 local[3], u32 shared) {
     init_table();
     memset(info, 0, sizeof *info);
     info->stage = stage;
     Ctx ctx = {0}, *c = &ctx;
+    c->lang = lang;
+    c->msl = lang == SHADER_MSL;
+    c->four_gathers = lang != SHADER_HLSL_FXC;
+    c->lod_long = c->sb_words = lang == SHADER_HLSL_VKD3D;
     if (local) { c->local[0] = local[0]; c->local[1] = local[1]; c->local[2] = local[2]; }
     c->shared = shared;
     c->read_cbuf = read;
@@ -1649,128 +2149,33 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
     c->indent = 1;
     decode_program(c, program, size);
     emit_body(c);
+    finish_info(c);
 
     Str out = {0};
     put(&out, "// Maxwell %s shader, %u instructions\n", stage == SHADER_VERTEX ? "vertex" : stage == SHADER_PIXEL ? "pixel" : "compute", c->n);
-    put(&out, "cbuffer Params : register(b0) { struct { uint4 attr[32]; float4 fix; float4 frag; uint4 base; uint4 swz[16]; uint4 sb[32]; } params; };\n");
-    put(&out, "float comp_(float4 v, uint s) { return s == 2u ? v.x : s == 3u ? v.y : s == 4u ? v.z : s == 5u ? v.w : s >= 6u ? 1.0f : 0.0f; }\n"
-              "float4 swz(float4 v, uint k) { uint s = params.swz[%u + (k >> 2)][k & 3u];\n"
-              "  return float4(comp_(v, s & 7u), comp_(v, (s >> 3) & 7u), comp_(v, (s >> 6) & 7u), comp_(v, (s >> 9) & 7u)); }\n",
-        stage == SHADER_VERTEX ? 0 : 8);
-    for (u32 b = 0; b < 18; b++)
-        if (info->cbuf_mask >> b & 1) put(&out, "ByteAddressBuffer cb%u : register(t%u);\n", b, b);
-    for (u32 k = 0; k < info->ntex; k++) {
-        put(&out, "%s tex%u : register(t%u);\n", texture_decl(info->tex[k].type, info->tex[k].shadow), k, 64 + k);
-        put(&out, "%s smp%u : register(s%u);\n", info->tex[k].shadow ? "SamplerComparisonState" : "SamplerState", k, k);
-    }
-    if (strstr(c->body.s ? c->body.s : "", "lop3(")) put(&out, "%s", LOP3);
-    if (!c->uses_gmem) info->sb_count = 0;
-    else {   /* a global address is looked up in each storage buffer in turn; outside them, 0 */
-        u32 first = stage == SHADER_PIXEL ? 16 : 0;
-        /* (vkd3d-shader cannot read a RWByteAddressBuffer: there, the same words as a structured buffer) */
-        int words = stage == SHADER_COMPUTE && VKD3D_FORMS;
-        for (u32 k = 0; k < info->sb_count; k++)
-            put(&out, stage != SHADER_COMPUTE ? "ByteAddressBuffer gm%u : register(t%u);\n" : words ? "RWStructuredBuffer<uint> gm%u : register(u%u);\n"
-                      : "RWByteAddressBuffer gm%u : register(u%u);\n", k, stage == SHADER_COMPUTE ? k : 96 + k);
-        put(&out, "uint gload_(uint lo, uint hi) {\n");
-        for (u32 k = 0; k < info->sb_count; k++)
-            put(&out, words ? "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u[d >> 2u]; }\n"
-                            : "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) return gm%u.Load(d); }\n",
-                first + k, k);
-        put(&out, "  return 0u;\n}\n");
-        if (stage == SHADER_COMPUTE) {
-            put(&out, "void gstore_(uint lo, uint hi, uint v) {\n");
-            for (u32 k = 0; k < info->sb_count; k++)
-                put(&out, words ? "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u[d >> 2u] = v; return; } }\n"
-                                : "  { uint4 s = params.sb[%u]; uint d = lo - s.x; if (hi - s.y - (lo < s.x ? 1u : 0u) == 0u && d < s.z) { gm%u.Store(d, v); return; } }\n",
-                    first + k, k);
-            put(&out, "}\n");
-            put(&out, "void gstore_part_(uint lo, uint hi, uint v, uint bits) {\n"
-                      "  uint m = (1u << bits) - 1u, sh = (lo & 3u) * 8u, w = gload_(lo & ~3u, hi);\n"
-                      "  gstore_(lo & ~3u, hi, (w & ~(m << sh)) | ((v & m) << sh));\n}\n");
-        }
-    }
-    if (stage == SHADER_COMPUTE) {
-        u32 words = c->shared / 4 ? c->shared / 4 : 1;
-        put(&out, "#define SMEM_WORDS %uu\n", words);
-        if (c->uses_smem) put(&out, "groupshared uint smem_[%u];\n", words);
-        put(&out, "#define LMEM_WORDS 256u\n");
-        put(&out, "[numthreads(%u, %u, %u)]\nvoid main(uint3 tid_ : SV_GroupThreadID, uint3 cta_ : SV_GroupID) {\n",
-            c->local[0] ? c->local[0] : 1, c->local[1] ? c->local[1] : 1, c->local[2] ? c->local[2] : 1);
-        for (u32 r = 0; r < 255; r++) if (c->reg_used[r]) put(&out, "  uint r%u = 0u;\n", r);
-        for (u32 p = 0; p < 7; p++) if (c->pred_used[p]) put(&out, "  bool p%u = false;\n", p);
-        if (c->uses_cc) put(&out, "  uint cc_c = 0u; bool cc_z = false, cc_s = false;\n");
-        if (c->uses_lmem) put(&out, "  uint lmem_[LMEM_WORDS];\n");
-        put(&out, "%s}\n", c->body.s ? c->body.s : "");
-        free(c->body.s);
-        free(c->ins);
-        free(c->leader);
-        return out.s;
-    }
-
-    /* the interface between the stages: identical on both sides */
-    u32 outputs = stage == SHADER_VERTEX ? c->out_attr_mask : vs_outputs;
-    info->outputs = stage == SHADER_VERTEX ? c->out_attr_mask : 0;
-    put(&out, "struct VSOut {\n  float4 pos : SV_Position;\n  float clipw : CLIPW;\n");
-    for (u32 n = 0; n < 32; n++) {
-        if (!(outputs >> n & 1)) continue;
-        const char *interp = "";
-        if (stage == SHADER_PIXEL) {
-            u8 m = program[0x18 + n];
-            u32 mode = 0;
-            for (u32 k = 0; k < 4 && !mode; k++) mode = (m >> (k * 2)) & 3;
-            info->interp[n] = (u8)mode;
-            interp = mode == 1 ? "nointerpolation " : mode == 3 ? "noperspective " : "";
-        }
-        put(&out, "  %sfloat4 a%u : ATTR%u;\n", interp, n, n);
-    }
-    put(&out, "};\n");
-
-    if (stage == SHADER_VERTEX) {
-        put(&out, "%s", VERTEX_FETCH);
-        for (u32 n = 0; n < 32; n++) {
-            if (!(info->inputs >> n & 1)) continue;
-            put(&out, "ByteAddressBuffer vb%u : register(t%u);\n", n, 18 + n);
-            put(&out, "uint4 fetch%u(uint vid, uint iid) {\n"
-                      "  uint4 a = params.attr[%u];\n"
-                      "  if ((a.x & 0x40u) != 0u || a.w == 0u) return uint4(0u, 0u, 0u, 0x3F800000u);\n"
-                      "  uint index = a.z != 0u ? params.base.y + iid / a.z : vid;\n"
-                      "  return decode_attr(vb%u, index * a.y + ((a.x >> 7) & 0x3FFFu), a.x);\n"
-                      "}\n", n, n, n);
-        }
-        put(&out, "VSOut finish(VSOut o) {\n"
-                  "  o.clipw = o.pos.w;\n"
-                  "  o.pos = float4(o.pos.x * params.fix.x, o.pos.y * params.fix.y, o.pos.z * params.fix.z + o.pos.w * params.fix.w, o.pos.w);\n"
-                  "  return o;\n}\n");
-        put(&out, "VSOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID) {\n");
-        put(&out, "  VSOut o = (VSOut)0; o.pos.w = 1.0f;\n");
-        for (u32 n = 0; n < 32; n++)
-            if (info->inputs >> n & 1) put(&out, "  uint4 va%u = fetch%u(vid, iid);\n", n, n);
-    } else {
-        u32 target = *(const u32 *)(program + 0x48), flags = *(const u32 *)(program + 0x4C);
-        put(&out, "struct PSOut {\n");
-        for (u32 rt = 0; rt < 8; rt++)
-            if ((target >> (rt * 4)) & 15) put(&out, "  float4 c%u : SV_Target%u;\n", rt, rt);
-        if (flags & 2) put(&out, "  float depth : SV_Depth;\n");
-        put(&out, "};\n");
-        put(&out, "PSOut main(VSOut i, bool front : SV_IsFrontFace) {\n");
-    }
-    for (u32 r = 0; r < 255; r++) if (c->reg_used[r]) put(&out, "  uint r%u = 0u;\n", r);
-    for (u32 p = 0; p < 7; p++) if (c->pred_used[p]) put(&out, "  bool p%u = false;\n", p);
-    if (c->uses_cc) put(&out, "  uint cc_c = 0u; bool cc_z = false, cc_s = false;\n");
-    put(&out, "%s}\n", c->body.s ? c->body.s : "");
+    if (c->msl) msl_out(c, &out);
+    else hlsl_out(c, &out);
     free(c->body.s);
     free(c->ins);
     free(c->leader);
     return out.s;
 }
 
+char *shader_translate(int lang, const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared,
+                       ShaderInfo *info, CbufReader *read, void *user) {
+    return translate(lang, program, size, stage, vs_outputs, info, read, user, stage == SHADER_COMPUTE ? local : NULL, shared);
+}
+
+char *shader_hlsl(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info) {
+    return shader_hlsl_ex(program, size, stage, vs_outputs, info, NULL, NULL);
+}
+
 char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user) {
-    return translate(program, size, stage, vs_outputs, info, read, user, NULL, 0);
+    return translate(HLSL_DEFAULT, program, size, stage, vs_outputs, info, read, user, NULL, 0);
 }
 
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user) {
-    return translate(program, size, SHADER_COMPUTE, 0, info, read, user, local, shared);
+    return translate(HLSL_DEFAULT, program, size, SHADER_COMPUTE, 0, info, read, user, local, shared);
 }
 
 u32 shader_size(const u8 *program, u32 max) {
