@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "gpu.h"   /* (gpu_queue_drain) */
 
 enum { R_OK = 0, R_TIMEOUT = 0xEA01, R_CANCELLED = 0xEC01, R_INVALID_HANDLE = 0xE401, R_INVALID_STATE = 0xFA01,
        R_INVALID_ADDRESS = 0xCC01, R_INVALID_ENUM = 0xF001, R_OUT_OF_MEMORY = 0xD001 };
@@ -42,13 +43,19 @@ typedef struct KThread {
     u64 cv_mutex;       /* the mutex to re-acquire when that wait is signalled */
     u64 arb_addr;       /* address-arbiter address this thread waits on, or 0 */
     u64 order;          /* arrival order, so hand-over is first-come-first-served */
+    CONDITION_VARIABLE woken;   /* what this thread sleeps on (kwait): wakes go to the threads concerned */
+    u64 wait_handles;   /* while in WaitSynchronization: its handle array (guest) and count */
+    u32 wait_count;
 } KThread;
 
 typedef struct KObject { int type, signaled; KThread *thread; void *session; } KObject;
 typedef struct Region { u64 base, size; u32 state, perm; } Region;
 
 static CRITICAL_SECTION klock;
-static CONDITION_VARIABLE kchanged;
+/* Every thread the kernel made (an exited one stays: its handle may still be waited on). Waits
+ * and hand-overs look through these rather than through every handle. */
+static KThread *threads[1024];
+static u32 nthreads;
 static KObject objects[4096];
 static Region regions[4096];
 static u32 region_count;
@@ -62,16 +69,31 @@ u64 rt_ticks(void) { return rt_clock_ns() * 12 / 625; }   /* (19.2 MHz) */
 
 static u64 deadline_of(i64 timeout_ns) { return timeout_ns < 0 ? ~0ull : now_ns() + (u64)timeout_ns; }
 
-/* Sleep until kernel state changes or the deadline passes; returns 0 once it has passed. */
-static int kwait(u64 deadline) {
+/* Sleep until something wakes this thread (kwake) or the deadline passes; returns 0 once it
+ * has passed. Each thread sleeps on its own condition variable: a mutex handed over, a
+ * condition variable signalled, an event set wakes just the threads waiting for it (one shared
+ * one, woken in full, sent every sleeping thread round the kernel lock at every change). The
+ * callers look at their condition again either way. */
+static int kwait(KThread *me, u64 deadline) {
     DWORD ms = INFINITE;
     if (deadline != ~0ull) {
         u64 now = now_ns();
         if (now >= deadline) return 0;
         ms = (DWORD)((deadline - now + 999999) / 1000000);
     }
-    SleepConditionVariableCS(&kchanged, &klock, ms);
+    SleepConditionVariableCS(&me->woken, &klock, ms);
     return 1;
+}
+
+static void kwake(KThread *t) { WakeConditionVariable(&t->woken); }
+
+/* Object `handle` became signalled: wake the threads waiting for it in WaitSynchronization. */
+static void kwake_handle(u32 handle) {
+    for (u32 i = 0; i < nthreads; i++) {
+        KThread *t = threads[i];
+        for (u32 k = 0; k < t->wait_count; k++)
+            if (ld32(t->wait_handles + 4ull * k) == handle) { kwake(t); break; }
+    }
 }
 
 /* ---- handles --------------------------------------------------------------------- */
@@ -125,8 +147,16 @@ static void query_memory(u64 info, u64 addr) {
     u64 end = ASPACE_BASE + ASPACE_SIZE, prev = 0;
     if (addr >= end) r = (Region){end, 0 - end, GM_INACCESSIBLE, 0};
     else {
-        u32 i = 0;
-        for (; i < region_count && regions[i].base + regions[i].size <= addr; i++) prev = regions[i].base + regions[i].size;
+        /* the first region ending above addr: the regions are sorted and apart, so their ends
+         * are in order too (thousands of them, and C++ exceptions ask tens of thousands of
+         * times a second - libunwind finds each frame's module through QueryMemory) */
+        u32 i = 0, hi = region_count;
+        while (i < hi) {
+            u32 mid = (i + hi) / 2;
+            if (regions[mid].base + regions[mid].size <= addr) i = mid + 1;
+            else hi = mid;
+        }
+        if (i) prev = regions[i - 1].base + regions[i - 1].size;
         if (i < region_count && regions[i].base <= addr) r = regions[i];
         else r = (Region){prev, (i < region_count ? regions[i].base : end) - prev, GM_FREE, 0};
     }
@@ -148,6 +178,9 @@ static void *commit(u64 at, u64 size, const char *what) {
 /* ---- threads --------------------------------------------------------------------- */
 static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 core) {
     KThread *t = calloc(1, sizeof *t);
+    if (nthreads == sizeof threads / sizeof *threads) rt_fatal("kernel: too many threads");
+    threads[nthreads++] = t;
+    InitializeConditionVariable(&t->woken);
     t->entry = entry; t->arg = arg; t->stack_top = stack_top; t->priority = priority; t->core = core;
     t->id = next_thread_id++;
     t->tlr = tlr_next;
@@ -174,7 +207,7 @@ static _Noreturn void exit_thread(KThread *t) {
     EnterCriticalSection(&klock);
     t->exited = 1;
     objects[t->handle - 0xA000].signaled = 1;
-    WakeAllConditionVariable(&kchanged);
+    kwake_handle(t->handle);
     LeaveCriticalSection(&klock);
 #ifndef _WIN32
     if (exit_point) longjmp(*exit_point, 1);
@@ -221,9 +254,9 @@ Cpu *kernel_main_thread(u32 *handle) {
 static KThread *threads_waiting(u64 KThread_field_offset, u64 addr, u32 *count) {
     KThread *first = NULL;
     *count = 0;
-    for (u32 i = 1; i < 4096; i++) {
-        KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
-        if (!t || *(u64 *)((u8 *)t + KThread_field_offset) != addr) continue;
+    for (u32 i = 0; i < nthreads; i++) {
+        KThread *t = threads[i];
+        if (t->exited || *(u64 *)((u8 *)t + KThread_field_offset) != addr) continue;
         ++*count;
         if (!first || t->order < first->order) first = t;
     }
@@ -237,7 +270,7 @@ static void mutex_release(u64 addr) {
     if (!next) { st32(addr, 0); return; }
     next->mutex_addr = 0;   /* this is what the waiter is watching for */
     st32(addr, next->mutex_tag | (count > 1 ? WAITERS : 0));
-    WakeAllConditionVariable(&kchanged);
+    kwake(next);
 }
 
 /* Give `t` the mutex if it is free, otherwise queue it behind the current owner. */
@@ -298,7 +331,12 @@ static u32 wait_synchronization(Cpu *c, u64 handles, u32 count, i64 timeout, u32
             if (objects[k].signaled) { *index = i; return R_OK; }
         }
         if (me->cancelled) { me->cancelled = 0; return R_CANCELLED; }
-        if (timeout == 0 || !kwait(deadline)) return R_TIMEOUT;
+        if (timeout == 0) return R_TIMEOUT;
+        me->wait_handles = handles;
+        me->wait_count = count;
+        int more = kwait(me, deadline);
+        me->wait_count = 0;
+        if (!more) return R_TIMEOUT;
     }
 }
 
@@ -314,7 +352,7 @@ static u32 wait_for_address(Cpu *c, u64 addr, u32 type, i32 value, i64 timeout) 
     me->order = ++wait_order;
     me->arb_addr = addr;
     while (me->arb_addr)
-        if (!kwait(deadline)) { me->arb_addr = 0; return R_TIMEOUT; }
+        if (!kwait(me, deadline)) { me->arb_addr = 0; return R_TIMEOUT; }
     return R_OK;
 }
 
@@ -332,9 +370,9 @@ static u32 signal_to_address(u64 addr, u32 type, i32 value, i32 count) {
     } else if (type != 0) return R_INVALID_ENUM;
     for (i32 n = 0; t && (count <= 0 || n < count); n++) {
         t->arb_addr = 0;
+        kwake(t);
         t = WAITING(arb_addr, addr, &waiting);
     }
-    WakeAllConditionVariable(&kchanged);
     return R_OK;
 }
 
@@ -349,14 +387,14 @@ static u32 wait_condition(Cpu *c, u64 mutex, u64 key, u32 tag, i64 timeout) {
     me->order = ++wait_order;
     me->cv_key = key;
     while (me->cv_key)
-        if (!kwait(deadline)) {
+        if (!kwait(me, deadline)) {
             if (!me->cv_key) break;                 /* signalled just as the wait expired */
             me->cv_key = 0;
             WAITING(cv_key, key, &others);
             if (!others) st32(key, 0);
             return R_TIMEOUT;                       /* the caller re-locks the mutex itself */
         }
-    while (me->mutex_addr) kwait(~0ull);            /* the signaller queued us on the mutex */
+    while (me->mutex_addr) kwait(me, ~0ull);        /* the signaller queued us on the mutex */
     return R_OK;
 }
 
@@ -367,10 +405,10 @@ static void signal_condition(u64 key, i32 count) {
         t->cv_key = 0;
         /* the woken thread must own the mutex again before it returns */
         mutex_acquire_or_queue(t, t->cv_mutex, t->mutex_tag);
+        kwake(t);   /* (queued on the mutex instead, it waits on there) */
         t = WAITING(cv_key, key, &waiting);
     }
     if (!t) st32(key, 0);
-    WakeAllConditionVariable(&kchanged);
 }
 
 void rt_svc(Cpu *c, u32 n) {
@@ -439,6 +477,7 @@ void rt_svc(Cpu *c, u32 n) {
         for (u32 i = 0; i < 1024; i++)
             if (maps[i].size && maps[i].dst == x[0]) {
                 memcpy((void *)maps[i].src, (void *)maps[i].dst, maps[i].size);
+                if (gpu_memory_overlaps(maps[i].dst, maps[i].size)) gpu_queue_drain();   /* (queued GPU work may read it) */
                 VirtualFree((void *)maps[i].dst, maps[i].size, MEM_DECOMMIT);
                 remove_region(maps[i].dst);
                 maps[i].size = 0;
@@ -476,7 +515,7 @@ void rt_svc(Cpu *c, u32 n) {
     case 0x11:     /* SignalEvent(handle) */
         if (!(o = object_of(c, (u32)x[0], OBJ_EVENT))) { x[0] = R_INVALID_HANDLE; break; }
         o->signaled = 1;
-        WakeAllConditionVariable(&kchanged);
+        kwake_handle((u32)x[0]);
         x[0] = R_OK;
         break;
     case 0x12:     /* ClearEvent(handle) */
@@ -507,7 +546,7 @@ void rt_svc(Cpu *c, u32 n) {
     case 0x19:     /* CancelSynchronization(thread) */
         if (!(o = object_of(c, (u32)x[0], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
         o->thread->cancelled = 1;
-        WakeAllConditionVariable(&kchanged);
+        kwake(o->thread);
         x[0] = R_OK;
         break;
     case 0x1A:     /* ArbitrateLock(owner handle, mutex address, own handle) */
@@ -515,7 +554,7 @@ void rt_svc(Cpu *c, u32 n) {
             me->mutex_tag = (u32)x[2];
             me->order = ++wait_order;
             me->mutex_addr = x[1];
-            while (me->mutex_addr) kwait(~0ull);
+            while (me->mutex_addr) kwait(me, ~0ull);
         }
         x[0] = R_OK;
         break;
@@ -539,6 +578,7 @@ void rt_svc(Cpu *c, u32 n) {
         x[0] = R_OK;
         break;
     case 0x2D:     /* UnmapPhysicalMemory(address, size) */
+        if (gpu_memory_overlaps(x[0], x[1])) gpu_queue_drain();   /* (queued GPU work may read it) */
         VirtualFree((void *)x[0], x[1], MEM_DECOMMIT);
         unmap_range(x[0], x[1]);
         x[0] = R_OK;
@@ -622,8 +662,7 @@ u32 kernel_create_event(void) {
 void kernel_signal_event(u32 handle) {
     EnterCriticalSection(&klock);
     u32 k = handle - 0xA000;
-    if (k < 4096 && objects[k].type == OBJ_EVENT) objects[k].signaled = 1;
-    WakeAllConditionVariable(&kchanged);
+    if (k < 4096 && objects[k].type == OBJ_EVENT) { objects[k].signaled = 1; kwake_handle(handle); }
     LeaveCriticalSection(&klock);
 }
 
@@ -637,7 +676,6 @@ u32 rt_attach_system_event(Cpu *c, u64 system_event, int auto_clear) {
 
 void kernel_init(void) {
     InitializeCriticalSection(&klock);
-    InitializeConditionVariable(&kchanged);
     rt_clock_ns();   /* (the clock set up - and its line logged - before the game asks it) */
     /* Reserve the areas the guest maps into; pages are committed as they are used. The alias
      * area, where the game keeps its GPU memory, has its writes watched so that the renderer

@@ -14,8 +14,20 @@ extern u32 gpu_syncpt_min[SYNCPT_MAX], gpu_syncpt_max[SYNCPT_MAX];
 u64 gpu_va_to_guest(u64 va);
 
 /* Work submitted on a channel: `count` GPFIFO entries (each an address/length pair of a
- * command list in GPU virtual memory). Called with the device lock held. */
+ * command list in GPU virtual memory). Run on the GPU thread (gpu_queue.c), or in the ioctl
+ * with the device lock held when there is none. */
 void gpu_submit(u32 channel, const u64 *entries, u32 count);
+
+/* The GPU thread (gpu_queue.c): submissions run in order on a thread of their own, and the
+ * sync point of each reaches its fence when it has run. */
+int gpu_threaded(void);                                   /* is there one (SSBU_GPU_THREAD=0: no) */
+void gpu_queue_submit(u32 channel, const u64 *entries, u32 count, u32 syncpoint, u32 fence);
+u64 gpu_queue_mark(void);                                 /* submissions queued so far */
+void gpu_queue_wait(u64 mark);                            /* until that many have run */
+void gpu_queue_drain(void);                               /* until everything queued has run */
+int gpu_memory_overlaps(u64 addr, u64 size);              /* guest memory holding an nvmap allocation (hle_nv.c) */
+/* Until sync point `id` reaches `threshold` (or `timeout_ms` passes; ~0u: no limit): 1 reached. */
+int gpu_syncpt_wait(u32 id, u32 threshold, u32 timeout_ms);
 
 /* The multimedia engines (gpu_host1x.c): an nvmap handle's address in their address space,
  * and a command buffer for the engine of class cls ({handle, byte offset, word count}). */
