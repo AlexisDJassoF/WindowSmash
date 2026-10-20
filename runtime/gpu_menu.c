@@ -355,7 +355,7 @@ static void build(void) {
             snprintf(r->value, sizeof r->value, "%s", KEYS[i][1]);
         }
         r = add(R_NONE, K_INFO, W_NONE, "Version", "The game version this folder has (version.txt).");
-        snprintf(r->value, sizeof r->value, "%s", version[0] ? version : "?");
+        snprintf(r->value, sizeof r->value, "%s", version[0] ? version : "unknown (no version.txt)");
         break;
     }
 }
@@ -820,15 +820,27 @@ static void box(float x, float y, float w, float h, float s) {
     ovl_rect(x, y, w, 3 * s, OVL_RGBA(225, 60, 60, 255));
 }
 
-static void draw_toast(float w, float h, float s) {
-    char t[160];
+/* The message showing now (its time starting at the first look), or 0. */
+static int toast_now(char *t, size_t size) {
     ULONGLONG now = GetTickCount64();
     AcquireSRWLockExclusive(&toast_lock);
     if (toast_until == 1) toast_until = now + 4000;
     int show = toast_until && now < toast_until;
-    snprintf(t, sizeof t, "%s", toast);
+    snprintf(t, size, "%s", toast);
     ReleaseSRWLockExclusive(&toast_lock);
-    if (!show) return;
+    return show;
+}
+
+/* A question or an editor over the menu: the menu dimmed, the box lighter and solid. */
+static void modal_box(float w, float h, float x, float y, float bw, float bh, float s) {
+    ovl_rect(0, 0, w, h, OVL_RGBA(0, 0, 0, 120));
+    ovl_rect(x, y, bw, bh, OVL_RGBA(30, 34, 48, 255));
+    ovl_rect(x, y, bw, 3 * s, OVL_RGBA(225, 60, 60, 255));
+}
+
+static void draw_toast(float w, float h, float s) {
+    char t[160];
+    if (!toast_now(t, sizeof t)) return;
     float size = 28 * s, tw = text_w(t, size) + 48 * s, th = size + 28 * s;
     float x = (w - tw) / 2, y = h - th - 40 * s;
     box(x, y, tw, th, s);
@@ -849,7 +861,9 @@ void menu_draw(float w, float h) {
     net_status(status, sizeof status);
     if (strstr(status, "Room:")) snprintf(banner, sizeof banner, "You are in a netplay room: the game keeps running while this menu is open.");
     else if (restart_pending) snprintf(banner, sizeof banner, "Some changes take effect when the game starts again: Game > Restart the game.");
-    if (banner[0]) ovl_text(px + 300 * s, py + 34 * s, 24 * s, strstr(status, "Room:") ? ACCENT : AMBER, banner);
+    char t[160];
+    if (toast_now(t, sizeof t)) ovl_text(px + 300 * s, py + 34 * s, 24 * s, WHITE, t);   /* (a message, in the menu: here) */
+    else if (banner[0]) ovl_text(px + 300 * s, py + 34 * s, 24 * s, strstr(status, "Room:") ? ACCENT : AMBER, banner);
     /* the pages */
     float ty = py + 110 * s;
     for (int i = 0; i < 4; i++) {
@@ -901,17 +915,17 @@ void menu_draw(float w, float h) {
     /* on top: a question, the text being typed, or a control being waited for */
     if (confirm) {
         float bw = 820 * s, bh = 200 * s, bx = (w - bw) / 2, by = (h - bh) / 2;
-        box(bx, by, bw, bh, s);
+        modal_box(w, h, bx, by, bw, bh, s);
         ovl_text(bx + 36 * s, by + 34 * s, 34 * s, WHITE, confirm == R_RESTART ? "Start the game again?" : "Quit the game?");
         ovl_text(bx + 36 * s, by + 84 * s, 26 * s, GREY, "A match in progress is lost.");
         ovl_text(bx + 36 * s, by + 140 * s, 26 * s, AMBER, "A / Enter: yes      B / Esc: no");
     } else if (editing) {
         float bw = 900 * s, bh = 600 * s, bx = (w - bw) / 2, by = (h - bh) / 2, cs = 56 * s;
-        box(bx, by, bw, bh, s);
+        modal_box(w, h, bx, by, bw, bh, s);
         ovl_text(bx + 36 * s, by + 28 * s, 30 * s, GREY, editing == R_NET_NAME ? "Your name" : editing == R_NET_CODE ? "Lobby code" : "Server (host:port)");
         char t[80];
         snprintf(t, sizeof t, "%s_", edit_buf);
-        ovl_rect(bx + 30 * s, by + 72 * s, bw - 60 * s, 56 * s, OVL_RGBA(30, 34, 48, 255));
+        ovl_rect(bx + 30 * s, by + 72 * s, bw - 60 * s, 56 * s, OVL_RGBA(16, 18, 26, 255));
         ovl_text(bx + 44 * s, by + 82 * s, 34 * s, WHITE, t);
         float gx = bx + (bw - GRID_COLS * cs) / 2, gy = by + 160 * s;
         for (int r = 0; r < GRID_ROWS; r++)
@@ -928,7 +942,7 @@ void menu_draw(float w, float h) {
         ovl_text(bx + 36 * s, by + bh - 52 * s, 22 * s, DIM, "Type, then Enter (Esc: cancel). Pad: A types, B deletes, + done, L cancels.");
     } else if (capture_button >= 0) {
         float bw = 900 * s, bh = 200 * s, bx = (w - bw) / 2, by = (h - bh) / 2;
-        box(bx, by, bw, bh, s);
+        modal_box(w, h, bx, by, bw, bh, s);
         char t[160];
         PadInfo *pad = pad_slot >= 0 ? &pads[pad_slot] : NULL;
         snprintf(t, sizeof t, "Press the control for %s", pad_button_name(capture_button));
@@ -939,5 +953,4 @@ void menu_draw(float w, float h) {
         snprintf(t, sizeof t, "Esc: cancel   (%d s)", capture_until > now ? (int)((capture_until - now + 999) / 1000) : 0);
         ovl_text(bx + 36 * s, by + 140 * s, 26 * s, AMBER, t);
     }
-    draw_toast(w, h, s);
 }
