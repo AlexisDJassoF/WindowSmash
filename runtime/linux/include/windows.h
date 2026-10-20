@@ -1,10 +1,14 @@
-/* The part of the Windows API the runtime uses, for Linux (runtime/linux/win32.c).
+/* The part of the Windows API the runtime uses, for Linux (runtime/linux/win32.c) and macOS.
  *
  * The runtime was written against Win32; rather than rewrite every lock, thread, file and
  * memory call, Linux builds get this header in place of <windows.h>: the same names, with
  * the same meaning, on POSIX threads, futexes, mmap and file descriptors. Types come from
  * DXVK's windows_base.h, which its Direct3D headers need anyway (DWORD and LONG are 32-bit,
- * as on Windows). Only what the runtime calls is here. */
+ * as on Windows). Only what the runtime calls is here.
+ *
+ * macOS builds use it too, with the same win32.c; what differs there (memory with 16 KiB pages,
+ * arm64 fibers, Mach thread ids, the profiler) is in runtime/macos/, whose include folder comes
+ * first and has small stand-ins for DXVK's two headers. */
 #pragma once
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
@@ -22,7 +26,7 @@
 #include <wchar.h>
 #include <sys/types.h>
 
-#include "windows_base.h"   /* (DXVK's) */
+#include "windows_base.h"   /* (DXVK's; macOS: runtime/macos/include's) */
 #include "unknwn.h"
 
 #ifdef __cplusplus
@@ -117,7 +121,11 @@ static inline PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID e
 }
 static inline PVOID InterlockedExchangePointer(PVOID volatile *p, PVOID v) { return __atomic_exchange_n(p, v, RT_SC); }
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#if defined(__aarch64__)
+#define YieldProcessor() __asm__ __volatile__("isb" ::: "memory")   /* (arm64's spin-wait pause: yield is a no-op on Apple's cores) */
+#else
 #define YieldProcessor() __builtin_ia32_pause()
+#endif
 
 /* ---- locks and condition variables ------------------------------------------------------- */
 typedef struct SRWLOCK { pthread_rwlock_t l; } SRWLOCK, *PSRWLOCK;
@@ -130,6 +138,32 @@ static inline void ReleaseSRWLockShared(SRWLOCK *l) { pthread_rwlock_unlock(&l->
 static inline BOOLEAN TryAcquireSRWLockExclusive(SRWLOCK *l) { return pthread_rwlock_trywrlock(&l->l) == 0; }
 static inline BOOLEAN TryAcquireSRWLockShared(SRWLOCK *l) { return pthread_rwlock_tryrdlock(&l->l) == 0; }
 
+#ifdef __APPLE__
+/* Recursive, as on Windows. Darwin's mutex keeps its owner to itself, so the holder's thread id
+ * (GetCurrentThreadId's, 0 when free) is noted here, with the depth of its recursion: read
+ * only, by other threads, for freeze reports. */
+typedef struct CRITICAL_SECTION {
+    pthread_mutex_t m;
+    volatile DWORD OwningThread;
+    int depth;
+} CRITICAL_SECTION, *LPCRITICAL_SECTION;
+void InitializeCriticalSection(CRITICAL_SECTION *cs);
+static inline BOOL InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return TRUE; }
+static inline void EnterCriticalSection(CRITICAL_SECTION *cs) {
+    pthread_mutex_lock(&cs->m);
+    if (!cs->depth++) cs->OwningThread = (DWORD)pthread_mach_thread_np(pthread_self());
+}
+static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) {
+    if (!--cs->depth) cs->OwningThread = 0;
+    pthread_mutex_unlock(&cs->m);
+}
+static inline BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
+    if (pthread_mutex_trylock(&cs->m)) return FALSE;
+    if (!cs->depth++) cs->OwningThread = (DWORD)pthread_mach_thread_np(pthread_self());
+    return TRUE;
+}
+static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(&cs->m); }
+#else
 /* Recursive, as on Windows. OwningThread is glibc's __owner field of the mutex (the holder's
  * thread id, 0 when free): read only, for freeze reports. */
 typedef union CRITICAL_SECTION {
@@ -142,6 +176,7 @@ static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lo
 static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_unlock(&cs->m); }
 static inline BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) { return pthread_mutex_trylock(&cs->m) == 0; }
 static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(&cs->m); }
+#endif
 
 /* A condition variable is a futex sequence number: works with any lock, wakes spuriously at
  * worst - as Windows' may. */
@@ -199,10 +234,16 @@ typedef void (CALLBACK *PTIMERAPCROUTINE)(LPVOID arg, DWORD low, DWORD high);
 HANDLE CreateWaitableTimerExW(void *security, LPCWSTR name, DWORD flags, DWORD access);
 BOOL SetWaitableTimer(HANDLE timer, const LARGE_INTEGER *due, LONG period, PTIMERAPCROUTINE fn, LPVOID arg, BOOL resume);
 /* Linux: the thread behind a handle (0 if none), and a thread's full description (pthread names
- * are cut at 15 characters) */
-pid_t rt_thread_tid(HANDLE thread);
+ * are cut at 15 characters). A thread id is the kernel's (gettid), as GetCurrentThreadId's; on
+ * macOS it is the thread's Mach port, which thread_suspend and task_threads use too. */
+#ifdef __APPLE__
+typedef unsigned int RtTid;   /* (mach_port_t) */
+#else
+typedef pid_t RtTid;
+#endif
+RtTid rt_thread_tid(HANDLE thread);
 pthread_t rt_thread_pthread(HANDLE thread);
-const char *rt_thread_description(pid_t tid);
+const char *rt_thread_description(RtTid tid);
 
 /* ---- fibers ------------------------------------------------------------------------------- */
 typedef void (WINAPI *LPFIBER_START_ROUTINE)(LPVOID param);
@@ -265,6 +306,13 @@ UINT ResetWriteWatch(LPVOID base, SIZE_T size);
  * protects pages, needs this; system calls fail rather than fault on protected pages). */
 void rt_ww_prepare_write(void *p, size_t n);
 const char *rt_ww_mode(void);
+#ifdef __APPLE__
+/* macOS (runtime/macos/memory.c): the guest's part of the address space, [RT_MEMBASE,
+ * RT_MEMBASE + 2^39) with an inaccessible moat each side, reserved before anything else takes
+ * any of it - first thing in main. 1 when done (or already), 0 (and the reason on stderr) if
+ * the system holds some of it. */
+int rt_guest_window(void);
+#endif
 typedef struct SYSTEM_INFO {
     WORD wProcessorArchitecture, wReserved;
     DWORD dwPageSize;
@@ -358,9 +406,20 @@ HMODULE GetModuleHandleW(LPCWSTR name);
 HMODULE GetModuleHandleA(LPCSTR name);
 USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash);
 void OutputDebugStringA(LPCSTR text);
-BOOL IsDebuggerPresent(void);   /* (a tracer is attached: /proc/self/status) */
+BOOL IsDebuggerPresent(void);   /* (a tracer is attached: /proc/self/status; macOS: P_TRACED) */
+#ifdef __APPLE__
+/* macOS (runtime/macos/platform.c): a thread's frame-pointer chain from its registers (pc
+ * first, then each return address; lr when the innermost function has not saved it yet), read
+ * without ever faulting - for a stopped thread, a fault's context or a fiber's stack alike;
+ * another thread's, stopped for it (by its thread id; its pc and lr too, when asked; 0 frames
+ * if it could not be stopped); and the program's own path (resolved). */
+int rt_frame_walk(uint64_t pc, uint64_t lr, uint64_t fp, void **frames, int max);
+int rt_thread_frames(unsigned thread_id, void **frames, int max, uint64_t *pc, uint64_t *lr);
+const char *rt_exe_path(void);
+#endif
 typedef struct _EXCEPTION_POINTERS EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;   /* (only pointed to: no SEH on Linux) */
-/* The game window's keyboard and focus, from the window system (runtime/linux/window.c). */
+/* The game window's keyboard and focus, from the window system (runtime/linux/window.c;
+ * macOS: runtime/macos/window.m). */
 #define VK_BACK 0x08
 #define VK_TAB 0x09
 #define VK_RETURN 0x0D
