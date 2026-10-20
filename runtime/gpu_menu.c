@@ -73,7 +73,7 @@ static const char *const PAGE_NAMES[4] = {"Display", "Controllers", "Online", "G
 enum { K_INFO, K_CHOICE, K_ACTION, K_TEXT };
 enum { W_NONE, W_NOW, W_RESTART };
 enum {
-    R_NONE, R_WINDOW, R_PACING, R_LATENCY, R_CURSOR, R_OVERLAY, R_SIZE, R_GPU,
+    R_NONE, R_WINDOW, R_PACING, R_LATENCY, R_CURSOR, R_OVERLAY, R_SIZE, R_SCALE, R_GPU,
     R_PAD, R_PAD_PLAYER, R_PAD_LAYOUT, R_PAD_DEADZONE, R_PAD_RUMBLE, R_PAD_TRIGGER, R_PAD_REMAP, R_PAD_TEST, R_PAD_RESET,
     R_KEYBOARD, R_BACKGROUND, R_PADS_FILE,
     R_NET_STATUS, R_NET_MODE, R_NET_CODE, R_NET_SERVER, R_NET_NAME, R_NET_DIRECT,
@@ -255,6 +255,11 @@ static void build(void) {
         r = add(R_SIZE, K_CHOICE, W_RESTART, "Window size", "The size of the game's window when it is not full screen (at 100% Windows scaling).");
         snprintf(r->value, sizeof r->value, "%d x %d", ds.width, ds.height);
         note_env(r, "SSBU_WINDOW_SIZE");
+        r = add(R_SCALE, K_CHOICE, W_RESTART, "Render scale",
+                "How many times 1920x1080 the game draws at: sharper on a big screen, more work for the graphics card. Auto: as many pixels as the window has.");
+        if (ds.render_scale <= 0) snprintf(r->value, sizeof r->value, "auto");
+        else snprintf(r->value, sizeof r->value, "%g", ds.render_scale);
+        note_env(r, "SSBU_RENDER_SCALE");
 #ifdef _WIN32
         r = add(R_GPU, K_CHOICE, W_RESTART, "Graphics card", "Auto picks the fastest card (on a laptop, the NVIDIA or AMD one). Pick another to use it instead.");
         snprintf(r->value, sizeof r->value, "%s", ds.gpu);
@@ -432,6 +437,16 @@ static void change(const Row *row, int dir) {
         set_display("width", v);
         snprintf(v, sizeof v, "%d", SIZES[i][1]);
         set_display("height", v);
+        break;
+    }
+    case R_SCALE: {
+        static const char *const SCALES[] = {"1", "auto", "1.5", "2", "3"};
+        static const float VALUES[] = {1, 0, 1.5f, 2, 3};
+        int n = sizeof SCALES / sizeof *SCALES, i = -1;
+        for (int k = 0; k < n; k++) if (VALUES[k] == ds.render_scale) i = k;
+        i = i < 0 ? (dir > 0 ? 0 : n - 1) : cycle(i, n, dir);
+        set_display("render_scale", SCALES[i]);
+        display_set_render_scale(VALUES[i]);   /* (shown now; the renderer takes it at the next start) */
         break;
     }
 #ifdef _WIN32

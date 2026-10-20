@@ -38,13 +38,16 @@ static ID3D11Device *dev, *compile_dev;
 static ID3D11DeviceContext *ctx;
 static IDXGISwapChain1 *swapchain;
 static UINT swapchain_flags;
-/* The game's picture at its own size, before it is fitted into the window (screenshots read it). */
+/* The game's picture at its own size (1920x1080 times the render scale), before it is fitted
+ * into the window (screenshots read it): its bytes as the game's framebuffer has them (sRGB),
+ * read plainly (final_srv) or as sRGB (final_srv_srgb: shrinking it averages in linear light). */
 static ID3D11Texture2D *final_tex;
 static ID3D11RenderTargetView *final_rtv;
-static ID3D11ShaderResourceView *final_srv;
-enum { FINAL_W = 1920, FINAL_H = 1080 };
+static ID3D11ShaderResourceView *final_srv, *final_srv_srgb;
+static u32 final_w, final_h;
 static ID3D11VertexShader *blit_vs;
-static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps, *decode_ps;
+static ID3D11PixelShader *blit_ps, *blit2d_ps, *blit_alpha_ps, *decode_ps, *down_ps;
+static ID3D11Buffer *down_cb;
 static ID3D11SamplerState *linear_sampler;
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -53,9 +56,17 @@ static int ready;
 u64 gfx_stat_clears, gfx_stat_presented;
 
 /* ---- surfaces: render targets on the host ------------------------------------------- */
+/* Render scale (display.ini render_scale): every render target is made this many times the
+ * game's size in each direction, and the draw state given in the game's pixels (viewports,
+ * scissors, blits, the fragment position) is scaled to match. 1 = the game's own size. Fixed at
+ * the device's start (see init). */
+static float render_scale = 1.0f;
+
 typedef struct Surface {
     u64 guest;
-    u32 width, height, format, depth;
+    u32 width, height, format, depth;     /* the game's size: what the surface is known and matched by */
+    u32 hw, hh;                           /* the host texture's size (the game's, scaled) */
+    float sx, sy;                         /* hw / width, hh / height */
     DXGI_FORMAT storage, view;            /* the texture's format, and how it is rendered to and sampled */
     ID3D11Texture2D *tex;
     ID3D11RenderTargetView *rtv;
@@ -225,6 +236,41 @@ static void warn_format(const char *what, u32 f) {
     fprintf(stderr, "[gfx] unsupported %s format %#x\n", what, f);
 }
 
+/* SSBU_SCALE_SKIP (testing): render targets kept at the game's size whatever the render scale,
+ * to find which one a scaling artifact comes from. A list of WxH sizes, and/or "square" for the
+ * power-of-two squares (shadow maps), e.g. "square,960x540". */
+static int scale_skipped(u32 w, u32 h) {
+    static int loaded;
+    static u32 sizes[32][2], nsizes, squares;
+    if (!loaded) {
+        const char *e = getenv("SSBU_SCALE_SKIP");
+        for (const char *p = e; p && *p;) {
+            u32 a, b;
+            if (!_strnicmp(p, "square", 6)) squares = 1;
+            else if (sscanf(p, "%ux%u", &a, &b) == 2 && nsizes < 32) { sizes[nsizes][0] = a; sizes[nsizes][1] = b; nsizes++; }
+            p = strchr(p, ',');
+            if (p) p++;
+        }
+        loaded = 1;
+    }
+    if (squares && w == h && !(w & (w - 1))) return 1;
+    for (u32 i = 0; i < nsizes; i++) if (sizes[i][0] == w && sizes[i][1] == h) return 1;
+    return 0;
+}
+
+/* The host size of a w x h render target. It depends on the game's size only (never the format
+ * or depth), so a colour target and the depth target drawn with it always match, as Direct3D
+ * requires. A target too big to scale stays at the game's size. */
+static void scaled_size(u32 w, u32 h, u32 *hw, u32 *hh) {
+    *hw = w; *hh = h;
+    if (render_scale == 1.0f || scale_skipped(w, h)) return;
+    float x = (float)w * render_scale + 0.5f, y = (float)h * render_scale + 0.5f;
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+    if (x > 16384 || y > 16384) return;
+    *hw = (u32)x; *hh = (u32)y;
+}
+
 /* The host texture standing for the render target at `guest`, created on first use. */
 static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth) {
     if (!guest || !width || !height || width > 16384 || height > 16384) return NULL;
@@ -261,13 +307,17 @@ static Surface *surface(u64 guest, u32 width, u32 height, u32 format, int depth)
             release_surface(s);
         }
     }
-    D3D11_TEXTURE2D_DESC td = {width, height, 1, 1, storage, {1, 0}, D3D11_USAGE_DEFAULT,
+    u32 hw, hh;
+    scaled_size(width, height, &hw, &hh);
+    D3D11_TEXTURE2D_DESC td = {hw, hh, 1, 1, storage, {1, 0}, D3D11_USAGE_DEFAULT,
                                D3D11_BIND_SHADER_RESOURCE | (depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET), 0, 0};
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->tex))) { s->tex = NULL; return NULL; }
     s->depth = depth;
     s->storage = storage;
     make_views(s, view);
     s->guest = guest; s->width = width; s->height = height; s->format = format;
+    s->hw = hw; s->hh = hh;
+    s->sx = (float)hw / (float)width; s->sy = (float)hh / (float)height;
     s->used = ++tick;
     return s;
 }
@@ -331,6 +381,35 @@ void *rt_window(void);
 void gfx_hotkey(int n) { InterlockedOr(&hotkeys, 1 << n); }
 #endif
 
+/* The picture's texture at w x h (the presented surface's host size), made again when that
+ * changes. Typeless: written and saved as the plain bytes, shrunk through an sRGB view. */
+static int make_final(u32 w, u32 h) {
+    if (final_tex && final_w == w && final_h == h) return 1;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv, *srv_srgb;
+    D3D11_TEXTURE2D_DESC fd = {w, h, 1, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_RENDER_TARGET_VIEW_DESC rd;
+    memset(&rd, 0, sizeof rd);
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &fd, NULL, &tex))) return 0;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex, &rd, &rtv))) { ID3D11Texture2D_Release(tex); return 0; }
+    srv = make_srv(tex, DXGI_FORMAT_R8G8B8A8_UNORM);
+    srv_srgb = make_srv(tex, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    if (!srv || !srv_srgb) {
+        if (srv) ID3D11ShaderResourceView_Release(srv);
+        if (srv_srgb) ID3D11ShaderResourceView_Release(srv_srgb);
+        ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(tex);
+        return 0;
+    }
+    if (final_tex) { bury(final_rtv); bury(final_srv); bury(final_srv_srgb); bury(final_tex); }
+    final_tex = tex; final_rtv = rtv; final_srv = srv; final_srv_srgb = srv_srgb;
+    final_w = w; final_h = h;
+    return 1;
+}
+
 static ID3DBlob *compile_hlsl(const char *src, const char *entry, const char *target) {
     ID3DBlob *code = NULL, *errors = NULL;
     if (FAILED(D3DCompile(src, strlen(src), NULL, NULL, NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors))) {
@@ -352,7 +431,15 @@ static const char BLIT_HLSL[] =
     "float4 psclear(V i) : SV_Target { return kcolor; }\n"   /* a clear of some channels: drawn, with a write mask */
     /* the 2D engine's blit: destination pixel p reads source point src0 + (p - dst0) * step */
     "cbuffer R : register(b1) { float4 src0_step; float4 dst0_inv; };\n"
-    "float4 ps2d(V i) : SV_Target { return t.Sample(s, (src0_step.xy + (i.pos.xy - dst0_inv.xy) * src0_step.zw) * dst0_inv.zw); }\n";
+    "float4 ps2d(V i) : SV_Target { return t.Sample(s, (src0_step.xy + (i.pos.xy - dst0_inv.xy) * src0_step.zw) * dst0_inv.zw); }\n"
+    /* the picture shrunk into the window (render scale): each window pixel the average of the
+     * picture's pixels under it, n x n bilinear taps spread over its footprint (read and written
+     * through sRGB views: averaged in linear light) */
+    "cbuffer D : register(b3) { float4 dsize; float4 dtaps; };\n"   /* picture w, h, 1/w, 1/h; taps x, y; footprint x, y */
+    "float4 psdown(V i) : SV_Target { float2 c = i.uv * dsize.xy - dtaps.zw * 0.5f; float3 sum = 0;\n"
+    "  [loop] for (int y = 0; y < (int)dtaps.y; y++) [loop] for (int x = 0; x < (int)dtaps.x; x++)\n"
+    "    sum += t.SampleLevel(s, (c + dtaps.zw * (float2(x, y) + 0.5f) / dtaps.xy) * dsize.zw, 0).rgb;\n"
+    "  return float4(sum / (dtaps.x * dtaps.y), 1); }\n";
 
 /* (get_texture) one level of a block-compressed texture, texel by texel, into its exact-size copy */
 static const char DECODE_HLSL[] =
@@ -693,14 +780,37 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
     D3D11_SAMPLER_DESC smp = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
                               D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, {0}, 0, D3D11_FLOAT32_MAX};
     ID3D11Device_CreateSamplerState(dev, &smp, &linear_sampler);
-    D3D11_TEXTURE2D_DESC fd = {FINAL_W, FINAL_H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
-                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
-    if (FAILED(ID3D11Device_CreateTexture2D(dev, &fd, NULL, &final_tex)) ||
-        FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)final_tex, NULL, &final_rtv)) ||
-        FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)final_tex, NULL, &final_srv))) {
+    if ((ps = compile_hlsl(BLIT_HLSL, "psdown", "ps_5_0"))) {
+        ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &down_ps);
+        ID3D10Blob_Release(ps);
+    }
+    D3D11_BUFFER_DESC dcb = {32, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+    ID3D11Device_CreateBuffer(dev, &dcb, NULL, &down_cb);
+    /* The render scale (display.ini render_scale; auto: the picture's height in the window as it
+     * is now, over the game's 1080), fixed from here on: render targets are made at it. */
+    float scale = display_render_scale();
+    DXGI_SWAP_CHAIN_DESC1 scd;
+    if (scale == 0) {
+        scale = 1;
+        if (SUCCEEDED(IDXGISwapChain1_GetDesc1(swapchain, &scd))) {
+            unsigned fx, fy, fw, fh;
+            display_fit(scd.Width, scd.Height, &fx, &fy, &fw, &fh);
+            scale = (float)fh / 1080.0f;
+            if (scale < 1) scale = 1;
+            if (scale > 4) scale = 4;
+        }
+    }
+    if (scale < 0.5f || scale > 4) scale = 1;
+    render_scale = scale;
+    u32 pw, ph;
+    scaled_size(1920, 1080, &pw, &ph);
+    if (!make_final(pw, ph)) {
         fprintf(stderr, "[gfx] cannot create the picture's texture\n");
         return TRUE;
     }
+    if (render_scale != 1.0f)
+        fprintf(stderr, "[gfx] render scale %.3g%s: the game's 1920x1080 drawn at %ux%u\n", render_scale,
+                display_render_scale() == 0 ? " (auto)" : "", pw, ph);
     start_compilers();
     /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
      * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
@@ -748,6 +858,7 @@ static void leave(void) {
 }
 
 static float f32_of(u32 bits) { float f; memcpy(&f, &bits, 4); return f; }
+static u32 f32_bits(float f) { u32 u; memcpy(&u, &f, 4); return u; }
 
 /* ---- the 3D engine's work -------------------------------------------------------- */
 #define RT(i, field) regs[0x200 + (i) * 0x10 + (field)]
@@ -1290,7 +1401,8 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     u32 size = shader_size(p, 0x40000), skip = stage == SHADER_COMPUTE ? 0x50 : 0;
     u64 h = shader_program_hash(p + skip, size - skip);
     if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
-    u64 program_hash = h;
+    u64 program_hash = h;   /* (the shader's name) */
+    h = shader_cache_hash(h, p, size, stage);
     /* (the salt changes with the alpha test's code, so cache files of an older form are not used) */
     if (alpha_tested) h = (h ^ 0x616C706861743032ull) * 1099511628211ull;
     CbufSource src = {stage_cb};
@@ -1666,6 +1778,12 @@ typedef struct Resident {
     u32 head, tail;
     u64 checked;   /* the submission it was last checked against the write watch in */
     u64 seen;      /* (the write watch's clock then: watch_written) */
+    /* The GPU's last write into it (a compute program's or a copy's): the write watch's clock
+     * then, and the frame. Whole pages stamped after that clock are the CPU's again (the region
+     * takes such pages whole), and so are the partial pages' bytes once taken since (head_taken,
+     * tail_taken): where all it holds of a range is the CPU's, guest memory there is the same. */
+    u64 wrote_seen, wrote_frame;
+    u8 head_taken, tail_taken;
 } Resident;
 static Resident residents[512];
 static u32 nresidents;
@@ -1801,13 +1919,14 @@ static int read_guarded(void *dst, u64 g, u32 n) {
 #endif
 
 /* A partial page's bytes inside the region (n at g; was: as the GPU copy last took them): taken
- * from guest memory if they changed. 0 if that memory is gone. */
-static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
+ * from guest memory if they changed (and *taken set). 0 if that memory is gone. */
+static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n, u8 *taken) {
     u8 now[0x1000];   /* (an edge lies within one page) */
     if (!n) return 1;
     if (!read_guarded(now, g, n)) return 0;
     if (!memcmp(was, now, n)) return 1;
     memcpy(was, now, n);
+    *taken = 1;
     D3D11_BOX box = {(UINT)(g - r->guest), 0, 0, (UINT)(g - r->guest + n), 1, 1};
     ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, was, 0, 0);
     gfx_stat_resident_pages++;
@@ -1842,7 +1961,8 @@ static void resident_sync(Resident *r, int every_frame) {
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
     if (no_pages || (!every_frame && r->checked == gpu_stat_batches) || !r->edge || !watched(r->guest, r->size)) return;
     r->checked = gpu_stat_batches;
-    if (!resident_take_edge(r, r->guest, r->edge, r->head) || !resident_take_edge(r, r->guest + r->size - r->tail, r->edge + r->head, r->tail))
+    if (!resident_take_edge(r, r->guest, r->edge, r->head, &r->head_taken) ||
+        !resident_take_edge(r, r->guest + r->size - r->tail, r->edge + r->head, r->tail, &r->tail_taken))
         return;   /* (its memory is gone: left alone; once mapped again its bytes differ, and are taken) */
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;   /* the whole pages */
     if (lo >= hi) return;
@@ -1864,9 +1984,55 @@ static Resident *resident_covering(u64 lo, u64 hi) {
     return NULL;
 }
 
-/* A raw view of [va, va + bytes) inside r: for shaders to read (srv) or compute to write. */
-static ResidentView *resident_viewx(Resident *r, u64 va, u32 bytes) {
-    u64 first = (va - r->va) & ~3ull;
+/* A compute program or a copy writes into the region. */
+static void resident_gpu_wrote(Resident *r) {
+    r->wrote_seen = watch_clock;
+    r->wrote_frame = gfx_stat_presented;
+    r->head_taken = r->tail_taken = 0;
+}
+
+/* Is all that r holds of [va, va + bytes) the CPU's again (see wrote_seen)? Then guest memory
+ * there is the same, and a read may take it from there. (r synced first, for the stamps.) */
+static int resident_cpu_owned(Resident *r, u64 va, u64 bytes) {
+    u64 lo = va > r->va ? va : r->va, hi = va + bytes < r->va + r->size ? va + bytes : r->va + r->size;
+    if (lo >= hi) return 1;
+    if (!r->edge || !watched(r->guest, r->size)) return 0;
+    u64 glo = r->guest + (lo - r->va), ghi = r->guest + (hi - r->va);
+    if (glo < r->guest + r->head && !r->head_taken) return 0;
+    if (ghi > r->guest + r->size - r->tail && !r->tail_taken) return 0;
+    u64 wlo = (r->guest + 0xFFF) & ~0xFFFull, whi = (r->guest + r->size) & ~0xFFFull;   /* its whole pages */
+    u64 p = glo & ~0xFFFull, end = (ghi + 0xFFF) & ~0xFFFull;
+    if (p < wlo) p = wlo;
+    if (end > whi) end = whi;
+    for (; p < end; p += 0x1000) {
+        u64 i = (p - ALIAS_BASE) >> 12;
+        const WatchChunk *c = watch_chunks[i / WATCH_CHUNK];
+        if (!c || c->page[i % WATCH_CHUNK] <= r->wrote_seen) return 0;
+    }
+    return 1;
+}
+
+/* The first resident region holding GPU data in [va, va + size) (synced), or NULL: regions
+ * there that hold only what the CPU wrote since (resident_cpu_owned) are the same as guest
+ * memory. Memory a scene gives up is handed out again, and a region left behind over it would
+ * otherwise send every draw reading its new data through upload_composed. */
+static Resident *resident_overlapping_gpu(u64 va, u32 size) {
+    for (u32 i = 0; i < nresidents; i++) {
+        Resident *r = &residents[i];
+        if (r->va >= va + size || va >= r->va + r->size) continue;
+        resident_sync(r, 0);
+        if (!resident_cpu_owned(r, va, size)) return r;
+    }
+    return NULL;
+}
+
+/* A raw view of [va, va + bytes) inside r: for shaders to read (srv) or compute to write. Raw
+ * views start on 16 bytes (D3D11 refuses others: most of a fighter's mesh parts start 4, 8 or 12
+ * bytes into a line of its skinned vertices, and every such draw went through upload_composed),
+ * so *skip says how far before va this one starts, for the shader to add to its offsets. */
+static ResidentView *resident_viewx(Resident *r, u64 va, u32 bytes, u32 *skip) {
+    u64 first = (va - r->va) & ~15ull;
+    *skip = (u32)(va - r->va - first);
     bytes = (u32)((va + bytes - r->va - first + 3) & ~3ull);
     if (first + bytes > ((r->size + 15) & ~15u)) bytes = (u32)(((r->size + 15) & ~15u) - first);
     for (u32 i = 0; i < r->nviews; i++)
@@ -1904,8 +2070,8 @@ static ResidentView *resident_viewx(Resident *r, u64 va, u32 bytes) {
     return v;
 }
 
-static ID3D11ShaderResourceView *resident_view(Resident *r, u64 va, u32 bytes) {
-    ResidentView *v = resident_viewx(r, va, bytes);
+static ID3D11ShaderResourceView *resident_view(Resident *r, u64 va, u32 bytes, u32 *skip) {
+    ResidentView *v = resident_viewx(r, va, bytes, skip);
     return v ? v->srv : NULL;
 }
 
@@ -1938,15 +2104,15 @@ static Resident *resident_create(u64 va, u32 size) {
     return r;
 }
 
-/* The resident region holding [va, va + size), made (or widened) as needed. Regions never
- * overlap: a range that overlaps some becomes one region over all of them, with the CPU's
- * data underneath and each old region's GPU data copied over it. */
+/* The resident region holding [va, va + size), made (or widened) as needed, for the GPU to
+ * write into. Regions never overlap: a range that overlaps some becomes one region over all of
+ * them, with the CPU's data underneath and each old region's GPU data copied over it. */
 static Resident *resident_acquire(u64 va, u32 size) {
     u64 lo = va, hi = va + size;
     int overlaps = 0;
     for (u32 i = 0; i < nresidents; i++) {
         Resident *r = &residents[i];
-        if (r->va <= va && va + size <= r->va + r->size) return r;
+        if (r->va <= va && va + size <= r->va + r->size) { resident_gpu_wrote(r); return r; }
         if (r->va < hi && va < r->va + r->size) {
             overlaps = 1;
             if (r->va < lo) lo = r->va;
@@ -1973,13 +2139,8 @@ static Resident *resident_acquire(u64 va, u32 size) {
         n = &residents[nresidents - 1];
     }
     if (n->guest >= ALIAS_BASE && n->guest + n->size <= ALIAS_BASE + ALIAS_SIZE) resident_watch_reset(n);
+    resident_gpu_wrote(n);
     return n;
-}
-
-static Resident *resident_overlapping(u64 va, u32 size) {
-    for (u32 i = 0; i < nresidents; i++)
-        if (residents[i].va < va + size && va < residents[i].va + residents[i].size) { resident_sync(&residents[i], 0); return &residents[i]; }
-    return NULL;
 }
 
 /* dst holds guest memory's [va, va + size): copy over it what resident regions hold of that. */
@@ -2036,7 +2197,7 @@ static ID3D11ShaderResourceView *upload_composed(int stage, u32 slot, u64 va, co
 /* The copy engine and resident data. */
 int gfx_copy_resident(u64 dst_va, u64 src_va, u64 bytes) {
     if (!bytes || bytes > (256u << 20) || !enter()) return 0;
-    Resident *src = resident_overlapping(src_va, (u32)bytes);
+    Resident *src = resident_overlapping_gpu(src_va, (u32)bytes);
     if (!src || src_va < src->va || src_va + bytes > src->va + src->size) {
         leave();
         if (src) gfx_resident_flush(src_va, bytes);   /* partly resident: through guest memory */
@@ -2166,10 +2327,25 @@ static void texture_ask(Texture *t) {
     watch_time(rt_clock_ns() - t0);
 }
 
-/* Once a frame: GPU-resident buffers the CPU has written to (those no draw has checked yet). */
+/* Once a frame: GPU-resident buffers the CPU has written to (those no draw has checked yet).
+ * A region no program has written into for a second that holds only what the CPU wrote since
+ * (resident_cpu_owned) is the same as guest memory, and is given up: memory a scene leaves is
+ * handed out again, and regions over it otherwise pile up for good (a player's long session
+ * had 338). */
+#define RESIDENT_IDLE 60
+u64 gfx_stat_residents_retired;
 static void note_writes(void) {
     u64 t0 = rt_clock_ns();
-    for (u32 i = 0; i < nresidents; i++) resident_sync(&residents[i], 1);
+    for (u32 i = 0; i < nresidents;) {
+        Resident *r = &residents[i];
+        resident_sync(r, 1);
+        if (gfx_stat_presented - r->wrote_frame >= RESIDENT_IDLE && resident_cpu_owned(r, r->va, r->size)) {
+            resident_drop(r);   /* (the last one moves here) */
+            gfx_stat_residents_retired++;
+            continue;
+        }
+        i++;
+    }
     watch_time(rt_clock_ns() - t0);
 }
 
@@ -2299,8 +2475,9 @@ static ID3D11Texture2D *unpack_texture(ID3D11Texture2D *bc, const TextureDesc *d
     return out;
 }
 
-static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
+static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, float *scale) {
     TextureDesc d;
+    *scale = 1.0f;
     int ok = tic_decode(tic, &d);
     u64 g = gpu_va_to_guest(d.address);
     if (!g) return NULL;
@@ -2317,7 +2494,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type) {
         if (!rt || s->used > rt->used) rt = s;
     }
     if (rt && draw_logging) note_sampled(rt);
-    if (rt) return surface_srv(rt, (int)d.srgb);
+    if (rt) { *scale = rt->sx; return surface_srv(rt, (int)d.srgb); }
     if (!ok || d.type == TIC_1D_BUFFER || d.bytes == 0) { warn_texture(&d); return NULL; }
     u32 layers = d.type == TIC_CUBE ? 6 : d.type == TIC_CUBE_ARRAY ? 6 * d.depth : d.type == TIC_2D_ARRAY || d.type == TIC_1D_ARRAY ? d.depth : 1;
     if (d.type == TIC_3D) layers = 1;
@@ -2885,8 +3062,14 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
                         s->info.sb_offset[k], va, desc[2]);
             if (!va || !size) continue;
             Resident *res = (va & 3) == 0 ? resident_covering(va, va + size) : NULL;   /* written by compute: the GPU's copy */
-            if (res && (gm[k] = resident_view(res, va, size))) continue;
-            int partly = resident_overlapping(va, size) != NULL;
+            u32 skip;
+            if (res && (gm[k] = resident_view(res, va, size, &skip))) {   /* (the view may start a little before va) */
+                params->sb[stage][k][0] = (u32)(va - skip);
+                params->sb[stage][k][1] = (u32)((va - skip) >> 32);
+                params->sb[stage][k][2] = size + skip;
+                continue;
+            }
+            int partly = resident_overlapping_gpu(va, size) != NULL;
             if (!partly && !draw_logging) { gm[k] = upload_gpu(stage, 96 + k, va, size); continue; }
             if (size > gcap) { gdata = realloc(gdata, size); gcap = size; }
             read_gpu(va, size, gdata);
@@ -2915,9 +3098,13 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
         u32 tic_index = handle & 0xFFFFF, tsc_index = regs[M_SAMPLER_BINDING] & 1 ? tic_index : (handle >> 20) & 0xFFF;
         read_gpu(tic_pool + tic_index * 32ull, 32, tic);
         read_gpu(tsc_pool + tsc_index * 32ull, 32, tsc);
-        tex[k] = get_texture(tic, s->info.tex[k].type);
+        float scale;
+        tex[k] = get_texture(tic, s->info.tex[k].type, &scale);
         if (k < 16) smp[k] = get_sampler(tsc);
         params->swz[stage][k] = (tic[0] >> 19) & 0xFFF;
+        /* a render target's render scale, 4.12 fixed point in the top half (0: 1), for the few
+         * programs that step in texels (gpu_shader.c: tsc_) */
+        if (scale != 1.0f) params->swz[stage][k] |= (u32)(scale * 4096.0f + 0.5f) << 16;
         if (draw_logging) {
             TextureDesc d;
             int ok = tic_decode(tic, &d);
@@ -3056,17 +3243,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     ID3D11RenderTargetView *rtv[8] = {0};
     ID3D11DepthStencilView *dsv = NULL;
     u32 sel = regs[M_CT_SELECT], count = sel & 15, rt_w = 0, rt_h = 0;
+    float rt_sx = 1.0f, rt_sy = 1.0f;   /* the targets' render scale: host pixels per game pixel */
     for (u32 i = 0; i < count && i < 8; i++) {
         u32 ct = (sel >> (4 + 3 * i)) & 7;
         u64 va = (u64)regs[M_CT(ct)] << 32 | regs[M_CT(ct) + 1];
         if (!va || !regs[M_CT(ct) + 4]) continue;
         Surface *sf = surface(gpu_va_to_guest(va), regs[M_CT(ct) + 2], regs[M_CT(ct) + 3], regs[M_CT(ct) + 4], 0);
-        if (sf) { rtv[i] = sf->rtv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; } }
+        if (sf) { rtv[i] = sf->rtv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; rt_sx = sf->sx; rt_sy = sf->sy; } }
     }
     if (regs[M_ZT_SELECT] & 1) {
         u64 va = (u64)regs[M_ZT_A] << 32 | regs[M_ZT_A + 1];
         Surface *sf = surface(gpu_va_to_guest(va), regs[M_ZT_SIZE], regs[M_ZT_SIZE + 1], regs[M_ZT_A + 2], 1);
-        if (sf) { dsv = sf->dsv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; } }
+        if (sf) { dsv = sf->dsv; if (!rt_w) { rt_w = sf->width; rt_h = sf->height; rt_sx = sf->sx; rt_sy = sf->sy; } }
     }
     if (!rt_w) { gfx_stat_skipped++; gfx_skip_target++; leave(); return; }
     /* (a render target bound as a texture of the same draw is unbound by D3D: fine) */
@@ -3096,6 +3284,9 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     D3D11_VIEWPORT vp = {ox - fabsf(sx), oy - fabsf(sy), 2 * fabsf(sx), 2 * fabsf(sy), zmin, zmax};
     if (vp.Width < 1) { vp.TopLeftX = 0; vp.Width = (float)rt_w; }
     if (vp.Height < 1) { vp.TopLeftY = 0; vp.Height = (float)rt_h; }
+    /* (worked out in the game's pixels, then in the targets' own) */
+    vp.TopLeftX *= rt_sx; vp.Width *= rt_sx;
+    vp.TopLeftY *= rt_sy; vp.Height *= rt_sy;
     if (memcmp(&cur.vp, &vp, sizeof vp)) { ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp); cur.vp = vp; }
     params.fix[0] = sx < 0 ? -1.0f : 1.0f;
     params.fix[1] = sy < 0 ? 1.0f : -1.0f;
@@ -3103,6 +3294,9 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     params.fix[3] = minus_one ? 0.5f : 0.0f;
     params.frag[0] = lower_left ? 1.0f : 0.0f;
     params.frag[1] = (float)rt_h;
+    /* the fragment position in the game's pixels: SV_Position times these (gpu_shader.c ps_input) */
+    params.base[2] = f32_bits(1.0f / rt_sx);
+    params.base[3] = f32_bits(1.0f / rt_sy);
     if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
@@ -3116,6 +3310,10 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
             u32 h = regs[M_SCISSOR(0) + 1], v = regs[M_SCISSOR(0) + 2];
             r = (D3D11_RECT){(LONG)(h & 0xFFFF), (LONG)(v & 0xFFFF), (LONG)(h >> 16), (LONG)(v >> 16)};
             if (lower_left) { LONG t = (LONG)rt_h - r.bottom; r.bottom = (LONG)rt_h - r.top; r.top = t; }
+            /* scaled outwards: at a fractional scale neighbouring rectangles overlap by a pixel
+             * rather than leaving a gap between them */
+            r = (D3D11_RECT){(LONG)floorf((float)r.left * rt_sx), (LONG)floorf((float)r.top * rt_sy),
+                             (LONG)ceilf((float)r.right * rt_sx), (LONG)ceilf((float)r.bottom * rt_sy)};
         }
         if (memcmp(&cur.scissor, &r, sizeof r)) { ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &r); cur.scissor = r; }
     }
@@ -3220,6 +3418,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
 
     /* vertex streams: each attribute the shader reads gets its stream's data at t18 + n */
     ID3D11ShaderResourceView *vsrv[32] = {0}, *stream_srv[32] = {0};
+    u32 stream_skip[32];   /* (how far before the stream its view starts: added to its attributes' offsets) */
     static u8 *stream_data;
     static u32 stream_cap;
     for (u32 n = 0; n < 32; n++) {
@@ -3235,17 +3434,29 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         if (!params.attr[n][3]) continue;
         u64 size = limit >= start ? limit - start + 1 : 0;
         if (size > (64u << 20)) size = 64u << 20;
-        if (stream_srv[j]) { vsrv[n] = stream_srv[j]; continue; }   /* another attribute of the same stream */
+        u32 off = (fmt >> 7) & 0x3FFF;
+        if (stream_srv[j] && off + stream_skip[j] <= 0x3FFF) {   /* another attribute of the same stream */
+            vsrv[n] = stream_srv[j];
+            params.attr[n][0] = fmt + (stream_skip[j] << 7);
+            continue;
+        }
         /* A stream inside data the GPU keeps (compute results) is read from there; one only
          * partly inside gets the guest's data around the GPU's. */
         Resident *res = (start & 3) == 0 ? resident_covering(start, start + size) : NULL;
         if (res) {
-            vsrv[n] = stream_srv[j] = resident_view(res, start, (u32)size);
+            u32 skip;
+            ID3D11ShaderResourceView *v = resident_view(res, start, (u32)size, &skip);
             if (draw_logging)
                 fprintf(stderr, "[draw]   attr%u: stream %u at %#llx (+%#llx) from resident %#llx + %#x\n", n, j, start, size, res->va, res->size);
-            if (vsrv[n]) continue;
+            if (v && off + skip <= 0x3FFF) {   /* (a view starting before the stream: so do the offsets) */
+                vsrv[n] = stream_srv[j] = v;
+                stream_skip[j] = skip;
+                params.attr[n][0] = fmt + (skip << 7);
+                continue;
+            }
         }
-        Resident *part = resident_overlapping(start, (u32)size);
+        stream_skip[j] = 0;
+        Resident *part = resident_overlapping_gpu(start, (u32)size);
         if (!part && !draw_logging) { vsrv[n] = stream_srv[j] = upload_gpu(SHADER_VERTEX, 18 + n, start, (u32)size); continue; }
         if (size > stream_cap) { stream_data = realloc(stream_data, size + 16); stream_cap = (u32)size; }
         read_gpu(start, (u32)size, stream_data);
@@ -3438,15 +3649,15 @@ typedef struct Texture Texture;
 static void capture_textures(const char *dir, int frame);
 
 /* A surface drawn into an RGBA8 image (so any format can be saved) with the given blit pixel
- * shader, saved as a BMP. Leaves the pipeline state changed. */
+ * shader, saved as a BMP at its host size (render scale included). Leaves the pipeline state changed. */
 static void save_surface_bmp(Surface *s, ID3D11PixelShader *ps, const char *path) {
-    D3D11_TEXTURE2D_DESC td = {s->width, s->height, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+    D3D11_TEXTURE2D_DESC td = {s->hw, s->hh, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
                                D3D11_BIND_RENDER_TARGET, 0, 0};
     ID3D11Texture2D *tmp;
     ID3D11RenderTargetView *rtv;
     if (!ps || FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tmp))) return;
     ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tmp, NULL, &rtv);
-    D3D11_VIEWPORT vp = {0, 0, (float)s->width, (float)s->height, 0, 1};
+    D3D11_VIEWPORT vp = {0, 0, (float)s->hw, (float)s->hh, 0, 1};
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     D3D11_RASTERIZER_DESC rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE};
@@ -3501,8 +3712,8 @@ static void note_sampled(Surface *s) {
     sampled_saved[nsampled_saved++].used = s->used;
     sampled_seq_of[nsampled_pending] = sampled_seq;
     sampled_pending[nsampled_pending++] = s;
-    fprintf(stderr, "[draw]   (samples render target %#llx %ux%u fmt %#x: saved as in_%03d)\n", s->guest, s->width, s->height,
-            s->format, sampled_seq++);
+    fprintf(stderr, "[draw]   (samples render target %#llx %ux%u fmt %#x: saved as in_%03d, %ux%u on the host)\n", s->guest, s->width,
+            s->height, s->format, sampled_seq++, s->hw, s->hh);
 }
 
 static void save_sampled(void) {
@@ -3521,7 +3732,8 @@ static void save_sampled(void) {
     nsampled_pending = 0;
 }
 
-/* SSBU_CAPTURE=<dir>: save the window's contents there every few seconds (frame_N.bmp). */
+/* SSBU_CAPTURE=<dir>: save the game's picture there every few seconds (frame_N.bmp); with
+ * SSBU_CAPTURE_WINDOW too, the window's back buffer as well, as fitted into it (window_N.bmp). */
 static void save_bmp(ID3D11Texture2D *back, const char *path) {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D_GetDesc(back, &td);
@@ -3554,11 +3766,11 @@ static void save_bmp(ID3D11Texture2D *back, const char *path) {
     ID3D11Texture2D_Release(staging);
 }
 
-static void capture(ID3D11Texture2D *back) {
+static void capture(ID3D11Texture2D *back, ID3D11Texture2D *window) {
     static const char *dir;
     static int checked, count;
     static u64 last;
-    static int most = 40;   /* SSBU_CAPTURE_MAX: how many (at 6 MB each) */
+    static int most = 40;   /* SSBU_CAPTURE_MAX: how many (6 MB each at 1920x1080, 4 times that at render scale 2) */
     static u64 every = 3000000000ull;   /* SSBU_CAPTURE_EVERY: seconds apart */
     if (!checked++) {
         dir = getenv("SSBU_CAPTURE");
@@ -3570,6 +3782,10 @@ static void capture(ID3D11Texture2D *back) {
     char path[1024];
     snprintf(path, sizeof path, "%s/frame_%03d.bmp", dir, count);
     save_bmp(back, path);
+    if (window && getenv("SSBU_CAPTURE_WINDOW")) {
+        snprintf(path, sizeof path, "%s/window_%03d.bmp", dir, count);
+        save_bmp(window, path);
+    }
     if (getenv("SSBU_CAPTURE_SURFACES")) capture_surfaces(dir, count);
     count++;
 }
@@ -3802,13 +4018,20 @@ void gfx_dispatch(const u32 *regs, const u32 *q) {
         params.sb[0][k][1] = desc[1];
         params.sb[0][k][2] = size;
         if (!va || !size) continue;
-        Resident *over = resident_overlapping(va, size);
+        Resident *over = resident_overlapping_gpu(va, size);
         if (learned) {
             /* what it writes stays on the GPU; what it only reads is the GPU's data where there is
              * some, the guest's elsewhere */
             Resident *res = cs->written_mask >> k & 1 ? resident_acquire(va, size) : over ? resident_covering(va, va + size) : NULL;
-            ResidentView *v = res ? resident_viewx(res, va, size) : NULL;
-            if (v) { uav[k] = v->uav; continue; }
+            u32 skip;
+            ResidentView *v = res ? resident_viewx(res, va, size, &skip) : NULL;
+            if (v) {   /* (the view may start a little before va) */
+                params.sb[0][k][0] = (u32)(va - skip);
+                params.sb[0][k][1] = (u32)((va - skip) >> 32);
+                params.sb[0][k][2] = size + skip;
+                uav[k] = v->uav;
+                continue;
+            }
             if (!(cs->written_mask >> k & 1) && !over && (uav[k] = input_uav(va, size))) continue;   /* only read: cached */
         } else if (over)
             gfx_resident_flush(va, size);   /* learning diffs it all against guest memory, which needs the GPU's data first */
@@ -3885,7 +4108,7 @@ static void clear_channels(Surface *s, const float color[4], u32 mask) {
     ID3D11ShaderResourceView *none[96] = {0};
     ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 96, none);
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &s->rtv, NULL);
-    D3D11_VIEWPORT vp = {0, 0, (float)s->width, (float)s->height, 0, 1};
+    D3D11_VIEWPORT vp = {0, 0, (float)s->hw, (float)s->hh, 0, 1};
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     D3D11_RECT all = {0, 0, 16384, 16384};
     ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &all);
@@ -3935,11 +4158,14 @@ void gfx_blit2d(const u32 *regs) {
     ID3D11ShaderResourceView *none[96] = {0};
     ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 96, none);
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &dst->rtv, NULL);
-    D3D11_VIEWPORT vp = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1};
+    /* (the rectangles are in the game's pixels; the destination's own are dst->sx, sy times those) */
+    D3D11_VIEWPORT vp = {(float)dx * dst->sx, (float)dy * dst->sy, (float)dw * dst->sx, (float)dh * dst->sy, 0, 1};
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     D3D11_RECT all = {0, 0, 16384, 16384};
     ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &all);
-    /* each destination pixel samples the source at src0 + (pixel - dst0) * step, in source pixels */
+    /* each destination pixel samples the source at src0 + (pixel - dst0) * step, in source pixels:
+     * the game's, whatever either surface's render scale (the shader works in the destination's
+     * host pixels, so dst0 and step are given in those, and the source is read normalized) */
     static ID3D11Buffer *rect_cb;
     if (!rect_cb) {
         D3D11_BUFFER_DESC bd = {32, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
@@ -3947,7 +4173,8 @@ void gfx_blit2d(const u32 *regs) {
     }
     D3D11_MAPPED_SUBRESOURCE m;
     if (rect_cb && SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)rect_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        float r[8] = {(float)sx, (float)sy, (float)du, (float)dv, (float)dx, (float)dy, 1.0f / (float)src->width, 1.0f / (float)src->height};
+        float r[8] = {(float)sx, (float)sy, (float)(du / dst->sx), (float)(dv / dst->sy), (float)dx * dst->sx, (float)dy * dst->sy,
+                      1.0f / (float)src->width, 1.0f / (float)src->height};
         memcpy(m.pData, r, sizeof r);
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)rect_cb, 0);
     }
@@ -4073,8 +4300,9 @@ void gfx_present(u64 guest, u32 width, u32 height) {
     ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xFFFFFFFF);
     ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
     ID3D11ShaderResourceView *none = NULL;
-    if (src) {   /* the game's picture at its own size */
-        D3D11_VIEWPORT vp = {0, 0, FINAL_W, FINAL_H, 0, 1};
+    if (src) {   /* the game's picture at its own size (render scale included): pixel for pixel */
+        if (src->hw != final_w || src->hh != final_h) make_final(src->hw, src->hh);
+        D3D11_VIEWPORT vp = {0, 0, (float)final_w, (float)final_h, 0, 1};
         ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &final_rtv, NULL);
         ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
         /* the bytes as they are: the display shows them as sRGB, which an sRGB framebuffer's already are */
@@ -4086,18 +4314,47 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         static const float grey[4] = {0.1f, 0.1f, 0.12f, 1};
         ID3D11DeviceContext_ClearRenderTargetView(ctx, final_rtv, grey);
     }
-    capture(final_tex);
     /* then into the window: 16:9, centred, black around it */
     static const float black[4] = {0, 0, 0, 1};
     unsigned fit_x, fit_y, fit_w, fit_h;
     display_fit(back_desc.Width, back_desc.Height, &fit_x, &fit_y, &fit_w, &fit_h);
     D3D11_VIEWPORT wvp = {(float)fit_x, (float)fit_y, (float)fit_w, (float)fit_h, 0, 1};
     ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
-    ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv);
-    ID3D11DeviceContext_Draw(ctx, 3, 0);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+    ID3D11RenderTargetView *rtv_srgb = NULL;
+    if ((final_w > fit_w || final_h > fit_h) && down_ps && down_cb) {
+        /* a picture bigger than its place (render scale): shrunk, each window pixel the average
+         * of the picture's under it, in linear light (an sRGB view of each side) */
+        D3D11_RENDER_TARGET_VIEW_DESC rd;
+        memset(&rd, 0, sizeof rd);
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)back, &rd, &rtv_srgb);
+    }
+    D3D11_MAPPED_SUBRESOURCE dm;
+    if (rtv_srgb && SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)down_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &dm))) {
+        float rx = (float)final_w / (float)fit_w, ry = (float)final_h / (float)fit_h;
+        float k[8] = {(float)final_w, (float)final_h, 1.0f / (float)final_w, 1.0f / (float)final_h,
+                      ceilf(rx), ceilf(ry), rx, ry};   /* taps per axis; the footprint in picture pixels */
+        memcpy(dm.pData, k, sizeof k);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)down_cb, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv_srgb, NULL);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
+        ID3D11DeviceContext_PSSetShader(ctx, down_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 3, 1, &down_cb);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv_srgb);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+        ID3D11DeviceContext_PSSetShader(ctx, blit_ps, NULL, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    } else {   /* as big as its place or smaller: drawn bilinear */
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &wvp);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &final_srv);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+    }
+    if (rtv_srgb) ID3D11RenderTargetView_Release(rtv_srgb);
+    capture(final_tex, back);   /* (before the overlay) */
 
     /* debug keys and the overlay */
     LONG keys = InterlockedExchange(&hotkeys, 0);
@@ -4199,6 +4456,10 @@ void gfx_present(u64 guest, u32 width, u32 height) {
         snprintf(hint, sizeof hint, "F2 details  Esc settings%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
                  profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
         if (net[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", net); }
+        if (render_scale != 1.0f) {
+            size_t l = strlen(detail);
+            snprintf(detail + l, sizeof detail - l, "\nrender scale %.3g: picture %ux%u", render_scale, final_w, final_h);
+        }
         char pads[256];
         pad_describe(pads, sizeof pads);
         { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\npads: %s", pads[0] ? pads : "none (keyboard only)"); }

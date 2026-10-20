@@ -27,6 +27,10 @@ void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw,
 int display_latency(void);              /* frames the GPU may queue ahead: 1-3 */
 Pacing display_pacing(void);
 const char *display_gpu(void);          /* the graphics card to use: "auto", or part of its name (SSBU_GPU) */
+/* render_scale: the game's pictures are drawn this many times its 1920x1080 in each direction
+ * (0.5-4; SSBU_RENDER_SCALE). 0 = auto: as many as the picture has pixels in the window at the
+ * start (1440p: 1.33), at least 1. */
+float display_render_scale(void);
 /* The renderer says whether the swap chain can tear (for VRR); the flags each Present gets. */
 void display_set_tearing(int supported);
 unsigned display_present_flags(void);
@@ -35,7 +39,7 @@ void display_wait_tick(void);
 
 /* The settings menu (gpu_menu.c), which saves display.ini itself: the settings in effect, and
  * changes that take effect now. The window's size and the graphics card count at the next start. */
-typedef struct DisplaySettings { int mode, width, height, latency, hide_cursor, overlay; Pacing pacing; char gpu[64]; } DisplaySettings;
+typedef struct DisplaySettings { int mode, width, height, latency, hide_cursor, overlay; Pacing pacing; char gpu[64]; float render_scale; } DisplaySettings;
 void display_settings(DisplaySettings *out);
 const char *display_ini_path(void);
 int display_overlay(void);                /* overlay = 1: the frame-rate overlay shows from the start */
@@ -45,3 +49,4 @@ void display_set_pacing(Pacing pacing);
 void display_set_hide_cursor(int on);
 void display_set_latency(int frames);
 int display_take_latency(void);           /* the renderer, at a present: a new latency, or 0 */
+void display_set_render_scale(float scale);   /* (shown by the menu; the renderer takes it at the next start) */

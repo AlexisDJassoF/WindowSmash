@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
         if (setjmp(on_fatal)) { count.translate_failed++; continue; }
         p->size = shader_size(p->bytes, p->length);
         if (p->size <= 0x50) continue;
-        p->hash = shader_program_hash(p->bytes, p->size);
+        p->hash = shader_cache_hash(shader_program_hash(p->bytes, p->size), p->bytes, p->size, SHADER_VERTEX);
         char *hlsl = translate(p, 0, &info);
         if (!hlsl) { count.translate_failed++; continue; }
         free(hlsl);
@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
         if (setjmp(on_fatal)) { count.translate_failed++; continue; }
         p->size = shader_size(p->bytes, p->length);
         if (p->size <= 0x50) continue;
-        p->hash = shader_program_hash(p->bytes, p->size);
+        p->hash = shader_cache_hash(shader_program_hash(p->bytes, p->size), p->bytes, p->size, SHADER_PIXEL);
         p->nmasks = pixel_masks(p, prog, total);
         for (u32 m = 0; m < p->nmasks; m++) progress_of += to_count(p->hash * 5 ^ p->masks[m]);
         if (!p->nmasks) progress_of++;   /* (its one key: what it reads, found when it is compiled) */

@@ -44,7 +44,7 @@ static __declspec(thread) u32 last_native;        /* which native slot the curre
 static const char *phase = "start-up";
 int rt_trace;
 static int status_every;   /* seconds between thread dumps, 0 for none */
-extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_stat_dispatched, gfx_stat_residents, gfx_stat_clears, gfx_stat_drawn, gfx_stat_skipped,
+extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_stat_dispatched, gfx_stat_residents, gfx_stat_residents_retired, gfx_stat_clears, gfx_stat_drawn, gfx_stat_skipped,
     gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology,
     gfx_skip_target, gfx_stat_unmap_dropped;
 u64 present_frames(void);
@@ -869,9 +869,9 @@ static DWORD WINAPI guest_main(LPVOID unused) {
 }
 
 static void print_status(void) {
-    fprintf(stderr, "\n[status] %.0f s into %s; GPU: %llu submissions, %llu command lists, %llu draws, %llu clears, %llu compute launches (%llu run, %llu GPU-resident buffers made); %llu frames presented\n",
+    fprintf(stderr, "\n[status] %.0f s into %s; GPU: %llu submissions, %llu command lists, %llu draws, %llu clears, %llu compute launches (%llu run, %llu GPU-resident buffers made, %llu given up); %llu frames presented\n",
             (double)rt_now_ns() / 1e9, phase, gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gfx_stat_clears, gpu_stat_dispatches,
-            gfx_stat_dispatched, gfx_stat_residents,
+            gfx_stat_dispatched, gfx_stat_residents, gfx_stat_residents_retired,
             present_frames());
     fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures (%llu unpacked); %llu ms watching writes; %llu buffers dropped after unmaps\n",
             gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked,

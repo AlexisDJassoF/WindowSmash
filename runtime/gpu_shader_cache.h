@@ -23,6 +23,15 @@ static inline u64 shader_program_hash(const u8 *p, u32 size) {
     return h;
 }
 
+/* The hash a program's cache files are named by: shader_program_hash's (and a compute
+ * program's group size), mixed with a salt for the few programs whose translation takes the
+ * render scale into account (shader_uses_pixels), so that their files from before it are not
+ * used. Every other program keeps its files. */
+#define SHADER_SCALE_SALT 0x7273636C30303031ull   /* "rscl0001" */
+static inline u64 shader_cache_hash(u64 hash, const u8 *program, u32 size, int stage) {
+    return shader_uses_pixels(program, size, stage) ? (hash ^ SHADER_SCALE_SALT) * 1099511628211ull : hash;
+}
+
 static inline void shader_cache_file(char *out, size_t n, const char *dir, int stage, u64 hash, u32 vs_outputs, u64 table_hash) {
     snprintf(out, n, "%s/v%u_%s_%016llx_%08x_%016llx.dxbc", dir, SHADER_CACHE_VERSION,
              stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)hash, vs_outputs,
