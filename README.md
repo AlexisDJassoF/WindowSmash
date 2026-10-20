@@ -56,13 +56,13 @@ The game itself still comes from your files. This repository holds only the tran
 - **Your DLC fighters**, and a tool that unlocks the base-game roster on your own save.
 - **Any game version**, including 13.0.5 with Kazuya and Sora, and several versions side by side.
 - **An experimental Linux version**, built from the same source: `install-windowsmash.sh` sets it up on Linux in one go ([Linux](docs/LINUX.md)).
-- **An experimental macOS version** for Macs with Apple silicon, newer still: `Install WindowSmash.command` sets it up on the Mac in one go ([macOS](docs/MACOS.md)).
+- **An experimental macOS version** for Macs with Apple silicon, built from the same source: `Install WindowSmash.command` sets it up on the Mac in one go ([macOS](docs/MACOS.md)).
 
 ## What you need
 
 | | Requirement |
 | :--- | :--- |
-| **Computer** | A Windows 10 or Windows 11 PC, 64-bit. |
+| **Computer** | A Windows 10 or Windows 11 PC, 64-bit. Experimental: a Linux PC ([Linux](docs/LINUX.md)), or a Mac with Apple silicon and macOS 14.5 or newer ([macOS](docs/MACOS.md)). |
 | **Processor** | One with AVX2: an Intel Core i3, i5, i7 or i9 of the 4th generation (2013) or newer, or any AMD Ryzen. Most Pentium and Celeron processors don't have it. |
 | **Graphics** | Any graphics card or chip that supports DirectX 11, with an up-to-date driver. |
 | **Memory** | 16 GB recommended. |
@@ -268,7 +268,7 @@ WindowSmash is **experimental**. Menus and matches run and Local Wireless connec
 | **DLC** | The DLC fighters your version has: 11.0.0 has them up to Pyra/Mythra; Kazuya came with 12.0.0 and Sora with 13.0.0. |
 | **Multiplayer** | The online lobby (with direct connections) and private rooms work. Complete matches between two PCs, and the whole roster online, haven't been fully verified. |
 | **Linux** | Experimental, built from the same source and drawn through DXVK on Vulkan: on Linux itself with `install-windowsmash.sh`, or cross-compiled on Windows. |
-| **macOS** | Experimental and new: Macs with Apple silicon and macOS 14.5 or newer, built on the Mac itself with `Install WindowSmash.command`, drawn by a Metal renderer of its own. |
+| **macOS** | Experimental: Macs with Apple silicon and macOS 14.5 or newer, built on the Mac itself with `Install WindowSmash.command` and drawn by a Metal renderer of its own. **13.0.5** has been checked through its opening and menus at 60 fps; matches haven't been yet. |
 
 There is no connection to Nintendo's online service, no claim of general Switch compatibility, and no verified performance target.
 

@@ -12,7 +12,8 @@ Linux versions.
 - `Install WindowSmash.command` sets it all up and builds the game, as `Install WindowSmash.bat` does
   on Windows.
 
-Any game version should work; the Windows build has been tested with 11.0.0 and 13.0.5.
+Any game version should work. On a Mac, 13.0.5 has been checked through its opening and menus, at
+60 fps; full matches haven't been yet. The Windows build has been tested with 11.0.0 and 13.0.5.
 
 > [!IMPORTANT]
 > WindowSmash doesn't include the game. You need your own copy of Super Smash Bros. Ultimate, dumped
@@ -308,6 +309,7 @@ the game's C (`tools/recomp.py all --generate-only`) and compiles and links it w
 | Area | Where it stands |
 | :--- | :--- |
 | **Overall** | Experimental, and the newest of the three versions. Expect problems that Windows doesn't have. |
+| **Game versions** | **13.0.5** runs its opening movie, the new-save screens, Challenges, stage select and fighter select at 60 fps (on an M5 Pro). Full matches haven't been checked yet, and other versions haven't been tried on a Mac. |
 | **Graphics** | A new Metal renderer. Shaders are compiled the first time each is used; there is no ahead-of-time preparation yet. |
 | **Controllers, sound** | Through SDL3, as on Windows. Testing with real pads has been limited. |
 | **Multiplayer** | The same online lobby and private rooms as on Windows and Linux. Playing between a Mac and the other two hasn't been tested yet. |
