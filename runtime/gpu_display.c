@@ -39,7 +39,8 @@ static struct {
     Pacing pacing;
     int loaded;
     char gpu[64];
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, "auto"};
+    float render_scale;   /* 0: auto */
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, "auto", 1.0f};
 
 static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
@@ -84,6 +85,13 @@ static const char DEFAULT_INI[] =
     "latency = 3\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
     "hide_cursor = 1\n"
+    "\n"
+    "; render_scale = 1 | auto | a number from 0.5 to 4\n"
+    ";   The game draws its pictures at 1920x1080. render_scale draws them this many times as wide and\n"
+    ";   as tall: sharper on a bigger screen, more work for the graphics card (2 = four times the pixels).\n"
+    ";   auto: as many pixels as the picture has in the window when the game starts (1.33 on a 2560x1440\n"
+    ";   monitor with window = borderless), at least 1. A bigger picture than the window is shrunk to fit.\n"
+    "render_scale = 1\n"
 #ifdef _WIN32
     "\n"
     "; gpu = auto, or part of a graphics card's name (e.g. nvidia, radeon, intel)\n"
@@ -105,6 +113,15 @@ static void parse_pacing(const char *v) {
     else if (!_stricmp(v, "vrr")) cfg.pacing = PACING_VRR;
     else if (!_stricmp(v, "display")) cfg.pacing = PACING_DISPLAY;
     else fprintf(stderr, "[display] pacing is clock, vrr or display, not '%s'\n", v);
+}
+
+/* render_scale = auto, or a number from 0.5 to 4 (1: the game's own 1920x1080). */
+static void parse_render_scale(const char *v) {
+    char *end;
+    double x = strtod(v, &end);
+    if (!_stricmp(v, "auto")) cfg.render_scale = 0;
+    else if (end != v && x >= 0.5 && x <= 4) cfg.render_scale = (float)x;
+    else { fprintf(stderr, "[display] render_scale is auto or a number from 0.5 to 4, not '%s': 1 it is\n", v); cfg.render_scale = 1; }
 }
 
 static char *trim(char *s) {
@@ -137,6 +154,7 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "latency")) cfg.latency = atoi(value);
         else if (!_stricmp(key, "hide_cursor")) cfg.hide_cursor = atoi(value) != 0;
         else if (!_stricmp(key, "gpu")) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", value);
+        else if (!_stricmp(key, "render_scale")) parse_render_scale(value);
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
@@ -144,6 +162,7 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
+    if ((env = getenv("SSBU_RENDER_SCALE")) && *env) parse_render_scale(env);
     if (cfg.width < 320) cfg.width = 320;
     if (cfg.height < 180) cfg.height = 180;
     if (cfg.latency < 1) cfg.latency = 1;
@@ -160,6 +179,7 @@ static void load(void) {
 int display_latency(void) { load(); return cfg.latency; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
 const char *display_gpu(void) { load(); return cfg.gpu; }
+float display_render_scale(void) { load(); return cfg.render_scale; }
 
 #ifdef _WIN32
 void display_dpi_aware(void) {
