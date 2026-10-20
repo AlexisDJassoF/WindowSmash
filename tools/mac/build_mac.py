@@ -61,9 +61,10 @@ ICON = os.path.join(REPO, "docs", "assets", "windowsmash.ico")
 RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "macos", "include"), "-I", os.path.join(RUNTIME, "linux", "include"),
                     "-I", RUNTIME, "-I", GEN, "-F", SDL3_DIR, "-I", os.path.join(REPO, "third_party", "libvpx")]
 RUNTIME_DEFINES = ["-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL3"]
-# runtime/*.c as on Linux, but for Direct3D 11 and its overlay: the Metal renderer (runtime/macos) instead
+# runtime/*.c as on Linux, but for Direct3D 11 and its overlay: the Metal renderer (runtime/macos) instead.
+# The settings menu (gpu_menu.c) draws with that overlay, so it is not here yet (macos/platform.c: no menu).
 RUNTIME_PATTERN = r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c"
-RUNTIME_LEFT_OUT = ("gpu_d3d11.c", "gpu_overlay.c")
+RUNTIME_LEFT_OUT = ("gpu_d3d11.c", "gpu_overlay.c", "gpu_menu.c")
 LINUX_PARTS = ("win32.c", "upnp.c", "eh.cpp")   # (runtime/linux: the Win32 calls on POSIX, UPnP, C++ landing sites)
 MAC_SOURCES = (".c", ".m", ".cpp", ".S")
 FRAMEWORKS = ("SDL3", "Metal", "QuartzCore", "AppKit", "Foundation", "CoreFoundation", "IOKit", "CoreGraphics")

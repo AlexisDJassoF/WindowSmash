@@ -63,6 +63,7 @@ typedef int SOCKET;
 
 #include "host.h"
 #include "net.h"
+#include "settings.h"
 
 #define MAGIC0 'S'
 #define MAGIC1 'N'
@@ -148,6 +149,27 @@ static u64 process_age_ms(void) {
 static u64 process_age_ms(void) { return rt_now_ns() / 1000000; }
 #endif
 
+/* Started with --online (Play SSBU.bat; settings.h): the lobby, name and direct connections from
+ * the files the settings menu and the launcher write, where no SSBU_NET_* variable says them.
+ * online_server.txt: "host:port [lobby code]" or "off"; online_name.txt: the name (one is picked
+ * and kept there when it is missing); online_direct.txt: "off" for no direct connections. */
+static void configure_from_files(void) {
+    char line[256], host[256] = "", code[NAME_LEN + 1] = "";
+    if (settings_line_read("online_server.txt", line, sizeof line)) sscanf(line, "%255s %32s", host, code);
+    if (!host[0] || !_stricmp(host, "off")) return;
+    snprintf(relay_text, sizeof relay_text, "%s", host);
+    if (code[0] && !getenv("SSBU_NET_ROOM")) snprintf(room, sizeof room, "%s", code);
+    if (!getenv("SSBU_NET_NAME")) {
+        if (!settings_line_read("online_name.txt", line, sizeof line) || !line[0]) {
+            snprintf(line, sizeof line, "Player%04u", 1000 + (unsigned)(GetTickCount64() * 2654435761u >> 7) % 9000);
+            settings_line_write("online_name.txt", line);
+            fprintf(stderr, "[net] online as %s (change it in the settings: Esc)\n", line);
+        }
+        snprintf(name, sizeof name, "%s", line);
+    }
+    if (!getenv("SSBU_NET_DIRECT") && settings_line_read("online_direct.txt", line, sizeof line) && !_strnicmp(line, "off", 3)) direct_ok = 0;
+}
+
 static void configure(void) {
     if (configured >= 0) return;
     const char *h = getenv("SSBU_NET_HOST"), *r = getenv("SSBU_NET_RELAY"), *v;
@@ -166,7 +188,8 @@ static void configure(void) {
         test_block_at = now_ms() + (at > age ? at - age : 0);
     }
     if (hosting) snprintf(relay_text, sizeof relay_text, "127.0.0.1:%u", port);
-    else if (r && *r) snprintf(relay_text, sizeof relay_text, "%s", r);
+    else if (r && *r) { if (_stricmp(r, "off")) snprintf(relay_text, sizeof relay_text, "%s", r); }
+    else if (settings_online()) configure_from_files();
     configured = hosting || relay_text[0];
 }
 

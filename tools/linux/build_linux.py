@@ -179,7 +179,7 @@ def overlay_font():
         if r.returncode:   # (only the debug overlay's text needs it: not worth stopping the build for)
             print("could not draw the overlay font: the overlay (F1, F2) shows no text")
             with open(header, "w", newline="\n") as f:
-                f.write("static const unsigned char overlay_font[%d] = {0};\n" % (12 * 16 * 24 * 6))
+                f.write("static const unsigned char overlay_font[%d] = {0};\n" % (24 * 16 * 48 * 6))
         return True
     exe = os.path.join(GEN, "make_overlay_font.exe")
     code, out = run([os.path.join(LLVM, "clang-cl.exe"), "/nologo", "/O1", "-w", "-fuse-ld=lld", tool_src, "/Fe" + exe, "/link", "gdi32.lib", "user32.lib"])
