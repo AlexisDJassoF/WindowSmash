@@ -357,7 +357,7 @@ static int menu_keys(UINT msg, WPARAM w, LPARAM l) {
 static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     LRESULT result;
     if (display_message(h, msg, w, l, &result)) return result;   /* size, full screen, pointer (gpu_display.c) */
-    if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); ExitProcess(0); }
+    if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); gfx_closing(); fflush(stderr); ExitProcess(0); }
     if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F6 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
     if (menu_keys(msg, w, l)) return 0;
     return DefWindowProcW(h, msg, w, l);
@@ -449,6 +449,9 @@ static const char DECODE_HLSL[] =
 
 static void start_compilers(void);                 /* (see "shaders") */
 static DWORD WINAPI prewarm_main(void *unused);
+static int warm_first_draws;                       /* (see "first draws") */
+static LUID warm_adapter;
+static void warm_start(void);
 
 /* Direct3D 11 is DXVK's: always on Linux; on Windows when d3d11.dll is not the system's (the
  * DXVK test builds of tools/linux/wintest.py). */
@@ -736,6 +739,11 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
         FAILED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
                                  levels, 2, D3D11_SDK_VERSION, &compile_dev, NULL, NULL)))
         compile_dev = NULL;
+    /* AMD's: a program's GPU code is made at the first draw that uses it (see "first draws").
+     * SSBU_SHADER_WARM=0/1 overrides. */
+    const char *wv = getenv("SSBU_SHADER_WARM");
+    warm_first_draws = wv ? atoi(wv) != 0 : ad.VendorId == 0x1002 && !on_dxvk();
+    warm_adapter = ad.AdapterLuid;
     /* The back buffer is the window's inside (display.ini sizes the window). Where the system
      * allows it, the swap chain may tear, which VRR pacing asks for at each Present. */
     IDXGIFactory5 *factory5;
@@ -812,6 +820,7 @@ static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *c) {
         fprintf(stderr, "[gfx] render scale %.3g%s: the game's 1920x1080 drawn at %ux%u\n", render_scale,
                 display_render_scale() == 0 ? " (auto)" : "", pw, ph);
     start_compilers();
+    if (warm_first_draws) warm_start();
     /* The prewarm is for a driver that compiles a shader when it is created (NVIDIA's Direct3D:
      * 190 ms at first use). DXVK queues a Vulkan pipeline library per shader on its own workers
      * instead: the whole cache at once kept them busy for minutes and the first frame waited
@@ -941,7 +950,7 @@ static void dump_shaders(const u32 *regs) {
  * a move is first used). So a second device, with the driver's
  * threading off, compiles each one first - inside Create*Shader, on our thread, with our stack;
  * the rendering device keeps its threading (without it the renderer took twice as long a
- * frame). A draw whose
+ * frame). AMD's driver compiles at a program's first draw instead (see "first draws"). A draw whose
  * shaders are not ready is skipped. The disk cache's names, and fxc's flags, are
  * gpu_shader_cache.h's (shared with tools/shaderaot.c). */
 
@@ -958,6 +967,7 @@ typedef struct Shader {
     struct Shader *next_job;
     int cached;            /* an earlier run compiled it (its job is a load) */
     struct Prewarm *prewarm;   /* a prewarm job (not a shader of the game yet): the entry it fills */
+    int drawn;             /* a draw (or launch) has used it: its first one was timed (first_draw_done) */
 } Shader;
 
 static Shader **shader_cache;
@@ -1040,8 +1050,10 @@ static int create_noted(struct Compiler *me, Shader *s, const void *code, size_t
  * own shaders) into a table by the cache's key.
  * When the game first uses a program, get_shader_ex still translates it (that gives its
  * interface), then takes the object from here instead of loading it, so the draw is not
- * skipped. SSBU_SHADER_PREWARM=0: no prewarm; under DXVK it is off unless =1 (see init). */
-typedef struct Prewarm { u64 hash, table_hash; u32 vs_outputs; int stage; LONG state; void *obj; } Prewarm;
+ * skipped. SSBU_SHADER_PREWARM=0: no prewarm; under DXVK it is off unless =1 (see init).
+ * outputs: the generic attributes between the stages (a vertex program's, from its DXBC; a pixel
+ * program's, vs_outputs), for its first draw (warm_prewarmed). */
+typedef struct Prewarm { u64 hash, table_hash; u32 vs_outputs, outputs; int stage; LONG state; void *obj; } Prewarm;
 enum { PW_EMPTY, PW_QUEUED, PW_LOADING, PW_READY, PW_TAKEN, PW_FAILED };
 #define PREWARM_SLOTS 32768
 static Prewarm *volatile prewarm_table;
@@ -1095,6 +1107,8 @@ static void *prewarm_take(const Shader *s) {
     return obj;
 }
 
+static u32 dxbc_outputs(const u8 *code, size_t size);   /* (see "first draws") */
+
 /* (on a compiler thread) one prewarm job: the file, then both devices' objects */
 static void prewarm_job(struct Compiler *me, Shader *s) {
     Prewarm *p = s->prewarm;
@@ -1103,6 +1117,7 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
     if (go) p->state = PW_LOADING;
     ReleaseSRWLockExclusive(&prewarm_lock);
     void *obj = NULL;
+    u32 outputs = s->stage == SHADER_PIXEL ? s->vs_outputs : ~0u;
     if (go) {
         char path[1200];
         cache_path(s, path, sizeof path);
@@ -1114,12 +1129,14 @@ static void prewarm_job(struct Compiler *me, Shader *s) {
             fseek(f, 0, SEEK_SET);
             void *code = n > 0 ? malloc(n) : NULL;
             if (code && fread(code, 1, n, f) == (size_t)n && create_noted(me, s, code, n)) obj = s->obj;
+            if (obj && s->stage == SHADER_VERTEX) outputs = dxbc_outputs(code, n);
             fclose(f);
             free(code);
         }
     }
     AcquireSRWLockExclusive(&prewarm_lock);
     if (go && p->state == PW_LOADING) {
+        p->outputs = outputs;
         p->obj = obj;
         p->state = obj ? PW_READY : PW_FAILED;
         if (obj) prewarm_ready++;
@@ -1225,41 +1242,60 @@ static int newest_first(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* (a thread of its own, at start) every file of the disk cache into the prewarm queue */
-static DWORD WINAPI prewarm_main(void *unused) {
-    (void)unused;
-    SetThreadDescription(GetCurrentThread(), L"shader prewarm");
+/* The disk cache's files of this SHADER_CACHE_VERSION that the game has used (not the ahead-of-time
+ * compiler's it never asked for), newest first: the shaders of what was played last, first. */
+static u32 played_files(const char *dir, Found **out) {
     Found *found = NULL;
     u32 n = 0, cap = 0;
     char pattern[1100];
-    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", cache_dir(), SHADER_CACHE_VERSION);
+    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", dir, SHADER_CACHE_VERSION);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     for (BOOL more = h != INVALID_HANDLE_VALUE; more; more = FindNextFileA(h, &fd)) {
-        /* only what the game has used: not the ahead-of-time compiler's files it never asked for */
         if (((u64)fd.ftLastWriteTime.dwHighDateTime << 32 | fd.ftLastWriteTime.dwLowDateTime) < SHADER_CACHE_PLAYED) continue;
         if (n == cap) found = realloc(found, sizeof *found * (cap = cap * 2 + 1024));
         snprintf(found[n].name, sizeof found[n].name, "%s", fd.cFileName);
         found[n++].written = (u64)fd.ftLastWriteTime.dwHighDateTime << 32 | fd.ftLastWriteTime.dwLowDateTime;
     }
     if (h != INVALID_HANDLE_VALUE) FindClose(h);
-    qsort(found, n, sizeof *found, newest_first);   /* the shaders of what was played last, first */
+    if (n) qsort(found, n, sizeof *found, newest_first);
+    *out = found;
+    return n;
+}
+
+/* A cache file's name: its stage (-1: not one), program hash, pixel program's vs_outputs, tables. */
+static int cache_name(const char *name, u64 *hash, u32 *vs_outputs, u64 *tables) {
+    unsigned version, vo;
+    char stage_name[4];
+    unsigned long long h, t;
+    if (sscanf(name, "v%u_%2[a-z]_%16llx_%8x_%16llx.dxbc", &version, stage_name, &h, &vo, &t) != 5) return -1;
+    *hash = h; *vs_outputs = vo; *tables = t;
+    return !strcmp(stage_name, "vs") ? SHADER_VERTEX : !strcmp(stage_name, "ps") ? SHADER_PIXEL : !strcmp(stage_name, "cs") ? SHADER_COMPUTE : -1;
+}
+
+static void warm_prewarmed(Prewarm **order, u32 n);   /* (see "first draws") */
+
+/* (a thread of its own, at start) every file of the disk cache into the prewarm queue */
+static DWORD WINAPI prewarm_main(void *unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"shader prewarm");
+    Found *found;
+    u32 n = played_files(cache_dir(), &found);
     prewarm_t0 = GetTickCount64();
     prewarm_bytes0 = private_bytes();
     Prewarm *table = calloc(PREWARM_SLOTS, sizeof *table);
     prewarm_table = table;
+    Prewarm **order = n ? malloc(sizeof *order * n) : NULL;   /* (the entries in queue order) */
     Shader *head = NULL, *tail = NULL;
     u32 queued = 0;
-    for (u32 i = 0; i < n && table; i++) {
-        unsigned version, vs_outputs;
-        char stage_name[4];
-        unsigned long long hash, tables;
-        if (sscanf(found[i].name, "v%u_%2[a-z]_%16llx_%8x_%16llx.dxbc", &version, stage_name, &hash, &vs_outputs, &tables) != 5) continue;
-        int stage = !strcmp(stage_name, "vs") ? SHADER_VERTEX : !strcmp(stage_name, "ps") ? SHADER_PIXEL : !strcmp(stage_name, "cs") ? SHADER_COMPUTE : -1;
+    for (u32 i = 0; i < n && table && order; i++) {
+        u64 hash, tables;
+        u32 vs_outputs;
+        int stage = cache_name(found[i].name, &hash, &vs_outputs, &tables);
         if (stage < 0 || queued >= PREWARM_SLOTS / 2) continue;
         Shader *s = calloc(1, sizeof *s);
         s->hash = hash; s->stage = stage; s->vs_outputs = vs_outputs; s->table_hash = tables;
-        snprintf(s->name, sizeof s->name, "%s_%016llx", stage_name, hash);
+        snprintf(s->name, sizeof s->name, "%s_%016llx", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)hash);
         AcquireSRWLockExclusive(&prewarm_lock);
         s->prewarm = prewarm_slot(stage, hash, vs_outputs, tables, 1);
         if (s->prewarm && s->prewarm->state == PW_EMPTY) s->prewarm->state = PW_QUEUED;
@@ -1268,10 +1304,10 @@ static DWORD WINAPI prewarm_main(void *unused) {
         if (!s) continue;
         if (tail) tail->next_job = s; else head = s;
         tail = s;
-        queued++;
+        order[queued++] = s->prewarm;
     }
     free(found);
-    if (!queued) return 0;
+    if (!queued) { free(order); return 0; }
     prewarm_total = (LONG)queued;
     AcquireSRWLockExclusive(&jobs_lock);
     if (job_queue[2].tail) job_queue[2].tail->next_job = head; else job_queue[2].head = head;
@@ -1279,7 +1315,424 @@ static DWORD WINAPI prewarm_main(void *unused) {
     ReleaseSRWLockExclusive(&jobs_lock);
     WakeAllConditionVariable(&jobs_cv);
     fprintf(stderr, "[gfx] prewarm: %u shaders from the disk cache, on %u threads\n", queued, ncompilers - 1);
+    if (warm_first_draws) warm_prewarmed(order, queued);
+    free(order);
     return 0;
+}
+
+/* ---- first draws: for a driver that compiles a program at the first draw that uses it -------
+ * AMD's Direct3D 11 driver makes a program's GPU code at the first draw or launch with it, not
+ * when the program is created (measured elsewhere: 36 ms for a large one; another render target
+ * format, blend or depth state does not compile it again; the driver's disk cache, kept under the
+ * exe's name, gives it back in about a millisecond to a later process). So the prewarm's objects
+ * alone still left each compile to the first draw the game made with the program - in a match,
+ * the first time a move or its effect showed, every session. Here:
+ *  - once the prewarm has made a program, it is drawn once on the rendering device
+ *    (warm_prewarmed): into a 1x1 target, with a partner shader made to match its interface,
+ *    taking at most a quarter of the time, newest first. Where the driver's disk cache has the
+ *    program that is about a millisecond, during start-up; where it has not, it is a whole compile
+ *    on the renderer's time, so after 3 slow ones in a row (or 10 in all) the start-up stops there
+ *    and the game's own draws compile the rest, as before;
+ *  - when the game closes (gfx_closing), this exe starts again as ssbu --warm-shaders, which draws
+ *    every program the game has used once, on devices of its own, and exits: what the driver
+ *    compiled there is in its disk cache for the next start. Its result is in warm.log beside the
+ *    cache, which the next start shows in its log.
+ * On with AMD's driver (not under DXVK); SSBU_SHADER_WARM=0 turns it off, =1 on with any. The
+ * partners declare the stages' interface as the translator does (gpu_shader.c: struct VSOut). */
+#define WARM_SLOW_MS 20.0   /* a first draw this long compiled the program */
+
+static u32 rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
+
+/* A vertex program's generic attributes out (ATTRn of its output signature), from its DXBC;
+ * ~0u if it can't be read so. */
+static u32 dxbc_outputs(const u8 *code, size_t size) {
+    if (!code || size < 32 || memcmp(code, "DXBC", 4)) return ~0u;
+    u32 chunks = rd32(code + 28);
+    for (u32 c = 0; c < chunks && 32 + 4 * (size_t)c + 4 <= size; c++) {
+        u32 at = rd32(code + 32 + 4 * c);
+        if ((size_t)at + 8 > size) return ~0u;
+        const u8 *chunk = code + at;
+        /* (OSG5 and OSG1 elements start with their stream) */
+        u32 stride = !memcmp(chunk, "OSGN", 4) ? 24 : !memcmp(chunk, "OSG5", 4) ? 28 : !memcmp(chunk, "OSG1", 4) ? 32 : 0;
+        if (!stride) continue;
+        u32 len = rd32(chunk + 4), first = stride == 24 ? 0 : 4;
+        const u8 *d = chunk + 8;
+        if (len < 8 || (size_t)at + 8 + len > size) return ~0u;
+        u32 count = rd32(d), mask = 0;
+        for (u32 e = 0; e < count; e++) {
+            u64 el = 8 + (u64)e * stride + first;
+            if (el + 8 > len) return ~0u;
+            u32 name = rd32(d + el), index = rd32(d + el + 4);
+            if ((u64)name + 5 > len) return ~0u;
+            if (!memcmp(d + name, "ATTR", 5) && index < 32) mask |= 1u << index;
+        }
+        return mask;
+    }
+    return ~0u;
+}
+
+typedef struct Warmer {
+    ID3D11Device *dev;
+    ID3D11DeviceContext *ctx;
+    ID3D11RenderTargetView *rtv;   /* 1x1 */
+    ID3D11Query *done;
+    SRWLOCK lock;                  /* (the partners) */
+    u32 npartners;
+    struct { u32 outputs; int stage; void *obj; } partner[256];
+} Warmer;
+
+static int warmer_init(Warmer *w, ID3D11Device *d, ID3D11DeviceContext *c) {
+    memset(w, 0, sizeof *w);
+    InitializeSRWLock(&w->lock);
+    w->dev = d;
+    w->ctx = c;
+    D3D11_TEXTURE2D_DESC td = {1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+    D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+    ID3D11Texture2D *t = NULL;
+    int ok = SUCCEEDED(ID3D11Device_CreateTexture2D(d, &td, NULL, &t)) &&
+             SUCCEEDED(ID3D11Device_CreateRenderTargetView(d, (ID3D11Resource *)t, NULL, &w->rtv)) &&
+             SUCCEEDED(ID3D11Device_CreateQuery(d, &qd, &w->done));
+    if (t) ID3D11Texture2D_Release(t);
+    return ok;
+}
+
+static void warmer_free(Warmer *w) {
+    for (u32 i = 0; i < w->npartners; i++) IUnknown_Release((IUnknown *)w->partner[i].obj);
+    if (w->rtv) ID3D11RenderTargetView_Release(w->rtv);
+    if (w->done) ID3D11Query_Release(w->done);
+}
+
+/* The other side of a program's interface, on w's device (stage: the partner's): for a pixel
+ * program, a vertex shader writing its inputs (a triangle over the target); for a vertex program,
+ * a pixel shader reading all its outputs. NULL if it can't be made. */
+static void *warm_partner(Warmer *w, int stage, u32 outputs) {
+    void *obj = NULL;
+    AcquireSRWLockShared(&w->lock);
+    for (u32 i = 0; i < w->npartners && !obj; i++)
+        if (w->partner[i].stage == stage && w->partner[i].outputs == outputs) obj = w->partner[i].obj;
+    ReleaseSRWLockShared(&w->lock);
+    if (obj) return obj;
+    char src[4096];
+    int len = snprintf(src, sizeof src, "struct VSOut {\n  float4 pos : SV_Position;\n  float clipw : CLIPW;\n");
+    for (u32 n = 0; n < 32; n++)
+        if (outputs >> n & 1) len += snprintf(src + len, sizeof src - len, "  float4 a%u : ATTR%u;\n", n, n);
+    if (stage == SHADER_VERTEX)
+        snprintf(src + len, sizeof src - len, "};\nVSOut main(uint vid : SV_VertexID) {\n  VSOut o = (VSOut)0;\n"
+                                              "  o.pos = float4(vid == 1u ? 3.0f : -1.0f, vid == 2u ? -3.0f : 1.0f, 0.5f, 1.0f);\n  return o;\n}\n");
+    else {
+        len += snprintf(src + len, sizeof src - len, "};\nfloat4 main(VSOut i) : SV_Target {\n  float4 s = i.pos + i.clipw;\n");
+        for (u32 n = 0; n < 32; n++)
+            if (outputs >> n & 1) len += snprintf(src + len, sizeof src - len, "  s += i.a%u;\n", n);
+        snprintf(src + len, sizeof src - len, "  return s;\n}\n");
+    }
+    ID3DBlob *code = NULL, *errors = NULL;
+    if (SUCCEEDED(D3DCompile(src, strlen(src), "warm", NULL, NULL, "main", stage == SHADER_VERTEX ? "vs_5_0" : "ps_5_0",
+                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors)))
+        create_on(w->dev, stage, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), &obj);
+    if (code) ID3D10Blob_Release(code);
+    if (errors) ID3D10Blob_Release(errors);
+    if (!obj) return NULL;
+    void *have = NULL;
+    AcquireSRWLockExclusive(&w->lock);
+    for (u32 i = 0; i < w->npartners && !have; i++)   /* (another thread made it meanwhile) */
+        if (w->partner[i].stage == stage && w->partner[i].outputs == outputs) have = w->partner[i].obj;
+    if (!have && w->npartners < sizeof w->partner / sizeof *w->partner) {
+        w->partner[w->npartners].outputs = outputs;
+        w->partner[w->npartners].stage = stage;
+        w->partner[w->npartners++].obj = have = obj;
+        obj = NULL;
+    }
+    ReleaseSRWLockExclusive(&w->lock);
+    if (obj) IUnknown_Release((IUnknown *)obj);
+    return have;
+}
+
+/* A draw (or launch) with the program on w's context: its target, the partner, the rest of the
+ * state Direct3D's defaults. The partner must be made already (warm_partner). */
+static int warm_issue(Warmer *w, int stage, void *obj, u32 outputs) {
+    ID3D11DeviceContext *c = w->ctx;
+    if (stage == SHADER_COMPUTE) {
+        ID3D11DeviceContext_CSSetShader(c, (ID3D11ComputeShader *)obj, NULL, 0);
+        ID3D11DeviceContext_Dispatch(c, 1, 1, 1);
+        ID3D11DeviceContext_CSSetShader(c, NULL, NULL, 0);
+        return 1;
+    }
+    void *partner = warm_partner(w, stage == SHADER_VERTEX ? SHADER_PIXEL : SHADER_VERTEX, outputs);
+    if (!partner) return 0;
+    D3D11_VIEWPORT vp = {0, 0, 1, 1, 0, 1};
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &w->rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+    ID3D11DeviceContext_RSSetState(c, NULL);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(c, (ID3D11VertexShader *)(stage == SHADER_VERTEX ? obj : partner), NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, (ID3D11PixelShader *)(stage == SHADER_PIXEL ? obj : partner), NULL, 0);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    return 1;
+}
+
+static Warmer render_warmer;   /* the rendering device's: its context is the renderer's (under its lock) */
+static int render_warmer_ok;
+
+/* (init) the rendering device's warmer, and what the last run of ssbu --warm-shaders did */
+static void warm_start(void) {
+    render_warmer_ok = warmer_init(&render_warmer, dev, ctx);
+    fprintf(stderr, "[gfx] this driver compiles a shader at its first draw: the prewarm draws each one once, and when the game "
+                    "closes they are drawn again for the driver's cache (SSBU_SHADER_WARM=0 turns this off)\n");
+    char path[1100], line[512];
+    snprintf(path, sizeof path, "%s/warm.log", cache_dir());
+    FILE *f = fopen(path, "r");
+    if (f && fgets(line, sizeof line, f)) fprintf(stderr, "[gfx] after the last game: %s%s", line, strchr(line, '\n') ? "" : "\n");
+    if (f) fclose(f);
+}
+
+/* One first draw on the rendering device, between the game's: ms from the draw until the GPU had
+ * run it (-1: not drawn). */
+static double render_warm(int stage, void *obj, u32 outputs) {
+    if (stage == SHADER_COMPUTE || !warm_partner(&render_warmer, stage == SHADER_VERTEX ? SHADER_PIXEL : SHADER_VERTEX, outputs)) return -1;
+    if (!enter()) return -1;
+    u64 t0 = rt_clock_ns();
+    int drew = warm_issue(&render_warmer, stage, obj, outputs);
+    if (drew) {
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)render_warmer.done);
+        ID3D11DeviceContext_Flush(ctx);
+    }
+    forget_draw_state();   /* (the game's next draw sets all of its own again) */
+    leave();
+    if (!drew) return -1;
+    for (;;) {   /* (the lock let go between looks: the game's draws go on meanwhile) */
+        if (!enter()) return -1;
+        HRESULT hr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)render_warmer.done, NULL, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        leave();
+        double ms = (double)(rt_clock_ns() - t0) / 1e6;
+        if (hr != S_FALSE || ms > 250) return ms;
+        if (ms < 20) SwitchToThread(); else Sleep(1);
+    }
+}
+
+/* (the prewarm's thread) each prewarmed program drawn once on the rendering device, in queue
+ * order as its job finishes, unless the game took it first */
+static void warm_prewarmed(Prewarm **order, u32 n) {
+    if (!render_warmer_ok) return;
+    u64 t0 = GetTickCount64();
+    u32 drawn = 0, slow = 0, slow_run = 0;
+    double total = 0, longest = 0;
+    for (u32 i = 0; i < n && slow_run < 3 && slow < 10; i++) {
+        Prewarm *p = order[i];
+        void *obj = NULL;
+        u32 outputs = ~0u;
+        for (;;) {   /* (until its job is done: made, failed, or taken by the game first) */
+            AcquireSRWLockExclusive(&prewarm_lock);
+            LONG state = p->state;
+            if (state == PW_READY && p->obj) { obj = p->obj; IUnknown_AddRef((IUnknown *)obj); outputs = p->outputs; }
+            ReleaseSRWLockExclusive(&prewarm_lock);
+            if (state != PW_QUEUED && state != PW_LOADING) break;
+            Sleep(2);
+        }
+        if (!obj) continue;
+        double ms = outputs == ~0u ? -1 : render_warm(p->stage, obj, outputs);
+        IUnknown_Release((IUnknown *)obj);
+        if (ms < 0) continue;
+        drawn++;
+        total += ms;
+        if (ms > longest) longest = ms;
+        if (ms > WARM_SLOW_MS) { slow++; slow_run++; } else slow_run = 0;
+        Sleep((DWORD)(ms * 3));   /* (a quarter of the time at most) */
+    }
+    fprintf(stderr, "[gfx] prewarm: %u shaders drawn once on the rendering device in %.1f s (%.1f ms each on average, longest %.0f ms; %u over %.0f ms)%s\n",
+            drawn, (GetTickCount64() - t0) / 1000.0, drawn ? total / drawn : 0.0, longest, slow, WARM_SLOW_MS,
+            slow_run >= 3 || slow >= 10 ? ": stopped - the driver had not compiled them yet; the game's draws compile the rest, "
+                                          "and they are drawn for its cache when the game closes" : "");
+}
+
+#ifdef _WIN32
+/* ---- ssbu --warm-shaders <cache dir> <adapter LUID, hex>: started as the game closes. Each
+ * thread draws programs once on a device of its own (compiling on the thread itself), then lets
+ * the device go, so the driver keeps the GPU code in its disk cache. */
+typedef struct WarmRun {
+    const char *dir;
+    Found *files;
+    u32 n;
+    IDXGIAdapter1 *adapter;
+    volatile LONG next, drawn, failed, slow;
+} WarmRun;
+
+static DWORD WINAPI warm_worker(void *arg) {
+    WarmRun *r = arg;
+    D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    ID3D11Device *d = NULL;
+    ID3D11DeviceContext *c = NULL;
+    /* (SSBU_D3D_DEBUG: Direct3D's debug layer, a draw it refused counted as not drawn, its message on stderr) */
+    UINT debug = getenv("SSBU_D3D_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0;
+    if (FAILED(D3D11CreateDevice((IDXGIAdapter *)r->adapter, r->adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                 D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS | debug, levels, 2, D3D11_SDK_VERSION, &d, NULL, &c)))
+        return 1;
+    ID3D11InfoQueue *iq = NULL;
+    if (debug && FAILED(ID3D11Device_QueryInterface(d, &IID_ID3D11InfoQueue, (void **)&iq))) iq = NULL;
+    Warmer *w = calloc(1, sizeof *w);
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    if (w && warmer_init(w, d, c))
+        for (LONG i; (i = InterlockedIncrement(&r->next) - 1) < (LONG)r->n;) {
+            u64 hash, tables;
+            u32 vs_outputs;
+            int stage = cache_name(r->files[i].name, &hash, &vs_outputs, &tables);
+            char path[1300];
+            snprintf(path, sizeof path, "%s/%s", r->dir, r->files[i].name);
+            FILE *f = stage >= 0 ? fopen(path, "rb") : NULL;
+            long size = 0;
+            void *code = NULL;
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                size = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (size > 0 && (code = malloc(size)) && fread(code, 1, size, f) != (size_t)size) { free(code); code = NULL; }
+                fclose(f);
+            }
+            void *obj = NULL;
+            u32 outputs = stage == SHADER_PIXEL ? vs_outputs : stage == SHADER_VERTEX ? dxbc_outputs(code, size) : 0;
+            if (!code || outputs == ~0u || FAILED(create_on(d, stage, code, size, &obj))) {
+                free(code);
+                InterlockedIncrement(&r->failed);
+                continue;
+            }
+            free(code);
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            int ok = warm_issue(w, stage, obj, outputs);
+            if (ok) {
+                ID3D11DeviceContext_End(c, (ID3D11Asynchronous *)w->done);
+                ID3D11DeviceContext_Flush(c);
+                for (u64 until = GetTickCount64() + 10000; ID3D11DeviceContext_GetData(c, (ID3D11Asynchronous *)w->done, NULL, 0, 0) == S_FALSE &&
+                                                           GetTickCount64() < until;)
+                    SwitchToThread();
+            }
+            QueryPerformanceCounter(&b);
+            IUnknown_Release((IUnknown *)obj);
+            for (UINT64 m = 0, nm = iq ? ID3D11InfoQueue_GetNumStoredMessages(iq) : 0; m < nm; m++) {
+                SIZE_T len = 0;
+                D3D11_MESSAGE *msg = SUCCEEDED(ID3D11InfoQueue_GetMessage(iq, m, NULL, &len)) && len ? malloc(len) : NULL;
+                if (msg && SUCCEEDED(ID3D11InfoQueue_GetMessage(iq, m, msg, &len)) && msg->Severity <= D3D11_MESSAGE_SEVERITY_ERROR) {
+                    fprintf(stderr, "[warm] %s: %.*s\n", r->files[i].name, (int)msg->DescriptionByteLength, msg->pDescription);
+                    ok = 0;
+                }
+                free(msg);
+            }
+            if (iq) ID3D11InfoQueue_ClearStoredMessages(iq);
+            InterlockedIncrement(ok ? &r->drawn : &r->failed);
+            if (ok && (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart > WARM_SLOW_MS) InterlockedIncrement(&r->slow);
+        }
+    if (w) {
+        ID3D11DeviceContext_ClearState(c);
+        warmer_free(w);
+        free(w);
+    }
+    if (iq) ID3D11InfoQueue_Release(iq);
+    ID3D11DeviceContext_Release(c);
+    ID3D11Device_Release(d);
+    return 0;
+}
+
+int gfx_warm_shaders_main(const char *dir, const char *luid) {
+    HANDLE one = CreateMutexA(NULL, TRUE, "Local\\ssbu-warm-shaders");   /* (one at a time) */
+    if (!one || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    driver_stacks();
+    u64 want = strtoull(luid, NULL, 16);
+    WarmRun r;
+    memset(&r, 0, sizeof r);
+    r.dir = dir;
+    char name[128] = "the default graphics card";
+    IDXGIFactory1 *f1;
+    if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) {
+        IDXGIAdapter1 *a;
+        for (UINT i = 0; !r.adapter && SUCCEEDED(IDXGIFactory1_EnumAdapters1(f1, i, &a)); i++) {
+            DXGI_ADAPTER_DESC1 d;
+            if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) && ((u64)(u32)d.AdapterLuid.HighPart << 32 | d.AdapterLuid.LowPart) == want) {
+                r.adapter = a;
+                adapter_name(&d, name, sizeof name);
+            } else IDXGIAdapter1_Release(a);
+        }
+        IDXGIFactory1_Release(f1);
+    }
+    u64 t0 = GetTickCount64();
+    r.n = played_files(dir, &r.files);
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const char *env = getenv("SSBU_WARM_THREADS");
+    u32 nthreads = env ? (u32)atoi(env) : si.dwNumberOfProcessors / 2;
+    nthreads = nthreads < 1 ? 1 : nthreads > 6 ? 6 : nthreads;
+    HANDLE threads[6];
+    u32 started = 0;
+    for (u32 i = 0; i < nthreads && r.n; i++)
+        if ((threads[started] = CreateThread(NULL, 16 << 20, warm_worker, &r, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL))) started++;
+    if (started) WaitForMultipleObjects(started, threads, TRUE, INFINITE);
+    for (u32 i = 0; i < started; i++) CloseHandle(threads[i]);
+    char path[1100];
+    snprintf(path, sizeof path, "%s/warm.log", dir);
+    FILE *out = fopen(path, "w");
+    if (out) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(out, "%04u-%02u-%02u %02u:%02u: %ld of %u shaders drawn once on %s in %.1f s, %ld of them compiled there (over %.0f ms), %ld not drawn\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, (long)r.drawn, r.n, name, (GetTickCount64() - t0) / 1000.0, (long)r.slow,
+                WARM_SLOW_MS, (long)r.failed);
+        fclose(out);
+    }
+    free(r.files);
+    if (r.adapter) IDXGIAdapter1_Release(r.adapter);
+    return 0;
+}
+#endif
+
+/* The game is closing (its window, or the settings menu's Quit): with a driver that compiles at
+ * the first draw, the shaders it has used are drawn once more for that driver's cache, by a
+ * process of their own that goes on after this one ends (see "first draws"). */
+void gfx_closing(void) {
+#ifdef _WIN32
+    static LONG once;
+    if (!ready || !warm_first_draws || InterlockedExchange(&once, 1)) return;
+    wchar_t exe[MAX_PATH], cmd[2 * MAX_PATH + 96];
+    char dir[MAX_PATH];
+    DWORD n = GetFullPathNameA(cache_dir(), MAX_PATH, dir, NULL);
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH) || !n || n >= MAX_PATH) return;
+    _snwprintf(cmd, sizeof cmd / sizeof *cmd, L"\"%ls\" --warm-shaders \"%hs\" %llx", exe, dir,
+               (unsigned long long)((u64)(u32)warm_adapter.HighPart << 32 | warm_adapter.LowPart));
+    cmd[sizeof cmd / sizeof *cmd - 1] = 0;
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi;
+    DWORD how = DETACHED_PROCESS | BELOW_NORMAL_PRIORITY_CLASS;   /* (out of a launcher's job if it allows that: not ended with it) */
+    if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, how | CREATE_BREAKAWAY_FROM_JOB, NULL, NULL, &si, &pi) ||
+        CreateProcessW(exe, cmd, NULL, NULL, FALSE, how, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        fprintf(stderr, "[gfx] the shaders the game has used are drawn once more for the driver's cache, in the background\n");
+    }
+#endif
+}
+
+/* ---- first draws timed (every driver): how long the draw or launch that first used each shader
+ * took the renderer - where a driver compiling then would show (a [status] line) */
+u64 gfx_stat_first_draws, gfx_stat_first_slow;
+static double first_slow_ms, first_longest_ms;
+static char first_longest[64];
+
+static void first_draw_done(u64 ns, const Shader *s) {
+    double ms = (double)ns / 1e6;
+    gfx_stat_first_draws++;
+    if (ms > 4) { gfx_stat_first_slow++; first_slow_ms += ms; }
+    if (ms > first_longest_ms) { first_longest_ms = ms; snprintf(first_longest, sizeof first_longest, "%s", s->name); }
+}
+
+void gfx_status_lines(void) {
+    if (!ready || !gfx_stat_first_draws) return;
+    EnterCriticalSection(&lock);
+    fprintf(stderr, "[status] first draws with a shader: %llu, %llu of them over 4 ms (%.0f ms in all); longest %.1f ms (%s)\n",
+            gfx_stat_first_draws, gfx_stat_first_slow, first_slow_ms, first_longest_ms, first_longest);
+    LeaveCriticalSection(&lock);
 }
 
 /* Hand a shader to the compiler threads. A compute program's cache load goes to the front:
@@ -3618,6 +4071,8 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     static int force_swap = -2;   /* debug: SSBU_STENCIL_SWAP=0/1 overrides */
     if (force_swap == -2) force_swap = getenv("SSBU_STENCIL_SWAP") ? atoi(getenv("SSBU_STENCIL_SWAP")) != 0 : -1;
     int swap_faces = force_swap >= 0 ? force_swap : (int)((regs[M_WINDOW_ORIGIN] >> 4) & 1);
+    const Shader *first = !vs->drawn ? vs : ps && !ps->drawn ? ps : NULL;   /* (its first draw: timed) */
+    u64 first_t0 = first ? rt_clock_ns() : 0;
     for (int pass = 0; pass < (split ? 2 : 1); pass++) {
         if (split) {
             int back_faces = pass == 1, back = back_faces != swap_faces;
@@ -3636,6 +4091,11 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         if (indexed) ID3D11DeviceContext_DrawIndexed(ctx, regs[M_DRAW_INDEX_COUNT], index_first, (INT)regs[M_GLOBAL_BASE_VERTEX]);
         else ID3D11DeviceContext_Draw(ctx, regs[M_VERTEX_ARRAY_COUNT], regs[M_VERTEX_ARRAY_START]);
         gpu_times_after(vs->name, ps ? ps->name : "-", rt_w, rt_h);
+    }
+    if (first) {
+        first_draw_done(rt_clock_ns() - first_t0, first);
+        vs->drawn = 1;
+        if (ps) ps->drawn = 1;
     }
     gfx_stat_drawn++;
     leave();
@@ -4050,7 +4510,9 @@ void gfx_dispatch(const u32 *regs, const u32 *q) {
     }
     ID3D11DeviceContext_CSSetConstantBuffers(ctx, 0, 1, &params_buffer);
     ID3D11DeviceContext_CSSetShader(ctx, (ID3D11ComputeShader *)cs->obj, NULL, 0);
+    u64 first_t0 = cs->drawn ? 0 : rt_clock_ns();
     ID3D11DeviceContext_Dispatch(ctx, grid[0], grid[1], grid[2]);
+    if (!cs->drawn) { first_draw_done(rt_clock_ns() - first_t0, cs); cs->drawn = 1; }
     ID3D11UnorderedAccessView *none[16] = {0};
     ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 16, none, NULL);
     gfx_stat_dispatched++;

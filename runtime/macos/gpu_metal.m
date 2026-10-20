@@ -1319,6 +1319,8 @@ static void enqueue(Job *j, int q, int front) {
  * dispatch waits for it. */
 static void enqueue_shader(Shader *s) { enqueue(&s->job, s->cached ? 0 : 1, s->cached && s->stage == SHADER_COMPUTE); }
 
+void gfx_status_lines(void) {}   /* (no lines of its own yet) */
+
 /* For a crash or freeze report: what each compiler thread is doing (to line, a line at a time),
  * its program kept next to the disk cache (shadercrash/) so it can be compiled again outside the
  * game. */
