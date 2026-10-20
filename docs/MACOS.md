@@ -155,8 +155,9 @@ Terminal window that shows the game's log as it goes; closing that window leaves
 - `controllers.ini` and `display.ini` in the WindowSmash folder work as on Windows
   ([Playing](PLAYING.md#controllers)). In `display.ini`, the window's width and height are points,
   as macOS sizes windows: on a Retina display each point is 2×2 pixels. `borderless` and
-  `fullscreen` are both macOS's full screen, in a space of its own. `render_scale` isn't supported
-  on a Mac yet: the game always draws at 1920 × 1080 and is fitted into the window.
+  `fullscreen` are both macOS's full screen, in a space of its own. `render_scale` draws the
+  picture bigger than 1920 × 1080, as on Windows; `auto` counts the window's pixels, so a 1280 × 720
+  window on a Retina display (2560 × 1440 pixels) draws at 1.33, and full screen at the screen's size.
 - When the game asks for text, such as a name, a small window opens over the game for you to type
   it in.
 

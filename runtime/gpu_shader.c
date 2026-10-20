@@ -496,12 +496,17 @@ static void emit_tex(Ctx *c, const Insn *in) {
     const char *coord = coord_of(type, x, y, z, layer);
     const char *v = tmp("t%u", next_tex(c));
     /* HLSL's Sample needs constant offsets: shift the coordinates instead, in the game's texels
-     * (tsc_). MSL's sample takes any offset, in -8..7 as these are, except on cube maps */
+     * (tsc_). MSL's sample takes any offset, in -8..7 as these are, except on cube maps: there
+     * the coordinates move by the rest of the offset on a scaled render target (by 0 at 1) */
     if (offset && !(c->msl && type != TEX_CUBE && type != TEX_ARRAY_CUBE)) {
         line(c, "{ float tw_, th_, tl_; tex%u.GetDimensions(0, tw_, th_, tl_);", k);
         coord = coord_of(type, tmp("(%s + float(%s.x) * tsc_(%uu) / tw_)", x, offset, k),
                          y ? tmp("(%s + float(%s.y) * tsc_(%uu) / th_)", y, offset, k) : 0, z, layer);
         offset = NULL;
+    } else if (offset) {
+        line(c, "{");
+        coord = coord_of(type, tmp("(%s + float(%s.x) * (tsc_(%uu) - 1.0f) / float(tex%u.t.get_width()))", x, offset, k, k),
+                         y ? tmp("(%s + float(%s.y) * (tsc_(%uu) - 1.0f) / float(tex%u.t.get_height()))", y, offset, k, k) : 0, z, layer);
     } else line(c, "{");
     line(c, dref ? "  float4 %s = %s;" : "  float4 %s = swz(%s, %uu);", v, sample(c, k, type, coord, lod, lodx, dref, offset), k);
     if (dref) line(c, "  %s.w = 1.0f;", v);
@@ -1686,26 +1691,27 @@ static void put_swz(Str *out, int stage) {
         stage == SHADER_VERTEX ? 0 : 8);
 }
 
-/* Texels of a render target drawn at a render scale (gpu_d3d11.c): its scale is in the top half
- * of the texture's swizzle word (4.12 fixed point, 0 = 1). Offsets and texel numbers in the
- * game's texels become the target's own. MSL: the Metal renderer draws at the game's size, and
- * those bits of its swizzle words hold the sampler's LOD bias (lodb_): the scale is 1. */
+/* Texels of a render target drawn at a render scale (gpu_d3d11.c, macos/gpu_metal.m): its scale
+ * is 4.12 fixed point (0 = 1) in the top half of the texture's swizzle word - in MSL, whose
+ * swizzle words hold the sampler's LOD bias there (lodb_), in the spare fourth word of a storage
+ * buffer's descriptor, two textures' a word (texture k: sb[stage's first + k / 2].w, the half
+ * k & 1). Offsets and texel numbers in the game's texels become the target's own. */
 static void put_scale(Ctx *c, Str *out) {
     const char *body = c->body.s ? c->body.s : "";
     if (!strstr(body, "tsc_(") && !strstr(body, "toff_(") && !strstr(body, "tld_(")) return;
-    if (c->msl) {
-        put(out, "float tsc_(uint k) { return 1.0f; }\n"
-                 "int2 toff_(int2 o, uint k) { return o; }\n"
-                 "template <typename T> T tld_(T v, uint k) { return v; }\n");
-        return;
-    }
-    put(out, "float tsc_(uint k) { uint q = params.swz[%u + (k >> 2)][k & 3u] >> 16; return q != 0u ? float(q) / 4096.0f : 1.0f; }\n"
-             "int2 toff_(int2 o, uint k) { float s = tsc_(k); return s == 1.0f ? o : int2(round(float2(o) * s)); }\n"
+    if (c->msl)
+        put(out, "float tsc_(uint k) { uint q = (params.sb[%u + (k >> 1)].w >> ((k & 1u) * 16u)) & 0xFFFFu; return q != 0u ? float(q) / 4096.0f : 1.0f; }\n",
+            c->stage == SHADER_VERTEX ? 0 : 16);
+    else
+        put(out, "float tsc_(uint k) { uint q = params.swz[%u + (k >> 2)][k & 3u] >> 16; return q != 0u ? float(q) / 4096.0f : 1.0f; }\n",
+            c->stage == SHADER_VERTEX ? 0 : 8);
+    /* (rounding to the nearest even: HLSL's round, MSL's rint) */
+    put(out, "int2 toff_(int2 o, uint k) { float s = tsc_(k); return s == 1.0f ? o : int2(%s(float2(o) * s)); }\n"
              "int tc_(int v, float s) { return s == 1.0f ? v : int(floor((float(v) + 0.5f) * s - 0.5f)); }\n"
              "int2 tld_(int2 v, uint k) { float s = tsc_(k); return int2(tc_(v.x, s), v.y); }\n"
              "int3 tld_(int3 v, uint k) { float s = tsc_(k); return int3(tc_(v.x, s), tc_(v.y, s), v.z); }\n"
              "int4 tld_(int4 v, uint k) { float s = tsc_(k); return int4(tc_(v.x, s), tc_(v.y, s), v.z, v.w); }\n",
-        c->stage == SHADER_VERTEX ? 0 : 8);
+        c->msl ? "rint" : "round");
 }
 
 /* Global memory: a global address is looked up in each storage buffer in turn; outside them, 0. */
