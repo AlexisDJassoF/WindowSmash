@@ -130,7 +130,7 @@ The first start also writes **`display.ini`**, which sets how the game starts:
 > [!WARNING]
 > **This is the unlocked-frame-rate test build.** It always starts with the frame rate unlocked, whatever `pacing` says, to measure how fast the port can run. The game counts time in frames, so it plays faster than normal: at 240 frames a second, about four times as fast. <kbd>F7</kbd> switches to the `pacing` in `display.ini` (normal speed) and back. <kbd>F1</kbd> shows the frame rate. To start at normal speed, set `SSBU_PACING=clock` (or `vrr`, `display`) in the environment.
 >
-> Frames are presented without waiting for the monitor, so expect tearing. A graphics driver setting that forces vertical sync or caps the frame rate (NVIDIA Control Panel's *Vertical sync* or *Max Frame Rate*, AMD's *Wait for Vertical Refresh* or *Frame Rate Target Control*) still applies; turn it off for this build to see the full rate.
+> Frames are presented without waiting for the monitor, which shows the newest one at each refresh (with `pacing = vrr`, G-Sync or FreeSync shows each as it comes, and without VRR active that tears). The game runs at about twice its normal speed or more, so fast motion looks blurred or doubled, especially in photos. A graphics driver setting that forces vertical sync or caps the frame rate (NVIDIA Control Panel's *Vertical sync* or *Max Frame Rate*, AMD's *Wait for Vertical Refresh* or *Frame Rate Target Control*) still applies; turn it off for this build to see the full rate.
 
 ## Shaders and first-time stutter
 

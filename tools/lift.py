@@ -78,9 +78,13 @@ def logical(sf, opc, a, b, rd, rd_sp):
     return wr(rd, sf, f"{a} {'&|^'[opc]} {b}", sp=rd_sp)
 
 
-# SSBU_REGCACHE=1: guest registers in C locals, the context brought up to date only where
-# something else reads it (tools/regcache.py).
-REGCACHE = os.environ.get("SSBU_REGCACHE") == "1"
+# Guest registers in C locals, the context brought up to date only where something else reads
+# it (tools/regcache.py). SSBU_REGCACHE=0: every register in the context, as before.
+REGCACHE = os.environ.get("SSBU_REGCACHE", "1") != "0"
+# Not for giant functions (a 200,000-instruction one in lua2cpp_item): their locals tie the
+# optimiser in knots for half an hour; they stay as they were (the two forms call each other
+# freely: the context is right at every call and return either way).
+REGCACHE_MAX = 20000
 
 _RE_CALL = re.compile(r"(X\(30\) = 0x[0-9A-F]+ull; )(f_[0-9a-f]+\(c\);)")
 _RE_SVC = re.compile(r"(rt_svc\(c, 0x[0-9a-f]+\);)")
@@ -159,7 +163,7 @@ class Lifter(SimdMixin):
         elif falls:
             body.append((None, f'rt_trap(c, {const(self.base + self.fend)}, "fell off the end of a function");', False))
         decl = []
-        if REGCACHE:
+        if REGCACHE and len(self.words) <= REGCACHE_MAX:
             decl, cached = regcache.apply([(pc, mark_syncs(s), f) for pc, s, f in body], self.leaders,
                                           bool(self.sites) or any("rt_setjmp" in s for _pc, s, _f in body))
             body = [(pc, s, f) for (pc, s), (_pc, _s, f) in zip(cached, body)]

@@ -3114,7 +3114,9 @@ static void capture(ID3D11Texture2D *back) {
         if (getenv("SSBU_CAPTURE_MAX")) most = atoi(getenv("SSBU_CAPTURE_MAX"));
         if (getenv("SSBU_CAPTURE_EVERY")) every = (u64)(atof(getenv("SSBU_CAPTURE_EVERY")) * 1e9);
     }
-    if (!dir || count >= most || rt_now_ns() - last < every) return;
+    static double from = -1;   /* SSBU_CAPTURE_AT: the second to start at (consecutive frames mid-match) */
+    if (from < 0) from = getenv("SSBU_CAPTURE_AT") ? atof(getenv("SSBU_CAPTURE_AT")) : 0;
+    if (!dir || count >= most || rt_now_ns() - last < every || rt_now_ns() < (u64)(from * 1e9)) return;
     last = rt_now_ns();
     char path[1024];
     snprintf(path, sizeof path, "%s/frame_%03d.bmp", dir, count);

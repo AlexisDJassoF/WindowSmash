@@ -16,8 +16,9 @@
  *   display  the monitor's own refreshes (every 1st/2nd/4th at 60/120/240 Hz): every frame is
  *            on screen equally long, but the game then runs at the monitor's real rate (59.94
  *            frames a second on a 59.94 Hz monitor). Falls back to the clock on other rates.
- *   unlocked no pacing at all (a performance test): the vsync thread shows every frame the
- *            moment the game queues it, tearing where the system allows it. The game's speed
+ *   unlocked no pacing at all (a performance test): the vsync thread presents every frame the
+ *            moment the game queues it; the monitor shows the newest at each refresh (no
+ *            tearing - except with vrr pacing, where VRR does the showing). The game's speed
  *            follows its frame rate. This build starts unlocked whatever the file says; F7
  *            switches to the file's pacing and back.
  * SSBU_WINDOW, SSBU_WINDOW_SIZE (WxH) and SSBU_PACING override the file (test runs);
@@ -387,7 +388,9 @@ void display_set_tearing(int supported) { tearing = supported; }
 
 unsigned display_present_flags(void) {
     load();
-    return (unlocked || cfg.pacing == PACING_VRR) && tearing ? 0x200u /* DXGI_PRESENT_ALLOW_TEARING */ : 0;
+    /* Unlocked or not, tearing only for VRR: presenting at sync interval 0 without it, Windows
+     * shows the newest frame at each refresh and drops the rest - no tearing, and nothing waits */
+    return cfg.pacing == PACING_VRR && tearing ? 0x200u /* DXGI_PRESENT_ALLOW_TEARING */ : 0;
 }
 
 void *gfx_display_output(void);   /* gpu_d3d11.c: the swap chain's output (IDXGIOutput, referenced), or NULL */
