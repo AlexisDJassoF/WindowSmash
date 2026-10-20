@@ -70,7 +70,7 @@ The keyboard plays as player 1, together with player 1's pad if there is one:
 
 ## Controllers
 
-Up to **eight players** can use pads at once: Xbox, PlayStation, Switch Pro, and most other controllers.
+Up to **eight players** can use pads at once: Xbox, PlayStation, Switch Pro, GameCube, and most other controllers.
 
 - Each pad that connects becomes the **next free player**. A pad that's unplugged and plugged back in gets its player back.
 - Buttons go by **position**, as on a Switch controller. On an Xbox controller, the right-hand button (**B**) is the Switch's **A**, and the bottom one (**A**) is the Switch's **B**.
@@ -78,6 +78,21 @@ Up to **eight players** can use pads at once: Xbox, PlayStation, Switch Pro, and
 
 > [!NOTE]
 > PlayStation, Switch Pro and most other pads need `SDL3.dll` next to `build\ssbu.exe`. [Step 12 of the setup guide](BUILDING.md#step-12-optional-support-more-kinds-of-controllers) adds it. Without it, only Xbox (XInput) pads work, as players 1–4.
+
+### GameCube controllers
+
+GameCube controllers work through Nintendo's GameCube controller adapter (the one for Wii U and Switch), or another brand's adapter set to its **Wii U** mode. Each of the adapter's ports is its own player.
+
+They play as GameCube controllers, as they do on a Switch:
+
+- The game uses its own **GameCube controller** controls, which you can change in the game's **Options → Controls**.
+- The buttons go by the letters printed on them. **L** and **R** are analog, so the game reads how far they're pulled, and **Z** works as on the console.
+- Rumble works when the adapter's second plug (the grey one on Nintendo's adapter) is in a USB port too. WaveBird controllers have no rumble.
+
+> [!NOTE]
+> WindowSmash reads the adapter through the driver Windows installs for it. If you swapped that driver for WinUSB with Zadig (as Dolphin's setup asks), WindowSmash can't see the adapter. To undo that, open Device Manager, right-click the adapter (**WUP-028**), choose **Uninstall device** and tick the box that removes its driver, then unplug the adapter and plug it back in.
+
+Any other pad can use the game's GameCube controls too: set `style = gamecube` for it in `controllers.ini` (below). Its triggers become L and R, and its shoulder buttons become Z.
 
 ### controllers.ini
 
@@ -88,9 +103,10 @@ The first time the game starts, it writes **`controllers.ini`** into the WindowS
 | `keyboard_player` | Which player the keyboard adds to: 1–8, or 0 for no keyboard. | `1` |
 | `background` | `1`: pads keep working while the game window isn't in front. `0`: only while it is. | `1` |
 | `layout` | `positional`: buttons by position, as on a Switch pad. `labels`: by the letter printed on the pad (PlayStation pads stay positional). | `positional` |
+| `style` | `auto`: GameCube controllers play as GameCube controllers, other pads as Pro Controllers. `gamecube` or `pro`: this pad plays as that kind of controller. | `auto` |
 | `deadzone` | How much of the stick's travel around the centre is ignored, 0–50 percent. | `0` |
 | `rumble` | Rumble strength, 0–100 percent. `0` turns it off. | `100` |
-| `trigger_threshold` | How far a trigger must be pulled to press ZL or ZR, 1–99 percent. | `25` |
+| `trigger_threshold` | How far a trigger must be pulled to press ZL or ZR, 1–99 percent. (On a GameCube controller, the game itself decides how far L and R are pulled.) | `25` |
 | *remaps* | `<Switch button> = <pad control>`, for example `ZR = rightshoulder`. The file lists every name. | |
 
 The file has these sections:
@@ -100,7 +116,7 @@ The file has these sections:
 - **`[device default]`** applies to every pad.
 - **`[device ps5]`**, **`[device <name>]`** or **`[device <GUID>]`** applies to one kind of pad, or one pad. Types include `xbox360`, `xboxone`, `ps4`, `ps5`, `switchpro`, `joyconpair` and `gamecube`.
 
-For example, to make every pad use the printed letters and turn rumble down on a PlayStation 5 pad:
+For example, to make every pad use the printed letters, turn rumble down on a PlayStation 5 pad, and give Xbox One pads the game's GameCube controls:
 
 ```ini
 [device default]
@@ -108,6 +124,9 @@ layout = labels
 
 [device ps5]
 rumble = 60
+
+[device xboxone]
+style = gamecube
 ```
 
 ## Window and display
