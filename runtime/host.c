@@ -369,6 +369,7 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
 /* ---- Linux: faults and other threads' stacks come through signals ---------------------- */
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <setjmp.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <sys/syscall.h>
@@ -386,6 +387,24 @@ static void host_frame(const char *indent, void *pc) {   /* "[module +offset]" *
     } else out("%s[%#llx]\n", indent, (u64)pc);
 }
 
+/* A stack walked from a signal handler, on its own thread: the walk may come upon a frame it
+ * cannot read - the thread stopped halfway through a stack switch (rt_fiber_switch has no
+ * unwind information) - and a fault there would end the game for a diagnostic (the status
+ * report's thread list, every 30 s, ended a match after 7 minutes). Such a fault comes back
+ * here instead (on_fault), and the walk gives what it had: nothing. */
+static __thread sigjmp_buf *volatile unwind_escape;
+
+int rt_guarded_backtrace(void **frames, int max) {
+    sigjmp_buf env;
+    volatile int n = 0;
+    if (sigsetjmp(env, 1) == 0) {
+        unwind_escape = &env;
+        n = backtrace(frames, max);
+    }
+    unwind_escape = NULL;
+    return n;
+}
+
 /* Another thread's frames: it is interrupted and records its own stack. */
 #define SIG_BACKTRACE (SIGRTMIN + 2)
 static void *bt_frames[96];
@@ -395,7 +414,7 @@ static sem_t bt_done;
 static void on_backtrace_signal(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si; (void)uc;
     int saved = errno;
-    bt_count = backtrace(bt_frames, 96);
+    bt_count = rt_guarded_backtrace(bt_frames, 96);
     sem_post(&bt_done);
     errno = saved;
 }
@@ -430,6 +449,7 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
 static void on_fault(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
     if (sig == SIGSEGV && (uc->uc_mcontext.gregs[REG_ERR] & 2) && rt_ww_fault(si->si_addr)) return;
+    if ((sig == SIGSEGV || sig == SIGBUS) && unwind_escape) siglongjmp(*unwind_escape, 1);   /* (a stack walk's: rt_guarded_backtrace) */
     static volatile pid_t reporter;
     pid_t me = gettid(), none = 0;
     if (reporter == me) _exit(6);   /* (a fault while reporting one) */

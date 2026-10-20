@@ -357,6 +357,7 @@ static void report(U64 total, U64 busy) {
  * A thread is interrupted by SIG_PROFILE and its handler notes where it is (and its stack, when
  * asked). One shot at a time, for F6, freeze reports and the hitch log alike. */
 #define SIG_PROFILE (SIGRTMIN + 3)
+int rt_guarded_backtrace(void **frames, int max);   /* host.c */
 typedef struct Shot { U64 rip; int waiting, depth; void *frames[STACK_DEPTH + 8]; } Shot;
 static struct { Shot s; int want_stack; } shot;
 static sem_t shot_done;
@@ -370,7 +371,7 @@ static void on_sample(int sig, siginfo_t *si, void *ucv) {
     const unsigned char *at = (const unsigned char *)rip;
     shot.s.rip = rip;
     shot.s.waiting = (rip & 0xFFF) >= 2 && at[-2] == 0x0F && at[-1] == 0x05;   /* (stopped just after a `syscall`) */
-    shot.s.depth = shot.want_stack ? backtrace(shot.s.frames, STACK_DEPTH + 8) : 0;
+    shot.s.depth = shot.want_stack ? rt_guarded_backtrace(shot.s.frames, STACK_DEPTH + 8) : 0;   /* (host.c: a walk that faults gives none) */
     sem_post(&shot_done);
     errno = saved;
 }
