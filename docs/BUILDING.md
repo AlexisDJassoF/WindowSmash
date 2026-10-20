@@ -348,7 +348,7 @@ python tools/recomp.py all dump/exefs --out build --jobs 8
 python tools/recomp.py all dump/exefs --out build --jobs 16
 ```
 
-- It takes **30 minutes to a few hours**, and prints a lot while it works. The PC can be slow meanwhile.
+- It takes **30 minutes to a few hours**, and prints a lot while it works. The PC can be slow meanwhile. A bar on the last line shows how far it has got and the time left (once the first files are compiled); the window's title shows it too.
 - If it's interrupted (a restart, the PC going to sleep), run the same command again: it carries on where it stopped.
 - It's finished when a line says `linked … objects into build\ssbu.exe` and the `PS C:\WindowSmash>` line comes back.
 

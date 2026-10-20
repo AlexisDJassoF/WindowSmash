@@ -2,6 +2,7 @@
 import glob
 import os
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import codec_libs   # (this folder, which every importer of cc puts on sys.path)
@@ -80,11 +81,18 @@ def compile_many(sources, jobs=16, opt="/O2"):
         return list(pool.map(lambda s: compile_one(s, os.path.splitext(s)[0] + ".obj", opt), sources))
 
 
-def compile_each(jobs_list, jobs=16):
-    """Compile (src, obj, opt) triples in parallel; returns [(src, error text)] for failures."""
+def compile_each(jobs_list, jobs=16, started=None, finished=None):
+    """Compile (src, obj, opt) triples in parallel, in order; returns [(src, error text)] for
+    failures. started(job) and finished(job, seconds), if given, are called (from the worker
+    threads) as each one starts and ends."""
     def one(job):
         src, obj, opt = job
+        if started:
+            started(job)
+        t0 = time.time()
         r = subprocess.run([CLANG, "/c", opt, *CFLAGS, src, "/Fo" + obj], capture_output=True, text=True)
+        if finished:
+            finished(job, time.time() - t0)
         return (src, r.stdout + r.stderr) if r.returncode else None
     with ThreadPoolExecutor(jobs) as pool:
         return [f for f in pool.map(one, jobs_list) if f]
