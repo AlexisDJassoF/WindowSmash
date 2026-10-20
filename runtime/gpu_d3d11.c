@@ -3818,16 +3818,18 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         t->RenderTargetWriteMask = (UINT8)((mask & 1 ? 1 : 0) | (mask & 0x10 ? 2 : 0) | (mask & 0x100 ? 4 : 0) | (mask & 0x1000 ? 8 : 0));
         t->BlendEnable = regs[M_BLEND_ENABLE(i)] & 1;
         if (!t->BlendEnable) continue;
+        /* The alpha op and factors apply as written, whatever the "separate for alpha" flag says (as in yuzu/Eden):
+         * the game never sets that flag. Copying the colour ones into alpha wrote the shader's alpha where the game
+         * keeps the target's - e.g. the results cards (alpha ONE/ONE) lost the alpha under Mega Man's eyes, whose
+         * clap animation gives them alpha 0, and showed the card behind through them. */
         u32 base = regs[M_BLEND_STATE_PER_TARGET] & 1 ? M_BLEND_PER_TARGET(i) + 1 : 0;
         u32 cop, csrc, cdst, aop, asrc, adst;
         if (base) {
             cop = regs[base]; csrc = regs[base + 1]; cdst = regs[base + 2]; aop = regs[base + 3]; asrc = regs[base + 4]; adst = regs[base + 5];
-            if (!(regs[base - 1] & 1)) { aop = cop; asrc = csrc; adst = cdst; }   /* the target's own "separate alpha" */
         }
         else {
             cop = regs[M_BLEND_COLOR_OP]; csrc = regs[M_BLEND_COLOR_SRC]; cdst = regs[M_BLEND_COLOR_DST];
             aop = regs[M_BLEND_ALPHA_OP]; asrc = regs[M_BLEND_ALPHA_SRC]; adst = regs[M_BLEND_ALPHA_DST];
-            if (!(regs[M_BLEND_SEPARATE_ALPHA] & 1)) { aop = cop; asrc = csrc; adst = cdst; }
         }
         t->BlendOp = blend_op(cop); t->SrcBlend = blend_factor(csrc); t->DestBlend = blend_factor(cdst);
         t->BlendOpAlpha = blend_op(aop); t->SrcBlendAlpha = alpha_factor(blend_factor(asrc)); t->DestBlendAlpha = alpha_factor(blend_factor(adst));
