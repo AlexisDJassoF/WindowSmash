@@ -5,12 +5,14 @@ Usage:
   shader_aot.py [--tree <dir>] [--jobs N] [--dry]
 
 The game's GPU programs are stored in data.arc as they are uploaded: in the effect files
-(.eff), the shader databases (.nushdb) and nested archives (.arc). This finds every program
-there (by its header word: 256-byte boundaries + 0x30 in effects and archives, 16-byte ones in
-databases), keeps one copy of each, pairs each pixel program with the vertex programs of its
-file (a vertex program's outputs are its pixel program's inputs), and has
-tools/shaderaot.c translate and compile them all into <tree>/dump/shadercache, exactly as the
-renderer would: a program's first use in the game then loads its DXBC instead of compiling it.
+(.eff), the shader databases (.nushdb) and nested archives (.arc); a few more are built into the
+game's main executable (dump/modules/main.reloc.bin). This finds every program there (by its
+header word: 256-byte boundaries + 0x30 in effects and archives, 8-byte ones in databases - half
+of a database's programs start 8 bytes past a 16-byte one - and 16-byte ones in the executables),
+keeps one copy of each, pairs each pixel program with the vertex programs of its file (a vertex
+program's outputs are its pixel program's inputs), and has tools/shaderaot.c translate and
+compile them all into <tree>/dump/shadercache, exactly as the renderer would: a program's first
+use in the game then loads its DXBC instead of compiling it.
 
 The files are dated 2001-01-01 until the game first uses them, so the start's prewarm only
 makes the shaders the game has used. Programs with indirect branches are left out (their key
@@ -91,12 +93,54 @@ def read_retried(arc, off, size, pause=0.5):
             time.sleep(pause)
 
 
-def find_programs(arc, read_errors=None, pause=0.5):
+# the first two bytes of every word is_header takes (the second's top bits are flags: MRT, kills pixels)
+HEADER_START = re.compile(rb"\x61[\x04\x44\x84\xc4]|\x62[\x14\x54\x94\xd4]")
+
+
+def add_file(programs, ids, data, step, start):
+    """The programs in one file's bytes (at start + a multiple of step) into programs/ids, each
+    pixel program paired with every vertex program of the file: the one before it is right for
+    only about 60 % of the cache's pairs, the file's for about 95 % (the game has only a few dozen
+    distinct vertex output masks, so this stays small)."""
+    mv = memoryview(data)
+    at = [k for k in (m.start() for m in HEADER_START.finditer(data))
+          if k >= start and (k - start) % step == 0 and k < len(data) - 0x60 and is_header(int.from_bytes(mv[k:k + 4], "little"))]
+    here = ([], [])
+    for j, k in enumerate(at):
+        end = min(len(data), k + MAX_PROGRAM, at[j + 1] if j + 1 < len(at) else len(data))
+        blob = bytes(mv[k:end])
+        stage = 0 if blob[0] & 0x1F == 1 else 1
+        key = hashlib.blake2b(blob, digest_size=16).digest()
+        pid = ids.get(key)
+        if pid is None:
+            pid = ids[key] = len(programs)
+            programs.append([stage, blob, set()])
+        here[stage].append(pid)
+    for pid in here[1]:
+        programs[pid][2].update(here[0])
+
+
+MODULES = ("main", "sdk", "subsdk0")
+
+
+def module_images(tree):
+    """The game's executables as loaded (<tree>/dump/modules/<name>.reloc.bin) that are there: some
+    programs are built into main (the menus', the title's, the screen's own passes)."""
+    paths = [os.path.join(tree, "dump", "modules", name + ".reloc.bin") for name in MODULES]
+    return [p for p in paths if os.path.isfile(p)]
+
+
+def find_programs(arc, read_errors=None, pause=0.5, modules=()):
     """Distinct programs: list of [stage, bytes, set of paired vertex program ids], and how many
     files could not be read. A file the disk can't read is left out (its shaders compile when the
-    game first uses them, as without this tool); read_errors, a list, gets each such error."""
+    game first uses them, as without this tool); read_errors, a list, gets each such error.
+    modules: executables' images, scanned too (their programs on 16-byte boundaries; one that
+    isn't one - no end within MAX_PROGRAM - shaderaot leaves out)."""
     programs, ids = [], {}
     unread, failing = 0, 0
+    for path in modules:
+        with open(path, "rb") as f:
+            add_file(programs, ids, f.read(), 16, 0)
     for ext, (off, stored, size, flags) in containers(arc):
         if not stored or not size:   # (an empty file - data.arc has a few, marked compressed: nothing in it)
             continue
@@ -117,25 +161,8 @@ def find_programs(arc, read_errors=None, pause=0.5):
             except Exception:
                 unread += 1
                 continue
-        step, start = (16, 0) if ext == "nushdb" else (256, 0x30)
-        mv = memoryview(data)
-        at = [k for k in range(start, len(data) - 0x60, step) if is_header(int.from_bytes(mv[k:k + 4], "little"))]
-        here = ([], [])
-        for j, k in enumerate(at):
-            end = min(len(data), k + MAX_PROGRAM, at[j + 1] if j + 1 < len(at) else len(data))
-            blob = bytes(mv[k:end])
-            stage = 0 if blob[0] & 0x1F == 1 else 1
-            key = hashlib.blake2b(blob, digest_size=16).digest()
-            pid = ids.get(key)
-            if pid is None:
-                pid = ids[key] = len(programs)
-                programs.append([stage, blob, set()])
-            here[stage].append(pid)
-        # a pixel program is paired with every vertex program of its file: the one before it
-        # is right for only about 60 % of the cache's pairs, the file's for about 95 % (the
-        # game has only a few dozen distinct vertex output masks, so this stays small)
-        for pid in here[1]:
-            programs[pid][2].update(here[0])
+        step, start = (8, 0) if ext == "nushdb" else (256, 0x30)
+        add_file(programs, ids, data, step, start)
     return programs, unread
 
 
@@ -233,7 +260,7 @@ def main():
     arc = A.Arc(os.path.join(tree, "dump", "modules", "romfs.cfg"))
     read_errors = []
     try:
-        programs, unread = find_programs(arc, read_errors)
+        programs, unread = find_programs(arc, read_errors, modules=module_images(tree))
     except DiskGone as e:
         raise SystemExit(f"\nThe disk stopped answering: {READ_GIVE_UP} of the game's files running could not be read "
                          f"({e}). Check that it is still there (an SD card that came loose, a drive that went to sleep), "

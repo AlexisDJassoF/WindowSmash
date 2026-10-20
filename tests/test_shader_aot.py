@@ -78,6 +78,58 @@ class ReadErrorTests(unittest.TestCase):
         self.assertIn('copy WindowSmash made', shader_aot.read_error_text([e], tree))
 
 
+VS_WORD = 1 | 3 << 5 | 1 << 10 | 3 << 17   # a vertex program's first word (is_header's)
+PS_WORD = 2 | 3 << 5 | 5 << 10 | 3 << 17   # a pixel program's
+MRT, KILLS = 1 << 14, 1 << 15              # (flags most pixel programs have in that word)
+
+
+def blob_with(size, programs):
+    """size zero bytes with each (offset, first word) put in."""
+    data = bytearray(size)
+    for at, word in programs:
+        data[at:at + 4] = word.to_bytes(4, 'little')
+    return bytes(data)
+
+
+class ScanTests(unittest.TestCase):
+    """Where programs are looked for. In 11.0.0 the scan missed half of the shader databases'
+    programs (they start 8 bytes past a 16-byte boundary), every program built into the game's
+    executable, and with the first two bytes looked for, every pixel program with flags."""
+
+    def scan(self, ext, data):
+        arc = types.SimpleNamespace(read=lambda off, n: data[:n])
+        with mock.patch.object(shader_aot, 'containers', lambda a: [(ext, (0, len(data), len(data), 0))]):
+            programs, unread = shader_aot.find_programs(arc)
+        return [(stage, len(blob)) for stage, blob, _pairs in programs]
+
+    def test_databases_on_8_byte_boundaries(self):
+        data = blob_with(0x400, [(0x10, VS_WORD), (0x108, PS_WORD | MRT), (0x204, VS_WORD)])
+        self.assertEqual(self.scan('nushdb', data), [(0, 0xF8), (1, 0x2F8)])   # (not the one 4 bytes off)
+
+    def test_effects_on_256_byte_boundaries_and_0x30(self):
+        data = blob_with(0x400, [(0x30, VS_WORD), (0x130, PS_WORD | KILLS), (0x140, PS_WORD)])
+        self.assertEqual(self.scan('eff', data), [(0, 0x100), (1, 0x2D0)])
+
+    def test_every_header_word_is_looked_at(self):
+        for word in range(1 << 16):
+            word |= 3 << 17
+            if shader_aot.is_header(word):
+                self.assertTrue(shader_aot.HEADER_START.match(word.to_bytes(4, 'little')), hex(word))
+
+    def test_programs_in_the_executables(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            modules = Path(d) / 'dump' / 'modules'
+            modules.mkdir(parents=True)
+            (modules / 'main.reloc.bin').write_bytes(blob_with(0x300, [(0x50, VS_WORD), (0x130, PS_WORD | MRT | KILLS), (0x208, VS_WORD)]))
+            paths = shader_aot.module_images(d)
+            self.assertEqual([Path(p).name for p in paths], ['main.reloc.bin'])
+            arc = types.SimpleNamespace(read=lambda off, n: b'')
+            with mock.patch.object(shader_aot, 'containers', lambda a: []):
+                programs, _ = shader_aot.find_programs(arc, modules=paths)
+        self.assertEqual([(stage, len(blob), sorted(pairs)) for stage, blob, pairs in programs], [(0, 0xE0, []), (1, 0x1D0, [0])])
+
+
 class RomfsImageReadErrorTests(unittest.TestCase):
     def test_the_error_names_its_file(self):
         import nca
