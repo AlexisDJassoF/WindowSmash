@@ -45,7 +45,7 @@ int rt_trace;
 static int status_every;   /* seconds between thread dumps, 0 for none */
 extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_stat_dispatched, gfx_stat_residents, gfx_stat_clears, gfx_stat_drawn, gfx_stat_skipped,
     gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology,
-    gfx_skip_target;
+    gfx_skip_target, gfx_stat_unmap_dropped;
 u64 present_frames(void);
 void gfx_report_compiles(void (*line)(const char *text));
 const char *rt_data_dir;
@@ -872,9 +872,9 @@ static void print_status(void) {
             (double)rt_now_ns() / 1e9, phase, gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gfx_stat_clears, gpu_stat_dispatches,
             gfx_stat_dispatched, gfx_stat_residents,
             present_frames());
-    fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures (%llu unpacked); %llu ms watching writes\n",
+    fprintf(stderr, "[status] renderer: %llu draws drawn, %llu skipped (%llu shader, %llu topology, %llu target); %llu shaders (%llu failed), %llu textures (%llu unpacked); %llu ms watching writes; %llu buffers dropped after unmaps\n",
             gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, gfx_skip_topology, gfx_skip_target, gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked,
-            gfx_stat_watch_us / 1000);
+            gfx_stat_watch_us / 1000, gfx_stat_unmap_dropped);
     u32 fiber_slots, fibers_finalized;
     u64 fibers_made;
     fiber_counts(&fiber_slots, &fibers_finalized, &fibers_made);

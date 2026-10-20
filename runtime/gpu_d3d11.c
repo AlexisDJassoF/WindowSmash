@@ -681,7 +681,14 @@ static int enter(void) {
     return 1;
 }
 
+/* GPU addresses and guest memory taken away, whose cached data is not dropped yet ([lo, hi);
+ * hi 0: none). Dropped as the outermost entry point leaves (below: forget_unmapped). */
+typedef struct Span { u64 lo, hi; } Span;
+static Span unmapped_va, unmapped_guest;
+static void forget_unmapped(void);
+
 static void leave(void) {
+    if (enter_depth == 1 && (unmapped_va.hi || unmapped_guest.hi)) forget_unmapped();
     if (!--enter_depth) gfx_stat_busy_ns += rt_clock_ns() - enter_t0;
     LeaveCriticalSection(&lock);
 }
@@ -1712,7 +1719,8 @@ static void resident_snapshot(Resident *r) {
 }
 
 /* n bytes of guest memory at g, or 0 if they are not there any more: the guest can unmap the
- * memory under a resident region (svc UnmapPhysicalMemory) and the renderer does not hear of it. */
+ * memory under a resident region (svc UnmapPhysicalMemory). The renderer hears of that and drops
+ * the region (gfx_guest_unmapped), but only if the memory held an nvmap allocation when it went. */
 #ifdef _WIN32
 extern __declspec(thread) int rt_probing;   /* host.c: the crash handler leaves a fault to us */
 static __declspec(noinline) void copy_guest(void *dst, const void *src, u32 n) { memcpy(dst, src, n); }
@@ -1771,9 +1779,10 @@ static void resident_watch_reset(Resident *r) {
  * which drew effect meshes at a stale size over the whole screen (the white-outs). Checked
  * when a draw or dispatch uses the region (once a submission) and once a frame for all.
  * Whole pages go to the GPU copy through a copy of their own too, never straight from guest
- * memory: the driver reads what it is given unguarded, and a region outlives the memory under
- * it when the guest unmaps that (a region with no partial pages has no edges to find that out
- * by) - players' games crashed in the graphics driver on the vsync thread after 20-40 minutes. */
+ * memory: the driver reads what it is given unguarded. A region is dropped when the guest
+ * unmaps the memory under it (gfx_guest_unmapped), but before it was, regions outlived that
+ * memory and players' games crashed in the graphics driver on the vsync thread after 20-40
+ * minutes; the guarded copy stays for memory taken away without notice. */
 static void resident_sync(Resident *r, int every_frame) {
     static int no_pages = -1;   /* debug: leave resident regions alone */
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
@@ -2562,6 +2571,14 @@ static void kept_blocks_add(const KeptCb *e, int d) {
     for (u64 b = e->va >> 16; b <= (e->va + e->size - 1) >> 16; b++) kept_blocks[KEPT_BLOCK(b)] += (u16)d;
 }
 
+static void kept_drop(KeptCb *e) {
+    if (e->srv) kept_blocks_add(e, -1);
+    bury(e->srv);   /* (may be bound still) */
+    bury(e->buf);
+    free(e->shadow);
+    memset(e, 0, sizeof *e);
+}
+
 /* The command stream wrote [lo, hi) of GPU VA (guest memory has it already). */
 static void kept_apply(u64 lo, u64 hi) {
     int any = 0;
@@ -2653,11 +2670,7 @@ static ID3D11ShaderResourceView *kept_cb(u64 va, u32 size) {
     u32 mapped = kept_mapped(va, g, size);
     if (!watched(g, mapped)) return NULL;
     if (!e) e = lru;
-    if (e->srv) kept_blocks_add(e, -1);
-    bury(e->srv);   /* (may be bound still) */
-    bury(e->buf);
-    free(e->shadow);
-    memset(e, 0, sizeof *e);
+    kept_drop(e);
     if (kept_verify < 0) kept_verify = getenv("SSBU_KEPT_VERIFY") != NULL;
     u32 cap = (size + 15) & ~15u;
     D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
@@ -3561,6 +3574,13 @@ typedef struct InputBuf { u64 va, guest; u32 size; ID3D11Buffer *buf; ID3D11Unor
 static InputBuf inputs[128];
 static u64 input_clock;
 
+static void input_drop(InputBuf *b) {
+    bury(b->uav);   /* (may be bound still) */
+    bury(b->buf);
+    free(b->shadow);
+    memset(b, 0, sizeof *b);
+}
+
 static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     static int verify = -1;   /* SSBU_INPUT_VERIFY (debugging): keep a copy of what each holds, and report uses that find memory different */
     if (verify < 0) verify = getenv("SSBU_INPUT_VERIFY") != NULL;
@@ -3591,10 +3611,7 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
         return b->uav;
     }
     b = lru;
-    bury(b->uav);   /* (may be bound still) */
-    bury(b->buf);
-    free(b->shadow);
-    memset(b, 0, sizeof *b);
+    input_drop(b);
     D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
     u8 *init = calloc(1, cap);
     watch_written(g, size, &b->seen);   /* (before reading: a write meanwhile is news next time) */
@@ -3614,6 +3631,58 @@ static ID3D11UnorderedAccessView *input_uav(u64 va, u32 size) {
     if (FAILED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)b->buf, &ud, &b->uav))) { ID3D11Buffer_Release(b->buf); b->buf = NULL; return NULL; }
     b->va = va; b->guest = g; b->size = size; b->used = ++input_clock;
     return b->uav;
+}
+
+/* ---- memory taken away --------------------------------------------------------------------
+ * Resident regions, kept constant buffers and compute inputs are made from the guest memory at
+ * a GPU address, and outlive the draws that made them. When the game unmaps that address, or
+ * the memory under it, the device layer says so (hle_nv.c, once the GPU thread's queued work
+ * has run) and they are dropped: their next use makes them again from what is there then.
+ * Before, nothing told them. A region went on checking memory that was gone - the graphics
+ * driver crashed reading it on the vsync thread, in players' games after 20-40 minutes - and a
+ * buffer the game mapped at the same address later read the old region's GPU data instead of
+ * its own. Dropped under the lock, as the outermost entry point leaves (for these calls, their
+ * own): no entry point keeps a pointer to a region or buffer across leave(), and resident_drop
+ * moves regions around. What is dropped may still be bound: its views are buried. */
+u64 gfx_stat_unmapped, gfx_stat_unmap_dropped;   /* (notices the renderer had; what they dropped) */
+
+static int spans(Span s, u64 a, u64 n) { return a && n && a < s.hi && s.lo < a + n; }
+
+static void forget_unmapped(void) {
+    Span va = unmapped_va, g = unmapped_guest;
+    unmapped_va = unmapped_guest = (Span){0, 0};
+    for (u32 i = 0; i < nresidents;) {
+        Resident *r = &residents[i];
+        if (spans(va, r->va, r->size) || spans(g, r->guest, r->size)) { resident_drop(r); gfx_stat_unmap_dropped++; }
+        else i++;   /* (resident_drop moved the last region here) */
+    }
+    for (u32 i = 0; i < KEPT_SETS * KEPT_WAYS; i++) {   /* (a kept buffer holds the part mapped in one piece) */
+        KeptCb *e = &kept[i];
+        if (e->srv && (spans(va, e->va, e->mapped) || spans(g, e->guest, e->mapped))) { kept_drop(e); gfx_stat_unmap_dropped++; }
+    }
+    for (u32 i = 0; i < 128; i++) {
+        InputBuf *b = &inputs[i];
+        if (b->buf && (spans(va, b->va, b->size) || spans(g, b->guest, b->size))) { input_drop(b); gfx_stat_unmap_dropped++; }
+    }
+}
+
+static void note_unmapped(Span *s, u64 lo, u64 size) {   /* (one waiting already: widened over both) */
+    if (!size) return;
+    if (!s->hi || lo < s->lo) s->lo = lo;
+    if (lo + size > s->hi) s->hi = lo + size;
+    gfx_stat_unmapped++;
+}
+
+void gfx_gpu_unmapped(u64 va, u64 size) {
+    if (!ready || !enter()) return;   /* (nothing is kept before the renderer is up) */
+    note_unmapped(&unmapped_va, va, size);
+    leave();
+}
+
+void gfx_guest_unmapped(u64 addr, u64 size) {
+    if (!ready || !enter()) return;
+    note_unmapped(&unmapped_guest, addr, size);
+    leave();
 }
 
 void gfx_dispatch(const u32 *regs, const u32 *q) {
@@ -4082,6 +4151,8 @@ void gfx_present(u64 guest, u32 width, u32 height) {
             for (u32 i = 0; i < KEPT_SETS * KEPT_WAYS; i++) nk += kept[i].srv != NULL;
             fprintf(stderr, "[stats] kept constant buffers: %u; so far %llu made, %llu updated by the command stream, %llu taken again after CPU writes, %llu mismatches\n",
                     nk, gfx_stat_kept_made, gfx_stat_kept_applied, gfx_stat_kept_reloaded, gfx_stat_kept_mismatches);
+            fprintf(stderr, "[stats] memory taken away: %llu unmaps heard, %llu resident regions, kept buffers and compute inputs dropped\n",
+                    gfx_stat_unmapped, gfx_stat_unmap_dropped);
             static u64 last_compared, compared_frames0;
             fprintf(stderr, "[stats] state objects: %u rasterizer, %u depth/stencil, %u blend, %u samplers; reuse checks compared %.2f MB/frame\n",
                     raster_state_count, depth_state_count, blend_state_count, nsamplers,
