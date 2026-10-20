@@ -25,6 +25,7 @@
 #include "settings.h"
 
 int gfx_window_focused(void);
+void gfx_closing(void);   /* (gpu_d3d11.c) the game is about to end */
 #ifdef _WIN32
 int gfx_adapter_names(char names[][64], int max);   /* (gpu_d3d11.c) the graphics cards, fastest first */
 #endif
@@ -663,7 +664,7 @@ static void event(int ev, unsigned ch) {
             int what = confirm;
             confirm = 0;
             if (what == R_RESTART) settings_restart();
-            else { fprintf(stderr, "[menu] quit\n"); fflush(stderr); ExitProcess(0); }
+            else { fprintf(stderr, "[menu] quit\n"); gfx_closing(); fflush(stderr); ExitProcess(0); }
         } else if (ev == EV_B || ev == EV_BKSP || ev == EV_ESC) confirm = 0;
         return;
     }
