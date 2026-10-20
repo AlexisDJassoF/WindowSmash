@@ -2,6 +2,7 @@
 import glob
 import json
 import os
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -101,6 +102,38 @@ else:
     SDL3_DLL = None
 EXTRA_LIBS = OPUS_LIBS + VPX_LIBS + (["/NODEFAULTLIB:msvcrt.lib"] if EXTERNAL_LIBS else [])
 
+# Compiler crashes. A player's build stopped on two files that clang-cl crashed on (access violations,
+# one in the parser, one in the optimiser) where the very same clang-cl compiles them here: a PC short
+# of memory, or one not quite stable, does that, and it rarely happens twice to the same file. So
+# compile_each compiles a file the compiler crashed on again, on its own once the others are done, at
+# these levels: its own, then /O1 (fewer optimiser passes; the giant functions are built at /O1 anyway).
+# Never /Od: the C's huge functions would want huge stack frames. A crash is told from an error in the
+# code by what clang prints (it exits with 1 either way): its crash handler's report, or LLVM's own fatal
+# errors such as running out of memory; a clang-cl that crashes outright exits with the exception code.
+RETRY = {"/O2": ("/O2", "/O1"), "/O1": ("/O1", "/O1")}
+CRASH_SIGNS = ("PLEASE submit a bug report", "Stack dump:", "frontend command failed", "LLVM ERROR:")
+# and without a bug report's files: after a crash clang would preprocess the file again, into %TEMP%
+NO_CRASH_FILES = "-fno-crash-diagnostics"
+
+
+def crashed(code, out):
+    """Whether a failed compile (exit code, output) was the compiler crashing."""
+    return code < 0 or code >= 0xC0000000 or any(sign in out for sign in CRASH_SIGNS)
+
+
+def crash_cause(code, out):
+    """A crash's cause in a few words, for the build's log."""
+    if "LLVM ERROR: out of memory" in out:
+        return "out of memory"
+    found = re.search(r"Exception Code: (0x[0-9A-Fa-f]+)", out)
+    return f"exception {found.group(1)}" if found else f"exception 0x{code:08X}" if code >= 0xC0000000 else "a crash"
+
+
+def crash_report(out):
+    """A crash's output without the compiler's command line and its raw stack frames."""
+    return "\n".join(line for line in out.splitlines() if line.strip() and not re.match(r"\s*#\d+ 0x", line)
+                     and "Program arguments:" not in line and not line.startswith("PLEASE submit"))
+
 
 def compile_one(src, obj, opt="/O2"):
     r = subprocess.run([CLANG, "/c", opt, *CFLAGS, src, "/Fo" + obj], capture_output=True, text=True)
@@ -115,21 +148,49 @@ def compile_many(sources, jobs=16, opt="/O2"):
         return list(pool.map(lambda s: compile_one(s, os.path.splitext(s)[0] + ".obj", opt), sources))
 
 
-def compile_each(jobs_list, jobs=16, started=None, finished=None):
+def _compile(src, obj, opt):
+    r = subprocess.run([CLANG, "/c", opt, *CFLAGS, NO_CRASH_FILES, src, "/Fo" + obj], capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print):
     """Compile (src, obj, opt) triples in parallel, in order; returns [(src, error text)] for
     failures. started(job) and finished(job, seconds), if given, are called (from the worker
-    threads) as each one starts and ends."""
+    threads) as each one starts and ends. A file the compiler crashed on is compiled again once
+    the others are done, on its own (RETRY); log() says so."""
     def one(job):
         src, obj, opt = job
         if started:
             started(job)
         t0 = time.time()
-        r = subprocess.run([CLANG, "/c", opt, *CFLAGS, src, "/Fo" + obj], capture_output=True, text=True)
+        code, out = _compile(src, obj, opt)
         if finished:
             finished(job, time.time() - t0)
-        return (src, r.stdout + r.stderr) if r.returncode else None
+        return (job, code, out) if code else None
     with ThreadPoolExecutor(jobs) as pool:
-        return [f for f in pool.map(one, jobs_list) if f]
+        failed = [f for f in pool.map(one, jobs_list) if f]
+    return [f for f in (_compile_again(*f, log) for f in failed) if f]
+
+
+def _compile_again(job, code, out, log):
+    """A failed compile's (src, error text), or None if it was a crash and the file compiles now."""
+    src, obj, opt = job
+    name = os.path.basename(src)
+    if not crashed(code, out):
+        return src, out
+    for again in RETRY.get(opt, (opt, opt)):
+        log(f"the compiler crashed on {name} ({crash_cause(code, out)}): compiling it again on its own"
+            + (f", at {again}" if again != opt else ""))
+        code, out = _compile(src, obj, again)
+        if not code:
+            log(f"{name} compiled" + (f" (at {again}: a little less optimised, works the same)" if again != opt else ""))
+            return None
+        if not crashed(code, out):
+            return src, out
+    return src, (f"the compiler (clang-cl) crashed on this file {1 + len(RETRY.get(opt, (opt, opt)))} times. The same "
+                 "file compiles on other PCs with the same compiler, so this PC most likely ran out of memory or is not "
+                 "quite stable (overclocked, or overheating). Close other programs and run the build again: it carries "
+                 "on where it stopped.\n" + crash_report(out))
 
 
 def link(objs, exe, options=()):
