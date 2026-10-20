@@ -1612,6 +1612,12 @@ typedef struct Resident {
     u32 head, tail;
     u64 checked;   /* the submission it was last checked against the write watch in */
     u64 seen;      /* (the write watch's clock then: watch_written) */
+    /* The GPU's last write into it (a compute program's or a copy's): the write watch's clock
+     * then, and the frame. Whole pages stamped after that clock are the CPU's again (the region
+     * takes such pages whole), and so are the partial pages' bytes once taken since (head_taken,
+     * tail_taken): where all it holds of a range is the CPU's, guest memory there is the same. */
+    u64 wrote_seen, wrote_frame;
+    u8 head_taken, tail_taken;
 } Resident;
 static Resident residents[512];
 static u32 nresidents;
@@ -1747,13 +1753,14 @@ static int read_guarded(void *dst, u64 g, u32 n) {
 #endif
 
 /* A partial page's bytes inside the region (n at g; was: as the GPU copy last took them): taken
- * from guest memory if they changed. 0 if that memory is gone. */
-static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
+ * from guest memory if they changed (and *taken set). 0 if that memory is gone. */
+static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n, u8 *taken) {
     u8 now[0x1000];   /* (an edge lies within one page) */
     if (!n) return 1;
     if (!read_guarded(now, g, n)) return 0;
     if (!memcmp(was, now, n)) return 1;
     memcpy(was, now, n);
+    *taken = 1;
     D3D11_BOX box = {(UINT)(g - r->guest), 0, 0, (UINT)(g - r->guest + n), 1, 1};
     ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)r->buf, 0, &box, was, 0, 0);
     gfx_stat_resident_pages++;
@@ -1788,7 +1795,8 @@ static void resident_sync(Resident *r, int every_frame) {
     if (no_pages < 0) no_pages = getenv("SSBU_NO_RESIDENT_PAGES") != NULL;
     if (no_pages || (!every_frame && r->checked == gpu_stat_batches) || !r->edge || !watched(r->guest, r->size)) return;
     r->checked = gpu_stat_batches;
-    if (!resident_take_edge(r, r->guest, r->edge, r->head) || !resident_take_edge(r, r->guest + r->size - r->tail, r->edge + r->head, r->tail))
+    if (!resident_take_edge(r, r->guest, r->edge, r->head, &r->head_taken) ||
+        !resident_take_edge(r, r->guest + r->size - r->tail, r->edge + r->head, r->tail, &r->tail_taken))
         return;   /* (its memory is gone: left alone; once mapped again its bytes differ, and are taken) */
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;   /* the whole pages */
     if (lo >= hi) return;
@@ -1810,9 +1818,55 @@ static Resident *resident_covering(u64 lo, u64 hi) {
     return NULL;
 }
 
-/* A raw view of [va, va + bytes) inside r: for shaders to read (srv) or compute to write. */
-static ResidentView *resident_viewx(Resident *r, u64 va, u32 bytes) {
-    u64 first = (va - r->va) & ~3ull;
+/* A compute program or a copy writes into the region. */
+static void resident_gpu_wrote(Resident *r) {
+    r->wrote_seen = watch_clock;
+    r->wrote_frame = gfx_stat_presented;
+    r->head_taken = r->tail_taken = 0;
+}
+
+/* Is all that r holds of [va, va + bytes) the CPU's again (see wrote_seen)? Then guest memory
+ * there is the same, and a read may take it from there. (r synced first, for the stamps.) */
+static int resident_cpu_owned(Resident *r, u64 va, u64 bytes) {
+    u64 lo = va > r->va ? va : r->va, hi = va + bytes < r->va + r->size ? va + bytes : r->va + r->size;
+    if (lo >= hi) return 1;
+    if (!r->edge || !watched(r->guest, r->size)) return 0;
+    u64 glo = r->guest + (lo - r->va), ghi = r->guest + (hi - r->va);
+    if (glo < r->guest + r->head && !r->head_taken) return 0;
+    if (ghi > r->guest + r->size - r->tail && !r->tail_taken) return 0;
+    u64 wlo = (r->guest + 0xFFF) & ~0xFFFull, whi = (r->guest + r->size) & ~0xFFFull;   /* its whole pages */
+    u64 p = glo & ~0xFFFull, end = (ghi + 0xFFF) & ~0xFFFull;
+    if (p < wlo) p = wlo;
+    if (end > whi) end = whi;
+    for (; p < end; p += 0x1000) {
+        u64 i = (p - ALIAS_BASE) >> 12;
+        const WatchChunk *c = watch_chunks[i / WATCH_CHUNK];
+        if (!c || c->page[i % WATCH_CHUNK] <= r->wrote_seen) return 0;
+    }
+    return 1;
+}
+
+/* The first resident region holding GPU data in [va, va + size) (synced), or NULL: regions
+ * there that hold only what the CPU wrote since (resident_cpu_owned) are the same as guest
+ * memory. Memory a scene gives up is handed out again, and a region left behind over it would
+ * otherwise send every draw reading its new data through upload_composed. */
+static Resident *resident_overlapping_gpu(u64 va, u32 size) {
+    for (u32 i = 0; i < nresidents; i++) {
+        Resident *r = &residents[i];
+        if (r->va >= va + size || va >= r->va + r->size) continue;
+        resident_sync(r, 0);
+        if (!resident_cpu_owned(r, va, size)) return r;
+    }
+    return NULL;
+}
+
+/* A raw view of [va, va + bytes) inside r: for shaders to read (srv) or compute to write. Raw
+ * views start on 16 bytes (D3D11 refuses others: most of a fighter's mesh parts start 4, 8 or 12
+ * bytes into a line of its skinned vertices, and every such draw went through upload_composed),
+ * so *skip says how far before va this one starts, for the shader to add to its offsets. */
+static ResidentView *resident_viewx(Resident *r, u64 va, u32 bytes, u32 *skip) {
+    u64 first = (va - r->va) & ~15ull;
+    *skip = (u32)(va - r->va - first);
     bytes = (u32)((va + bytes - r->va - first + 3) & ~3ull);
     if (first + bytes > ((r->size + 15) & ~15u)) bytes = (u32)(((r->size + 15) & ~15u) - first);
     for (u32 i = 0; i < r->nviews; i++)
@@ -1850,8 +1904,8 @@ static ResidentView *resident_viewx(Resident *r, u64 va, u32 bytes) {
     return v;
 }
 
-static ID3D11ShaderResourceView *resident_view(Resident *r, u64 va, u32 bytes) {
-    ResidentView *v = resident_viewx(r, va, bytes);
+static ID3D11ShaderResourceView *resident_view(Resident *r, u64 va, u32 bytes, u32 *skip) {
+    ResidentView *v = resident_viewx(r, va, bytes, skip);
     return v ? v->srv : NULL;
 }
 
@@ -1884,15 +1938,15 @@ static Resident *resident_create(u64 va, u32 size) {
     return r;
 }
 
-/* The resident region holding [va, va + size), made (or widened) as needed. Regions never
- * overlap: a range that overlaps some becomes one region over all of them, with the CPU's
- * data underneath and each old region's GPU data copied over it. */
+/* The resident region holding [va, va + size), made (or widened) as needed, for the GPU to
+ * write into. Regions never overlap: a range that overlaps some becomes one region over all of
+ * them, with the CPU's data underneath and each old region's GPU data copied over it. */
 static Resident *resident_acquire(u64 va, u32 size) {
     u64 lo = va, hi = va + size;
     int overlaps = 0;
     for (u32 i = 0; i < nresidents; i++) {
         Resident *r = &residents[i];
-        if (r->va <= va && va + size <= r->va + r->size) return r;
+        if (r->va <= va && va + size <= r->va + r->size) { resident_gpu_wrote(r); return r; }
         if (r->va < hi && va < r->va + r->size) {
             overlaps = 1;
             if (r->va < lo) lo = r->va;
@@ -1919,13 +1973,8 @@ static Resident *resident_acquire(u64 va, u32 size) {
         n = &residents[nresidents - 1];
     }
     if (n->guest >= ALIAS_BASE && n->guest + n->size <= ALIAS_BASE + ALIAS_SIZE) resident_watch_reset(n);
+    resident_gpu_wrote(n);
     return n;
-}
-
-static Resident *resident_overlapping(u64 va, u32 size) {
-    for (u32 i = 0; i < nresidents; i++)
-        if (residents[i].va < va + size && va < residents[i].va + residents[i].size) { resident_sync(&residents[i], 0); return &residents[i]; }
-    return NULL;
 }
 
 /* dst holds guest memory's [va, va + size): copy over it what resident regions hold of that. */
@@ -1982,7 +2031,7 @@ static ID3D11ShaderResourceView *upload_composed(int stage, u32 slot, u64 va, co
 /* The copy engine and resident data. */
 int gfx_copy_resident(u64 dst_va, u64 src_va, u64 bytes) {
     if (!bytes || bytes > (256u << 20) || !enter()) return 0;
-    Resident *src = resident_overlapping(src_va, (u32)bytes);
+    Resident *src = resident_overlapping_gpu(src_va, (u32)bytes);
     if (!src || src_va < src->va || src_va + bytes > src->va + src->size) {
         leave();
         if (src) gfx_resident_flush(src_va, bytes);   /* partly resident: through guest memory */
@@ -2112,10 +2161,25 @@ static void texture_ask(Texture *t) {
     watch_time(rt_clock_ns() - t0);
 }
 
-/* Once a frame: GPU-resident buffers the CPU has written to (those no draw has checked yet). */
+/* Once a frame: GPU-resident buffers the CPU has written to (those no draw has checked yet).
+ * A region no program has written into for a second that holds only what the CPU wrote since
+ * (resident_cpu_owned) is the same as guest memory, and is given up: memory a scene leaves is
+ * handed out again, and regions over it otherwise pile up for good (a player's long session
+ * had 338). */
+#define RESIDENT_IDLE 60
+u64 gfx_stat_residents_retired;
 static void note_writes(void) {
     u64 t0 = rt_clock_ns();
-    for (u32 i = 0; i < nresidents; i++) resident_sync(&residents[i], 1);
+    for (u32 i = 0; i < nresidents;) {
+        Resident *r = &residents[i];
+        resident_sync(r, 1);
+        if (gfx_stat_presented - r->wrote_frame >= RESIDENT_IDLE && resident_cpu_owned(r, r->va, r->size)) {
+            resident_drop(r);   /* (the last one moves here) */
+            gfx_stat_residents_retired++;
+            continue;
+        }
+        i++;
+    }
     watch_time(rt_clock_ns() - t0);
 }
 
@@ -2831,8 +2895,14 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
                         s->info.sb_offset[k], va, desc[2]);
             if (!va || !size) continue;
             Resident *res = (va & 3) == 0 ? resident_covering(va, va + size) : NULL;   /* written by compute: the GPU's copy */
-            if (res && (gm[k] = resident_view(res, va, size))) continue;
-            int partly = resident_overlapping(va, size) != NULL;
+            u32 skip;
+            if (res && (gm[k] = resident_view(res, va, size, &skip))) {   /* (the view may start a little before va) */
+                params->sb[stage][k][0] = (u32)(va - skip);
+                params->sb[stage][k][1] = (u32)((va - skip) >> 32);
+                params->sb[stage][k][2] = size + skip;
+                continue;
+            }
+            int partly = resident_overlapping_gpu(va, size) != NULL;
             if (!partly && !draw_logging) { gm[k] = upload_gpu(stage, 96 + k, va, size); continue; }
             if (size > gcap) { gdata = realloc(gdata, size); gcap = size; }
             read_gpu(va, size, gdata);
@@ -3166,6 +3236,7 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
 
     /* vertex streams: each attribute the shader reads gets its stream's data at t18 + n */
     ID3D11ShaderResourceView *vsrv[32] = {0}, *stream_srv[32] = {0};
+    u32 stream_skip[32];   /* (how far before the stream its view starts: added to its attributes' offsets) */
     static u8 *stream_data;
     static u32 stream_cap;
     for (u32 n = 0; n < 32; n++) {
@@ -3181,17 +3252,29 @@ void gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         if (!params.attr[n][3]) continue;
         u64 size = limit >= start ? limit - start + 1 : 0;
         if (size > (64u << 20)) size = 64u << 20;
-        if (stream_srv[j]) { vsrv[n] = stream_srv[j]; continue; }   /* another attribute of the same stream */
+        u32 off = (fmt >> 7) & 0x3FFF;
+        if (stream_srv[j] && off + stream_skip[j] <= 0x3FFF) {   /* another attribute of the same stream */
+            vsrv[n] = stream_srv[j];
+            params.attr[n][0] = fmt + (stream_skip[j] << 7);
+            continue;
+        }
         /* A stream inside data the GPU keeps (compute results) is read from there; one only
          * partly inside gets the guest's data around the GPU's. */
         Resident *res = (start & 3) == 0 ? resident_covering(start, start + size) : NULL;
         if (res) {
-            vsrv[n] = stream_srv[j] = resident_view(res, start, (u32)size);
+            u32 skip;
+            ID3D11ShaderResourceView *v = resident_view(res, start, (u32)size, &skip);
             if (draw_logging)
                 fprintf(stderr, "[draw]   attr%u: stream %u at %#llx (+%#llx) from resident %#llx + %#x\n", n, j, start, size, res->va, res->size);
-            if (vsrv[n]) continue;
+            if (v && off + skip <= 0x3FFF) {   /* (a view starting before the stream: so do the offsets) */
+                vsrv[n] = stream_srv[j] = v;
+                stream_skip[j] = skip;
+                params.attr[n][0] = fmt + (skip << 7);
+                continue;
+            }
         }
-        Resident *part = resident_overlapping(start, (u32)size);
+        stream_skip[j] = 0;
+        Resident *part = resident_overlapping_gpu(start, (u32)size);
         if (!part && !draw_logging) { vsrv[n] = stream_srv[j] = upload_gpu(SHADER_VERTEX, 18 + n, start, (u32)size); continue; }
         if (size > stream_cap) { stream_data = realloc(stream_data, size + 16); stream_cap = (u32)size; }
         read_gpu(start, (u32)size, stream_data);
@@ -3748,13 +3831,20 @@ void gfx_dispatch(const u32 *regs, const u32 *q) {
         params.sb[0][k][1] = desc[1];
         params.sb[0][k][2] = size;
         if (!va || !size) continue;
-        Resident *over = resident_overlapping(va, size);
+        Resident *over = resident_overlapping_gpu(va, size);
         if (learned) {
             /* what it writes stays on the GPU; what it only reads is the GPU's data where there is
              * some, the guest's elsewhere */
             Resident *res = cs->written_mask >> k & 1 ? resident_acquire(va, size) : over ? resident_covering(va, va + size) : NULL;
-            ResidentView *v = res ? resident_viewx(res, va, size) : NULL;
-            if (v) { uav[k] = v->uav; continue; }
+            u32 skip;
+            ResidentView *v = res ? resident_viewx(res, va, size, &skip) : NULL;
+            if (v) {   /* (the view may start a little before va) */
+                params.sb[0][k][0] = (u32)(va - skip);
+                params.sb[0][k][1] = (u32)((va - skip) >> 32);
+                params.sb[0][k][2] = size + skip;
+                uav[k] = v->uav;
+                continue;
+            }
             if (!(cs->written_mask >> k & 1) && !over && (uav[k] = input_uav(va, size))) continue;   /* only read: cached */
         } else if (over)
             gfx_resident_flush(va, size);   /* learning diffs it all against guest memory, which needs the GPU's data first */
