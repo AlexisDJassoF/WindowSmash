@@ -141,11 +141,14 @@ class Player:
             self.ping()
         return self
 
-    def ping(self, ms=20, have=None):
+    def ping_packet(self, ms=20, have=None):
         p = R.header(R.PING) + self.nonce + struct.pack(">QQH", 1234, self.cookie, ms)
         if self.ext:
             p += struct.pack(">IIHBB", self.have if have is None else have, *self.lan, 1 if self.direct else 0, 0)
-        self.send(p)
+        return p
+
+    def ping(self, ms=20, have=None):
+        self.send(self.ping_packet(ms, have))
         return self.first(R.PONG)
 
     def peers(self, wait=0.4):
@@ -738,7 +741,7 @@ class Timeouts(LobbyTest):
         until = time.monotonic() + 1.6
         gone = []
         while time.monotonic() < until and not gone:   # (the station keeps itself alive; the host goes silent)
-            a.ping()
+            a.send(a.ping_packet())   # (not ping(): waiting for the PONG would throw away an LM_GONE that came first)
             gone = [p for s, d, sp, p in a.datas(0.2) if p[1] == R.LM_GONE]
         self.assertTrue(gone, "no LM_GONE after the host timed out")
         self.assertEqual(gone[0][4:20], session)
@@ -748,7 +751,7 @@ class Timeouts(LobbyTest):
         until = time.monotonic() + 1.6
         left = []
         while time.monotonic() < until and not left:
-            host.ping()
+            host.send(host.ping_packet())   # (the same: no wait for the PONG that could throw away the LM_LEAVE)
             host.advertise(session, [a.ip])
             left = [(s, p) for s, d, sp, p in host.datas(0.2) if p[1] == R.LM_LEAVE]
         self.assertTrue(left, "no LM_LEAVE after the station timed out")

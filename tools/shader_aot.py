@@ -37,6 +37,7 @@ except ImportError:                                               # 3.10 to 3.13
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arc as A    # noqa: E402
 import cc          # noqa: E402
+from progress import bar, time_left   # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOW40 = (1 << 40) - 1
@@ -181,21 +182,10 @@ def parse_progress(line):
     return None
 
 
-def time_left(seconds):
-    """A time left, as a person says it."""
-    minutes = round(seconds / 60)
-    if minutes < 1:
-        return "under a minute left"
-    if minutes < 60:
-        return f"about {minutes} min left"
-    return f"about {minutes // 60} h {minutes % 60:02d} min left"
-
-
 def progress_text(done, of, rate=None, width=30):
     """The bar, the share done, and the time left at `rate` shaders a second (once there is one)."""
     frac = min(1.0, done / of) if of else 1.0
-    filled = int(frac * width)
-    text = f"[{'#' * filled}{'-' * (width - filled)}] {frac:4.0%}  {done:,} of {of:,} shaders"
+    text = f"{bar(frac, width)} {frac:4.0%}  {done:,} of {of:,} shaders"
     if rate and 0 < done < of:
         text += ", " + time_left((of - done) / rate)
     return text

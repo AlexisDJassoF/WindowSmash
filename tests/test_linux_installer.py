@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'linux'))
@@ -291,20 +292,22 @@ class GenerateOnlyTests(unittest.TestCase):
             g.update(
                 TREE=tmp, NRO_DIR=os.path.join(tmp, 'nro'),
                 module_paths=lambda e: {'main': os.path.join(e, 'main'), 'sdk': os.path.join(e, 'sdk')},
-                check=lambda e: 0, tools_fingerprint=lambda: 'fp', image=lambda nso, img: done.append(('image', nso)),
-                Module=lambda nso: types.SimpleNamespace(build_id='b' * 64), MODULES={'main': 1, 'sdk': 2},
+                check=lambda e, mods=None: 0, tools_fingerprint=lambda: 'fp', image=lambda nso, img: done.append(('image', nso)),
+                Module=lambda nso: types.SimpleNamespace(build_id='b' * 64, text=types.SimpleNamespace(mem=0, end=4000)),
+                MODULES={'main': 1, 'sdk': 2}, stale_files=lambda target: [],
                 build=lambda nso, target, jobs, per_file: done.append(('build', os.path.basename(target))),
-                compile_dir=lambda target, jobs: done.append(('compile', target)) or True,
+                compile_dir=lambda target, jobs, shown=None: done.append(('compile', target)) or True,
                 link=lambda dirs, exe: done.append(('link', exe)) or True,
                 modcache=types.SimpleNamespace(build_info=lambda t: None, find_built=lambda *x: None,
                                                write_stamp=lambda t, *x: stamps.append(os.path.basename(t))))
-            with contextlib.redirect_stdout(io.StringIO()):
+            no_title = unittest.mock.patch.object(g['progress'], 'console_title', return_value=None)   # (the bar's)
+            with contextlib.redirect_stdout(io.StringIO()), no_title:
                 self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4, False))
             self.assertEqual([d for d in done if d[0] in ('compile', 'link')], [])
             self.assertEqual([d[1] for d in done if d[0] == 'build'], ['main', 'sdk'])
             self.assertEqual(stamps, ['main', 'sdk'])
             done.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), no_title:
                 self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4))   # (the Windows build: both)
             self.assertEqual([d[0] for d in done if d[0] in ('compile', 'link')], ['compile', 'compile', 'link'])
 
