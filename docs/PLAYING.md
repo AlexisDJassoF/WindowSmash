@@ -22,7 +22,8 @@ Everything starts from a launcher. `Play SSBU.bat` and `Install WindowSmash.bat`
 
 | Launcher | What it does |
 | :--- | :--- |
-| **`Play SSBU.bat`** | Starts the game and joins the online lobby, so Local Wireless shows everyone's rooms. If the lobby doesn't answer, the game plays offline. |
+| **`Play SSBU.bat`** | Opens the WindowSmash window (below), then starts the game and joins the online lobby, so Local Wireless shows everyone's rooms. If the lobby doesn't answer, the game plays offline. |
+| **`Play SSBU.bat`** with <kbd>Shift</kbd> held | Opens the WindowSmash window even when you've ticked **Start the game directly next time**. |
 | **`launchers\Play SSBU Offline.bat`** | Starts the game without going online. |
 | **`launchers\Host SSBU Netplay.bat`** | Starts the game as the host of a private room ([multiplayer guide](MULTIPLAYER.md#private-room)). |
 | **`launchers\Join SSBU Netplay.bat`** | Starts the game and joins someone's private room. |
@@ -32,7 +33,9 @@ Everything starts from a launcher. `Play SSBU.bat` and `Install WindowSmash.bat`
 | **`launchers\Build WindowSmash.bat`** | Builds the game from your files, when the tools are already installed ([setup guide](BUILDING.md#shortcut-build-windowsmashbat)). |
 | **`launchers\Configure Game Data.bat`** | Points WindowSmash at your game data and fonts ([setup guide, step 10](BUILDING.md#step-10-connect-your-game-data)). |
 
-With [more than one game version](VERSIONS.md) built, the launchers ask which one to start. The last one you picked is the default.
+`Play SSBU.bat` first opens a small window where you pick the [game version](VERSIONS.md) and change the most used settings: your online name and lobby, the window and frame pacing, the graphics card, and which player the keyboard is. **Play** saves what you changed and starts the game; **Close** changes nothing. It edits the same files as the in-game [settings](#settings), keeping their comments. Tick **Start the game directly next time** to skip the window; hold <kbd>Shift</kbd> while you start `Play SSBU.bat` to see it again.
+
+With [more than one game version](VERSIONS.md) built, the other launchers ask which one to start. The last one you picked is the default.
 
 The first time you play online, the game picks a name for you, such as `Player1234`, and shows it at the bottom of the screen. To change it, open the [settings](#settings) and go to **Online**.
 
