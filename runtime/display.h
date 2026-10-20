@@ -27,6 +27,10 @@ void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw,
 int display_latency(void);              /* frames the GPU may queue ahead: 1-3 */
 Pacing display_pacing(void);
 const char *display_gpu(void);          /* the graphics card to use: "auto", or part of its name (SSBU_GPU) */
+/* render_scale: the game's pictures are drawn this many times its 1920x1080 in each direction
+ * (0.5-4; SSBU_RENDER_SCALE). 0 = auto: as many as the picture has pixels in the window at the
+ * start (1440p: 1.33), at least 1. */
+float display_render_scale(void);
 /* The renderer says whether the swap chain can tear (for VRR); the flags each Present gets. */
 void display_set_tearing(int supported);
 unsigned display_present_flags(void);

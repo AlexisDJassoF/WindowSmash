@@ -451,9 +451,10 @@ static void emit_tex(Ctx *c, const Insn *in) {
     u32 k = texture_slot(c, handle, type, dc);
     const char *coord = coord_of(type, x, y, z, layer);
     const char *v = tmp("t%u", tex_counter++);
-    if (offset) {   /* Sample needs constant offsets: shift the coordinates instead */
+    if (offset) {   /* Sample needs constant offsets: shift the coordinates instead (in the game's texels: tsc_) */
         line(c, "{ float tw_, th_, tl_; tex%u.GetDimensions(0, tw_, th_, tl_);", k);
-        coord = coord_of(type, tmp("(%s + float(%s.x) / tw_)", x, offset), y ? tmp("(%s + float(%s.y) / th_)", y, offset) : 0, z, layer);
+        coord = coord_of(type, tmp("(%s + float(%s.x) * tsc_(%uu) / tw_)", x, offset, k),
+                         y ? tmp("(%s + float(%s.y) * tsc_(%uu) / th_)", y, offset, k) : 0, z, layer);
         offset = NULL;
     } else line(c, "{");
     line(c, dref ? "  float4 %s = %s;" : "  float4 %s = swz(%s, %uu);", v, sample(c, k, type, coord, lod, lodx, dref, offset), k);
@@ -488,6 +489,7 @@ static void emit_tld4(Ctx *c, const Insn *in, int scalar) {
             } else dref = F(c, b);
         }
         u32 k = texture_slot(c, handle, TEX_2D, dc);
+        if (offset) offset = tmp("toff_(%s, %uu)", offset, k);   /* (in the game's texels) */
         line(c, "{ float4 %s = %s;", v, gather(c, k, comp, coord, dref, offset));
         c->indent++;
         store_split(c, v, 15, da, db, f16);
@@ -505,18 +507,21 @@ static void emit_tld4(Ctx *c, const Insn *in, int scalar) {
     case TEX_ARRAY_CUBE: x = F(c, a + 1); y = F(c, a + 2); z = F(c, a + 3); layer = layer_of(c, a); break;
     default: unsupported(c, in, "TLD4 type"); return;
     }
+    u32 k = texture_slot(c, handle, type, dc);
+    /* (offsets are in the game's texels: toff_ turns them into a render target's own) */
     if (offmode == 1) {
         const char *o = R(c, m++);
-        offset = tmp("int2(((int)(%s << 26)) >> 26, ((int)(%s << 18)) >> 26)", o, o);
+        offset = tmp("toff_(int2(((int)(%s << 26)) >> 26, ((int)(%s << 18)) >> 26), %uu)", o, o, k);
     } else if (offmode == 2) {   /* a separate offset per texel: signed 6-bit x, y pairs in two registers */
         const char *o0 = R(c, m), *o1 = R(c, m + 1);
         m += 2;
-        offset = tmp("int2(((int)(%s << 26)) >> 26, ((int)(%s << 18)) >> 26), int2(((int)(%s << 10)) >> 26, ((int)(%s << 2)) >> 26), "
-                     "int2(((int)(%s << 26)) >> 26, ((int)(%s << 18)) >> 26), int2(((int)(%s << 10)) >> 26, ((int)(%s << 2)) >> 26)",
-                     o0, o0, o0, o0, o1, o1, o1, o1);
+        offset = tmp("toff_(int2(((int)(%s << 26)) >> 26, ((int)(%s << 18)) >> 26), %uu), "
+                     "toff_(int2(((int)(%s << 10)) >> 26, ((int)(%s << 2)) >> 26), %uu), "
+                     "toff_(int2(((int)(%s << 26)) >> 26, ((int)(%s << 18)) >> 26), %uu), "
+                     "toff_(int2(((int)(%s << 10)) >> 26, ((int)(%s << 2)) >> 26), %uu)",
+                     o0, o0, k, o0, o0, k, o1, o1, k, o1, o1, k);
     }
     if (dc) dref = F(c, m);
-    u32 k = texture_slot(c, handle, type, dc);
     if (offmode == 2 && VKD3D_FORMS) {   /* four gathers, each with its own offset, one component of each (what the four-offset form returns) */
         const char *o0 = R(c, m - 2), *o1 = R(c, m - 1);   /* (the two offset registers read above) */
         static const char *const part[4][2] = {{"<< 26", "<< 18"}, {"<< 10", "<< 2"}, {"<< 26", "<< 18"}, {"<< 10", "<< 2"}};
@@ -524,7 +529,7 @@ static void emit_tld4(Ctx *c, const Insn *in, int scalar) {
         line(c, "{ float4 %s;", v);
         for (u32 i = 0; i < 4; i++) {
             const char *o = i < 2 ? o0 : o1;
-            const char *one = tmp("int2(((int)(%s %s)) >> 26, ((int)(%s %s)) >> 26)", o, part[i][0], o, part[i][1]);
+            const char *one = tmp("toff_(int2(((int)(%s %s)) >> 26, ((int)(%s %s)) >> 26), %uu)", o, part[i][0], o, part[i][1], k);
             line(c, "  %s.%s = (%s).%s;", v, xyzw[i], gather(c, k, comp, coord_of(type, x, y, z, layer), dref, one), xyzw[i]);
         }
     } else
@@ -558,7 +563,7 @@ static void emit_tlds(Ctx *c, const Insn *in) {
     }
     u32 k = texture_slot(c, handle, type, 0);
     const char *v = tmp("t%u", tex_counter++);
-    line(c, "{ float4 %s = swz(tex%u.Load(%s), %uu);", v, k, load, k);
+    line(c, "{ float4 %s = swz(tex%u.Load(tld_(%s, %uu)), %uu);", v, k, load, k, k);   /* (texel numbers: the game's) */
     c->indent++;
     store_split(c, v, mask, da, db, f16);
     c->indent--;
@@ -601,9 +606,11 @@ static const char *ps_input(Ctx *c, u32 addr, int *perspective) {
         if (!(c->vs_outputs >> n & 1)) return "0.0f";
         return tmp("i.a%u.%s", n, XYZW[comp]);
     }
+    /* The fragment position in the game's pixels: SV_Position is in the render target's own,
+     * render scale included (base.zw: 1 / that scale). See shader_uses_pixels. */
     switch (addr) {
-    case 0x70: return "i.pos.x";
-    case 0x74: return "(params.frag[0] != 0 ? params.frag[1] - i.pos.y : i.pos.y)";
+    case 0x70: return "(i.pos.x * asfloat(params.base.z))";
+    case 0x74: return "(params.frag[0] != 0 ? params.frag[1] - i.pos.y * asfloat(params.base.w) : i.pos.y * asfloat(params.base.w))";
     case 0x78: return "i.pos.z";
     case 0x7C: return "(1.0f / i.clipw)";
     case 0x3FC: return "asfloat(front ? 0xFFFFFFFFu : 0u)";
@@ -1660,6 +1667,18 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
               "float4 swz(float4 v, uint k) { uint s = params.swz[%u + (k >> 2)][k & 3u];\n"
               "  return float4(comp_(v, s & 7u), comp_(v, (s >> 3) & 7u), comp_(v, (s >> 6) & 7u), comp_(v, (s >> 9) & 7u)); }\n",
         stage == SHADER_VERTEX ? 0 : 8);
+    /* Texels of a render target drawn at a render scale (gpu_d3d11.c): its scale is in the top half
+     * of the texture's swizzle word (4.12 fixed point, 0 = 1). Offsets and texel numbers in the
+     * game's texels become the target's own. */
+    const char *body = c->body.s ? c->body.s : "";
+    if (strstr(body, "tsc_(") || strstr(body, "toff_(") || strstr(body, "tld_("))
+        put(&out, "float tsc_(uint k) { uint q = params.swz[%u + (k >> 2)][k & 3u] >> 16; return q != 0u ? float(q) / 4096.0f : 1.0f; }\n"
+                  "int2 toff_(int2 o, uint k) { float s = tsc_(k); return s == 1.0f ? o : int2(round(float2(o) * s)); }\n"
+                  "int tc_(int v, float s) { return s == 1.0f ? v : int(floor((float(v) + 0.5f) * s - 0.5f)); }\n"
+                  "int2 tld_(int2 v, uint k) { float s = tsc_(k); return int2(tc_(v.x, s), v.y); }\n"
+                  "int3 tld_(int3 v, uint k) { float s = tsc_(k); return int3(tc_(v.x, s), tc_(v.y, s), v.z); }\n"
+                  "int4 tld_(int4 v, uint k) { float s = tsc_(k); return int4(tc_(v.x, s), tc_(v.y, s), v.z, v.w); }\n",
+            stage == SHADER_VERTEX ? 0 : 8);
     for (u32 b = 0; b < 18; b++)
         if (info->cbuf_mask >> b & 1) put(&out, "ByteAddressBuffer cb%u : register(t%u);\n", b, b);
     for (u32 k = 0; k < info->ntex; k++) {
@@ -1783,6 +1802,31 @@ char *shader_hlsl_alpha_tested(const u8 *program, u32 size, u32 vs_outputs, Shad
 
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user) {
     return translate(program, size, SHADER_COMPUTE, 0, info, read, user, local, shared, 0);
+}
+
+/* Does the program read its pixel's position, or step in the texels of what it samples (texel
+ * offsets, texel numbers)? Exactly those instructions take the render scale into account
+ * (ps_input, emit_tex, emit_tld4, emit_tlds): their translation differs from the one before
+ * render scaling, so they get cache files of their own (gpu_shader_cache.h shader_cache_hash).
+ * Very few do: one pixel program of the game reads its position, two gather with offsets. */
+int shader_uses_pixels(const u8 *program, u32 size, int stage) {
+    init_table();
+    Ctx c = {0};
+    decode_program(&c, program, size);
+    int uses = 0;
+    for (u32 i = 0; i < c.n && !uses; i++) {
+        u64 w = c.ins[i].w;
+        switch (c.ins[i].op) {
+        case OP_IPA: { u32 attr = BITS(w, 30, 8) * 4; uses = stage == SHADER_PIXEL && (attr == 0x70 || attr == 0x74); break; }
+        case OP_TEX: uses = BITS(w, 54, 1) != 0; break;                              /* AOFFI */
+        case OP_TLD4: uses = BITS(w, 54, 2) == 1 || BITS(w, 54, 2) == 2; break;     /* one offset, or four */
+        case OP_TLD4S: uses = BITS(w, 51, 1) != 0; break;                            /* AOFFI */
+        case OP_TLDS: uses = 1; break;
+        default: break;
+        }
+    }
+    free(c.ins);
+    return uses;
 }
 
 u32 shader_size(const u8 *program, u32 max) {
