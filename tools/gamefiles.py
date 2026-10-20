@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """What a folder of game files holds, for the build and the installer: the game's NCAs - which
-one is the program, the base, the update, the DLC - and the version.
+one is the program, the base, the update, the DLC - and the version; and whether the program's
+data is an early release's, which WindowSmash can't read yet (tools/arc.py table_form).
 
 Usage:
   gamefiles.py <folder> --keys <dir> [--json]
@@ -123,13 +124,38 @@ def describe_nca(nca, path, name, container=None):
     rec = {"path": path, "name": name, "container": container, "type": CONTENT_TYPES.get(nca.content_type, str(nca.content_type)),
            "title_id": f"{nca.title_id:016X}", "app": f"{app_of(nca.title_id):016X}", "kind": kind_of(nca.title_id),
            "content_id": name[:32].lower() if len(name) >= 36 and name[32:].lower() in (".nca", ".cnmt.nca") else None,
-           "size": nca.size, "version": None, "display_version": None, "game": None, "romfs": None}
+           "size": nca.size, "version": None, "display_version": None, "game": None, "romfs": None, "data_arc": None}
     if nca.content_type == 0:
         sec = nca.section(0)
         rec["romfs"] = None if sec is None else "plain" if nca.plaintext else ROMFS_STATES.get(sec.enc_type, "encrypted")
         if rec["romfs"] == "patch":   # (an update's program carries the game's own title id: its data says what it is)
             rec["kind"] = "update"
     return rec
+
+
+def data_arc_form(sec):
+    """[form, layout] of data.arc's file table in a program's RomFS section (arc.table_form), or
+    None when it can't be told."""
+    try:
+        from arc import data_arc_offset, table_form
+        base = data_arc_offset(sec)
+        return list(table_form(lambda off, size: sec.read(base + off, size))[:2])
+    except (SystemExit, ImportError, NotImplementedError, OSError, ValueError, struct.error):
+        return None
+
+
+def early_release(program):
+    """Why a program's own data can't be used, for a person, or None: an early release, whose
+    data.arc tools/arc.py does not read (an update's data is a patch: told after it is applied)."""
+    form = program.get("data_arc")
+    if not form:
+        return None
+    from arc import form_text, readable
+    if readable(*form):
+        return None
+    version = program["display_version"] or (version_string(program["version"]) if program["version"] is not None else None)
+    return (f"this is an early release of the game{f' ({version})' if version else ''}, whose data WindowSmash can't "
+            f"read yet ({form_text(*form)}): add the game's update (an .nsp file; the newest you have) to this folder")
 
 
 META_KINDS = {0x80: "base", 0x81: "update", 0x82: "dlc"}   # a .cnmt's content meta type
@@ -187,6 +213,8 @@ def scan(folder, keys, depth=1):
     for nca, path, name, container in opened:
         try:
             rec = describe_nca(nca, path, name, container)
+            if rec["romfs"] in ("plain", "encrypted") and int(rec["app"], 16) == APP_ID:
+                rec["data_arc"] = data_arc_form(nca.section(0))
             if nca.content_type == 1:
                 info = cnmt_info(nca)
                 if info:
@@ -296,7 +324,9 @@ def main():
     result = scan(a.folder, a.keys)
     try:
         program = pick_program(result["contents"])
-        problem = None
+        problem = early_release(program)
+        if problem:   # (the installer's window then says so, before the build starts)
+            program = None
     except Error as e:
         program, problem = None, str(e)
     result["program"] = program
