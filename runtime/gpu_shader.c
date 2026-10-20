@@ -175,6 +175,7 @@ typedef struct Ctx {
     int uses_lmem;                /* local (per-thread) memory */
     u32 local[3], shared;         /* compute: workgroup size, shared memory bytes */
     u32 vs_outputs;               /* pixel: the paired vertex shader's outputs */
+    int alpha_test;               /* pixel: the alpha-tested variant (shader_hlsl_alpha_tested) */
     CbufReader *read_cbuf;        /* optional: constant buffer contents, for jump tables */
     void *read_user;
     int indent;
@@ -631,6 +632,7 @@ static void emit_exit(Ctx *c) {
             if (m >> k & 1) line(c, "  o.c%u.%s = %s;", rt, XYZW[k], F(c, reg++));
     }
     if (flags & 2) { c->info->writes_depth = 1; line(c, "  o.depth = %s;", F(c, reg + 1)); }
+    if (c->alpha_test && (target & 15)) line(c, "  if (!alpha_pass(o.c0.w)) discard;");
     line(c, "  return o; }");
 }
 
@@ -1633,13 +1635,14 @@ char *shader_hlsl(const u8 *program, u32 size, int stage, u32 vs_outputs, Shader
 }
 
 static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user,
-                       const u32 local[3], u32 shared) {
+                       const u32 local[3], u32 shared, int alpha_test) {
     init_table();
     memset(info, 0, sizeof *info);
     info->stage = stage;
     Ctx ctx = {0}, *c = &ctx;
     if (local) { c->local[0] = local[0]; c->local[1] = local[1]; c->local[2] = local[2]; }
     c->shared = shared;
+    c->alpha_test = alpha_test;
     c->read_cbuf = read;
     c->read_user = user;
     c->stage = stage;
@@ -1753,6 +1756,12 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
             if ((target >> (rt * 4)) & 15) put(&out, "  float4 c%u : SV_Target%u;\n", rt, rt);
         if (flags & 2) put(&out, "  float depth : SV_Depth;\n");
         put(&out, "};\n");
+        if (c->alpha_test)   /* (the comparison as D3D11_COMPARISON_FUNC: 1 never .. 8 always) */
+            put(&out, "bool alpha_pass(float a) {\n"
+                      "  float r = params.frag.w;\n"
+                      "  switch ((uint)params.frag.z) {\n"
+                      "  case 1u: return false;\n  case 2u: return a < r;\n  case 3u: return a == r;\n  case 4u: return a <= r;\n"
+                      "  case 5u: return a > r;\n  case 6u: return a != r;\n  case 7u: return a >= r;\n  default: return true;\n  }\n}\n");
         put(&out, "PSOut main(VSOut i, bool front : SV_IsFrontFace) {\n");
     }
     for (u32 r = 0; r < 255; r++) if (c->reg_used[r]) put(&out, "  uint r%u = 0u;\n", r);
@@ -1766,11 +1775,15 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
 }
 
 char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user) {
-    return translate(program, size, stage, vs_outputs, info, read, user, NULL, 0);
+    return translate(program, size, stage, vs_outputs, info, read, user, NULL, 0, 0);
+}
+
+char *shader_hlsl_alpha_tested(const u8 *program, u32 size, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user) {
+    return translate(program, size, SHADER_PIXEL, vs_outputs, info, read, user, NULL, 0, 1);
 }
 
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user) {
-    return translate(program, size, SHADER_COMPUTE, 0, info, read, user, local, shared);
+    return translate(program, size, SHADER_COMPUTE, 0, info, read, user, local, shared, 0);
 }
 
 u32 shader_size(const u8 *program, u32 max) {
