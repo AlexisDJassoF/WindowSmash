@@ -76,7 +76,9 @@ the build needs, finds your game files, and builds the game. It needs:
 5. **Wait for the build.** The first one compiles the whole game: from one to a few hours,
    depending on the processor and the memory. Later ones redo only what changed. If it stops, run
    `bash install-windowsmash.sh` again: it carries on where it stopped. Everything it says also
-   goes to `install.log`.
+   goes to `install.log`. While it writes the game's code as C, then while it compiles it, a line
+   now and then shows how far it has got and the time left. The time left appears once the first
+   files are compiled. Most terminals also show it in the window's title.
 6. **Play:** run `./play-ssbu.sh` in the folder, or choose **WindowSmash** in your applications
    menu.
 

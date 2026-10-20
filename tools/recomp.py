@@ -639,7 +639,7 @@ def build_all(exefs, out, jobs, compile_c=True):
     fp = tools_fingerprint()
     targets = {name: os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
                for name, nso in paths.items()}
-    shown = progress.Build(min(jobs, 16))
+    shown = progress.Build(min(jobs, 16), compile=compile_c, link=progress.LINK if compile_c else None)
     for name, mod in mods.items():
         current = modcache.build_info(targets[name]) == (mod.build_id, MODULES[name], name, fp)
         shown.module(name, (mod.text.end - mod.text.mem) // 4,
@@ -647,7 +647,7 @@ def build_all(exefs, out, jobs, compile_c=True):
     build_ids = {name: mod.build_id for name, mod in mods.items()}
     del mods   # (the compilers want the memory)
     exe = os.path.join(out, "ssbu.exe")
-    with progress.Line(shown.status, title=f"building {os.path.basename(exe)}"):
+    with progress.Line(shown.status, title=f"building {os.path.basename(exe)}" if compile_c else "writing the game's C"):
         reused = 0
         for name, nso in paths.items():
             shown.begin("gen", name)

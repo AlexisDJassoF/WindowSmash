@@ -300,7 +300,7 @@ class GenerateOnlyTests(unittest.TestCase):
                 link=lambda dirs, exe: done.append(('link', exe)) or True,
                 modcache=types.SimpleNamespace(build_info=lambda t: None, find_built=lambda *x: None,
                                                write_stamp=lambda t, *x: stamps.append(os.path.basename(t))))
-            no_title = unittest.mock.patch.object(g['progress'], 'console_title', return_value=None)   # (the bar's)
+            no_title = unittest.mock.patch.object(g['progress'], 'save_title', return_value=None)   # (the bar's)
             with contextlib.redirect_stdout(io.StringIO()), no_title:
                 self.assertTrue(g['build_all'](exefs, os.path.join(tmp, 'build'), 4, False))
             self.assertEqual([d for d in done if d[0] in ('compile', 'link')], [])

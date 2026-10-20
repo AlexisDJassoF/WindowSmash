@@ -16,7 +16,8 @@ libvpx as the system has them). Built on Linux, the DXVK libraries go into <out>
 program runs from its own folder.
 Incremental: a file is compiled again when its source is newer than its object. <out> holds one
 tree's game (port.txt): build another tree's into another <out> (e.g. build-linux-11.0.0), or
-give --replace to start this one over."""
+give --replace to start this one over. A progress bar shows how far it has got and the time left
+(tools/progress.py)."""
 import os
 import re
 import shutil
@@ -28,6 +29,9 @@ from concurrent.futures import ThreadPoolExecutor
 from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, LLVM, LLVM_NM, REPO, RUNTIME, SYSROOT, TARGET,
                        TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each, default_port, read_port_stamp, run, same_path,
                        write_port_stamp)
+
+sys.path.insert(0, os.path.join(REPO, "tools"))
+import progress  # noqa: E402
 
 
 def arg(name, default=None):
@@ -43,6 +47,22 @@ RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.pa
                     "-I", os.path.join(DXVK_INCLUDE, "directx"), "-I", os.path.join(SYSROOT, "usr", "include", "SDL2"),
                     "-I", os.path.join(VKD3D_SRC, "include"), "-I", GEN]
 RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL2"]
+# Each job's estimated compile in seconds, by its source, for the progress bar (tools/progress.py).
+# A game file's grows with its size and with the square of its biggest function, as on Windows
+# (progress.file_cost), but measured here (13.0.5's main and lua2cpp_master, compiled for Linux):
+# the square counts half as much as with clang-cl, a file compiled as C++ takes a third longer,
+# and -O0 (giant functions full of landing sites) has no square at all. A runtime file's goes by
+# its size.
+ESTIMATES = {}
+PER_INSN, PER_BIGGEST_SQUARED, CXX, PER_INSN_O0 = 1.05e-4, 6e-9, 1.35, 9e-5
+RUNTIME_PER_BYTE = 1e-5   # (gpu_d3d11.c, 210 KB: about 2 s)
+LINK = 10.0               # the link and the symbol list (4 s on a fast PC)
+
+
+def game_estimate(insns, biggest, opt, cxx):
+    if opt == "-O0":
+        return PER_INSN_O0 * insns
+    return (PER_INSN * insns + PER_BIGGEST_SQUARED * biggest * biggest) * (CXX if cxx else 1.0)
 
 
 def modules():
@@ -90,18 +110,19 @@ def game_jobs():
     for name, src_dir, out_dir in modules():
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
-        for fname, _insns, biggest in rows + [["g_module.c", "0", "0"]]:
+        for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:
             src = os.path.join(src_dir, fname)
             obj = os.path.join(out_dir, fname[:-2] + ".o")
             # very large functions make the optimiser superlinear; build those at a lower level (as on Windows)
             opt = "-O1" if int(biggest) > 20000 or fname == "g_module.c" else "-O2"
             if not needs(obj, src, recomp_h):
                 continue
+            insns, biggest = int(insns), int(biggest)
             if fname != "g_module.c" and has_landing_sites(src):
                 # As C++, a huge function full of landing sites (lua2cpp item/fighter tables: up to
                 # 210k instructions, 41k sites) takes the optimiser hours even at -O1 - and seconds
                 # at -O0. Those are one-off set-up code; 38k-instruction ones still take 20 s at -O1.
-                if int(biggest) > 50000:
+                if biggest > 50000:
                     opt = "-O0"
                 wrapper = os.path.join(out_dir, fname[:-2] + "_cxx.cpp")
                 os.makedirs(out_dir, exist_ok=True)
@@ -112,6 +133,8 @@ def game_jobs():
                 jobs.append((wrapper, obj, opt))
             else:
                 jobs.append((src, obj, opt))
+            ESTIMATES[jobs[-1][0]] = (progress.TABLE if fname == "g_module.c" else
+                                      game_estimate(insns, biggest, opt, jobs[-1][0].endswith("_cxx.cpp")))
     return jobs
 
 
@@ -206,29 +229,54 @@ def runtime_jobs():
     return jobs
 
 
-def compile_all(jobs, what):
-    if not jobs:
-        print(f"{what}: up to date")
-        return True
-    t0 = time.time()
-    failures = []
-    # biggest first: a few files take minutes, and started last they would hold up the end
+def in_order(jobs):
+    """Biggest first: a few files take minutes, and started last they would hold up the end."""
     def source_size(job):   # (a C++ wrapper's size is that of the generated file it includes)
         src = job[0]
         if src.endswith("_cxx.cpp"):
             src = re.findall(r'#include "([^"]+)"', open(src).read())[-1]
         return os.path.getsize(src)
-    jobs = sorted(jobs, key=source_size, reverse=True)
+    return sorted(jobs, key=source_size, reverse=True)
+
+
+def compile_all(jobs, what, shown=None):
+    """Compile the jobs; `shown`, a progress.Build with a module named `what`, follows them."""
+    if not jobs:
+        print(f"{what}: up to date")
+        return True
+    t0 = time.time()
+    failures = []
+    jobs = in_order(jobs)
+    if shown:
+        shown.begin("compile", what, [(job[0], estimate(job)) for job in jobs])
+
+    def one(job):
+        if shown:
+            shown.started(job)
+        t = time.time()
+        failed = compile_each([job], 1)
+        if shown:
+            shown.finished(job, time.time() - t)
+        return failed
     from concurrent.futures import as_completed
     with ThreadPoolExecutor(JOBS) as pool:
-        futures = [pool.submit(compile_each, [job], 1) for job in jobs]
+        futures = [pool.submit(one, job) for job in jobs]
         for done, fut in enumerate(as_completed(futures), 1):
             failures += fut.result()
             if done % 64 == 0 or done == len(jobs):
                 print(f"{what}: {done}/{len(jobs)} compiled, {time.time() - t0:,.0f}s", flush=True)
+    if shown:
+        shown.end("compile", what)
     for src, err in failures[:8]:
         print(f"FAILED {src}:\n{err[:3000]}")
     return not failures
+
+
+def estimate(job):
+    """A job's estimated compile in seconds (ESTIMATES), for one not listed there by its source's size."""
+    if job[0] not in ESTIMATES:
+        ESTIMATES[job[0]] = RUNTIME_PER_BYTE * os.path.getsize(job[0])
+    return ESTIMATES[job[0]]
 
 
 def link():
@@ -298,14 +346,26 @@ def main():
     print(f"game tree: {PORT}")
     if "--runtime-only" not in sys.argv:
         use_tree()
-    if "--link-only" not in sys.argv:
-        if not overlay_font() or not compile_all(runtime_jobs(), "runtime"):
+    if "--link-only" in sys.argv:
+        return link()
+    if not overlay_font():
+        return False
+    runtime_only = "--runtime-only" in sys.argv
+    rt, game = in_order(runtime_jobs()), [] if runtime_only else in_order(game_jobs())
+    shown = progress.Build(JOBS, link=None if runtime_only else LINK)
+    shown.module("runtime", 0, [(job[0], estimate(job)) for job in rt])
+    shown.module("game", 0, [(job[0], estimate(job)) for job in game])
+    with progress.Line(shown.status, title="building ssbu"):
+        if not compile_all(rt, "runtime", shown):
             return False
-        if "--runtime-only" in sys.argv:
+        if runtime_only:
             return True
-        if not compile_all(game_jobs(), "game"):
+        if not compile_all(game, "game", shown):
             return False
-    return link()
+        shown.begin("link")
+        ok = link()
+        shown.end("link")
+        return ok
 
 
 if __name__ == "__main__":
