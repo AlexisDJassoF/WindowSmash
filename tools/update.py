@@ -129,7 +129,24 @@ class Patch:
         self.l6, self.l6size, blocklog = levels[5]
         self.block = 1 << blocklog
         self.blocks = (self.l6size + self.block - 1) // self.block
-        self.hashes = self.vread(levels[4][0], self.blocks * 32)   # level 5: one SHA-256 per level-6 block
+        # level 5: one SHA-256 per level-6 block. An update can keep parts of it as they were in the
+        # original release (13.0.4 does): those come from the base, once it is known (load_hashes).
+        self.hash_level = (levels[4][0], self.blocks * 32)
+        try:
+            self.hashes = self.vread(*self.hash_level)
+        except LookupError:
+            self.hashes = None
+
+    def load_hashes(self, base_section, base_read):
+        """The hash tree's parts kept from the original release, read from the base: its RomFS
+        section starts at `base_section` in the file base_read(offset, n) reads (base_section is
+        None when the base is not that release's NCA: then they can't be had)."""
+        if self.hashes is not None:
+            return
+        if base_section is None:
+            raise SystemExit("part of this update's hash tree is kept from the original release, so the base must be "
+                             "the original release's own NCA (the game as dumped, decrypted), not a rebuilt image")
+        self.hashes = self.vread(*self.hash_level, base=lambda ph, n: base_read(base_section + ph, n))
 
     def storage(self, off, size):
         """The patch's own data (section-relative), decrypted: each region has its own counter."""
@@ -188,6 +205,21 @@ class Seg:
         return t
 
 
+def base_section_start(path, keydir, l6=None):
+    """Where the RomFS section of the NCA at `path` starts in the file, or None if it is not a
+    readable NCA with a hashed RomFS (with `l6`, whose image is at that offset of the file)."""
+    if not keydir:
+        return None
+    try:
+        nca = Nca(path, keydir)
+    except (SystemExit, OSError, ValueError):
+        return None
+    sec = nca.section(0)
+    if sec is None or sec.hash_type != 3 or (l6 is not None and nca.base + sec.start + sec.data_off != l6):
+        return None
+    return nca.base + sec.start
+
+
 class Builder:
     def __init__(self, patch, base_cfg, keydir=None):
         self.p = patch
@@ -211,16 +243,7 @@ class Builder:
     def base_section(self):
         """Where the base's RomFS section starts in its file - what the patch's base offsets
         count from - or None if the base's file is not an NCA with its RomFS where romfs.cfg says."""
-        if not self.keydir:
-            return None
-        try:
-            nca = Nca(self.base_path, self.keydir)
-        except (SystemExit, OSError, ValueError):
-            return None
-        sec = nca.section(0)
-        if sec is None or sec.hash_type != 3 or nca.base + sec.start + sec.data_off != self.base_l6:
-            return None
-        return nca.base + sec.start
+        return base_section_start(self.base_path, self.keydir, self.base_l6)
 
     def exact_segments(self, start):
         """The pieces as the patch says: base pieces are the base's bytes at their offsets."""
@@ -632,6 +655,7 @@ def apply_romfs(patch, base_cfg, keydir, tree):
     os.makedirs(modules, exist_ok=True)
     b = Builder(patch, base_cfg, keydir)
     start = b.base_section()
+    patch.load_hashes(start, b.base_read)
     if start is not None and b.is_original(start):
         log("the base is the release this update was made for: applying the patch as it is")
     else:
@@ -686,6 +710,14 @@ def main():
     else:
         patch = Patch(a.nsp, a.keys, a.inner)
         modules = os.path.join(a.tree, "dump", "modules")
+        if patch.hashes is None:   # (the base: the layered romfs.cfg's first source)
+            with open(os.path.join(modules, "romfs.cfg")) as f:
+                base_path = f.read().splitlines()[2]
+            with open(base_path, "rb") as bf:
+                def read(off, n):
+                    bf.seek(off)
+                    return bf.read(n)
+                patch.load_hashes(base_section_start(base_path, a.keys), read)
         sys.exit(1 if verify(patch, os.path.join(modules, "romfs.cfg"), os.path.join(modules, "romfs.unverified.txt")) else 0)
 
 

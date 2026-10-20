@@ -113,8 +113,9 @@ def write_pack(programs, path):
 
 
 def build_tool(exe):
-    sources = [os.path.join(ROOT, "tools", "shaderaot.c"), os.path.join(ROOT, "runtime", "gpu_shader.c")]
-    headers = [os.path.join(ROOT, "runtime", n) for n in ("gpu_shader.h", "gpu_shader_cache.h")]
+    sources = [os.path.join(ROOT, "tools", "shaderaot.c"), os.path.join(ROOT, "runtime", "gpu_shader.c"),
+               os.path.join(ROOT, "runtime", "gpu_shader_cfg.c")]
+    headers = [os.path.join(ROOT, "runtime", n) for n in ("gpu_shader.h", "gpu_shader_cache.h", "gpu_shader_cfg.h")]
     if os.path.exists(exe) and os.path.getmtime(exe) > max(os.path.getmtime(p) for p in sources + headers):
         return
     r = subprocess.run([cc.CLANG, "/nologo", "/O2", *cc.CFLAGS, *sources, "/Fe" + exe, "/link", "d3dcompiler.lib"],

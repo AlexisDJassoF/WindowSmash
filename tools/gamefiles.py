@@ -21,6 +21,7 @@ update carry the application's title id in their own headers, so what an NCA is 
 the metadata that lists it (apply_metadata), or from its data being a patch.
 """
 import argparse
+import glob
 import json
 import os
 import struct
@@ -36,6 +37,38 @@ ROMFS_STATES = {1: "plain", 3: "encrypted", 4: "patch"}   # an NCA section's enc
 
 class Error(Exception):
     """Something about the folder that stops the build; the message says what."""
+
+
+YUZU_LIKE = ("yuzu", "eden", "sudachi", "citron", "suyu")   # yuzu and the forks with its layout
+
+
+def emulator_folders(env=os.environ, home=None, find=glob.glob):
+    """Where the emulators keep keys, firmware and installed games on Linux, most likely first:
+    {"keys": [...], "firmware": [...], "game": [...]} (the folders may not exist). yuzu and its
+    forks keep theirs in the XDG data folder, Ryujinx in the XDG config folder; installed as a
+    Flatpak, each in its own ~/.var/app/<id>/data or config. (On Windows the installer has the
+    same list for %APPDATA%: tools/install_windowsmash.ps1 Get-FolderCandidates.)"""
+    home = home or os.path.expanduser("~")
+    data = [env.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")]
+    config = [env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")]
+    data += sorted(find(os.path.join(home, ".var", "app", "*", "data")))
+    config += sorted(find(os.path.join(home, ".var", "app", "*", "config")))
+    found = {"keys": [], "firmware": [], "game": []}
+    for root in data:
+        for name in YUZU_LIKE:
+            emu = os.path.join(root, name)
+            found["keys"].append(os.path.join(emu, "keys"))
+            found["firmware"].append(os.path.join(emu, "nand", "system", "Contents", "registered"))
+            found["game"].append(os.path.join(emu, "nand", "user", "Contents", "registered"))
+            found["game"].append(os.path.join(emu, "sdmc", "Nintendo", "Contents", "registered"))
+    for root in config:
+        emu = os.path.join(root, "Ryujinx")
+        found["keys"].append(os.path.join(emu, "system"))
+        found["firmware"].append(os.path.join(emu, "bis", "system", "Contents", "registered"))
+        found["game"].append(os.path.join(emu, "bis", "user", "Contents", "registered"))
+        found["game"].append(os.path.join(emu, "sdcard", "Nintendo", "Contents", "registered"))
+    found["keys"].append(os.path.join(home, ".switch"))
+    return found
 
 
 # ---- pure: what a title id says ---------------------------------------------------------------

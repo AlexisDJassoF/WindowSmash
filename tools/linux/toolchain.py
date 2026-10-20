@@ -2,14 +2,17 @@
 
 Everything third-party lives outside the repository, in linux-toolchain/ next to this checkout
 (SSBU_LINUX_TOOLCHAIN overrides; README-LINUX.md says where each part comes from):
-  sysroot/        Ubuntu 22.04 packages (glibc 2.35, libgcc, libstdc++, SDL2, libopus, libvpx)
+  sysroot/        Ubuntu 22.04 packages (glibc 2.35, libgcc, libstdc++ and its development link, SDL2, libopus, libvpx)
   dxvk-native/    DXVK's native Linux libraries (Direct3D 11 on Vulkan)
   dxvk-headers/   their headers (DXVK's include/native and mingw-directx-headers)
   src/vkd3d-*/    vkd3d source; build-vkd3d/ holds its generated parsers and libraries
 Linking against glibc 2.35 keeps the program runnable on Ubuntu 22.04 and anything newer."""
 import glob
 import os
+import re
+import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +57,9 @@ def write_port_stamp(folder, port):
         f.write(port + "\n")
 
 
+LINUX_PACKAGES = {"clang": "clang", "ld.lld": "lld", "llvm-ar": "llvm", "llvm-nm": "llvm"}
+
+
 def _find_llvm():
     if os.environ.get("SSBU_LLVM_BIN"):
         return os.environ["SSBU_LLVM_BIN"]
@@ -68,9 +74,72 @@ def _find_llvm():
     raise SystemExit("no clang + ld.lld found (set SSBU_LLVM_BIN)")
 
 
-LLVM = _find_llvm()
-CLANG = os.path.join(LLVM, "clang.exe")
-LLVM_AR = os.path.join(LLVM, "llvm-ar.exe")
+def find_linux_llvm(env=os.environ, which=shutil.which, isfile=os.path.isfile, find=glob.glob):
+    """On a Linux host: {tool: path} for clang, ld.lld, llvm-ar and llvm-nm, all of one LLVM.
+    SSBU_LLVM_BIN names their folder; else the unsuffixed names on PATH (Ubuntu's clang, lld and
+    llvm packages); else the newest /usr/lib/llvm-NN/bin that has all four; else the newest
+    version NN whose clang-NN, ld.lld-NN, llvm-ar-NN and llvm-nm-NN are all on PATH."""
+    if env.get("SSBU_LLVM_BIN"):
+        folder = env["SSBU_LLVM_BIN"]
+        tools = {t: os.path.join(folder, t) for t in LINUX_PACKAGES}
+        missing = [t for t, p in tools.items() if not isfile(p)]
+        if missing:
+            raise SystemExit(f"SSBU_LLVM_BIN={folder} has no {', '.join(missing)}")
+        return tools
+    plain = {t: which(t) for t in LINUX_PACKAGES}
+    if all(plain.values()):
+        return plain
+    def version(folder):   # /usr/lib/llvm-NN/bin -> NN
+        m = re.search(r"llvm-(\d+)/bin$", folder)
+        return int(m.group(1)) if m else 0
+    for folder in sorted(find("/usr/lib/llvm-*/bin"), key=version, reverse=True):
+        tools = {t: os.path.join(folder, t) for t in LINUX_PACKAGES}
+        if all(isfile(p) for p in tools.values()):
+            return tools
+    versions = set()
+    for folder in env.get("PATH", "").split(os.pathsep):
+        for path in find(os.path.join(folder, "clang-[0-9]*")):
+            m = re.fullmatch(r"clang-(\d+)", os.path.basename(path))
+            if m:
+                versions.add(int(m.group(1)))
+    for v in sorted(versions, reverse=True):
+        tools = {t: which(f"{t}-{v}") for t in LINUX_PACKAGES}
+        if all(tools.values()):
+            return tools
+    missing = sorted({LINUX_PACKAGES[t] for t, p in plain.items() if not p})
+    raise SystemExit("the LLVM tools are missing (clang, ld.lld, llvm-ar, llvm-nm): install them with\n"
+                     f"  sudo apt install {' '.join(missing)}\nor name their folder in SSBU_LLVM_BIN")
+
+
+HOST_LINUX = sys.platform.startswith("linux")
+_tools = None
+
+
+def tools():
+    """LLVM (their folder), CLANG, LLVM_AR, LLVM_NM and LINKER (clang's flags naming the linker),
+    found the first time one is asked for - the module's attributes of those names are these - so
+    that what only reads the layout (package_linux.py) needs no compiler."""
+    global _tools
+    if _tools is None:
+        if HOST_LINUX:
+            found = find_linux_llvm()
+            _tools = {"LLVM": os.path.dirname(found["clang"]), "CLANG": found["clang"], "LLVM_AR": found["llvm-ar"],
+                      "LLVM_NM": found["llvm-nm"],
+                      # (an absolute linker: -fuse-ld=lld would not find a version-suffixed ld.lld-NN)
+                      "LINKER": ["--ld-path=" + found["ld.lld"]]}
+        else:
+            llvm = _find_llvm()
+            _tools = {"LLVM": llvm, "CLANG": os.path.join(llvm, "clang.exe"), "LLVM_AR": os.path.join(llvm, "llvm-ar.exe"),
+                      "LLVM_NM": os.path.join(llvm, "llvm-nm.exe"), "LINKER": ["-fuse-ld=lld"]}
+    return _tools
+
+
+def __getattr__(name):
+    if name in ("LLVM", "CLANG", "LLVM_AR", "LLVM_NM", "LINKER"):
+        return tools()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 TARGET = ["--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT]
 # Guest FP semantics need IEEE-exact arithmetic: no contraction, no fast-math (as on Windows).
 # -fno-pic: the program is linked at a fixed address (non-PIE); its code is far over the size
@@ -97,7 +166,7 @@ def compile_each(jobs_list, jobs=16, extra=()):
         os.makedirs(os.path.dirname(obj), exist_ok=True)
         lang = ["-x", "c++", "-std=gnu++20", "-fexceptions"] if src.endswith((".cpp", ".cc")) or "c++" in flags else []
         flags = [f for f in flags if f != "c++"]
-        code, out = run([CLANG, "-c", opt, *CFLAGS, *lang, *extra, *flags, src, "-o", obj])
+        code, out = run([tools()["CLANG"], "-c", opt, *CFLAGS, *lang, *extra, *flags, src, "-o", obj])
         return (src, out) if code else None
     with ThreadPoolExecutor(jobs) as pool:
         return [f for f in pool.map(one, jobs_list) if f]

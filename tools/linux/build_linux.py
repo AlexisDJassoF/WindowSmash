@@ -22,7 +22,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, LLVM, REPO, RUNTIME, SYSROOT, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC,
+from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, LINKER, LLVM_NM, REPO, RUNTIME, SYSROOT, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC,
                        compile_each, default_port, read_port_stamp, run, same_path, write_port_stamp)
 
 
@@ -37,7 +37,9 @@ GEN = os.path.join(OUT, "gen")
 
 RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.path.join(DXVK_INCLUDE, "windows"),
                     "-I", os.path.join(DXVK_INCLUDE, "directx"), "-I", os.path.join(SYSROOT, "usr", "include", "SDL2"),
-                    "-I", os.path.join(VKD3D_SRC, "include"), "-I", GEN]
+                    "-I", os.path.join(VKD3D_SRC, "include"),
+                    # (overlay_font.h, kept in the repository: before gen/, which may hold an older build's)
+                    "-I", os.path.join(RUNTIME, "linux"), "-I", GEN]
 RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL2"]
 
 
@@ -138,26 +140,11 @@ def write_if_changed(path, text):
     return True
 
 
-def overlay_font():
-    """gen/overlay_font.h: the debug overlay's glyphs, drawn by GDI here as the Windows build does."""
-    os.makedirs(GEN, exist_ok=True)
-    header = os.path.join(GEN, "overlay_font.h")
-    tool_src = os.path.join(REPO, "tools", "linux", "make_overlay_font.c")
-    if not needs(header, tool_src):
-        return True
-    exe = os.path.join(GEN, "make_overlay_font.exe")
-    code, out = run([os.path.join(LLVM, "clang-cl.exe"), "/nologo", "/O1", "-w", "-fuse-ld=lld", tool_src, "/Fe" + exe, "/link", "gdi32.lib", "user32.lib"])
-    if code or subprocess.run([exe, header]).returncode:
-        print("could not make the overlay font:\n" + out)
-        return False
-    return True
-
-
 def runtime_jobs():
     os.makedirs(GEN, exist_ok=True)
     rt_out = os.path.join(OUT, "rt")
     headers = [os.path.join(RUNTIME, n) for n in os.listdir(RUNTIME) if n.endswith(".h")] + \
-              [os.path.join(RUNTIME, "linux", "include", "windows.h")]
+              [os.path.join(RUNTIME, "linux", "include", "windows.h"), os.path.join(RUNTIME, "linux", "overlay_font.h")]
     sources = [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME))
                if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
     sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
@@ -230,7 +217,7 @@ def link():
         f.write("\n".join('"%s"' % o.replace("\\", "/") for o in objs))
     lib = os.path.join(SYSROOT, "usr", "lib", "x86_64-linux-gnu")
     t0 = time.time()
-    code, out = run([CLANG, "--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT, "-fuse-ld=lld", "-no-pie", "@" + rsp, "-o", exe,
+    code, out = run([CLANG, "--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT, *LINKER, "-no-pie", "@" + rsp, "-o", exe,
                      os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a"), os.path.join(lib, "libopus.a"), os.path.join(lib, "libvpx.a"),
                      "-L" + DXVK_LIBS, "-l:libdxvk_d3d11.so.0", "-l:libdxvk_dxgi.so.0", "-l:libSDL2-2.0.so.0",
                      "-lstdc++", "-lm", "-lpthread", "-ldl", "-lrt",
@@ -240,7 +227,7 @@ def link():
         errors = [l for l in out.splitlines() if "error" in l.lower()] or out.splitlines()
         print("link failed\n" + "\n".join(errors)[:6000])
         return False
-    syms = subprocess.run([os.path.join(LLVM, "llvm-nm.exe"), "-n", "--defined-only", exe], capture_output=True, text=True)
+    syms = subprocess.run([LLVM_NM, "-n", "--defined-only", exe], capture_output=True, text=True)
     with open(os.path.join(OUT, "ssbu.syms"), "w", newline="\n") as f:
         f.write(syms.stdout)
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
@@ -270,7 +257,7 @@ def main():
     if "--runtime-only" not in sys.argv:
         use_tree()
     if "--link-only" not in sys.argv:
-        if not overlay_font() or not compile_all(runtime_jobs(), "runtime"):
+        if not compile_all(runtime_jobs(), "runtime"):
             return False
         if "--runtime-only" in sys.argv:
             return True

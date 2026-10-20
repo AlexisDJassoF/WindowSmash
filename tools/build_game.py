@@ -2,8 +2,13 @@
 """Build the game from your own files in one go: what Build WindowSmash.bat runs.
 
 Usage:
-  build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir>] [--jobs N] [--prepare-only]
-  build_game.py --check
+  build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir>] [--jobs N] [--prepare-only] [--target windows|linux]
+  build_game.py --check [--target windows|linux]
+
+--target is what to build: windows (build/ssbu.exe, on Windows only) or linux (build-linux/ssbu,
+the Linux program: README-LINUX.md); the default is the system this runs on. On Linux, steps 1
+and 9 are Linux's: the LLVM tools, bison, flex and linux-toolchain/ (tools/linux/fetch_toolchain.py),
+and the build is recomp.py gen-all, then tools/linux/build_vkd3d.py and build_linux.py.
 
 It does the setup guide's steps (docs/BUILDING.md) one after the other and stops at the first
 that fails, saying why. A step whose result is already there is skipped, so running it again
@@ -21,7 +26,7 @@ carries on where it stopped. --check does the first step only (the installer use
   5. fonts     the .bfttf fonts of every firmware NCA into dump/fonts (or the six from a fonts
                folder in the game folder)
   6. data      dump/modules/romfs.cfg: the game folder's romfs.bin, checked and set by
-               tools/Configure-Game-Data.ps1; without one, the program NCA's own RomFS, read in
+               tools/game_data.py; without one, the program NCA's own RomFS, read in
                place when it is decrypted (tools/nca.py romfs-cfg), else decrypted first into
                dump/modules (tools/nca.py decrypt); an update's, which is a patch, is applied
                over the base's next to it (tools/update.py apply: a layered romfs.cfg)
@@ -30,10 +35,11 @@ carries on where it stopped. --check does the first step only (the installer use
   8. fighters  the fighter modules in data.arc into dump/nro (tools/arc.py nro, which skips the
                ones there already)
   9. build     build/ssbu.exe (tools/recomp.py all), unless it is newer than everything it is
-               made from; --jobs defaults to what the installed RAM allows: 4 under 16 GB, 8 with
+               made from (for linux: build-linux/ssbu, as above); --jobs defaults to what the installed RAM allows: 4 under 16 GB, 8 with
                16 GB, 16 with 32 GB or more
 """
 import argparse
+import errno
 import importlib.util
 import os
 import re
@@ -50,6 +56,10 @@ EXEFS = os.path.join(DUMP, "exefs")
 FONTS = os.path.join(DUMP, "fonts")
 MODULES = os.path.join(DUMP, "modules")
 EXE = os.path.join(ROOT, "build", "ssbu.exe")
+LINUX_EXE = os.path.join(ROOT, "build-linux", "ssbu")
+LINUX_TOOLS = os.path.join(TOOLS, "linux")
+HOST_LINUX = sys.platform.startswith("linux")
+FREE_GB = 40   # what a first build takes, about: the C, the objects, the game data read from
 SAVED = os.path.join(DUMP, "build_folders.txt")
 SOURCE = os.path.join(DUMP, "game_source.txt")   # which game and version dump/ was set up from
 EXEFS_FILES = ("main", "main.npdm", "rtld", "sdk", "subsdk0")
@@ -149,11 +159,23 @@ def missing_packages(requirements):
     return missing
 
 
+def shown(path):
+    """A path relative to the port's folder, for a person, with this system's separators."""
+    return path.replace("/", os.sep).replace("\\", os.sep)
+
+
+def default_target():
+    return "linux" if HOST_LINUX else "windows"
+
+
 # ---- the steps ------------------------------------------------------------------------------
-def check_tools():
+def check_tools(target="windows"):
     if sys.version_info < (3, 10):
         raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.10 or newer (setup guide step 3).")
     log(f"  Python {sys.version.split()[0]}: {sys.executable}")
+    if target == "linux":
+        check_linux_tools()
+        return
     import cc
     clang = cc.CLANG if os.path.isfile(cc.CLANG) else shutil.which(cc.CLANG)
     if not clang:
@@ -175,14 +197,57 @@ def check_tools():
     log(f"  clang-cl: {clang}")
 
 
+def linux_toolchain():
+    """tools/linux/toolchain.py, which finds the LLVM tools as it is imported (Failed if they are missing)."""
+    if LINUX_TOOLS not in sys.path:
+        sys.path.insert(0, LINUX_TOOLS)
+    try:
+        import toolchain
+        toolchain.tools()   # (found when first asked for)
+    except SystemExit as e:
+        raise Failed(str(e))
+    return toolchain
+
+
+def check_linux_tools():
+    tc = linux_toolchain()
+    log(f"  clang: {tc.CLANG}")
+    for name in ("bison", "flex"):
+        if not (os.environ.get("SSBU_" + name.upper()) or shutil.which(name)):
+            raise Failed(f"{name} was not found: sudo apt install {name}")
+    parts = {"sysroot": tc.SYSROOT, "dxvk-native": tc.DXVK_LIBS, "dxvk-headers": tc.DXVK_INCLUDE, "vkd3d source": tc.VKD3D_SRC}
+    missing = [name for name, path in parts.items() if not path or not os.path.isdir(path)]
+    if missing:
+        raise Failed(f"{tc.TOOLCHAIN} has no {', '.join(missing)}: run  python3 tools/linux/fetch_toolchain.py")
+    log(f"  linux-toolchain: {tc.TOOLCHAIN}")
+    # the game is linked long after the build starts: try the compiler, the sysroot and the linker now
+    with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
+        src = os.path.join(tmp, "check.c")
+        with open(src, "w") as f:
+            f.write("#include <stdio.h>\n#include <pthread.h>\n"
+                    "int main(void) { printf(\"%lu\\n\", (unsigned long)pthread_self()); return 0; }\n")
+        r = subprocess.run([tc.CLANG, *tc.TARGET, *tc.LINKER, "-no-pie", src, "-o", os.path.join(tmp, "check"), "-lpthread",
+                            "-lstdc++"],   # (as the game is linked: the C++ runtime too)
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise Failed(f"{tc.CLANG} could not build a test program against {tc.SYSROOT}. Run "
+                         "python3 tools/linux/fetch_toolchain.py again.\n" + (r.stdout + r.stderr)[-2000:])
+    free = shutil.disk_usage(ROOT).free / 2**30
+    if free < FREE_GB:
+        log(f"  note: {free:.0f} GB free here; a first build takes about {FREE_GB} GB")
+
+
 def install_packages():
     requirements = os.path.join(ROOT, "requirements.txt")
     missing = missing_packages(requirements)
     if not missing:
         log("  already installed")
         return
+    # (Ubuntu's own Python takes no pip packages - "externally-managed-environment": a venv does)
+    venv = ("\n  On Ubuntu, use a Python environment of this folder's own:\n"
+            "    python3 -m venv .venv && .venv/bin/python tools/build_game.py") if HOST_LINUX else ""
     run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
-        "pip could not install " + ", ".join(missing) + " (see above).")
+        "pip could not install " + ", ".join(missing) + " (see above)." + venv)
     importlib.invalidate_caches()
 
 
@@ -197,10 +262,27 @@ FOLDERS = {
 }
 
 
+LINUX_DEFAULTS = {"game": "~/MyDump", "keys": "~/MyKeys", "firmware": "~/MyFirmware"}
+
+
+def default_folder(key):
+    """What to offer when nothing was answered before: on Linux, the first of the emulators'
+    folders (gamefiles.emulator_folders) that would do, else a folder in the home folder; on
+    Windows, the setup guide's."""
+    if not HOST_LINUX:
+        return FOLDERS[key][1]
+    import gamefiles
+    check = FOLDERS[key][2]
+    for path in gamefiles.emulator_folders()[key]:
+        if os.path.isdir(path) and not check(path):
+            return path
+    return os.path.expanduser(LINUX_DEFAULTS[key])
+
+
 def ask_folder(key, given, saved):
     """A folder from the command line, or asked, with last time's answer as the default."""
-    label, default, check = FOLDERS[key]
-    default = saved.get(key, default)
+    label, _default, check = FOLDERS[key]
+    default = saved.get(key) or default_folder(key)
     while True:
         if given:
             answer = given
@@ -358,11 +440,13 @@ def missing_fonts(folder):
 def write_romfs_cfg(game, keys, the_program):
     romfs_bin = os.path.join(game, "romfs.bin")
     if os.path.isfile(romfs_bin):
-        run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             os.path.join("tools", "Configure-Game-Data.ps1"), "-NonInteractive", "-RomfsPath", romfs_bin,
-             "-FontsDirectory", FONTS],
-            f"{romfs_bin} could not be used (see above): it must be the game's data, unencrypted and with "
-            "your update applied (setup guide part 2).")
+        import game_data
+        try:
+            game_data.configure(romfs_bin, FONTS)
+        except game_data.Error as e:
+            raise Failed(f"{romfs_bin} could not be used: {e} It must be the game's data, unencrypted and with "
+                         "your update applied (setup guide part 2).")
+        log(f"  {romfs_bin}: checked and connected")
         return
     import gamefiles
     path, _title, program, result = the_program()
@@ -409,23 +493,35 @@ def decrypt_once(record, keys):
     return out
 
 
-def build_is_current():
+def build_is_current(target="windows"):
     """build/ssbu.exe is newer than the runtime, the tools and the modules it is built from, and
-    has SDL3.dll beside it if SDL3 is there to build with."""
-    if not os.path.isfile(EXE):
+    has SDL3.dll beside it if SDL3 is there to build with; for linux, build-linux/ssbu is newer
+    than those and the Linux runtime and tools."""
+    exe = LINUX_EXE if target == "linux" else EXE
+    if not os.path.isfile(exe):
         return False
-    import cc
-    if cc.SDL3_DLL and not os.path.isfile(os.path.join(ROOT, "build", "SDL3.dll")):
-        return False
+    if target == "windows":
+        import cc
+        if cc.SDL3_DLL and not os.path.isfile(os.path.join(ROOT, "build", "SDL3.dll")):
+            return False
     inputs = [os.path.join(ROOT, "runtime", n) for n in os.listdir(os.path.join(ROOT, "runtime"))]
     inputs += [os.path.join(TOOLS, n) for n in os.listdir(TOOLS) if n.endswith(".py")]
+    if target == "linux":
+        linux_runtime = os.path.join(ROOT, "runtime", "linux")
+        inputs += [os.path.join(linux_runtime, n) for n in os.listdir(linux_runtime)]
+        inputs += [os.path.join(LINUX_TOOLS, n) for n in os.listdir(LINUX_TOOLS) if n.endswith(".py")]
     inputs += [os.path.join(EXEFS, n) for n in os.listdir(EXEFS)]
     nro = os.path.join(DUMP, "nro")
     inputs += [os.path.join(nro, n) for n in os.listdir(nro) if n.endswith(".nro")] if os.path.isdir(nro) else []
-    return os.path.getmtime(EXE) > max(os.path.getmtime(p) for p in inputs if os.path.isfile(p))
+    return os.path.getmtime(exe) > max(os.path.getmtime(p) for p in inputs if os.path.isfile(p))
 
 
 def installed_ram_gb():
+    if HOST_LINUX:
+        try:
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+        except (ValueError, OSError):
+            return None
     import ctypes
     kb = ctypes.c_ulonglong()
     if not ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(kb)):
@@ -442,11 +538,14 @@ def in_use(path):
         return False
     except PermissionError:
         return True
+    except OSError as e:   # (Linux: a running program's file is busy)
+        return e.errno == errno.ETXTBSY
 
 
 def build(a):
+    a.target = getattr(a, "target", None) or default_target()
     log("[1/9] Check the tools")
-    check_tools()
+    check_tools(a.target)
 
     log("\n[2/9] Install the Python packages")
     install_packages()
@@ -477,7 +576,7 @@ def build(a):
         found = found or find_program(game, keys)
         return found
 
-    log("\n[4/9] Copy the game's program (dump\\exefs)")
+    log(shown("\n[4/9] Copy the game's program (dump\\exefs)"))
     if exefs_done:
         if game:
             check_same_game(the_program()[2])
@@ -485,7 +584,7 @@ def build(a):
     else:
         extract_exefs(the_program()[2], keys)
 
-    log("\n[5/9] Take the fonts out of your firmware (dump\\fonts)")
+    log(shown("\n[5/9] Take the fonts out of your firmware (dump\\fonts)"))
     if fonts_from is None:
         log("  already done")
     elif fonts_from == "game":
@@ -501,7 +600,7 @@ def build(a):
                          "your firmware's .nca files, and that your keys are from after your Switch's latest "
                          "system update.")
 
-    log("\n[6/9] Connect your game data (dump\\modules\\romfs.cfg)")
+    log(shown("\n[6/9] Connect your game data (dump\\modules\\romfs.cfg)"))
     if romfs_done:
         log("  already done")
     else:
@@ -509,7 +608,7 @@ def build(a):
             log(f"  {cfg} reads a file that is not there any more: setting it again")
         write_romfs_cfg(game, keys, the_program)
 
-    log("\n[7/9] Turn on your DLC (dump\\modules\\aoc.cfg)")
+    log(shown("\n[7/9] Turn on your DLC (dump\\modules\\aoc.cfg)"))
     if os.path.exists(aoc):
         log("  already done")
     else:
@@ -522,11 +621,14 @@ def build(a):
                  "--out", os.path.join("dump", "modules", "aoc.cfg"), "--app", f"{title & ~0xFFF:016X}"],
                 f"Could not read the DLC in {dlc} (see above).")
 
-    log("\n[8/9] Take out the fighters (dump\\nro)")
+    log(shown("\n[8/9] Take out the fighters (dump\\nro)"))
     run([sys.executable, os.path.join("tools", "arc.py"), "nro"],
         "Could not read the fighters from the game data (see above). Check that the game data from step 6 is "
         "the game's, with your update applied.")
 
+    if a.target == "linux":
+        build_linux(a)
+        return
     log("\n[9/9] Build the game (build\\ssbu.exe)")
     if a.prepare_only:
         log("  not now (--prepare-only): everything the build needs is ready")
@@ -552,6 +654,45 @@ def build(a):
     log("\nDone: build\\ssbu.exe is ready. Start the game with Play SSBU.bat.")
 
 
+def jobs_to_use(a):
+    if a.jobs:
+        return a.jobs
+    gb = installed_ram_gb()
+    jobs = jobs_for_ram(gb) if gb else 4
+    log(f"  {jobs} jobs at a time, for {gb:.0f} GB of RAM" if gb else f"  {jobs} jobs at a time (the RAM size is unknown)")
+    return jobs
+
+
+def build_linux(a):
+    """Step 9 for linux: the C (recomp.py gen-all, as all generates it), vkd3d-shader once, then
+    the Linux program (tools/linux/build_linux.py, of this folder's game tree)."""
+    log("\n[9/9] Build the game (build-linux/ssbu)")
+    if a.prepare_only:
+        log("  not now (--prepare-only): everything the build needs is ready")
+        return
+    if build_is_current("linux"):
+        log("  build-linux/ssbu is newer than everything it is built from: nothing to do (delete it to build again)")
+    else:
+        if in_use(LINUX_EXE):
+            raise Failed("The game is running from build-linux/ssbu: close it, then run this again.")
+        jobs = jobs_to_use(a)
+        log("  the first build takes from 30 minutes to a few hours, later ones minutes; if it stops, run this again to carry on")
+        retry = f"If the PC ran out of memory, build with fewer jobs at a time: python3 tools/build_game.py --jobs {max(2, jobs // 2)}"
+        run([sys.executable, os.path.join("tools", "recomp.py"), "gen-all", os.path.join("dump", "exefs"),
+             "--out", "build", "--jobs", str(jobs)],
+            "Generating the game's C failed (see above). " + retry)
+        tc = linux_toolchain()
+        if not os.path.isfile(os.path.join(tc.VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
+            run([sys.executable, os.path.join("tools", "linux", "build_vkd3d.py"), "linux"],
+                "vkd3d-shader could not be built (see above).")
+        run([sys.executable, os.path.join("tools", "linux", "build_linux.py"), "--port", ROOT, "--jobs", str(jobs)],
+            "The Linux build failed (see above). " + retry)
+    log("\nDone: build-linux/ssbu is ready. To play on this machine:\n"
+        "  python3 tools/linux/package_linux.py --link\n"
+        "  bash dist-linux/ssbu-linux/run.sh\n"
+        "(--tar instead of --link makes ssbu-linux.tar, to copy to another machine of yours: README-LINUX.md)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Build the game from your own files (Build WindowSmash.bat).")
     ap.add_argument("--game", help=r"the folder with the game's files (asked; default D:\MyDump)")
@@ -560,11 +701,16 @@ def main():
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
     ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
     ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")
+    ap.add_argument("--target", choices=("windows", "linux"), default=default_target(),
+                    help="what to build: the Windows program or the Linux one (default: this system's)")
     a = ap.parse_args()
     try:
+        if a.target == "windows" and HOST_LINUX:
+            raise Failed("--target windows builds build/ssbu.exe, which is made on Windows only. On Linux, "
+                         "--target linux (the default) builds the Linux program.")
         if a.check:
             log("[1/9] Check the tools")
-            check_tools()
+            check_tools(a.target)
             log("\nThe tools are ready.")
         else:
             build(a)

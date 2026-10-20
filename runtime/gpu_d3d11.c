@@ -568,6 +568,7 @@ typedef struct Shader {
     volatile LONG state;   /* 0 compiling, 1 ready, 2 failed */
     void *obj;             /* ID3D11VertexShader, ID3D11PixelShader or ID3D11ComputeShader */
     char *hlsl;            /* while compiling */
+    char *hlsl_dispatch;   /* while compiling a structured one: its dispatch loop, should that not compile */
     char name[64];
     ShaderInfo info;
     u32 written_mask, learn_runs;   /* compute: storage buffers it was seen to write, over its first runs */
@@ -768,7 +769,17 @@ static LONG make_ready(struct Compiler *me, Shader *s) {
     ID3DBlob *code = NULL, *errors = NULL;
     HRESULT hr = shader_cache_compile(s->hlsl, s->name, s->stage, &code, &errors);
     LONG state = 2;
-    if (SUCCEEDED(hr) && create_noted(me, s, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code))) {
+    int made = SUCCEEDED(hr) && create_noted(me, s, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code));
+    if (!made && s->hlsl_dispatch) {   /* the structured form did not compile: the dispatch loop, as before */
+        fprintf(stderr, "[gfx] shader %s: its structured form failed to compile (%.300s), using its dispatch loop\n", s->name,
+                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : SUCCEEDED(hr) ? "the driver refused its bytecode" : "?");
+        if (code) ID3D10Blob_Release(code);
+        if (errors) ID3D10Blob_Release(errors);
+        code = errors = NULL;
+        hr = shader_cache_compile(s->hlsl_dispatch, s->name, s->stage, &code, &errors);
+        made = SUCCEEDED(hr) && create_noted(me, s, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code));
+    }
+    if (made) {
         f = fopen(path, "wb");
         if (f) { fwrite(ID3D10Blob_GetBufferPointer(code), 1, ID3D10Blob_GetBufferSize(code), f); fclose(f); }
         state = 1;
@@ -810,7 +821,8 @@ static DWORD WINAPI compiler_main(void *arg) {
         me->step = STEP_IDLE;
         me->job = NULL;
         free(s->hlsl);
-        s->hlsl = NULL;
+        free(s->hlsl_dispatch);
+        s->hlsl = s->hlsl_dispatch = NULL;
         if (state == 1) InterlockedIncrement64((volatile LONG64 *)&gfx_stat_shaders);
         else InterlockedIncrement64((volatile LONG64 *)&gfx_stat_shader_failures);
         InterlockedExchange(&s->state, state);
@@ -848,7 +860,7 @@ static DWORD WINAPI prewarm_main(void *unused) {
     Found *found = NULL;
     u32 n = 0, cap = 0;
     char pattern[1100];
-    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", cache_dir(), SHADER_CACHE_VERSION);
+    snprintf(pattern, sizeof pattern, "%s/v%u%s_*.dxbc", cache_dir(), SHADER_CACHE_VERSION, shader_dispatch_forced() ? "d" : "");
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     for (BOOL more = h != INVALID_HANDLE_VALUE; more; more = FindNextFileA(h, &fd)) {
@@ -867,10 +879,11 @@ static DWORD WINAPI prewarm_main(void *unused) {
     Shader *head = NULL, *tail = NULL;
     u32 queued = 0;
     for (u32 i = 0; i < n && table; i++) {
-        unsigned version, vs_outputs;
+        unsigned vs_outputs;
         char stage_name[4];
         unsigned long long hash, tables;
-        if (sscanf(found[i].name, "v%u_%2[a-z]_%16llx_%8x_%16llx.dxbc", &version, stage_name, &hash, &vs_outputs, &tables) != 5) continue;
+        const char *key = strchr(found[i].name, '_');   /* (past "v<version>[d]_") */
+        if (!key || sscanf(key + 1, "%2[a-z]_%16llx_%8x_%16llx.dxbc", stage_name, &hash, &vs_outputs, &tables) != 4) continue;
         int stage = !strcmp(stage_name, "vs") ? SHADER_VERTEX : !strcmp(stage_name, "ps") ? SHADER_PIXEL : !strcmp(stage_name, "cs") ? SHADER_COMPUTE : -1;
         if (stage < 0 || queued >= PREWARM_SLOTS / 2) continue;
         Shader *s = calloc(1, sizeof *s);
@@ -1028,6 +1041,8 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     }
     s->table_hash = table_hash(&s->info, &src);
     if (s->info.unsupported[0]) fprintf(stderr, "[gfx] %s: %s\n", s->name, s->info.unsupported);
+    if (s->info.flow == SHADER_FLOW_DISPATCH && strcmp(s->info.flow_reason, "forced"))
+        fprintf(stderr, "[gfx] %s: a dispatch loop (%s; %u jump tables)\n", s->name, s->info.flow_reason, s->info.ntables);
     const char *find = getenv("SSBU_GFX_FIND");   /* debug: other copies of this program in guest memory */
     if (find && strstr(s->name, find) && size > 0x90) {
         fprintf(stderr, "[find] %s at %#llx, %#x bytes; around it:", s->name, g, size);
@@ -1072,6 +1087,11 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     char path[1200];
     cache_path(s, path, sizeof path);
     s->cached = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    if (!s->cached && s->info.flow == SHADER_FLOW_STRUCTURED) {   /* its fallback, while the draw's constant buffers are at hand */
+        ShaderInfo same;   /* (as s->info: both forms note the same resources) */
+        s->hlsl_dispatch = shader_translate(p, size, stage, vs_outputs, stage == SHADER_COMPUTE ? local : NULL, shared, &same, read_cbuf_word,
+                                            &src, SHADER_DISPATCH);
+    }
     enqueue_shader(s);
     /* a compute program that was compiled before is waited for (a few ms): a skipped launch
      * leaves its outputs (skinned vertices) unwritten for a frame */

@@ -37,7 +37,13 @@ typedef struct ShaderInfo {
     u32 sb_count;                  /* global memory: the storage buffers it may fall in, */
     u32 sb_offset[16];             /* by the offset of their descriptor in constant buffer 0 */
     int stores;                    /* compute: writes global memory */
+    int flow;                      /* SHADER_FLOW_*: how its control flow was emitted */
+    char flow_reason[24];          /* SHADER_FLOW_DISPATCH: why not structured (irreducible, brx, stack, loop-exits, ..., forced) */
 } ShaderInfo;
+
+/* Control flow: a program without branches is LINEAR; one with them STRUCTURED (if/else and
+ * loops) when its graph allows, else a DISPATCH loop over its blocks. */
+enum { SHADER_FLOW_LINEAR, SHADER_FLOW_STRUCTURED, SHADER_FLOW_DISPATCH };
 
 /* NVN describes storage buffers in constant buffer 0, 16 bytes each from SB_FIRST: the GPU
  * address (64 bits), then the size. Global memory accesses are resolved against them. */
@@ -58,6 +64,21 @@ char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, Sha
 /* A compute program (no header: pass it with 0x50 bytes of anything in front, so that its
  * addresses line up with those of the other stages), its workgroup size and shared memory. */
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user);
+
+/* All of the above: `local` and `shared` for a compute program (else NULL, 0). With
+ * SHADER_DISPATCH, a program with branches is a dispatch loop even if it could be structured (the
+ * renderer's fallback when the structured HLSL does not compile). Both modes give the same
+ * ShaderInfo but for flow and flow_reason. */
+enum { SHADER_DISPATCH = 1 };
+char *shader_translate(const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared, ShaderInfo *info,
+                       CbufReader *read, void *user, int flags);
+
+/* SSBU_SHADER_DISPATCH=1: every program with branches a dispatch loop (and its cache files apart). */
+int shader_dispatch_forced(void);
+
+/* For tests: a program's instructions as gpu_shader_cfg.h describes their control flow (one
+ * malloc'd block; *n of them). */
+struct CfInsn *shader_flow(const u8 *program, u32 size, CbufReader *read, void *user, u32 *n);
 
 /* Per-draw parameters (cbuffer b0), shared by both stages. */
 typedef struct DrawParams {

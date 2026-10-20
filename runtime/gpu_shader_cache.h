@@ -1,7 +1,8 @@
 /* The disk cache of compiled shaders (DXBC files), shared by the renderer (gpu_d3d11.c) and the
  * ahead-of-time compiler (tools/shaderaot.c), so that both key, name and compile a program alike.
  *
- * A file is "<dir>/v<version>_<vs|ps|cs>_<program hash>_<vs outputs>_<jump tables' hash>.dxbc".
+ * A file is "<dir>/v<version>_<vs|ps|cs>_<program hash>_<vs outputs>_<jump tables' hash>.dxbc"; with
+ * SSBU_SHADER_DISPATCH=1 (every program with branches a dispatch loop) "v<version>d_...", apart.
  * The ahead-of-time compiler dates its files 2001-01-01 until the game first uses them (the
  * renderer then dates them now): the start's prewarm makes only shaders the game has used. */
 #pragma once
@@ -12,7 +13,7 @@
 #include "gpu_shader.h"
 
 /* Bump when the translator changes what it generates: older files are then ignored. */
-#define SHADER_CACHE_VERSION 10
+#define SHADER_CACHE_VERSION 12
 #define SHADER_CACHE_UNPLAYED 0x01C07385C89DC000ull   /* FILETIME 2001-01-01 */
 #define SHADER_CACHE_PLAYED   0x01C1925741648000ull   /* written after 2002-01-01: the game used it */
 
@@ -24,7 +25,7 @@ static inline u64 shader_program_hash(const u8 *p, u32 size) {
 }
 
 static inline void shader_cache_file(char *out, size_t n, const char *dir, int stage, u64 hash, u32 vs_outputs, u64 table_hash) {
-    snprintf(out, n, "%s/v%u_%s_%016llx_%08x_%016llx.dxbc", dir, SHADER_CACHE_VERSION,
+    snprintf(out, n, "%s/v%u%s_%s_%016llx_%08x_%016llx.dxbc", dir, SHADER_CACHE_VERSION, shader_dispatch_forced() ? "d" : "",
              stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)hash, vs_outputs,
              (unsigned long long)table_hash);
 }

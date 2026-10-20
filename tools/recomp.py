@@ -10,6 +10,7 @@ Usage:
   recomp.py compile  <dir> [--jobs N]
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
   recomp.py all      <exefs dir> --out <build dir> [--jobs N]
+  recomp.py gen-all  <exefs dir> --out <build dir> [--jobs N]
   recomp.py check    <exefs dir>
   recomp.py wrap-sig <nso> <address>
 
@@ -25,6 +26,9 @@ compile   compile a build directory to objects (incremental; reports per-file fa
 link      compile the host runtime and link module build directories into an executable
 all       image + build + compile every module of an ExeFS, then link; a module another game
           version tree already built (same build id) is reused, not built again (modcache.py)
+gen-all   image + build every module of an ExeFS, as all does, but compile and link nothing: the
+          C for tools/linux/build_linux.py on a machine without clang-cl. A later all compiles
+          what it lacks (compile goes by each object's time, not by the stamp)
 check     list each module's imports that no module exports and the runtime does not implement
 wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
 
@@ -610,7 +614,8 @@ def check(exefs):
     return modcache.report_imports(mods, hle_names(), os.path.join(TREE, "build", "imports.unresolved.txt"))
 
 
-def build_all(exefs, out, jobs):
+def build_all(exefs, out, jobs, compile=True):
+    """all; with compile=False, gen-all: the C only, nothing compiled or linked."""
     dirs = []
     paths = module_paths(exefs)
     check(exefs)
@@ -634,11 +639,13 @@ def build_all(exefs, out, jobs):
             reused += 1
         else:
             build(nso, target, jobs, 40000)
-        if not compile_dir(target, min(jobs, 16)):
+        if compile and not compile_dir(target, min(jobs, 16)):
             return False
         modcache.write_stamp(target, mod.build_id, base, name, fp)
         dirs.append(target)
     print(f"{reused} of {len(paths)} modules reused without generating their C again")
+    if not compile:
+        return True
     return link(dirs, os.path.join(out, "ssbu.exe"))
 
 
@@ -668,6 +675,8 @@ if __name__ == "__main__":
         sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
         sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20"))) else 1)
+    elif cmd == "gen-all":
+        sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), compile=False) else 1)
     elif cmd == "check":
         check(nso)
     elif cmd == "wrap-sig":

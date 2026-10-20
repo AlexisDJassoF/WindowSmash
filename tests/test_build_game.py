@@ -79,7 +79,7 @@ class BuildStepsTests(unittest.TestCase):
         self.ns.update(
             DUMP=str(dump), EXEFS=str(exefs), FONTS=str(dump / 'fonts'), MODULES=str(dump / 'modules'),
             SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'),
-            log=lambda msg='': None, check_tools=lambda: None, install_packages=lambda: None,
+            log=lambda msg='': None, check_tools=lambda target="windows": None, install_packages=lambda: None,
             ask_folder=lambda key, given, saved: folders[key],
             find_program=lambda game, keys: (self.program['path'], BASE, self.program, {'contents': self.contents}),
             romfs_cfg_ok=lambda cfg: True, missing_fonts=lambda folder: [], check_same_game=lambda rec: None,

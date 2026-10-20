@@ -1,6 +1,7 @@
-/* The debug overlay's glyph atlas for the Linux build, drawn here on Windows exactly as
- * gpu_overlay.c draws it there (GDI, the same font and cells), and written out as a C header
- * (overlay_font.h, a build product - not kept in the repository).
+/* The debug overlay's glyph atlas, drawn here on Windows exactly as gpu_overlay.c draws it there
+ * (GDI, the same font and cells), and written out as a C header. No longer what the Linux build
+ * uses: runtime/linux/overlay_font.h, kept in the repository, is drawn in a free font by
+ * tools/linux/make_overlay_font.py (Consolas is Microsoft's). Kept to compare the two.
  *
  * Usage: make_overlay_font <output header> */
 #define _CRT_SECURE_NO_WARNINGS

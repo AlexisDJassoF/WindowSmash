@@ -4,14 +4,16 @@
 Usage: build_vkd3d.py [linux|windows]...   (default: linux)
 
 The parsers come from vkd3d's grammar files through bison and flex, generated once into
-build-vkd3d/gen (tools: SSBU_BISON / SSBU_FLEX, else linux-toolchain/winflexbison). The
-windows build is only for checking shaders on a Windows machine (tools/linux/hlsltest)."""
+build-vkd3d/gen (tools: SSBU_BISON / SSBU_FLEX, else on Linux the system's bison and flex, on
+Windows linux-toolchain/winflexbison). The windows build is only for checking shaders on a
+Windows machine (tools/linux/hlsltest), and is made there only."""
 import glob
 import os
+import shutil
 import subprocess
 import sys
 
-from toolchain import CLANG, CFLAGS, LLVM, LLVM_AR, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each
+from toolchain import CLANG, CFLAGS, HOST_LINUX, LLVM, LLVM_AR, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each
 
 GEN = os.path.join(VKD3D_BUILD, "gen")
 SPIRV = (glob.glob(os.path.join(TOOLCHAIN, "src", "SPIRV-Headers-*", "include")) or [""])[0]
@@ -66,10 +68,22 @@ def sources():
     return shader, common
 
 
+def parser_tool(name):
+    """bison or flex: SSBU_BISON / SSBU_FLEX, else the system's (Linux) or win_<name>.exe (Windows)."""
+    named = os.environ.get("SSBU_" + name.upper())
+    if named:
+        return named
+    if not HOST_LINUX:
+        return os.path.join(TOOLCHAIN, "winflexbison", f"win_{name}.exe")
+    found = shutil.which(name)
+    if not found:
+        raise SystemExit(f"{name} not found: sudo apt install {name} (or name it in SSBU_{name.upper()})")
+    return found
+
+
 def generate():
     os.makedirs(GEN, exist_ok=True)
-    bison = os.environ.get("SSBU_BISON") or os.path.join(TOOLCHAIN, "winflexbison", "win_bison.exe")
-    flex = os.environ.get("SSBU_FLEX") or os.path.join(TOOLCHAIN, "winflexbison", "win_flex.exe")
+    bison, flex = parser_tool("bison"), parser_tool("flex")
     src = os.path.join(VKD3D_SRC, "libs", "vkd3d-shader")
     for name in ("hlsl", "preproc"):
         if not os.path.exists(os.path.join(GEN, name + ".tab.c")):
@@ -127,5 +141,7 @@ def build(target):
 
 
 if __name__ == "__main__":
+    if HOST_LINUX and "windows" in sys.argv[1:]:
+        raise SystemExit("the windows build of vkd3d-shader is made on Windows only")
     ok = all(build(t) for t in (sys.argv[1:] or ["linux"]))
     sys.exit(0 if ok else 1)

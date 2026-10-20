@@ -219,7 +219,86 @@ back.
 
 ## Building it
 
-The Linux program is cross-compiled on Windows, next to the Windows build. It compiles the same
+You can build the Linux program on Ubuntu itself, from your own game files, keys and firmware.
+No Windows machine is involved. It can also still be cross-compiled on Windows, next to the
+Windows build ([below](#cross-compiling-on-windows)). Both ways give the same program: the same
+compiler flags, linked against Ubuntu 22.04's glibc, so it runs on Ubuntu 22.04 or newer, on
+Debian 12 or newer, and on the distributions based on them.
+
+### On Ubuntu
+
+You need about **40 GB free** and **16 GB of RAM** or more. The first build takes from one to a
+few hours (with 4 jobs on less than 16 GB of RAM, the longer end); later ones take minutes. In
+the WindowSmash folder:
+
+1. **Install the build tools:**
+
+   ```bash
+   sudo apt install clang lld llvm bison flex python3-venv
+   ```
+
+2. **Set up Python for WindowSmash.** Ubuntu's own Python doesn't take extra packages, so
+   WindowSmash gets an environment of its own, in `.venv`:
+
+   ```bash
+   python3 -m venv .venv
+   ```
+
+3. **Fetch the third-party parts** into `linux-toolchain/`, next to the WindowSmash folder:
+   Ubuntu 22.04's libraries (the sysroot), DXVK, vkd3d and SPIRV-Headers. Each download is
+   checked before it is used. The libraries come from one fixed moment of the Ubuntu archive,
+   checked against its signature, so every machine gets the same ones.
+
+   ```bash
+   python3 tools/linux/fetch_toolchain.py
+   ```
+
+4. **Build:**
+
+   ```bash
+   .venv/bin/python tools/build_game.py
+   ```
+
+   It asks where your game files, keys and firmware are. When yuzu (or eden, sudachi, citron,
+   suyu) or Ryujinx has them, it offers their folders, Flatpak installs included. It then does
+   what [docs/BUILDING.md](docs/BUILDING.md) describes for Windows, up to the program, which is
+   `build-linux/ssbu`. Stopped or failed, it carries on from where it was when you run it again.
+   `--jobs N` sets how many files compile at once; `--check` only checks the tools.
+
+5. **Play on this machine:**
+
+   ```bash
+   python3 tools/linux/package_linux.py --link
+   ```
+
+   ```bash
+   bash dist-linux/ssbu-linux/run.sh
+   ```
+
+   `--link` makes `dist-linux/ssbu-linux` from links to the build instead of copies: it takes a
+   few megabytes, a new build is played without running it again, and the shaders the game
+   compiles are kept in `dump/shadercache`. From there, everything in this guide from
+   [Setting up](#setting-up) step 2 on applies.
+
+   To take the game to **another machine of yours**, make a folder to copy instead:
+   `python3 tools/linux/package_linux.py --tar` writes `dist-linux/ssbu-linux.tar`.
+
+The first time each effect shows, its shader is compiled, so it can show a moment late: a build
+made on Linux has no shader cache from a Windows build to start from.
+
+| Commands | What they do |
+| :--- | :--- |
+| `fetch_toolchain.py` | Makes `linux-toolchain/` (or the folder `SSBU_LINUX_TOOLCHAIN` names). Run again, it fetches only what is missing or changed. `--list` shows what it would fetch. |
+| `build_game.py` | On Linux, `--target linux` is the default. Steps 1 to 8 are the Windows build's. Step 9 is `recomp.py gen-all` (the game's C, without compiling it for Windows), `tools/linux/build_vkd3d.py` once, and `tools/linux/build_linux.py`. |
+| `package_linux.py` | `--link` to play here, `--tar` for a folder to copy: they don't go together. |
+
+The LLVM tools are found on `PATH` (`clang`, `ld.lld`, `llvm-ar`, `llvm-nm`), else as
+`/usr/lib/llvm-NN/bin` or with a version suffix (`clang-20`); `SSBU_LLVM_BIN` names their folder
+outright. `SSBU_BISON` and `SSBU_FLEX` name bison and flex.
+
+### Cross-compiling on Windows
+
+The Linux program can also be cross-compiled on Windows, next to the Windows build. It compiles the same
 generated C again, so build the game tree for Windows first (`tools/recomp.py`; for a version
 folder, `--tree`). You also need Visual Studio's Clang (`clang.exe` and `ld.lld.exe`, or name
 their folder in `SSBU_LLVM_BIN`) and Python 3.
@@ -229,7 +308,7 @@ The third-party parts go in `linux-toolchain/`, next to the checkout (or in the 
 
 | Folder | What goes there |
 | :--- | :--- |
-| `sysroot/` | These Ubuntu 22.04 (jammy) amd64 packages, each `.deb`'s data archive extracted into it: `libc6`, `libc6-dev`, `linux-libc-dev`, `libgcc-s1`, `libgcc-11-dev`, `libstdc++6`, `libsdl2-2.0-0`, `libsdl2-dev`, `libopus-dev`, `libvpx-dev`. Linking against 22.04's glibc keeps the program runnable on 22.04 and anything newer. |
+| `sysroot/` | These Ubuntu 22.04 (jammy) amd64 packages, each `.deb`'s data archive extracted into it: `libc6`, `libc6-dev`, `linux-libc-dev`, `libgcc-s1`, `libgcc-11-dev`, `libstdc++6`, `libstdc++-11-dev`, `libsdl2-2.0-0`, `libsdl2-dev`, `libopus-dev`, `libvpx-dev`. Linking against 22.04's glibc keeps the program runnable on 22.04 and anything newer. |
 | `dxvk-native/` | DXVK's native Linux build, version 3.1.1 (`dxvk-native-3.1.1-steamrt-sniper.tar.gz` from DXVK's releases), so that `dxvk-native/usr/lib` holds `libdxvk_d3d11.so.0` and `libdxvk_dxgi.so.0`. |
 | `dxvk-headers/include/native/` | `include/native` from the DXVK 3.1.1 source, with mingw-directx-headers in its `directx/` folder (the commit DXVK 3.1.1 uses, `9df86f2`). |
 | `src/vkd3d-2.1/` | The vkd3d 2.1 source. |

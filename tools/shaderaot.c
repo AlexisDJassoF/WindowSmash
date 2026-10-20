@@ -41,19 +41,32 @@ static u32 zero_cbuf(void *user, u32 bank, u32 offset) { (void)user; (void)bank;
 
 typedef struct Program { int stage; u32 length, npairs; const u32 *pairs; const u8 *bytes; u32 size; u64 hash; int ok; u32 outputs, ntables; } Program;
 
-static char *translate(Program *p, u32 vs_outputs, ShaderInfo *info) {
+static char *translate(Program *p, u32 vs_outputs, ShaderInfo *info, int flags) {
     if (setjmp(on_fatal)) return NULL;
-    return shader_hlsl_ex(p->bytes, p->size, p->stage, vs_outputs, info, zero_cbuf, NULL);
+    return shader_translate(p->bytes, p->size, p->stage, vs_outputs, NULL, 0, info, zero_cbuf, NULL, flags);
 }
 
 static int exists(const char *path) { return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES; }
 
-static struct { u32 compiled, existing, tables, failed, translate_failed, keys; } count;
+static struct { u32 compiled, existing, tables, failed, translate_failed, keys, fallback; } count;
 
-/* Compile and write one cache file, dated as not yet used. */
-static void compile_to(const char *hlsl, const char *name, int stage, const char *path) {
+/* Compile and write one cache file, dated as not yet used. A structured program whose HLSL does
+ * not compile is compiled as its dispatch loop instead, as the renderer does. */
+static void compile_to(Program *p, u32 vs_outputs, const char *hlsl, int structured, const char *name, const char *path) {
+    int stage = p->stage;
     ID3DBlob *code, *errors;
     HRESULT hr = shader_cache_compile(hlsl, name, stage, &code, &errors);
+    if (FAILED(hr) && structured) {
+        ShaderInfo info;
+        char *dispatch = translate(p, vs_outputs, &info, SHADER_DISPATCH);
+        if (dispatch) {
+            if (code) code->lpVtbl->Release(code);
+            if (errors) errors->lpVtbl->Release(errors);
+            hr = shader_cache_compile(dispatch, name, stage, &code, &errors);
+            free(dispatch);
+            count.fallback++;
+        }
+    }
     if (FAILED(hr)) {
         count.failed++;
         fprintf(stderr, "%s: fxc failed: %.300s\n", name, errors ? (const char *)errors->lpVtbl->GetBufferPointer(errors) : "?");
@@ -153,7 +166,7 @@ int main(int argc, char **argv) {
         p->size = shader_size(p->bytes, p->length);
         if (p->size <= 0x50) continue;
         p->hash = shader_program_hash(p->bytes, p->size);
-        char *hlsl = translate(p, 0, &info);
+        char *hlsl = translate(p, 0, &info, 0);
         if (!hlsl) { count.translate_failed++; continue; }
         p->ok = 1;
         p->outputs = info.outputs;
@@ -165,7 +178,7 @@ int main(int argc, char **argv) {
             if (dry) printf("vs %016llx\n", (unsigned long long)p->hash);
             else if (info.ntables) count.tables++;
             else if (exists(path)) count.existing++;
-            else compile_to(hlsl, name, SHADER_VERTEX, path);
+            else compile_to(p, 0, hlsl, info.flow == SHADER_FLOW_STRUCTURED, name, path);
         }
         free(hlsl);
     }
@@ -186,7 +199,7 @@ int main(int argc, char **argv) {
             if (m == nmasks) masks[nmasks++] = v->outputs;
         }
         if (!nmasks) {   /* no vertex program known: what it reads */
-            char *probe = translate(p, 0xFFFFFFFFu, &info);
+            char *probe = translate(p, 0xFFFFFFFFu, &info, 0);
             if (!probe) { count.translate_failed++; continue; }
             free(probe);
             masks[nmasks++] = info.inputs;
@@ -198,14 +211,15 @@ int main(int argc, char **argv) {
             shader_cache_file(path, sizeof path, dir, SHADER_PIXEL, p->hash, masks[m], 0);
             if (dry) { printf("ps %016llx %08x\n", (unsigned long long)p->hash, masks[m]); continue; }
             if (exists(path)) { count.existing++; continue; }
-            char *hlsl = translate(p, masks[m], &info);
+            char *hlsl = translate(p, masks[m], &info, 0);
             if (!hlsl) { count.translate_failed++; continue; }
             if (info.ntables) count.tables++;
-            else compile_to(hlsl, name, SHADER_PIXEL, path);
+            else compile_to(p, masks[m], hlsl, info.flow == SHADER_FLOW_STRUCTURED, name, path);
             free(hlsl);
         }
     }
-    fprintf(stderr, "part %u/%u: %u keys; %u compiled, %u already cached, %u with jump tables (left out), %u fxc failures, %u not translated\n",
-            part, parts, count.keys, count.compiled, count.existing, count.tables, count.failed, count.translate_failed);
+    fprintf(stderr, "part %u/%u: %u keys; %u compiled (%u as dispatch loops, their structured form failing), %u already cached, "
+            "%u with jump tables (left out), %u fxc failures, %u not translated\n",
+            part, parts, count.keys, count.compiled, count.fallback, count.existing, count.tables, count.failed, count.translate_failed);
     return 0;
 }

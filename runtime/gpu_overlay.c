@@ -55,7 +55,8 @@ static ID3DBlob *compile(const char *entry, const char *target) {
 }
 
 /* The glyphs: drawn white on black by GDI, kept as coverage in a one-channel texture. (Linux:
- * the same drawing, done at build time on Windows - tools/linux/make_overlay_font.c.) */
+ * the same drawing in DejaVu Sans Mono Bold, a free font, kept in runtime/linux/overlay_font.h -
+ * tools/linux/make_overlay_font.py writes it again.) */
 #ifndef _WIN32
 #include "overlay_font.h"
 #endif

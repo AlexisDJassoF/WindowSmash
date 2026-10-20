@@ -9,11 +9,13 @@
  * buffers are raw buffers (any offset, out of range reads 0). Vertex shaders pull their
  * attributes from raw vertex-stream buffers themselves, decoding every Maxwell format.
  *
- * Control flow: a program without branches is emitted straight. Otherwise its basic blocks
- * become cases of a switch inside a loop driven by a `pc` variable, with the SSY/PBK
- * reconvergence targets on small per-thread stacks - per-thread execution makes SYNC and
- * BRK plain jumps to the saved target. Pixel shaders in that form sample with explicit LOD
- * zero (gradients are unavailable inside a loop). */
+ * Control flow: a program without branches is emitted straight. Otherwise its blocks and the
+ * SSY/PBK stacks are resolved into a graph (gpu_shader_cfg.c) - per-thread execution makes SYNC
+ * and BRK plain jumps to the saved target - and, when the graph allows, emitted as if/else and
+ * loops. When it does not (an irreducible graph, an unknown jump table, ...), the blocks become
+ * cases of a switch inside a loop driven by a `pc` variable, with the stacks as small per-thread
+ * arrays: the dispatch loop. Pixel shaders with branches sample with explicit LOD zero either way
+ * (gradients are unavailable inside the dispatch loop, and both forms compute the same). */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,6 +23,7 @@
 #include <string.h>
 
 #include "gpu_shader.h"
+#include "gpu_shader_cfg.h"
 
 /* The Linux build compiles HLSL with vkd3d-shader, which lacks a few things fxc has
  * (CalculateLevelOfDetail, RWByteAddressBuffer.Load, gathers with four offsets): for it the
@@ -166,8 +169,11 @@ typedef struct Ctx {
     Str body;
     u8 reg_used[256], pred_used[8];
     ShaderInfo *info;
-    int dispatch;                 /* blocks in a switch loop */
-    u8 *leader;                   /* per instruction: starts a block */
+    int branchy;                  /* has branches: structured or a dispatch loop */
+    CfInsn *flow;                 /* per instruction: its control flow */
+    u32 *targets, ntargets;       /* the jump tables' targets (CfInsn.table points in) */
+    Cfg cfg;
+    u32 loop_id, next_id;         /* structured: the innermost loop being emitted; names given out */
     u32 out_attr_mask;            /* vertex: generic attributes written (from AST) */
     int uses_cc;
     int uses_gmem;                /* global memory loads (LDG) */
@@ -330,7 +336,7 @@ static u32 texture_slot(Ctx *c, u32 handle_offset, u32 type, int shadow) {
 }
 
 /* Can this stage compute gradients here? (Implicit-LOD sampling needs them.) */
-static int gradients(Ctx *c) { return c->stage == SHADER_PIXEL && !c->dispatch; }
+static int gradients(Ctx *c) { return c->stage == SHADER_PIXEL && !c->branchy; }
 
 static const char *coord_of(u32 type, const char *x, const char *y, const char *z, const char *layer) {
     switch (type) {
@@ -1432,9 +1438,10 @@ static int emit_flow(Ctx *c, const Insn *in, u32 next) {
 
 
 /* Jump tables of indirect branches. The compiler emits
- *     IMNMX.U32 rI, rI, N-1 ;  SHL rI, rI, 2 ;  LDC rT, c[bank][rI + off] ;  BRX rT - k
- * with the table's entries relative to the BRX. If every BRX of the program resolves, only
- * their targets need to be blocks; otherwise every instruction must be one. */
+ *     IMNMX.U32 rI, rI, N-1 ;  SHL rJ, rI, 2 ;  LDC rT, c[bank][rJ + off] ;  BRX rT - k
+ * (rJ often rI) with the table's entries relative to the BRX. If every BRX of the program resolves, only
+ * their targets need to be blocks; otherwise every instruction must be one. A resolved BRX's
+ * targets go in its CfInsn. */
 static int brx_resolved(Ctx *c) {
     if (!c->read_cbuf) return 0;
     int all = 1;
@@ -1451,61 +1458,69 @@ static int brx_resolved(Ctx *c) {
                 break;
             }
         for (int k = j - 1; found && k >= 0 && k > j - 24; k--)
-            if ((c->ins[k].op == OP_IMNMX_imm) && BITS(c->ins[k].w, 0, 8) == index_reg) { count = imm20(c->ins[k].w) + 1; break; }
+            if (c->ins[k].op == OP_SHL_imm && BITS(c->ins[k].w, 0, 8) == index_reg) index_reg = BITS(c->ins[k].w, 8, 8);   /* (the index, scaled) */
+            else if ((c->ins[k].op == OP_IMNMX_imm) && BITS(c->ins[k].w, 0, 8) == index_reg) { count = imm20(c->ins[k].w) + 1; break; }
         if (!found || !count || count > 256) { all = 0; continue; }
         if (c->info->ntables < 4) {
             c->info->table[c->info->ntables].bank = bank; c->info->table[c->info->ntables].offset = off;
             c->info->table[c->info->ntables++].count = count;
         }
+        u32 first = c->ntargets;
+        c->targets = realloc(c->targets, sizeof *c->targets * (c->ntargets + count));
         for (u32 e = 0; e < count; e++) {
             u32 t = align_target(c->read_cbuf(c->read_user, bank, off + 4 * e) + c->ins[i].addr + 8 + (u32)branch_offset(c->ins[i].w));
-            int at = find(c, t);
-            if (at < 0) { all = 0; break; }
-            c->leader[at] = 1;
+            if (find(c, t) < 0) { all = 0; break; }
+            c->targets[c->ntargets++] = t;
         }
+        if (c->ntargets - first == count) c->flow[i].ntable = count;
+        else c->ntargets = first;
+        c->flow[i].table = (const u32 *)(uintptr_t)first;   /* (an index until the last table is in) */
     }
+    for (u32 i = 0; i < c->n; i++)
+        if (c->flow[i].ntable) c->flow[i].table = c->targets + (uintptr_t)c->flow[i].table;
+        else c->flow[i].table = NULL;
     return all;
 }
 
-static int brx_checked, brx_ok;
-static int brx_targets(Ctx *c, u32 i) {
-    (void)i;
-    if (!brx_checked) { brx_checked = 1; brx_ok = brx_resolved(c); }
-    return brx_ok;
+static int flow_kind(u32 op) {
+    switch (op) {
+    case OP_SSY: return CF_SSY;
+    case OP_PBK: return CF_PBK;
+    case OP_BRA: return CF_BRA;
+    case OP_SYNC: return CF_SYNC;
+    case OP_BRK: return CF_BRK;
+    case OP_EXIT: return CF_EXIT;
+    case OP_BRX: return CF_BRX;
+    }
+    return CF_PLAIN;
 }
 
-static void emit_body(Ctx *c) {
-    int branchy = 0, brx = 0;
-    for (u32 i = 0; i < c->n; i++) { branchy |= is_branchy(c->ins[i].op); brx |= c->ins[i].op == OP_BRX; }
-    c->dispatch = branchy;
-    if (!branchy) {
-        for (u32 i = 0; i < c->n; i++) {
-            const Insn *in = &c->ins[i];
-            if (in->op == OP_EXIT) emit_flow(c, in, 0);
-            else emit_guarded(c, in);
-        }
-        emit_exit(c);
-        return;
-    }
-    /* blocks */
-    c->leader = calloc(c->n + 1, 1);
-    u8 *ssy_target = calloc(c->n + 1, 1), *pbk_target = calloc(c->n + 1, 1);
-    c->leader[0] = 1;
-    brx_checked = 0;
+/* What each instruction does to control flow, as emit_flow acts on it. */
+static void describe_flow(Ctx *c) {
+    c->flow = calloc(c->n + 1, sizeof *c->flow);
+    int brx = 0;
     for (u32 i = 0; i < c->n; i++) {
         const Insn *in = &c->ins[i];
-        if (brx && !brx_targets(c, i)) c->leader[i] = 1;
-        if (in->op == OP_BRA || in->op == OP_SSY || in->op == OP_PBK) {
-            int t = find(c, branch_target(in));
-            if (t >= 0) {
-                c->leader[t] = 1;
-                if (in->op == OP_SSY) ssy_target[t] = 1;
-                if (in->op == OP_PBK) pbk_target[t] = 1;
-            }
-        }
-        if ((in->op == OP_BRA || in->op == OP_BRX || in->op == OP_SYNC || in->op == OP_BRK || in->op == OP_EXIT) && i + 1 < c->n)
-            c->leader[i + 1] = 1;
+        CfInsn *f = &c->flow[i];
+        f->addr = in->addr;
+        f->kind = (u8)flow_kind(in->op);
+        if (f->kind == CF_PLAIN) continue;
+        brx |= f->kind == CF_BRX;
+        if (f->kind == CF_SSY || f->kind == CF_PBK || f->kind == CF_BRA) f->target = branch_target(in);
+        u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
+        if (p == PT && neg) { f->cond = CF_NEVER; continue; }
+        const char *cond;
+        int taken = flow_true(c, in, &cond);
+        if (f->kind == CF_SSY || f->kind == CF_PBK || f->kind == CF_BRX) f->cond = CF_ALWAYS;   /* (whatever the predicate) */
+        else if (!taken) f->cond = CF_NEVER;
+        else f->cond = p == PT && !strcmp(cond, "true") ? CF_ALWAYS : CF_MAYBE;
     }
+    if (brx) brx_resolved(c);
+}
+
+/* The dispatch loop: every block a case of a switch, in a loop driven by pc_. */
+static void emit_dispatch(Ctx *c) {
+    const Cfg *g = &c->cfg;
     line(c, "uint pc_ = 0x%xu; uint ssy_[16], pbk_[16]; uint ssp_ = 0u, psp_ = 0u;", c->ins[0].addr);
     line(c, "[loop] for (uint guard_ = 0u; guard_ < 1000000u; guard_++) {");
     c->indent++;
@@ -1514,13 +1529,13 @@ static void emit_body(Ctx *c) {
     int open = 0, ended = 0;
     for (u32 i = 0; i < c->n; i++) {
         const Insn *in = &c->ins[i];
-        if (c->leader[i]) {
+        if (g->leader[i]) {
             if (open) { if (!ended) goto_pc(c, in->addr); c->indent--; line(c, "}"); }
             line(c, "case 0x%xu: {", in->addr);
             c->indent++;
             open = 1; ended = 0;
-            if (ssy_target[i]) line(c, "if (ssp_ > 0u && ssy_[(ssp_ - 1u) & 15u] == 0x%xu) ssp_ = ssp_ - 1u;", in->addr);
-            if (pbk_target[i]) line(c, "if (psp_ > 0u && pbk_[(psp_ - 1u) & 15u] == 0x%xu) psp_ = psp_ - 1u;", in->addr);
+            if (g->ssy_target[i]) line(c, "if (ssp_ > 0u && ssy_[(ssp_ - 1u) & 15u] == 0x%xu) ssp_ = ssp_ - 1u;", in->addr);
+            if (g->pbk_target[i]) line(c, "if (psp_ > 0u && pbk_[(psp_ - 1u) & 15u] == 0x%xu) psp_ = psp_ - 1u;", in->addr);
         }
         if (ended) continue;   /* unreachable within the block */
         switch (in->op) {
@@ -1545,10 +1560,184 @@ static void emit_body(Ctx *c) {
     c->indent--;
     line(c, "}");
     emit_exit(c);
-    free(ssy_target);
-    free(pbk_target);
 }
 
+/* ---- structured control flow ------------------------------------------------------------ */
+/* When a block's last instruction acts (a taken branch, SYNC or BRK, an exit): its predicate and flow test. */
+static const char *flow_guard(Ctx *c, const Insn *in) {
+    u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
+    const char *cond;
+    flow_true(c, in, &cond);
+    const char *guard = p == PT ? NULL : PRED(c, p, neg);
+    if (strcmp(cond, "true")) guard = guard ? tmp("(%s && %s)", guard, cond) : cond;
+    return guard ? guard : "true";
+}
+
+static int arm_empty(const SNode *s) { return !s->n || (s->n == 1 && s->kid[0]->kind == SN_CONTINUE); }
+static int arm_breaks(const SNode *s) { return s->n == 1 && s->kid[0]->kind == SN_BREAK; }
+
+static void emit_tree(Ctx *c, const SNode *s);
+
+static void emit_arm(Ctx *c, const SNode *s) {
+    c->indent++;
+    emit_tree(c, s);
+    c->indent--;
+}
+
+/* The tree of gpu_shader_cfg.c. A loop is left through its run flag, set where a BREAK is,
+ * never with `break` (fxc mishandles break in an if); no code follows a BREAK or CONTINUE in
+ * its iteration, so the flag only stops the next one. Each loop keeps the dispatch loop's guard. */
+static void emit_tree(Ctx *c, const SNode *s) {
+    const Cfg *g = &c->cfg;
+    switch (s->kind) {
+    case SN_SEQ:
+        for (u32 k = 0; k < s->n; k++) emit_tree(c, s->kid[k]);
+        break;
+    case SN_BLOCK: {
+        const CfgBlock *b = &g->block[s->block];
+        for (u32 i = b->first; i < b->end; i++) {
+            const Insn *in = &c->ins[i];
+            if (c->flow[i].kind != CF_PLAIN) {
+                u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
+                line(c, "// %04x: %016llx %s%s%u %s (test %u)", in->addr, in->w, p == PT && !neg ? "" : "@", neg ? "!P" : "P", p,
+                     OPS[in->op].name, BITS(in->w, 0, 5));
+            } else emit_guarded(c, in);
+        }
+        break;
+    }
+    case SN_IF: {
+        const SNode *taken = s->kid[0], *not_taken = s->kid[1];
+        const char *cond = flow_guard(c, &c->ins[g->block[s->block].term]);
+        if (arm_empty(taken) && arm_empty(not_taken)) break;
+        if (arm_breaks(taken) || arm_breaks(not_taken)) {   /* the run flag, as a value: no assignment under the condition */
+            int t = arm_breaks(taken);
+            line(c, t ? "run%u_ = !(%s);" : "run%u_ = %s;", c->loop_id, cond);
+            const SNode *other = t ? not_taken : taken;
+            if (!arm_empty(other)) {
+                line(c, "if (run%u_) {", c->loop_id);
+                emit_arm(c, other);
+                line(c, "}");
+            }
+        } else if (arm_empty(not_taken)) {
+            line(c, "if (%s) {", cond);
+            emit_arm(c, taken);
+            line(c, "}");
+        } else if (arm_empty(taken)) {
+            line(c, "if (!(%s)) {", cond);
+            emit_arm(c, not_taken);
+            line(c, "}");
+        } else {
+            line(c, "if (%s) {", cond);
+            emit_arm(c, taken);
+            line(c, "} else {");
+            emit_arm(c, not_taken);
+            line(c, "}");
+        }
+        break;
+    }
+    case SN_SWITCH: {   /* an indirect branch: its table's targets, in turn */
+        const CfgBlock *b = &g->block[s->block];
+        const Insn *in = &c->ins[b->term];
+        const CfInsn *f = &c->flow[b->term];
+        u32 id = c->next_id++;
+        line(c, "{ uint bx%u_ = %s + 0x%xu; bx%u_ = (bx%u_ & 31u) == 16u ? bx%u_ + 8u : bx%u_;", id, R(c, BITS(in->w, 8, 8)),
+             in->addr + 8 + (u32)branch_offset(in->w), id, id, id, id);
+        c->indent++;
+        for (u32 k = 0; k < b->nsucc; k++) {
+            char test[2048];
+            size_t n = 0;
+            test[0] = 0;
+            for (u32 e = 0; e < f->ntable; e++) {
+                int dup = 0;
+                for (u32 d = 0; d < e; d++) dup |= f->table[d] == f->table[e];
+                if (dup || b->succ[k] == CFG_EXIT || g->block[b->succ[k]].addr != f->table[e] || n + 40 > sizeof test) continue;
+                n += (size_t)snprintf(test + n, sizeof test - n, "%sbx%u_ == 0x%xu", n ? " || " : "", id, f->table[e]);
+            }
+            line(c, "%sif (%s) {", k ? "} else " : "", n ? test : "false");
+            emit_arm(c, s->kid[k]);
+        }
+        line(c, "} else {");
+        c->indent++;
+        emit_exit(c);
+        c->indent--;
+        line(c, "}");
+        c->indent--;
+        line(c, "}");
+        break;
+    }
+    case SN_LOOP: {
+        u32 outer = c->loop_id, id = c->next_id++;
+        c->loop_id = id;
+        if (s->breaks) {
+            line(c, "bool run%u_ = true;", id);
+            line(c, "[loop] for (uint g%u_ = 0u; run%u_ && g%u_ < 1000000u; g%u_++) {", id, id, id, id);
+        } else line(c, "[loop] for (uint g%u_ = 0u; g%u_ < 1000000u; g%u_++) {", id, id, id);
+        emit_arm(c, s->kid[0]);
+        line(c, "}");
+        c->loop_id = outer;
+        if (s->breaks) {   /* still running: the guard ran out, and the program ends, as in the dispatch loop */
+            line(c, "if (run%u_) {", id);
+            c->indent++;
+            emit_exit(c);
+            c->indent--;
+            line(c, "}");
+        } else emit_exit(c);
+        break;
+    }
+    case SN_CONTINUE: line(c, "// continue"); break;
+    case SN_BREAK: line(c, "run%u_ = false;", c->loop_id); break;
+    case SN_RETURN: emit_exit(c); break;
+    }
+}
+
+int shader_dispatch_forced(void) {
+    static int forced = -1;
+    if (forced < 0) {
+        const char *e = getenv("SSBU_SHADER_DISPATCH");
+        forced = e && *e && strcmp(e, "0") != 0;
+    }
+    return forced;
+}
+
+static void emit_body(Ctx *c, int flags) {
+    int branchy = 0;
+    for (u32 i = 0; i < c->n; i++) branchy |= is_branchy(c->ins[i].op);
+    c->branchy = branchy;
+    if (!branchy) {
+        c->info->flow = SHADER_FLOW_LINEAR;
+        for (u32 i = 0; i < c->n; i++) {
+            const Insn *in = &c->ins[i];
+            if (in->op == OP_EXIT) emit_flow(c, in, 0);
+            else emit_guarded(c, in);
+        }
+        emit_exit(c);
+        return;
+    }
+    describe_flow(c);
+    cfg_blocks(&c->cfg, c->flow, c->n);
+    /* The dispatch loop first, structured or not: what it notes in ShaderInfo (textures and their
+     * order, attributes, registers) is then the same in both forms - the structured one emits a
+     * subset of its instructions - and either can stand in for the other. */
+    emit_dispatch(c);
+    c->info->flow = SHADER_FLOW_DISPATCH;
+    const char *why = (flags & SHADER_DISPATCH) || shader_dispatch_forced() ? "forced"
+                    : !cfg_resolve(&c->cfg) || !cfg_structure(&c->cfg) ? c->cfg.reject : NULL;
+    if (why) {
+        snprintf(c->info->flow_reason, sizeof c->info->flow_reason, "%s", why);
+        return;
+    }
+    c->body.n = 0;
+    c->indent = 1;
+    c->loop_id = c->next_id = 0;
+    emit_tree(c, c->cfg.root);
+    const SNode *last = c->cfg.root->n ? c->cfg.root->kid[c->cfg.root->n - 1] : NULL;
+    if (!last || !(last->kind == SN_RETURN || (last->kind == SN_LOOP && !last->breaks))) emit_exit(c);   /* (ends otherwise) */
+    c->info->flow = SHADER_FLOW_STRUCTURED;
+}
+
+/* A vertex attribute, from its stream. (Rewritten without the array and as a [loop], it was
+ * half the DXBC instructions and had no indexable memory, but drew wrong and slower on Intel
+ * under DXVK - the bytecode looked right, so a driver or DXVK matter: kept as it was.) */
 static const char VERTEX_FETCH[] =
     "uint4 decode_attr(ByteAddressBuffer b, uint addr, uint fmt) {\n"
     "  uint size = (fmt >> 21) & 0x3Fu, type = (fmt >> 27) & 7u, n = 4u, bits = 32u;\n"
@@ -1617,11 +1806,19 @@ static const char *texture_decl(u32 type, int shadow) {
 }
 
 char *shader_hlsl(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info) {
-    return shader_hlsl_ex(program, size, stage, vs_outputs, info, NULL, NULL);
+    return shader_translate(program, size, stage, vs_outputs, NULL, 0, info, NULL, NULL, 0);
 }
 
-static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user,
-                       const u32 local[3], u32 shared) {
+static void release(Ctx *c) {
+    free(c->body.s);
+    free(c->ins);
+    free(c->flow);
+    free(c->targets);
+    cfg_free(&c->cfg);
+}
+
+char *shader_translate(const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared, ShaderInfo *info,
+                       CbufReader *read, void *user, int flags) {
     init_table();
     memset(info, 0, sizeof *info);
     info->stage = stage;
@@ -1636,7 +1833,7 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
     c->vs_outputs = vs_outputs;
     c->indent = 1;
     decode_program(c, program, size);
-    emit_body(c);
+    emit_body(c, flags);
 
     Str out = {0};
     put(&out, "// Maxwell %s shader, %u instructions\n", stage == SHADER_VERTEX ? "vertex" : stage == SHADER_PIXEL ? "pixel" : "compute", c->n);
@@ -1690,9 +1887,7 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
         if (c->uses_cc) put(&out, "  uint cc_c = 0u; bool cc_z = false, cc_s = false;\n");
         if (c->uses_lmem) put(&out, "  uint lmem_[LMEM_WORDS];\n");
         put(&out, "%s}\n", c->body.s ? c->body.s : "");
-        free(c->body.s);
-        free(c->ins);
-        free(c->leader);
+        release(c);
         return out.s;
     }
 
@@ -1747,18 +1942,16 @@ static char *translate(const u8 *program, u32 size, int stage, u32 vs_outputs, S
     for (u32 p = 0; p < 7; p++) if (c->pred_used[p]) put(&out, "  bool p%u = false;\n", p);
     if (c->uses_cc) put(&out, "  uint cc_c = 0u; bool cc_z = false, cc_s = false;\n");
     put(&out, "%s}\n", c->body.s ? c->body.s : "");
-    free(c->body.s);
-    free(c->ins);
-    free(c->leader);
+    release(c);
     return out.s;
 }
 
 char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user) {
-    return translate(program, size, stage, vs_outputs, info, read, user, NULL, 0);
+    return shader_translate(program, size, stage, vs_outputs, NULL, 0, info, read, user, 0);
 }
 
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user) {
-    return translate(program, size, SHADER_COMPUTE, 0, info, read, user, local, shared);
+    return shader_translate(program, size, SHADER_COMPUTE, 0, local, shared, info, read, user, 0);
 }
 
 u32 shader_size(const u8 *program, u32 max) {
@@ -1768,4 +1961,25 @@ u32 shader_size(const u8 *program, u32 max) {
     u32 end = c.n ? c.ins[c.n - 1].addr + 8 : 0x50;
     free(c.ins);
     return end;
+}
+
+CfInsn *shader_flow(const u8 *program, u32 size, CbufReader *read, void *user, u32 *n) {
+    init_table();
+    ShaderInfo info = {0};
+    Ctx ctx = {0}, *c = &ctx;
+    c->info = &info;
+    c->prog = program;
+    c->read_cbuf = read;
+    c->read_user = user;
+    decode_program(c, program, size);
+    describe_flow(c);
+    CfInsn *out = malloc(sizeof *out * (c->n + 1) + sizeof *c->targets * c->ntargets);
+    u32 *targets = (u32 *)(out + c->n + 1);
+    memcpy(out, c->flow, sizeof *out * (c->n + 1));
+    if (c->ntargets) memcpy(targets, c->targets, sizeof *targets * c->ntargets);
+    for (u32 i = 0; i < c->n; i++)
+        if (out[i].table) out[i].table = targets + (out[i].table - c->targets);
+    *n = c->n;
+    release(c);
+    return out;
 }

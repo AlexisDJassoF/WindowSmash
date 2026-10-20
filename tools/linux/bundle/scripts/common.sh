@@ -11,7 +11,7 @@
 
 # Filled in by tools/linux/package_linux.py: "plain" (the RomFS in place in the NCA, from byte
 # ROMFS_OFFSET on) or "layered", and the files, in romfs.cfg's order, one per line:
-#   <variable naming it outright>|<name>|<size in bytes>|<its folder on Windows>
+#   <variable naming it outright>|<name>|<size in bytes>|<its folder where the package was made>
 ROMFS_KIND="@ROMFS_KIND@"
 ROMFS_OFFSET="@ROMFS_OFFSET@"
 ROMFS_FILES='@ROMFS_FILES@'
@@ -55,6 +55,10 @@ find_game_data() {
         if [ -z "$path" ] && [ -f "${old[i]}" ] && [ "$(file_size "${old[i]}")" = "$size" ]; then
             path="${old[i]}"
         fi
+        # (where it was when this folder was made, if that is a folder here: a package made on Linux)
+        if [ -z "$path" ] && [ -f "$windir/$name" ] && [ "$(file_size "$windir/$name")" = "$size" ]; then
+            path="$windir/$name"
+        fi
         if [ -z "$path" ]; then
             echo "Looking for the game data ($name)..."
             for d in "$PWD" "$PWD/game" /mnt/hgfs /media /mnt "$HOME"; do
@@ -66,7 +70,7 @@ find_game_data() {
         if [ -z "$path" ] || [ ! -f "$path" ]; then
             echo
             echo "Cannot find the game data: $name ($(awk "BEGIN { printf \"%.1f\", $size / 1e9 }") GB)."
-            echo "On Windows it is in  $windir\\"
+            echo "When this folder was made, it was in  $windir"
             echo "Copy it into $PWD/game/, or share that folder with this VM (VMware: VM > Settings >"
             echo "Options > Shared Folders), or run with $var=/path/to/$name bash run.sh"
             return 1
@@ -88,8 +92,11 @@ find_game_data() {
 
 check_libraries() {
     chmod +x ./ssbu 2>/dev/null
+    # (the program finds lib/ by its own folder, $ORIGIN - but a --link package's ssbu is a link
+    # into the build, whose folder has no lib/: name the package's outright, for the game too)
+    export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     local missing
-    missing=$(LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd ./ssbu 2>/dev/null | grep "not found")
+    missing=$(ldd ./ssbu 2>/dev/null | grep "not found")
     if [ -n "$missing" ]; then
         echo "Some libraries the game needs are not installed:"
         echo "$missing"
