@@ -56,19 +56,25 @@ typedef u32 CbufReader(void *user, u32 bank, u32 offset);
 char *shader_hlsl_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
 
 /* A pixel shader that also does the fixed-function alpha test (ALPHA_TEST): render target 0's
- * alpha compared with DrawParams.frag[3] by the comparison in frag[2], the pixel discarded when
- * it fails. Draws with the test on use it in place of the plain one. */
+ * alpha compared with DrawParams.frag[3], the pixel discarded when the outcome (less, equal,
+ * greater, or unordered) is not one of the bits in frag[2] (see alpha_test_mask). Draws with the
+ * test on use it in place of the plain one. */
 char *shader_hlsl_alpha_tested(const u8 *program, u32 size, u32 vs_outputs, ShaderInfo *info, CbufReader *read, void *user);
 
 /* A compute program (no header: pass it with 0x50 bytes of anything in front, so that its
  * addresses line up with those of the other stages), its workgroup size and shared memory. */
 char *shader_hlsl_cs(const u8 *program, u32 size, const u32 local[3], u32 shared, ShaderInfo *info, CbufReader *read, void *user);
 
+/* The alpha test's passing outcomes for a D3D11_COMPARISON_FUNC (NEVER 1 .. ALWAYS 8): bit 0 the
+ * alpha less than the reference, 1 equal, 2 greater - the function less one - and 3 unordered
+ * (a NaN), which only NOT_EQUAL and ALWAYS pass. */
+static inline u32 alpha_test_mask(u32 func) { return (func - 1) | (func == 6 || func == 8 ? 8u : 0u); }
+
 /* Per-draw parameters (cbuffer b0), shared by both stages. */
 typedef struct DrawParams {
     u32 attr[32][4];       /* vertex attribute: format word, stream stride, instance divisor (0: per vertex), stream bound */
     float fix[4];          /* clip-space fix-up: x sign, y sign, z scale, z offset */
-    float frag[4];         /* fragment y: flip (nonzero), render target height; alpha test: D3D11_COMPARISON_FUNC, reference */
+    float frag[4];         /* fragment y: flip (nonzero), render target height; alpha test: passing outcomes (bits, not a float), reference */
     u32 base[4];           /* base vertex, base instance */
     u32 swz[2][32];        /* per texture of each stage (vertex, pixel): component sources, 3 bits each */
     u32 sb[2][16][4];      /* per storage buffer of each stage: GPU address low, high, size */
