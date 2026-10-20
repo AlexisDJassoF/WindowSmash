@@ -34,6 +34,7 @@ import datetime
 import os
 import shutil
 import struct
+import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAVE = os.path.join("save", "0123456789abcdeffedcba9876543210", "save_data", "system_data.bin")
@@ -85,6 +86,10 @@ def main():
     version, SAVE_SIZE, FLAGS, RECORDS = LAYOUTS[build_id]
     a.save = a.save or os.path.join(a.tree, SAVE)
     print(f"game version {version}: {a.save}")
+    if not os.path.isfile(a.save):   # (the game makes it: the first time it reaches the main menu)
+        launcher = "launchers/Unlock All Fighters.command" if sys.platform == "darwin" else "Unlock All Fighters"
+        raise SystemExit(f"No save found ({a.save}). Start the game once, reach the main menu, close it, then run "
+                         f"{launcher} again.")
 
     data = bytearray(open(a.save, "rb").read())
     if len(data) != SAVE_SIZE or struct.unpack_from("<I", data, 0)[0] != SAVE_SIZE:

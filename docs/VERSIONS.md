@@ -23,6 +23,8 @@ One WindowSmash folder can hold several versions of the game side by side, each 
 
 To skip the question, set `SSBU_TREE` to a version's folder before starting a launcher.
 
+On a Mac, `Play SSBU.command`, `launchers/*.command` and the Play SSBU app ask the same way ([macOS](MACOS.md)); a version folder's game is its `build-mac/WindowSmash.app`.
+
 ## Installing a version
 
 One command, from the WindowSmash folder, with your own update file, DLC and keys (example paths):
@@ -86,7 +88,7 @@ Deleting a version's folder deletes only that version. Other versions keep their
 
 **Modules.** The game is made of several modules: `main`, `subsdk0`, `sdk`, and about 100 fighter modules (NROs). Each has a build ID. Its built code depends only on its bytes, the address it's built for, and the tools.
 
-`sdk` and `subsdk0` are byte-identical from 11.0.0 to 13.0.5, and fighter modules can be the same between nearby updates. When a version needs a module another version's folder has already built (same build ID, same address), its build files are taken from there: as hard links when the folders are on the same drive (instant, no extra space), or as copies otherwise. The tools always write a changed file as a new one, so one version never changes another's files.
+`sdk` and `subsdk0` are byte-identical from 11.0.0 to 13.0.5, and fighter modules can be the same between nearby updates. When a version needs a module another version's folder has already built (same build ID, same address), its build files are taken from there: as hard links when the folders are on the same drive (instant, no extra space), or as copies otherwise. The tools always write a changed file as a new one, so one version never changes another's files. On a Mac, a module's generated C is shared this way before it is compiled, and each version compiles it into its own `build-mac/obj/`; the build records which C each object was compiled from, so C taken from another version is compiled again even though its files are older than the objects there.
 
 Each module's build folder has a `module.txt` stamp: build ID, address, name, and a fingerprint of the tools that generated it (the recompiler's sources and the runtime's list of native functions). With the same fingerprint, the C isn't generated again; it's only checked for objects to compile. After a change to the recompiler, the C is generated again, but only changed files are compiled.
 

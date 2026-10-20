@@ -91,8 +91,8 @@ static int make_atlas(ID3D11Device *dev) {
 #else
     memcpy(coverage, overlay_font, sizeof coverage);
 #endif
-    int solid = 127 - 32;
-    for (int y = 0; y < CELL_H; y++) memset(coverage + (solid / COLS * CELL_H + y) * ATLAS_W + solid % COLS * CELL_W, 255, CELL_W);
+    int solid = 127 - 32;   /* (filled away from its edges: scaled-down text samples next to its cell, and 'o' is above) */
+    for (int y = 4; y < CELL_H - 4; y++) memset(coverage + (solid / COLS * CELL_H + y) * ATLAS_W + solid % COLS * CELL_W + 4, 255, CELL_W - 8);
 #ifdef _WIN32
     SelectObject(dc, old_font);
     SelectObject(dc, old_bmp);

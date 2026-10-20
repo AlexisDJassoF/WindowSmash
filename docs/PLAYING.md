@@ -41,11 +41,11 @@ The first time you play online, the game picks a name for you, such as `Player12
 
 ## Settings
 
-Press <kbd>Esc</kbd> in the game to open the settings. On a controller, press its **Home** button (the PS or Xbox button), or hold **−** and **+** together for a second. Close the settings the same way, or with **B**.
+Press <kbd>Esc</kbd> in the game to open the settings (on Windows and Linux; the macOS version doesn't have them yet, so there you edit the files below). On a controller, press its **Home** button (the PS or Xbox button), or hold **−** and **+** together for a second. Close the settings the same way, or with **B**.
 
 | Page | What you can change |
 | :--- | :--- |
-| **Display** | Window or full screen, frame pacing, how many frames the graphics card works ahead, the mouse pointer, the frame rate in the corner, the window's size, the graphics card. |
+| **Display** | Window or full screen, frame pacing, how many frames the graphics card works ahead, the mouse pointer, the frame rate in the corner, the window's size, the render scale, the graphics card. |
 | **Controllers** | For each connected controller: which player it is, face buttons by position or by label, stick dead zone, rumble, how far a trigger is pulled for ZL / ZR, and which control is each button (**Buttons...**). For the keyboard: which player it adds to. Also whether controllers work while another window is in front. |
 | **Online** | Public lobby, a private lobby code, your own server, or offline; your name; direct connections ([multiplayer guide](MULTIPLAYER.md)). |
 | **Game** | Restart or quit the game, the keys, and the game version. |
@@ -135,7 +135,7 @@ rumble = 60
 
 ## Window and display
 
-<kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> switches between a window and full screen at any time. The game draws its picture at 1920 × 1080 and fits it into the window, always at 16:9, with black bars when the window has another shape. Screenshots keep the full 1920 × 1080 picture.
+<kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> switches between a window and full screen at any time. The game draws its picture at 1920 × 1080 and fits it into the window, always at 16:9, with black bars when the window has another shape. `render_scale` (below) draws it bigger for a sharper picture on a bigger screen. Screenshots keep the whole picture at the size it was drawn.
 
 The first start also writes **`display.ini`**, which sets how the game starts. The settings' **Display** page changes it too:
 
@@ -148,8 +148,9 @@ The first start also writes **`display.ini`**, which sets how the game starts. T
 | `hide_cursor` | `1` hides the mouse pointer after two seconds without movement. | `1` |
 | `overlay` | `1` shows the frame rate in the corner from the start (<kbd>F1</kbd> shows or hides it while playing). | `1` |
 | `gpu` | Which graphics card draws the game. `auto`: the fastest; on a laptop with two, the NVIDIA or AMD one rather than the processor's own. Or part of a card's name, such as `nvidia`, `radeon` or `intel`. `build\play.log` lists the cards found (a `[gfx] graphics cards` line). | `auto` |
+| `render_scale` | How many times bigger than 1920 × 1080 the game draws its picture, in each direction: a number from `0.5` to `4`, or `auto`. `auto` matches the picture to the screen when the game starts, for example 1.33 (2560 × 1440) on a 1440p monitor with `window = borderless`; it never goes below 1. A picture bigger than the window is shrunk to fit, which smooths edges (`2` on a 1440p monitor). Each step up costs the graphics card more: `2` draws four times the pixels and needs about 200 MB more graphics memory. | `1` |
 
-`controllers.ini` and `display.ini` apply to every game version started from the same folder. A `display.ini` written by an older version has no `gpu` line; the game then uses `auto`.
+`controllers.ini` and `display.ini` apply to every game version started from the same folder. A `display.ini` written by an older version has no `gpu` or `render_scale` line; the game then uses `auto` and `1`. Add the line yourself to use it, or delete `display.ini` to get a new one with every setting. `render_scale` is read when the game starts: change it, then start the game again.
 
 ## Shaders and first-time stutter
 
