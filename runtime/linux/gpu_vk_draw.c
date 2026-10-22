@@ -539,24 +539,88 @@ static u32 ntextures;
 static int watched(u64 g, u64 size) { return g >= ALIAS_BASE && g + size <= ALIAS_BASE + ALIAS_SIZE; }
 
 /* Which textures has the CPU written since they were read (the write watch, once a frame) */
+/* The pages written since their watch was last reset, in the watched textures and resident regions:
+ * asked once a frame over their ranges sorted and merged where they touch (a kernel call for each of
+ * thousands of textures took ~2-4 ms a frame; one over all their span takes in the game's own memory
+ * between them, written all the time), each range then looked up in it. Valid during note_writes
+ * only; not at all if more pages were written than the list holds (each range is then asked alone). */
+static void *frame_dirty[1 << 16];
+static ULONG_PTR nframe_dirty;
+static int frame_dirty_ok;
+/* 1 if a page of [lo, hi) is in the frame's list, 0 if none, -1 if the list is not to be used */
+static int frame_range_dirty(u64 lo, u64 hi) {
+    if (!frame_dirty_ok) return -1;
+    u64 first = lo & ~0xFFFull;
+    ULONG_PTR a = 0, b = nframe_dirty;
+    while (a < b) { ULONG_PTR m = (a + b) / 2; if ((u64)frame_dirty[m] < first) a = m + 1; else b = m; }
+    return a < nframe_dirty && (u64)frame_dirty[a] < hi;
+}
+
+static u64 watch_split_ns[3], watch_span, watch_pages;   /* (SSBU_LOG_STATS: note_writes' parts) */
+static int watch_ok;
+typedef struct WatchRange { u64 lo, hi; } WatchRange;
+static int range_order(const void *a, const void *b) {
+    const WatchRange *x = a, *y = b;
+    return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+static void residents_ranges(WatchRange *out, u32 *n, u32 cap);
 static void residents_sync_all(void);
 static void note_writes(void) {
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
     static u8 written[4096];
+    static WatchRange ranges[4096 + 512];
+    u32 nranges = 0;
+    for (u32 i = 0; i < ntextures; i++) {
+        Texture *t = &textures[i];
+        if (!t->img.image || !t->watched || t->stale) continue;
+        ranges[nranges++] = (WatchRange){t->guest & ~0xFFFull, (t->guest + t->size + 0xFFF) & ~0xFFFull};
+    }
+    residents_ranges(ranges, &nranges, sizeof ranges / sizeof *ranges);
+    u64 n0 = rt_now_ns();
+    qsort(ranges, nranges, sizeof *ranges, range_order);
+    u32 merged = 0;
+    for (u32 i = 0; i < nranges; i++) {   /* (touching, or a page or so apart) */
+        if (merged && ranges[i].lo <= ranges[merged - 1].hi + 0x2000) {
+            if (ranges[i].hi > ranges[merged - 1].hi) ranges[merged - 1].hi = ranges[i].hi;
+        } else ranges[merged++] = ranges[i];
+    }
+    ULONG granularity;
+    const ULONG_PTR cap = sizeof frame_dirty / sizeof *frame_dirty;
+    frame_dirty_ok = 1;
+    nframe_dirty = 0;
+    for (u32 i = 0; i < merged && frame_dirty_ok; i++) {
+        ULONG_PTR count = cap - nframe_dirty;
+        if (GetWriteWatch(0, (void *)ranges[i].lo, ranges[i].hi - ranges[i].lo, frame_dirty + nframe_dirty, &count, &granularity) != 0 ||
+            nframe_dirty + count >= cap)
+            frame_dirty_ok = 0;
+        else nframe_dirty += count;
+    }
+    if (!frame_dirty_ok) nframe_dirty = 0;
+    u64 lo = 0, hi = merged;   /* (for the statistics: the ranges asked) */
+    u64 n1 = rt_now_ns();
     for (u32 i = 0; i < ntextures; i++) {
         Texture *t = &textures[i];
         written[i] = 0;
         if (!t->img.image || !t->watched || t->stale) continue;
-        void *page;
-        ULONG_PTR count = 1;
-        ULONG granularity;
-        if (GetWriteWatch(0, (void *)t->guest, t->size, &page, &count, &granularity) == 0 && count) written[i] = 1;
+        int d = frame_range_dirty(t->guest, t->guest + t->size);
+        if (d < 0) {
+            void *page;
+            ULONG_PTR one = 1;
+            d = GetWriteWatch(0, (void *)t->guest, t->size, &page, &one, &granularity) == 0 && one;
+        }
+        written[i] = (u8)d;
     }
     for (u32 i = 0; i < ntextures; i++)
         if (written[i]) { textures[i].stale = 1; watch_reset(textures[i].guest, textures[i].guest + textures[i].size); }
+    u64 n2 = rt_now_ns();
     residents_sync_all();   /* (after the textures: they share the pages' write watch) */
+    u64 n3 = rt_now_ns();
+    watch_split_ns[0] += n1 - n0; watch_split_ns[1] += n2 - n1; watch_split_ns[2] += n3 - n2;
+    watch_span = hi - lo; watch_pages = nframe_dirty; watch_ok = frame_dirty_ok;
+    (void)lo;
+    frame_dirty_ok = 0;
     QueryPerformanceCounter(&t1);
     gfx_stat_watch_us += (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
 }
@@ -1185,7 +1249,7 @@ static void resident_sync(Resident *r, int always) {
     if (!resident_take_edge(r, r->guest, r->edge, r->head) || !resident_take_edge(r, r->guest + r->size - r->tail, r->edge + r->head, r->tail))
         return;
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;
-    if (lo >= hi) return;
+    if (lo >= hi || !frame_range_dirty(lo, hi)) return;   /* (the frame's list says nothing was written there) */
     ULONG_PTR count = 16384;
     ULONG granularity;
     if (GetWriteWatch(0, (void *)lo, hi - lo, pages, &count, &granularity) != 0 || !count) return;
@@ -1195,6 +1259,16 @@ static void resident_sync(Resident *r, int always) {
         u64 pg = (u64)pages[k];
         buf_write(r->buf, pg - r->guest, P(void, pg), granularity);
         gfx_stat_resident_pages++;
+    }
+}
+
+/* The watched resident regions' whole pages, added to the ranges note_writes asks about */
+static void residents_ranges(WatchRange *out, u32 *n, u32 cap) {
+    for (u32 i = 0; i < nresidents && *n < cap; i++) {
+        Resident *r = &residents[i];
+        if (!r->edge || !watched(r->guest, r->size)) continue;
+        u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;
+        if (lo < hi) out[(*n)++] = (WatchRange){lo, hi};
     }
 }
 
@@ -1581,14 +1655,43 @@ static Shader *get_shader(u64 g, int stage, u32 vs_outputs, const CbBinding *sta
 
 /* The vertex-input version of vertex shader base (the program at g): attributes of these classes
  * fetched by the device (vin, shader_spirv_ex's). NULL if it fails. */
+/* Every vertex-input version, by its program, table hash and classes (a search of the whole cache
+ * for one a base's recent ones lack was a scan of thousands of shaders, draw after draw) */
+static Shader **variants;
+static u64 vk_stat_variant_lookups;   /* (SSBU_LOG_STATS: a base's recent versions missed) */
+static u32 nvariants, variants_cap;
+static u64 variant_hash(u64 hash, u64 table_hash, u64 vin) { return (hash ^ table_hash * 31 ^ vin * 0x9E3779B97F4A7C15ull) * 1099511628211ull; }
+static Shader *variant_find(u64 hash, u64 table_hash, u64 vin) {
+    if (!variants_cap) return NULL;
+    for (u32 i = (u32)variant_hash(hash, table_hash, vin) & (variants_cap - 1); variants[i]; i = (i + 1) & (variants_cap - 1))
+        if (variants[i]->hash == hash && variants[i]->table_hash == table_hash && variants[i]->vin == vin) return variants[i];
+    return NULL;
+}
+static void variant_add(Shader *s) {
+    if (nvariants * 2 >= variants_cap) {   /* (grown and placed again) */
+        u32 cap = variants_cap ? variants_cap * 2 : 1024;
+        Shader **t = calloc(cap, sizeof *t);
+        for (u32 i = 0; i < variants_cap; i++) {
+            if (!variants[i]) continue;
+            u32 k = (u32)variant_hash(variants[i]->hash, variants[i]->table_hash, variants[i]->vin) & (cap - 1);
+            while (t[k]) k = (k + 1) & (cap - 1);
+            t[k] = variants[i];
+        }
+        free(variants);
+        variants = t;
+        variants_cap = cap;
+    }
+    u32 k = (u32)variant_hash(s->hash, s->table_hash, s->vin) & (variants_cap - 1);
+    while (variants[k]) k = (k + 1) & (variants_cap - 1);
+    variants[k] = s;
+    nvariants++;
+}
+
 static Shader *vertex_variant(Shader *base, u64 g, const CbBinding *stage_cb, u64 vin) {
     for (u32 i = 0; i < 4; i++)
         if (base->variant[i] && base->variant[i]->vin == vin) return base->variant[i]->failed ? NULL : base->variant[i];
-    Shader *s = NULL;
-    for (u32 i = 0; i < shader_count && !s; i++) {   /* (from the disk cache) */
-        Shader *o = shader_cache[i];
-        if (o->vin == vin && o->hash == base->hash && o->stage == SHADER_VERTEX && o->table_hash == base->table_hash) s = o;
-    }
+    vk_stat_variant_lookups++;
+    Shader *s = variant_find(base->hash, base->table_hash, vin);   /* (made before, or from the disk cache) */
     if (!s) {
         const u8 *p = P(u8, g);
         CbufSource src = {stage_cb};
@@ -1598,6 +1701,8 @@ static Shader *vertex_variant(Shader *base, u64 g, const CbBinding *stage_cb, u6
         s->hash = base->hash; s->stage = SHADER_VERTEX; s->vin = vin;
         memcpy(s->name, base->name, sizeof s->name);
         translate(s, p, shader_size(p, 0x40000), &src);
+        s->table_hash = base->table_hash;   /* (as found by: the base's) */
+        variant_add(s);
     }
     memmove(base->variant + 1, base->variant, sizeof base->variant - sizeof *base->variant);   /* (the latest first) */
     base->variant[0] = s;
@@ -2110,6 +2215,7 @@ static void cache_load(void) {
         if (vkCreateShaderModule(vk.dev, &mi, NULL, &s->module) != VK_SUCCESS) { free(s); continue; }
         if (shader_count == shader_cap) shader_cache = realloc(shader_cache, sizeof *shader_cache * (shader_cap = shader_cap * 2 + 64));
         shader_cache[shader_count++] = s;
+        if (s->vin) variant_add(s);
         gfx_stat_shaders++;
         vk_stat_cached_shaders++;
         if (vk.has.gpl && s->stage != SHADER_COMPUTE) library_ready(s, 0);   /* (queued: compiled now, on the compiler threads) */
@@ -3242,9 +3348,14 @@ void vk_draw_presenting(void) {
                 (unsigned long long)vk_stat_compute_barriers);
         vk_stat_wait_ns = vk_stat_flushes = vk_stat_flush_waits = vk_stat_buffer_barriers = vk_stat_compute_barriers = 0;
         static u64 last_composed, last_pages;
-        fprintf(stderr, "[vk stats]   composed uploads %llu, resident pages taken %llu; draws with vertex inputs %llu\n",
+        fprintf(stderr, "[vk stats]   write watch: scan %.0f ms, textures %.0f ms, residents %.0f ms (%.0f ranges asked, %llu pages written, list %s)\n",
+                watch_split_ns[0] / 1e6, watch_split_ns[1] / 1e6, watch_split_ns[2] / 1e6, (double)watch_span, (unsigned long long)watch_pages,
+                watch_ok ? "used" : "not used");
+        memset(watch_split_ns, 0, sizeof watch_split_ns);
+        fprintf(stderr, "[vk stats]   composed uploads %llu, resident pages taken %llu; draws with vertex inputs %llu (versions looked up %llu)\n",
                 (unsigned long long)(gfx_stat_composed - last_composed), (unsigned long long)(gfx_stat_resident_pages - last_pages),
-                (unsigned long long)vk_stat_vertex_input_draws);
+                (unsigned long long)vk_stat_vertex_input_draws, (unsigned long long)vk_stat_variant_lookups);
+        vk_stat_variant_lookups = 0;
         vk_stat_vertex_input_draws = 0;
         fprintf(stderr, "[vk stats]   streams read: base instance %llu, attributes %llu, format %llu, divisor %llu, limits %llu, alignment %llu\n",
                 (unsigned long long)vin_why[0], (unsigned long long)vin_why[1], (unsigned long long)vin_why[2], (unsigned long long)vin_why[3],
