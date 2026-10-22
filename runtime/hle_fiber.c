@@ -22,6 +22,11 @@
  * thread's identity (kernel thread, thread-local region, TPIDR_EL0) moves with every switch. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
+#ifndef _WIN32
+#include <errno.h>
+#include <sys/uio.h>   /* process_vm_readv */
+#include <unistd.h>
+#endif
 
 #include "host.h"
 
@@ -47,12 +52,41 @@ static Fib *by_token(u64 token) {
     return f && f->token == token ? f : NULL;
 }
 
+/* 8 bytes of guest memory at a, or 0 if they are not there any more: a finalized fiber's FiberType
+ * may be in memory the game has unmapped since (as gpu_d3d11.c's read_guarded) */
+#ifdef _WIN32
+extern __declspec(thread) int rt_probing;   /* host.c: the crash handler leaves a fault to us */
+static __declspec(noinline) u64 load64(u64 a) { return ld64(a); }
+static int read64_guarded(u64 a, u64 *out) {
+    volatile int ok = 1;
+    rt_probing = 1;
+    __try {
+        *out = load64(a);   /* (a call of its own: a fault inside __try is only caught reliably in a callee) */
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = 0;
+    }
+    rt_probing = 0;
+    return ok;
+}
+#else   /* (Linux: process_vm_readv fails with EFAULT where a read would fault) */
+static int read64_guarded(u64 a, u64 *out) {
+    struct iovec to = {out, 8}, from = {P(void, a), 8};
+    ssize_t got = process_vm_readv(getpid(), &to, 1, &from, 1, 0);
+    if (got == 8) return 1;
+    if (got >= 0 || errno == EFAULT) return 0;
+    *out = ld64(a);   /* (where the call isn't allowed, as in some sandboxes: a plain read) */
+    return 1;
+}
+#endif
+
 /* Suspended fibers whose FiberType has moved on (another token, or a new fiber's frame, where this
- * one's token was saved): finalized. Every 256 slots made, under the lock. */
+ * one's token was saved - or memory no longer there): finalized. Every 256 slots made, under the lock. */
 static void reclaim(void) {
     for (u32 i = 0; i < fib_count; i++) {
         Fib *f = fibs[i];
-        if (f->finalized || f->running || !f->guest || f->saved_at != f->guest + CONTEXT || ld64(f->saved_at) == f->token) continue;
+        u64 now;
+        if (f->finalized || f->running || !f->guest || f->saved_at != f->guest + CONTEXT) continue;
+        if (read64_guarded(f->saved_at, &now) && now == f->token) continue;
         f->finalized = 1;
         spare[nspare++] = f;
     }
