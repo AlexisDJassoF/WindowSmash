@@ -33,6 +33,3 @@ typedef struct GfxBackend {
 /* The Vulkan renderer (gpu_vulkan.c), if this machine can run it: NULL otherwise, with the reason
  * in why. Called once, from the first gfx_* call. */
 const GfxBackend *vk_backend_open(char *why, size_t why_size);
-/* The renderer was asked for by name (display.ini's renderer = vulkan, the start-up menu): it runs
- * though not complete yet, as SSBU_VK_INCOMPLETE=1 has it */
-extern int vk_incomplete_ok;

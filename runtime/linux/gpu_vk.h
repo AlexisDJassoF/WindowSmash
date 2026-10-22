@@ -27,7 +27,7 @@
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) \
     X(vkCmdSetDepthBoundsTestEnable) X(vkResetDescriptorPool) X(vkCreatePipelineCache) X(vkCmdCopyBuffer) X(vkCreateComputePipelines) \
     X(vkCmdDispatch) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) \
-    X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) X(vkCmdSetColorWriteMaskEXT)
+    X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) X(vkCmdSetColorWriteMaskEXT) X(vkCmdCopyImageToBuffer)
 
 #define VK_EXTERN(name) extern PFN_##name name;
 VK_INSTANCE_LEVEL_FNS(VK_EXTERN)
@@ -134,3 +134,18 @@ void vk_draw_describe(char *out, size_t n);   /* the overlay's details */
 /* The quads gpu_overlay_quads.c built last, drawn over the frame's image at (x, y, w x h)
  * (rendering into it has begun). */
 void vk_overlay_draw(VkFrameTarget *t, unsigned x, unsigned y, unsigned w, unsigned h);
+
+/* ---- FSR (gpu_vk_fsr.c) -------------------------------------------------------------------- */
+/* EASU, before the window's rendering begins: the picture at guest (crop: as gfx_present's) into
+ * FSR's texture at fit_w x fit_h. 0 if FSR cannot (or need not: not enlarged): the picture is then
+ * copied as without FSR. RCAS, in the window's rendering: that texture, sharpened, at the fit. */
+int vk_fsr_easu(VkFrameTarget *t, u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, unsigned fit_w, unsigned fit_h);
+void vk_fsr_rcas(VkFrameTarget *t, unsigned fit_x, unsigned fit_y, unsigned fit_w, unsigned fit_h);
+/* (gpu_vk_draw.c) The picture's surface for a pass that samples it: its plain view, readable from
+ * the fragment stage, its size, and the part that is the picture (x, y, w, h). 0 if there is none. */
+/* (gpu_vk_draw.c) The picture (no overlay) at the game's resolution into a BMP; F4's draw log, begun
+ * and counted down at each present */
+int vk_draw_capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, const char *path);
+void vk_draw_log_begin(void);
+void vk_draw_log_present(u64 guest);
+int vk_draw_picture_view(VkCommandBuffer cb, u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, VkImageView *view, u32 size[2], u32 pic[4]);

@@ -16,6 +16,7 @@
 #   REF_MANUAL=1: no scripted input - the player goes to the battle and plays it (give more seconds)
 #   SSBU_INPUT, SSBU_CAPTURE_EVERY, SSBU_CAPTURE_MAX: other presses or captures (to work out a route)
 #   REF_EXE=<program>: another build in the package folder (default ./ssbu)
+#   SSBU_MODE, SSBU_SCALE, SSBU_UPSCALE: another mode, scale or upscaling than the reference's
 #   SSBU_RENDERER and other SSBU_* settings pass through from the environment.
 set -u
 PKG="$(cd "$1" && pwd)"; NAME="$2"; SECS="${3:-120}"
@@ -30,7 +31,7 @@ find_game_data || exit 1
 set -u
 unset SSBU_NET_RELAY SSBU_NET_HOST
 export SSBU_DATA_ROOT="$RUN/root" SSBU_CAPTURE="$RUN/shots" SSBU_CAPTURE_EVERY="${SSBU_CAPTURE_EVERY:-5}" SSBU_CAPTURE_MAX="${SSBU_CAPTURE_MAX:-40}"
-export SSBU_MENU=0 SSBU_MODE=handheld SSBU_UPSCALE=fsr SSBU_SCALE=50 SSBU_WINDOW=windowed SSBU_WINDOW_SIZE=1920x1080
+export SSBU_MENU=0 SSBU_MODE="${SSBU_MODE:-handheld}" SSBU_UPSCALE="${SSBU_UPSCALE:-fsr}" SSBU_SCALE="${SSBU_SCALE:-50}" SSBU_WINDOW=windowed SSBU_WINDOW_SIZE=1920x1080
 export SSBU_PACING=clock SSBU_GPU_TIMES="${REF_AT:-80}" SSBU_NET_UPNP=0
 [ -n "${REF_MANUAL:-}" ] || export SSBU_INPUT="${SSBU_INPUT:-8:A,10:A,13:B,15:A,18:A,22:A,24.5:A,26:A,27.5:A,29:A,30.5:A,32:SUP/0.35,33:A,35:SUP/0.25,36:A,38:SUP/0.2,39:A,41:A,43:PLUS,44.5:PLUS,46:PLUS,52:A,54:A,56:A}"
 timeout "$SECS" "${REF_EXE:-./ssbu}" dump/modules --status 10 > "$RUN/play.log" 2>&1

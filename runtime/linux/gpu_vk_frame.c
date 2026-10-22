@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 #include "gpu_vk.h"
 #include <SDL.h>
@@ -163,8 +165,11 @@ VkCommandBuffer vk_cmd(void) {
 unsigned vk_slot(void) { vk_cmd(); return cur_slot; }
 u64 vk_frame_serial(void) { return serial + 1; }
 
+u64 vk_stat_flushes, vk_stat_flush_waits;   /* (SSBU_LOG_STATS: submissions in the middle of a frame) */
 void vk_flush(int wait) {
     if (!recording) return;
+    vk_stat_flushes++;
+    vk_stat_flush_waits += wait != 0;
     vk_draw_suspend();
     vkEndCommandBuffer(frames[cur_slot].cb);
     u64 value = ++vk.submitted;
@@ -271,6 +276,24 @@ int vk_gfx_menu(const char *title, int n, const char *const labels[], const char
 /* The game's picture (its surface at guest, the crop when it is one) fitted into the window, 16:9
  * and centred, black around it; grey where the picture would be when there is none yet. Then the
  * overlay, F7's notice and a window's mode bar. */
+/* SSBU_CAPTURE=<dir>: the picture every SSBU_CAPTURE_EVERY seconds (3), at most SSBU_CAPTURE_MAX (40),
+ * as frame_<n>.bmp - gpu_d3d11.c's captures */
+static void capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch) {
+    static const char *dir;
+    static int checked, count, most = 40;
+    static u64 last, every = 3000000000ull;
+    if (!checked++) {
+        dir = getenv("SSBU_CAPTURE");
+        if (getenv("SSBU_CAPTURE_MAX")) most = atoi(getenv("SSBU_CAPTURE_MAX"));
+        if (getenv("SSBU_CAPTURE_EVERY")) every = (u64)(atof(getenv("SSBU_CAPTURE_EVERY")) * 1e9);
+    }
+    if (!dir || count >= most || rt_now_ns() - last < every) return;
+    last = rt_now_ns();
+    char path[1024];
+    snprintf(path, sizeof path, "%s/frame_%03d.bmp", dir, count);
+    if (vk_draw_capture(guest, cx, cy, cw, ch, path)) count++;
+}
+
 void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     static const float black[4] = {0, 0, 0, 1};
     VkFrameTarget t;
@@ -278,7 +301,32 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     watchdog_present();
     hitch_present();
     gfx_stat_presented++;
+    vk_draw_log_present(guest);
     vk_draw_presenting();
+    /* the debug keys that save the picture, before the window's frame: F3 a screenshot, F4 the next
+     * frame's draws to the log (its picture beside); and SSBU_CAPTURE's every few seconds */
+    LONG keys = InterlockedExchange(&vk_hotkeys, 0);
+    static double f4_at = -1;   /* SSBU_F4_AT: the second to press F4 at (debug runs) */
+    if (f4_at == -1) f4_at = getenv("SSBU_F4_AT") ? atof(getenv("SSBU_F4_AT")) : -2;
+    if (f4_at >= 0 && rt_now_ns() > (u64)(f4_at * 1e9)) { f4_at = -2; keys |= 8; }
+    if (keys & (4 | 8)) {
+        char path[160], stamp[40];
+        time_t now = time(NULL);
+        strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", localtime(&now));
+        mkdir("screenshots", 0755);
+        if (keys & 4) {
+            snprintf(path, sizeof path, "screenshots/ssbu_%s.bmp", stamp);
+            if (vk_draw_capture(guest, crop_x, crop_y, crop_w, crop_h, path)) fprintf(stderr, "[gfx] screenshot: %s\n", path);
+        }
+        if (keys & 8) {
+            snprintf(path, sizeof path, "screenshots/frame_%s", stamp);
+            mkdir(path, 0755);
+            strncat(path, "/screen.bmp", sizeof path - strlen(path) - 1);
+            vk_draw_capture(guest, crop_x, crop_y, crop_w, crop_h, path);
+            vk_draw_log_begin();
+        }
+    }
+    capture(guest, crop_x, crop_y, crop_w, crop_h);
     if (!vk_frame_acquire(&t, display_sync_interval() != 0)) {   /* (no window to show it in: the work still goes) */
         vk_flush(0);
         vk_leave();
@@ -294,8 +342,10 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     display_fit(t.w, t.h, &fit_x, &fit_y, &fit_w, &fit_h);
     vk_image_barrier(t.cb, t.image, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    int pictured = fit_w && fit_h && vk_draw_picture(t.cb, t.image, guest, crop_x, crop_y, crop_w, crop_h, fit_x, fit_y, fit_w, fit_h);
+    int fsr = display_upscale() == UPSCALE_FSR && vk_fsr_easu(&t, guest, crop_x, crop_y, crop_w, crop_h, fit_w, fit_h);
+    int pictured = fsr || (fit_w && fit_h && vk_draw_picture(t.cb, t.image, guest, crop_x, crop_y, crop_w, crop_h, fit_x, fit_y, fit_w, fit_h));
     vk_frame_render(&t, NULL);
+    if (fsr) vk_fsr_rcas(&t, fit_x, fit_y, fit_w, fit_h);
     if (!pictured && fit_w && fit_h) {
         VkClearAttachment grey = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {.float32 = {0.1f, 0.1f, 0.12f, 1}}}};
         VkClearRect where = {{{(int32_t)fit_x, (int32_t)fit_y}, {fit_w, fit_h}}, 0, 1};
@@ -303,7 +353,6 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     }
 
     /* debug keys (F1 the overlay, F2 its details) and the overlay */
-    LONG keys = InterlockedExchange(&vk_hotkeys, 0);
     static int overlay = -1, details;
     if (overlay < 0) overlay = !getenv("SSBU_OVERLAY") || atoi(getenv("SSBU_OVERLAY")) != 0;
     if (keys & 1) overlay = !overlay;

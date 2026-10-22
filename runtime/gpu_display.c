@@ -116,7 +116,7 @@ static const char DEFAULT_INI[] =
     "; renderer = dxvk | vulkan: the graphics engine the game draws with.\n"
     ";   dxvk:   Direct3D 11 through DXVK, as the game has always run.\n"
     ";   vulkan: the port's own Vulkan renderer: fewer steps from the game's shaders to the graphics\n"
-    ";           card (experimental: no videos, F4 captures or FSR yet).\n"
+    ";           card (experimental).\n"
     "renderer = dxvk\n"
 #endif
     "\n"

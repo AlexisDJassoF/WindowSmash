@@ -13,7 +13,10 @@
  *
  * A fiber nn::os::FinalizeFiber is done with gives its slot to the next new one: the game's
  * script coroutines come and go by the thousand in a match. Its host fiber is deleted only
- * then - it stays where the guest fiber last stopped, and is never switched to again.
+ * then - it stays where the guest fiber last stopped, and is never switched to again. A module
+ * recompiled before that wrap existed never calls it; so, when slots run short, a fiber that is
+ * suspended and whose nn::os::FiberType no longer holds the token it was suspended with (the game
+ * finalized it, or initialized another fiber there) counts as finalized too.
  *
  * Fibers may resume on a different thread from the one they were suspended on, so the
  * thread's identity (kernel thread, thread-local region, TPIDR_EL0) moves with every switch. */
@@ -28,7 +31,7 @@
 #define CONTEXT 0x50                      /* (nn::os::FiberType: where the context is kept) */
 #define MAX_FIBERS 16384
 
-typedef struct Fib { LPVOID host; Cpu *cpu; u64 token; u64 guest; int finalized; } Fib;
+typedef struct Fib { LPVOID host; Cpu *cpu; u64 token; u64 guest, saved_at; int finalized, running; } Fib;
 
 static Fib *fibs[MAX_FIBERS];
 static u32 fib_count;
@@ -42,6 +45,17 @@ static Fib *by_token(u64 token) {
     u64 i = token & 0xFFFFFFFF;
     Fib *f = i < fib_count ? fibs[i] : NULL;
     return f && f->token == token ? f : NULL;
+}
+
+/* Suspended fibers whose FiberType has moved on (another token, or a new fiber's frame, where this
+ * one's token was saved): finalized. Every 256 slots made, under the lock. */
+static void reclaim(void) {
+    for (u32 i = 0; i < fib_count; i++) {
+        Fib *f = fibs[i];
+        if (f->finalized || f->running || !f->guest || f->saved_at != f->guest + CONTEXT || ld64(f->saved_at) == f->token) continue;
+        f->finalized = 1;
+        spare[nspare++] = f;
+    }
 }
 
 static Fib *new_fib(Cpu *cpu) {
@@ -97,10 +111,13 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
     }
     me->cpu = c;
     st64(save, me->token);
+    me->saved_at = save;
 
     Fib *next = by_token(target);
     if (!next) {   /* a fresh fiber: the frame InitializeFiber prepared at `target` - in a finalized one's slot if there is one */
         AcquireSRWLockExclusive(&lock);
+        me->running = 0;   /* (its token is saved: from here it may be found finalized) */
+        if (!nspare && fib_count && fib_count % 256 == 0) reclaim();
         next = nspare ? spare[--nspare] : NULL;
         if (next == me) next = NULL;   /* (finalized while it runs: a guest mistake - never deleted under itself) */
         if (next) {
@@ -108,6 +125,7 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
             next->finalized = 0;
         }
         started++;
+        if (next) next->running = 1;
         ReleaseSRWLockExclusive(&lock);
         Cpu *n;
         if (next) {
@@ -116,6 +134,7 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
         } else {
             n = _aligned_malloc(sizeof *n, 64);
             next = new_fib(n);
+            next->running = 1;
         }
         memset(n, 0, sizeof *n);
         n->x[0] = ld64(target);
@@ -123,10 +142,15 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
         for (int q = 8; q <= 15; q++) memcpy(&n->v[q], P(void, target + 0x70 + 16ull * (q - 8)), 16);
         n->sp = target + FRAME;
         next->guest = load - CONTEXT;
+        next->saved_at = 0;
         next->host = CreateFiberEx(64 << 10, 64 << 20, FIBER_FLAG_FLOAT_SWITCH, fiber_main, next);
         if (!next->host) rt_fatal("cannot create a host fiber (error %lu)", (unsigned long)GetLastError());
     } else {
         next->cpu->x[0] = 0;   /* what the frame of a suspended context holds in x0 */
+        AcquireSRWLockExclusive(&lock);
+        me->running = 0;
+        next->running = 1;
+        ReleaseSRWLockExclusive(&lock);
     }
     Cpu *n = next->cpu;
     n->thread = c->thread; n->tpidrro = c->tpidrro; n->tpidr = c->tpidr; n->fpcr = c->fpcr; n->fpsr = c->fpsr;

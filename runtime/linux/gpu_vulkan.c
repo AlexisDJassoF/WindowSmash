@@ -15,8 +15,8 @@
  * SSBU_VK_VALIDATE=1 turns on the Khronos validation layer, with synchronization validation; its
  * messages go to the log as [vk] lines.
  *
- * The renderer draws the game, menus and battles, but not yet its videos, captures or FSR: until it
- * does, a run asking for it gets DXVK, unless SSBU_VK_INCOMPLETE=1 (development) keeps it. */
+ * The renderer draws the whole game (its videos not yet checked); it runs when asked for by name
+ * (SSBU_RENDERER=vulkan, display.ini's renderer = vulkan), DXVK being the default. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -303,7 +303,12 @@ static int make_device(const DeviceInfo *d, char *why, size_t why_size) {
     v13.shaderDemoteToHelperInvocation = VK_TRUE;   /* (Maxwell's KIL: required in 1.3) */
     VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
     v12.timelineSemaphore = VK_TRUE;
-    VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
+    VkPhysicalDeviceVulkan11Features v11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
+    VkPhysicalDeviceVulkan11Features have11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 have_11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have11};
+    vkGetPhysicalDeviceFeatures2(d->pd, &have_11);
+    v11.shaderDrawParameters = have11.shaderDrawParameters;   /* (vkd3d-shader's SV_VertexID in the built-in passes) */
+    VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
     f.features.robustBufferAccess = VK_TRUE;   /* (robustBufferAccess2 asks for it) */
     /* what the game's drawing uses, where the device has it (Direct3D 11 has each) */
     VkPhysicalDeviceFeatures2 have = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -375,14 +380,20 @@ void vk_check(VkResult r, const char *what) {
     rt_fatal("the Vulkan renderer failed: %s: %s", what, vk_result(r));
 }
 
+u64 vk_stat_allocs, vk_stat_alloc_bytes, vk_stat_alloc_ns;   /* (SSBU_LOG_STATS) */
 VkDeviceMemory vk_alloc(VkMemoryRequirements req, VkMemoryPropertyFlags want) {
+    vk_stat_allocs++;
+    vk_stat_alloc_bytes += req.size;
     for (int pass = 0; pass < 2; pass++)   /* (what is asked for; then without DEVICE_LOCAL, for a host-visible one) */
         for (uint32_t i = 0; i < vk.memory.memoryTypeCount; i++) {
             VkMemoryPropertyFlags need = pass ? want & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : want;
             if (!(req.memoryTypeBits & 1u << i) || (vk.memory.memoryTypes[i].propertyFlags & need) != need) continue;
             VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, i};
             VkDeviceMemory m;
-            if (vkAllocateMemory(vk.dev, &ai, NULL, &m) == VK_SUCCESS) return m;
+            u64 t0 = rt_now_ns();
+            VkResult r = vkAllocateMemory(vk.dev, &ai, NULL, &m);
+            vk_stat_alloc_ns += rt_now_ns() - t0;
+            if (r == VK_SUCCESS) return m;
         }
     vk_check(VK_ERROR_OUT_OF_DEVICE_MEMORY, "memory");
     return VK_NULL_HANDLE;
@@ -429,9 +440,15 @@ void vk_once_end(VkCommandBuffer cb) {
     vkResetCommandPool(vk.dev, once_pool, 0);
 }
 
+u64 vk_stat_wait_ns;   /* (SSBU_LOG_STATS: time waiting for the GPU) */
 void vk_wait(u64 value) {
+    u64 done = 0;
+    vkGetSemaphoreCounterValue(vk.dev, vk.timeline, &done);
+    if (done >= value) return;
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &vk.timeline, &value};
+    u64 t0 = rt_now_ns();
     vk_check(vkWaitSemaphores(vk.dev, &wi, UINT64_MAX), "waiting for the GPU");
+    vk_stat_wait_ns += rt_now_ns() - t0;
 }
 
 void vk_image_barrier(VkCommandBuffer cb, VkImage image, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -460,7 +477,8 @@ static void *vk_gfx_display_output(void) { return NULL; }
 static int vk_gfx_window_focused(void) { void *w = rt_window(); return w && GetForegroundWindow() == (HWND)w; }
 static DWORD vk_gfx_lock_owner(void) { return vk_lock_thread; }
 static DWORD vk_gfx_last_enter_thread(void) { return vk_last_enter_thread; }
-static void vk_gfx_report_compiles(void (*line)(const char *text)) { (void)line; }
+void vk_draw_report_compiles(void (*line)(const char *text));   /* gpu_vk_draw.c */
+static void vk_gfx_report_compiles(void (*line)(const char *text)) { vk_draw_report_compiles(line); }
 
 volatile LONG vk_hotkeys;
 static void vk_gfx_hotkey(int n) { InterlockedOr(&vk_hotkeys, 1 << n); }
@@ -490,12 +508,6 @@ const GfxBackend *vk_backend_open(char *why, size_t why_size) {
     if (d.props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
         fprintf(stderr, "[gfx] note: this is a software renderer (no Vulkan GPU driver found): expect a low frame rate\n");
     if (d.optional_missing[0]) fprintf(stderr, "[gfx] Vulkan: without %s (another way is used for each)\n", d.optional_missing);
-    const char *incomplete = getenv("SSBU_VK_INCOMPLETE");
-    if (!vk_incomplete_ok && (!incomplete || !atoi(incomplete))) {
-        close_instance();
-        snprintf(why, why_size, "the renderer is not complete yet (SSBU_VK_INCOMPLETE=1 keeps it)");
-        return NULL;
-    }
     if (!make_device(&d, why, why_size)) {
         close_instance();
         return NULL;
@@ -504,6 +516,6 @@ const GfxBackend *vk_backend_open(char *why, size_t why_size) {
     pthread_mutexattr_init(&ma);
     pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&vk_lock, &ma);
-    fprintf(stderr, "[gfx] Vulkan ready (incomplete: no videos, captures or FSR yet)\n");
+    fprintf(stderr, "[gfx] Vulkan ready (experimental)\n");
     return &table;
 }

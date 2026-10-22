@@ -175,7 +175,7 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 | Sharpness | FSR's sharpening, 0.0 (the most) to 2.0. Only with FSR. |
 | VSync | **On**: every frame at the monitor's next refresh, no tearing. **Off**: shown the moment it's ready (less latency; may tear in full screen). **VRR**: for FreeSync / G-Sync monitors. |
 | Window | **Windowed** or **Fullscreen**. |
-| Renderer | **DXVK** (Direct3D 11 through DXVK, as the game has always run) or **Vulkan (experimental)**: the port's own Vulkan renderer, with fewer steps from the game's shaders to the graphics card. It does not show videos, F4 captures or FSR yet. Choosing the other one restarts the game on it, straight past this menu. |
+| Renderer | **DXVK** (Direct3D 11 through DXVK, as the game has always run) or **Vulkan (experimental)**: the port's own Vulkan renderer, with fewer steps from the game's shaders to the graphics card. Experimental: DXVK stays the default. Choosing the other one restarts the game on it, straight past this menu. |
 
 Arrows or a pad's D-pad / left stick move and change; **Enter** or the pad's bottom button
 plays; **Esc** or the right one starts without changes; the mouse works too (a value's left or

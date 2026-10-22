@@ -54,15 +54,12 @@ static const GfxBackend d3d11 = {
 static const GfxBackend *volatile chosen;
 static pthread_once_t choose_once = PTHREAD_ONCE_INIT;
 
-int vk_incomplete_ok;
-
 static void choose(void) {
     const char *want = getenv("SSBU_RENDERER");
     const GfxBackend *b = NULL;
     if (want && *want && strcmp(want, "vulkan") && strcmp(want, "dxvk"))
         fprintf(stderr, "[gfx] SSBU_RENDERER=%s: not vulkan or dxvk, ignored\n", want);
     if (!want || !*want) want = display_renderer() == RENDERER_VULKAN ? "vulkan" : "dxvk";   /* (display.ini's, as the start-up menu writes it) */
-    vk_incomplete_ok = 1;   /* (asked for by name, here or there: it runs as it is) */
     if (!strcmp(want, "vulkan")) {
         char why[256] = "";
         if (!(b = vk_backend_open(why, sizeof why))) fprintf(stderr, "[gfx] Vulkan: %s; using DXVK\n", why[0] ? why : "unavailable");

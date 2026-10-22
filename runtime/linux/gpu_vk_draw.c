@@ -38,6 +38,8 @@ extern u64 gfx_stat_clears, gfx_stat_drawn, gfx_stat_skipped, gfx_skip_shader, g
 extern u64 gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_watch_us, gfx_stat_upload_bytes;
 
 static float f32_of(u32 bits) { float f; memcpy(&f, &bits, 4); return f; }
+static int draw_logging;   /* F4: this frame's draws to the log, as gpu_d3d11.c's [draw] lines */
+static u64 vk_stat_residents_made, vk_stat_inputs_made, vk_stat_textures_made;   /* (SSBU_LOG_STATS) */
 static u64 sb_bytes, texture_bytes;   /* (SSBU_LOG_STATS: storage buffers' and textures' uploads) */
 
 /* ---- per-frame memory: the upload ring, descriptor pools ----------------------------------- */
@@ -687,6 +689,7 @@ static VkImageView get_texture(const u32 *tic, u32 shader_type, float *scale, Im
     VkImageCreateFlags flags = (d.type == TIC_CUBE || d.type == TIC_CUBE_ARRAY) && layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     u32 w = d.width, h = type == VK_IMAGE_TYPE_1D ? 1 : d.height;
     if (d.bw > 1 && ((w % 4) || (h % 4))) { w = (w + 3) & ~3u; h = (h + 3) & ~3u; }   /* (block-compressed: whole blocks at level 0) */
+    vk_stat_textures_made++;
     if (!make_image(&t->img, type, format, w, h, d.type == TIC_3D ? d.depth : 1, levels, layers,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, flags, NULL, 0)) {
         warn_texture(&d);
@@ -914,6 +917,14 @@ static Resident residents[512];
 static u32 nresidents;
 extern u64 gfx_stat_residents, gfx_stat_resident_pages, gfx_stat_gpu_waits, gfx_stat_composed;
 static int gpu_wrote, gpu_read;   /* since the last buffer barrier: buffers written by the GPU; draws or dispatches */
+/* Since then, as well: whether all of it was dispatches (copies and draws are not followed range by
+ * range), and those dispatches' storage buffers - so that a dispatch after others that touch other
+ * buffers (the fighters' skinning, one model after another) needs no barrier between them */
+static int untracked;
+static int ring_copied;   /* resident data copied into the ring (resident_patch) since the last barrier */
+static struct { VkBuffer buf; VkDeviceSize lo, hi; int write; } accessed[64];
+static u32 naccessed;
+u64 vk_stat_buffer_barriers, vk_stat_compute_barriers;
 
 static void buffer_barrier(void) {
     suspend_rendering();
@@ -923,7 +934,32 @@ static void buffer_barrier(void) {
                            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb, 0, NULL, 0, NULL};
     vkCmdPipelineBarrier2(cb, &di);
-    gpu_wrote = gpu_read = 0;
+    gpu_wrote = gpu_read = untracked = ring_copied = 0;
+    naccessed = 0;
+    vk_stat_buffer_barriers++;
+}
+/* Between dispatches that touch the same buffers, with only dispatches since the last barrier: the
+ * compute stage's writes before its next reads and writes, the graphics work left running. Draws
+ * still get the full barrier (gpu_wrote stays). */
+static void compute_barrier(void) {
+    VkCommandBuffer cb = vk_cmd();
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb, 0, NULL, 0, NULL};
+    vkCmdPipelineBarrier2(cb, &di);
+    naccessed = 0;
+    vk_stat_compute_barriers++;
+}
+/* Copies into fresh parts of the ring, before the draw or dispatch that reads them */
+static void copy_barrier(void) {
+    suspend_rendering();
+    VkCommandBuffer cb = vk_cmd();
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb, 0, NULL, 0, NULL};
+    vkCmdPipelineBarrier2(cb, &di);
+    ring_copied = 0;
 }
 /* Before the GPU writes buffers that earlier work may use */
 static void gpu_write_begin(void) {
@@ -963,7 +999,7 @@ static void buf_write(VkBuffer dst, VkDeviceSize off, const void *data, u64 n) {
         off += part;
         n -= part;
     }
-    gpu_wrote = 1;
+    gpu_wrote = untracked = 1;
 }
 
 static void resident_drop(Resident *r) {
@@ -1082,6 +1118,7 @@ static Resident *resident_create(u64 va, u32 size) {
     if (watched(r->guest, r->size)) resident_snapshot(r);
     nresidents++;
     gfx_stat_residents++;
+    vk_stat_residents_made++;
     return r;
 }
 
@@ -1116,7 +1153,7 @@ static Resident *resident_acquire(u64 va, u32 size) {
                 resident_drop(r);
             } else i++;
         }
-        gpu_wrote = 1;
+        gpu_wrote = untracked = 1;
         residents[nresidents++] = merged;
         n = &residents[nresidents - 1];
     }
@@ -1132,7 +1169,10 @@ static void resident_patch(VkBuffer dst, VkDeviceSize off, u64 va, u64 size) {
         if (r->va < va + size && va < r->va + r->size) { resident_sync(r, 0); any = 1; }
     }
     if (!any) return;
-    gpu_write_begin();
+    /* (dst is a fresh part of the ring: only the regions' last writes are waited for, and what reads
+     * it next waits for the copy alone - copy_barrier) */
+    suspend_rendering();
+    if (gpu_wrote) buffer_barrier();
     for (u32 i = 0; i < nresidents; i++) {
         Resident *r = &residents[i];
         u64 lo = va > r->va ? va : r->va, hi = va + size < r->va + r->size ? va + size : r->va + r->size;
@@ -1140,7 +1180,7 @@ static void resident_patch(VkBuffer dst, VkDeviceSize off, u64 va, u64 size) {
         VkBufferCopy c = {lo - r->va, off + (lo - va), hi - lo};
         vkCmdCopyBuffer(vk_cmd(), r->buf, dst, 1, &c);
     }
-    gpu_wrote = 1;
+    ring_copied = 1;
 }
 
 /* A range only partly held by resident regions, as the GPU sees it: the guest's data with the
@@ -1239,11 +1279,11 @@ int vk_gfx_copy_resident(u64 dst_va, u64 src_va, u64 bytes) {
         }
         VkBufferCopy a = {c.srcOffset, 0, bytes}, b = {0, c.dstOffset, bytes};
         vkCmdCopyBuffer(vk_cmd(), src->buf, tmp, 1, &a);
-        gpu_wrote = 1;
+        gpu_wrote = untracked = 1;
         buffer_barrier();
         vkCmdCopyBuffer(vk_cmd(), tmp, dst->buf, 1, &b);
     }
-    gpu_wrote = 1;
+    gpu_wrote = untracked = 1;
     vk_leave();
     return 1;
 }
@@ -1275,6 +1315,7 @@ static int input_buffer(u64 va, u32 size, VkDescriptorBufferInfo *out) {
         }
     } else {
         b = lru;
+        vk_stat_inputs_made++;
         bury_buffer(b->buf, b->mem);
         memset(b, 0, sizeof *b);
         b->buf = device_buffer(cap, &b->mem);
@@ -1696,9 +1737,16 @@ static pthread_cond_t jobs_ready = PTHREAD_COND_INITIALIZER;
 static volatile int compilers_started;
 static volatile long compiles_pending;
 
+/* What each compiler thread is doing (for a crash report: a fault in the driver's compiler names
+ * the shader) */
+static struct { DWORD thread; Shader *volatile shader; Pipe *volatile pipe; volatile u64 since_ms; } compilers[4];
+static volatile long ncompilers;
+
 static void *compiler(void *arg) {
     (void)arg;
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 5);   /* (below the game's threads) */
+    long me = __atomic_fetch_add(&ncompilers, 1, __ATOMIC_ACQ_REL);
+    compilers[me].thread = GetCurrentThreadId();
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (jobs_head == jobs_tail) pthread_cond_wait(&jobs_ready, &jobs_lock);
@@ -1710,6 +1758,9 @@ static void *compiler(void *arg) {
         jobs[pick] = jobs[jobs_head];
         jobs_head = (jobs_head + 1) % jobs_cap;
         pthread_mutex_unlock(&jobs_lock);
+        compilers[me].since_ms = GetTickCount64();
+        compilers[me].shader = j.shader;
+        compilers[me].pipe = j.pipe;
         if (j.shader) {
             VkPipeline lib = shader_library(j.shader, j.polygon);
             j.shader->lib[j.polygon] = lib;
@@ -1718,16 +1769,39 @@ static void *compiler(void *arg) {
             VkPipeline p = link_pipeline(j.pipe->libs, 1);
             if (p) __atomic_store_n(&j.pipe->optimized, p, __ATOMIC_RELEASE);
         }
+        compilers[me].shader = NULL;
+        compilers[me].pipe = NULL;
         __atomic_sub_fetch(&compiles_pending, 1, __ATOMIC_RELAXED);
     }
     return NULL;
+}
+
+/* gfx_report_compiles: the compiler threads at the time of a crash or a hang */
+void vk_draw_report_compiles(void (*line)(const char *text)) {
+    char text[300];
+    DWORD self = GetCurrentThreadId();
+    u64 now = GetTickCount64();
+    int busy = 0;
+    for (long i = 0; i < ncompilers && i < 4; i++) {
+        Shader *s = compilers[i].shader;
+        Pipe *p = compilers[i].pipe;
+        if (!s && !p) continue;
+        if (!busy++) line("Vulkan compiler threads at the time:\n");
+        if (s) snprintf(text, sizeof text, "  thread %lu%s: the driver compiling %s's library, for %.1f s\n", (unsigned long)compilers[i].thread,
+                        compilers[i].thread == self ? " (this thread)" : "", s->name, (now - compilers[i].since_ms) / 1000.0);
+        else snprintf(text, sizeof text, "  thread %lu%s: the driver optimizing a pipeline, for %.1f s\n", (unsigned long)compilers[i].thread,
+                      compilers[i].thread == self ? " (this thread)" : "", (now - compilers[i].since_ms) / 1000.0);
+        line(text);
+    }
+    snprintf(text, sizeof text, "Vulkan: %ld compiles pending, %u shaders, %llu pipelines\n", compiles_pending, shader_count, (unsigned long long)vk_stat_pipelines);
+    line(text);
 }
 
 static void queue_job(Job j) {
     if (!compilers_started) {
         long cpus = sysconf(_SC_NPROCESSORS_ONLN);
         int n = cpus > 4 ? (int)(cpus / 2) : 1;
-        if (n > 4) n = 4;
+        if (n > 4) n = 4;   /* (compilers[]' size) */
         for (int i = 0; i < n; i++) {
             pthread_t t;
             pthread_create(&t, NULL, compiler, NULL);
@@ -2307,7 +2381,8 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     /* the images' uses: the targets as attachments, the textures read (a texture that is one of the
      * draw's targets reads 0, as Direct3D unbinds it) */
     if (gpu_wrote) buffer_barrier();   /* (buffers the GPU wrote: compute results, copies) */
-    gpu_read = 1;
+    else if (ring_copied) copy_barrier();
+    gpu_read = untracked = 1;
     int changed = !rendering || cur_ncolor != ncolor || cur_depth != depth || memcmp(cur_color, color, sizeof color);
     int barriers = 0;
     for (u32 i = 0; i < ncolor; i++)
@@ -2433,6 +2508,28 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         vkCmdSetColorWriteMaskEXT(cmd, 0, ncolor, mask);
         memcpy(have.blend, blend, ncolor * sizeof *blend);
         have.nblend = ncolor;
+    }
+    if (draw_logging) {
+        fprintf(stderr, "[draw] programs: region %#llx vs +%#x ps +%#x\n", (unsigned long long)region, regs[M_PIPELINE(1) + 1], regs[M_PIPELINE(5) + 1]);
+        u32 c0 = sel >> 4 & 7;
+        fprintf(stderr, "[draw] %s %s rt0 %#llx %ux%u fmt %#x (ct sel %#x) zt %d | vp %.0f,%.0f %.0fx%.0f fix %.2f %.2f %.2f %.2f | "
+                "%s %u (first %u) topo %u | mask %#x blend %d | depth %d/%d func %#x | cull %d (en %#x face %#x front %#x origin %#x scale %g %g)\n",
+                vs->name, ps ? ps->name : "(no ps)", (unsigned long long)gpu_va_to_guest((u64)regs[M_CT(c0)] << 32 | regs[M_CT(c0) + 1]), rt_w, rt_h,
+                regs[M_CT(c0) + 4], sel, depth != NULL, vx, vy, vw, vh, params.fix[0], params.fix[1], params.fix[2], params.fix[3],
+                indexed ? "indexed" : "arrays", indexed ? regs[M_DRAW_INDEX_COUNT] : regs[M_VERTEX_ARRAY_COUNT],
+                indexed ? regs[M_INDEX_BUFFER + 5] : regs[M_VERTEX_ARRAY_START], begin & 0xFFFF, regs[M_CT_WRITE(0)], blend[0].enable,
+                (int)depth_test, regs[M_DEPTH_WRITE] & 1, regs[M_DEPTH_FUNC], (int)cull, regs[M_CULL_ENABLE], regs[M_CULL_FACE], regs[M_FRONT_FACE],
+                regs[M_WINDOW_ORIGIN], f32_of(regs[M_VIEWPORT_SCALE(0)]), f32_of(regs[M_VIEWPORT_SCALE(0) + 1]));
+        u32 sh = regs[M_SCISSOR(0) + 1], sv = regs[M_SCISSOR(0) + 2];
+        fprintf(stderr, "[draw]   scissor %s x %u-%u y %u-%u | stencil %d func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
+                "two-sided %u: back func %#x ref %#x mask %#x/%#x ops %#x %#x %#x | "
+                "blend src %d dst %d op %d, alpha src %d dst %d op %d\n",
+                regs[M_SCISSOR(0)] & 1 ? "on" : "off", sh & 0xFFFF, sh >> 16, sv & 0xFFFF, sv >> 16, (int)stencil, regs[M_STENCIL_FUNC],
+                regs[M_STENCIL_REF] & 0xFF, regs[M_STENCIL_FUNC_MASK] & 0xFF, regs[M_STENCIL_MASK] & 0xFF, regs[M_STENCIL_OP_FAIL],
+                regs[M_STENCIL_OP_ZFAIL], regs[M_STENCIL_OP_ZPASS], regs[M_TWO_SIDED_STENCIL] & 1, regs[M_BACK_STENCIL_FUNC],
+                regs[M_BACK_STENCIL_REF] & 0xFF, regs[M_BACK_STENCIL_FUNC_MASK] & 0xFF, regs[M_BACK_STENCIL_MASK] & 0xFF,
+                regs[M_BACK_STENCIL_OP_FAIL], regs[M_BACK_STENCIL_OP_ZFAIL], regs[M_BACK_STENCIL_OP_ZPASS], blend[0].src, blend[0].dst, blend[0].op,
+                blend[0].asrc, blend[0].adst, blend[0].aop);
     }
 
     if (indexed) {
@@ -2599,13 +2696,39 @@ void vk_gfx_dispatch(const u32 *regs, const u32 *q) {
     VkDescriptorSet sets[4];
     write_sets(sh, b, NULL, sets);
     sets[3] = slots[vk_slot()].params_set;
-    gpu_write_begin();   /* (after the uploads and copies above) */
+    /* a barrier before it (after the uploads and copies above) unless only dispatches came since the
+     * last, and none wrote what this one touches nor read what it writes */
+    suspend_rendering();
+    int conflict = 0;
+    for (u32 k = 0; k < cs->info.sb_count && !conflict; k++) {
+        const VkDescriptorBufferInfo *d = &b[0].sb[k];
+        int write = !learned || (cs->written_mask >> k & 1);
+        for (u32 i = 0; i < naccessed && !conflict; i++)
+            conflict = accessed[i].buf == d->buffer && accessed[i].lo < d->offset + d->range && d->offset < accessed[i].hi && (write || accessed[i].write);
+    }
+    if (untracked || naccessed + cs->info.sb_count > 64) buffer_barrier();
+    else {   /* (only dispatches since the last, and copies into the ring: each waited for as it needs) */
+        if (ring_copied) copy_barrier();
+        if (conflict) compute_barrier();
+    }
+    for (u32 k = 0; k < cs->info.sb_count; k++) {
+        const VkDescriptorBufferInfo *d = &b[0].sb[k];
+        accessed[naccessed].buf = d->buffer;
+        accessed[naccessed].lo = d->offset;
+        accessed[naccessed].hi = d->offset + d->range;
+        accessed[naccessed++].write = !learned || (cs->written_mask >> k & 1);
+    }
     VkCommandBuffer cmd = vk_cmd();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cs->compute);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 4, sets, 1, &poff);
     vkCmdDispatch(cmd, grid[0], grid[1], grid[2]);
     gpu_wrote = gpu_read = 1;
     gfx_stat_dispatched++;
+    if (draw_logging)
+        fprintf(stderr, "[draw] dispatch %s grid %ux%ux%u, buffers %#llx+%#x %#llx+%#x %#llx+%#x (written %#x)\n", cs->name, grid[0], grid[1], grid[2],
+                (unsigned long long)((u64)params.sb[0][0][1] << 32 | params.sb[0][0][0]), params.sb[0][0][2],
+                (unsigned long long)((u64)params.sb[0][1][1] << 32 | params.sb[0][1][0]), params.sb[0][1][2],
+                (unsigned long long)((u64)params.sb[0][2][1] << 32 | params.sb[0][2][0]), params.sb[0][2][2], cs->written_mask);
 
     /* while learning, what it wrote goes back to guest memory; the buffers written are noted */
     if (cs->info.stores && !learned) {
@@ -2720,6 +2843,12 @@ void vk_gfx_clear(const u32 *regs, u32 arg) {
     vk_enter();
     gfx_stat_clears++;
     u32 rt = (arg >> 6) & 0xF;
+    if (draw_logging)
+        fprintf(stderr, "[draw] clear rt %u (%#llx %ux%u fmt %#x) channels %#x%s, zt %#llx: color %g %g %g %g depth %g stencil %#x\n", rt,
+                (unsigned long long)gpu_va_to_guest((u64)RT(rt & 7, 0) << 32 | RT(rt & 7, 1)), RT(rt & 7, 2), RT(rt & 7, 3), RT(rt & 7, 4),
+                (arg >> 2) & 0xF, arg & 3 ? (arg & 1 ? " +depth" : " +stencil") : "",
+                (unsigned long long)gpu_va_to_guest((u64)regs[0x3F8] << 32 | regs[0x3F9]), f32_of(regs[0x360]), f32_of(regs[0x361]),
+                f32_of(regs[0x362]), f32_of(regs[0x363]), f32_of(regs[0x364]), regs[0x368] & 0xFF);
     if (arg & 0x3C && rt < 8) {   /* any of R, G, B, A */
         u64 va = (u64)RT(rt, 0) << 32 | RT(rt, 1);
         Surface *s = surface(gpu_va_to_guest(va), RT(rt, 2), RT(rt, 3), RT(rt, 4), 0);
@@ -2748,6 +2877,10 @@ void vk_gfx_blit2d(const u32 *regs) {
     for (u32 i = 0; i < nsurfaces; i++)
         if (surfaces[i].img.image && !surfaces[i].depth && surfaces[i].guest == src_g) src = &surfaces[i];
     Surface *dst = surface(dst_g, regs[0x86], regs[0x87], regs[0x80], 0);
+    if (draw_logging)
+        fprintf(stderr, "[draw] 2D blit %#llx (%ux%u fmt %#x, %s) -> %#llx (%ux%u fmt %#x): dst rect %u,%u %ux%u\n", (unsigned long long)src_g, regs[0x92],
+                regs[0x93], regs[0x8C], src ? "on the host" : "in memory", (unsigned long long)dst_g, regs[0x86], regs[0x87], regs[0x80], regs[0x22C],
+                regs[0x22D], regs[0x22E], regs[0x22F]);
     if (!src || !dst || src == dst) { vk_leave(); return; }   /* (sources only in guest memory: not yet) */
     double du = regs[0x231] + regs[0x230] / 4294967296.0, dv = regs[0x233] + regs[0x232] / 4294967296.0;
     double sx = regs[0x235] + regs[0x234] / 4294967296.0, sy = (i32)regs[0x237] + regs[0x236] / 4294967296.0;
@@ -2779,6 +2912,20 @@ void vk_draw_presenting(void) {
                 kept_miss_bytes[3] / 1048576.0, gfx_stat_upload_bytes / 1048576.0);
         fprintf(stderr, "[vk stats]   storage buffers %.1f MB, textures %.1f MB; descriptor sets reused %llu\n", sb_bytes / 1048576.0,
                 texture_bytes / 1048576.0, (unsigned long long)vk_stat_sets_reused);
+        extern u64 vk_stat_allocs, vk_stat_alloc_bytes, vk_stat_alloc_ns, vk_stat_wait_ns, vk_stat_flushes, vk_stat_flush_waits;
+        fprintf(stderr, "[vk stats]   GPU waits %.0f ms; submissions in the middle of a frame %llu (%llu waited for); buffer barriers %llu, compute ones %llu\n",
+                vk_stat_wait_ns / 1e6, (unsigned long long)vk_stat_flushes, (unsigned long long)vk_stat_flush_waits, (unsigned long long)vk_stat_buffer_barriers,
+                (unsigned long long)vk_stat_compute_barriers);
+        vk_stat_wait_ns = vk_stat_flushes = vk_stat_flush_waits = vk_stat_buffer_barriers = vk_stat_compute_barriers = 0;
+        static u64 last_composed, last_pages;
+        fprintf(stderr, "[vk stats]   composed uploads %llu, resident pages taken %llu\n", (unsigned long long)(gfx_stat_composed - last_composed),
+                (unsigned long long)(gfx_stat_resident_pages - last_pages));
+        last_composed = gfx_stat_composed;
+        last_pages = gfx_stat_resident_pages;
+        fprintf(stderr, "[vk stats]   device memory: %llu allocations, %.1f MB, %.0f ms; residents made %llu, input buffers made %llu, textures made %llu\n",
+                (unsigned long long)vk_stat_allocs, vk_stat_alloc_bytes / 1048576.0, vk_stat_alloc_ns / 1e6, (unsigned long long)vk_stat_residents_made,
+                (unsigned long long)vk_stat_inputs_made, (unsigned long long)vk_stat_textures_made);
+        vk_stat_allocs = vk_stat_alloc_bytes = vk_stat_alloc_ns = vk_stat_residents_made = vk_stat_inputs_made = vk_stat_textures_made = 0;
         fprintf(stderr, "[vk stats]   shaders translated %llu in %.0f ms (modules %.0f ms); pipelines made %llu, libraries %llu, in %.0f ms; "
                         "links %.0f ms, optimized ones %.0f ms; draws skipped compiling %llu; %ld compiles pending\n",
                 (unsigned long long)vk_stat_translated, vk_stat_translate_ns / 1e6, vk_stat_module_ns / 1e6, (unsigned long long)vk_stat_pipelines_made,
@@ -2817,6 +2964,100 @@ int vk_draw_picture(VkCommandBuffer cb, VkImage dst, u64 guest, u32 cx, u32 cy, 
     return 1;
 }
 
+int vk_draw_picture_view(VkCommandBuffer cb, u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, VkImageView *view, u32 size[2], u32 pic[4]) {
+    Surface *src = NULL;
+    for (u32 i = 0; i < nsurfaces; i++)
+        if (surfaces[i].img.image && !surfaces[i].depth && surfaces[i].guest == guest) src = &surfaces[i];
+    if (!src) return 0;
+    int cropped = cw && ch && cx + cw <= src->width && cy + ch <= src->height;
+    float s = src->scale;
+    pic[0] = cropped ? (u32)(cx * s + 0.5f) : 0;
+    pic[1] = cropped ? (u32)(cy * s + 0.5f) : 0;
+    pic[2] = cropped ? (u32)(cw * s + 0.5f) : src->pw;
+    pic[3] = cropped ? (u32)(ch * s + 0.5f) : src->ph;
+    size[0] = src->pw;
+    size[1] = src->ph;
+    use(&src->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    flush_barriers(cb);
+    *view = surface_sampled(src, 0, 0);   /* (the bytes as they are, as the copy without FSR) */
+    return 1;
+}
+
+/* The picture as the game drew it (no overlay), at the game's resolution, into a 24-bit BMP at path,
+ * as gpu_d3d11.c's captures: blitted into an RGBA8 image (any format, any scale), read back. Submits
+ * the frame's work so far and waits for it. 0 if there is no picture. */
+int vk_draw_capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, const char *path) {
+    Surface *src = NULL;
+    for (u32 i = 0; i < nsurfaces; i++)
+        if (surfaces[i].img.image && !surfaces[i].depth && surfaces[i].guest == guest) src = &surfaces[i];
+    if (!src) return 0;
+    unsigned w, h;
+    display_screen_size(&w, &h);
+    static Img cap;
+    static VkBuffer buf;
+    static VkDeviceMemory buf_mem;
+    static u8 *buf_map;
+    if (!cap.image || cap.width != w || cap.height != h) {
+        if (cap.image) {
+            vk_flush(1);
+            vkDestroyImage(vk.dev, cap.image, NULL);
+            vkFreeMemory(vk.dev, cap.memory, NULL);
+            vkDestroyBuffer(vk.dev, buf, NULL);
+            vkFreeMemory(vk.dev, buf_mem, NULL);
+        }
+        if (!make_image(&cap, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0,
+                        NULL, 0))
+            return 0;
+        cap.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        void *map;
+        buf = vk_buffer((VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &buf_mem, &map);
+        buf_map = map;
+    }
+    int cropped = cw && ch && cx + cw <= src->width && cy + ch <= src->height;
+    float s = src->scale;
+    int32_t px = cropped ? (int32_t)(cx * s + 0.5f) : 0, py = cropped ? (int32_t)(cy * s + 0.5f) : 0;
+    int32_t pw = cropped ? (int32_t)(cw * s + 0.5f) : (int32_t)src->pw, ph = cropped ? (int32_t)(ch * s + 0.5f) : (int32_t)src->ph;
+    suspend_rendering();
+    VkCommandBuffer cb = vk_cmd();
+    use(&src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    cap.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    cap.stage = VK_PIPELINE_STAGE_2_COPY_BIT;
+    cap.access = 0;
+    use(&cap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    flush_barriers(cb);
+    VkImageBlit blit = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{px, py, 0}, {px + pw, py + ph, 1}},
+                        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    vkCmdBlitImage(cb, src->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cap.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    use(&cap, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    flush_barriers(cb);
+    VkBufferImageCopy copy = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, cap.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb, 0, NULL, 0, NULL};
+    vkCmdPipelineBarrier2(cb, &di);
+    vk_flush(1);
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    u32 row = w * 3, pad = (4 - row % 4) % 4, data = (row + pad) * h;
+    u8 hdr[54] = {'B', 'M'};
+    *(u32 *)(hdr + 2) = 54 + data; *(u32 *)(hdr + 10) = 54; *(u32 *)(hdr + 14) = 40;
+    *(i32 *)(hdr + 18) = (i32)w; *(i32 *)(hdr + 22) = -(i32)h; *(u16 *)(hdr + 26) = 1; *(u16 *)(hdr + 28) = 24;
+    *(u32 *)(hdr + 34) = data;
+    fwrite(hdr, 1, 54, f);
+    u8 *line = malloc(row + pad + 4);
+    for (u32 y = 0; y < h; y++) {
+        const u8 *p = buf_map + (size_t)y * w * 4;
+        for (u32 x = 0; x < w; x++) { line[x * 3] = p[x * 4 + 2]; line[x * 3 + 1] = p[x * 4 + 1]; line[x * 3 + 2] = p[x * 4]; }
+        memset(line + row, 0, pad);
+        fwrite(line, 1, row + pad, f);
+    }
+    free(line);
+    fclose(f);
+    return 1;
+}
+
 void vk_draw_describe(char *out, size_t n) {
     snprintf(out, n, "Vulkan: draws %llu  skipped %llu  uploads reused %llu\nshaders %llu  pipelines %llu  textures %u  surfaces %u", (unsigned long long)gfx_stat_drawn,
              (unsigned long long)gfx_stat_skipped, (unsigned long long)vk_stat_kept_reused, (unsigned long long)gfx_stat_shaders, (unsigned long long)vk_stat_pipelines, ntextures, nsurfaces);
@@ -2829,4 +3070,16 @@ void vk_gfx_stream_wrote(u64 va, u64 bytes) {
     for (u64 b = va >> 16; b <= (va + bytes - 1) >> 16; b++) block_written[KEPT_BLOCK(b)] = epoch;
 }
 void vk_gfx_stream_end(void) {}
-int vk_gfx_draw_logging(void) { return 0; }
+int vk_gfx_draw_logging(void) { return draw_logging; }
+
+/* F4 (gpu_vk_frame.c): the draws of the next two presents' worth - the game presents in the middle
+ * of drawing a frame, so one would miss half - to the log */
+void vk_draw_log_begin(void) {
+    draw_logging = 2;
+    fprintf(stderr, "[draw] -- frame start (F4)\n");
+}
+void vk_draw_log_present(u64 guest) {
+    if (!draw_logging) return;
+    fprintf(stderr, "[draw] -- frame presented from %#llx\n", (unsigned long long)guest);
+    draw_logging--;
+}
