@@ -25,6 +25,10 @@ DXVK_INCLUDE = os.path.join(TOOLCHAIN, "dxvk-headers", "include", "native")
 VKD3D_SRC = sorted(glob.glob(os.path.join(TOOLCHAIN, "src", "vkd3d-*")))[-1:] or [""]
 VKD3D_SRC = VKD3D_SRC[0]
 VKD3D_BUILD = os.path.join(TOOLCHAIN, "build-vkd3d")
+# (the Vulkan renderer's headers - runtime/linux/gpu_vulkan*.c; Vulkan itself is loaded at run time)
+VULKAN_INCLUDE = (sorted(glob.glob(os.path.join(TOOLCHAIN, "src", "Vulkan-Headers-*", "include")))[-1:] or [""])[0]
+# (SPIR-V's opcodes and enums: spirv/unified1/spirv.h, for the Maxwell-to-SPIR-V translator, runtime/linux/gpu_spirv*.c)
+SPIRV_INCLUDE = (sorted(glob.glob(os.path.join(TOOLCHAIN, "src", "SPIRV-Headers-*", "include")))[-1:] or [""])[0]
 
 # The game tree (dump/, build/, save/) a Linux build is made from unless --port names another:
 # the 13.0.5 update's folder (tools/update.py --tree v13.0.5) once it is built, otherwise the

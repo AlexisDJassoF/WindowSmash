@@ -47,7 +47,7 @@ class MenuTests(unittest.TestCase):
         out = self.run_menu('dra')   # down from Play wraps to Mode; right; Mode is not Play, so a moves down
         self.assertEqual(out['mode'], 'Handheld (720p)')
         self.assertEqual(int(out['state']), OPEN)
-        out = self.run_menu('dr' + 'd' * 5 + 'a')   # on down to Play (Sharpness hidden: 5 rows)
+        out = self.run_menu('dr' + 'd' * 6 + 'a')   # on down to Play (Sharpness hidden: 6 rows)
         self.assertEqual((int(out['state']), out['mode']), (PLAY, 'Handheld (720p)'))
 
     def test_sharpness_only_with_fsr(self):
@@ -61,14 +61,21 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(out['sharpness'], '0.0')
 
     def test_vsync_cycles(self):
-        self.assertEqual(self.run_menu('uur')['vsync'], 'VRR')        # (up from Play: Window, then VSync; Off -> VRR)
-        self.assertEqual(self.run_menu('uul')['vsync'], 'On')
-        self.assertEqual(self.run_menu('uu', TEST_PACING='2')['vsync'], 'Display')
-        self.assertEqual(self.run_menu('uul', TEST_PACING='2')['vsync'], 'On')    # display paces as Off: stepped from there
-        self.assertEqual(self.run_menu('uur', TEST_PACING='2')['vsync'], 'VRR')
+        self.assertEqual(self.run_menu('uuur')['vsync'], 'VRR')        # (up from Play: Renderer, Window, then VSync; Off -> VRR)
+        self.assertEqual(self.run_menu('uuul')['vsync'], 'On')
+        self.assertEqual(self.run_menu('uuu', TEST_PACING='2')['vsync'], 'Display')
+        self.assertEqual(self.run_menu('uuul', TEST_PACING='2')['vsync'], 'On')    # display paces as Off: stepped from there
+        self.assertEqual(self.run_menu('uuur', TEST_PACING='2')['vsync'], 'VRR')
 
     def test_window_toggles(self):
-        self.assertEqual(self.run_menu('ur')['window'], 'Fullscreen')
+        self.assertEqual(self.run_menu('uur')['window'], 'Fullscreen')
+
+    def test_renderer_toggles(self):
+        self.assertEqual(self.run_menu('')['renderer'], 'DXVK')
+        out = self.run_menu('ur')   # (up from Play: Renderer)
+        self.assertEqual((out['row'], out['renderer']), ('Renderer', 'Vulkan (experimental)'))
+        self.assertEqual(self.run_menu('url')['renderer'], 'DXVK')
+        self.assertEqual(self.run_menu('ur', TEST_LOCKED='32')['renderer'], 'DXVK (set by SSBU_RENDERER)')
 
     def test_untouched_starts_itself(self):
         self.assertEqual(int(self.run_menu('t9.9')['state']), OPEN)
@@ -97,12 +104,12 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(self.run_menu('ddl', TEST_LOCKED='16')['scale'], '100% (1920 x 1080) (set by SSBU_SCALE)')
 
     def test_clicks(self):
-        # row 0 (Mode) at y 100-140: its value's right half steps it; Play is row 5 at y 300-340
+        # row 0 (Mode) at y 100-140: its value's right half steps it
         out = self.run_menu('c500,120')
         self.assertEqual((out['row'], out['mode']), ('Mode', 'Handheld (720p)'))
         out = self.run_menu('c100,120')   # the label: selects only
         self.assertEqual((out['row'], out['mode']), ('Mode', 'Docked (1080p)'))
-        self.assertEqual(int(self.run_menu('c300,360')['state']), PLAY)   # (Play: row 6, y 340-380)
+        self.assertEqual(int(self.run_menu('c300,400')['state']), PLAY)   # (Play: row 7, y 380-420)
 
 
 if __name__ == '__main__':

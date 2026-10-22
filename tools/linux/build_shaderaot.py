@@ -14,7 +14,8 @@ from toolchain import CFLAGS, DXVK_INCLUDE, LINKER, REPO, RUNTIME, SYSROOT, VKD3
 
 INCLUDES = ["-I", RUNTIME, "-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.path.join(DXVK_INCLUDE, "windows"),
             "-I", os.path.join(DXVK_INCLUDE, "directx"), "-I", os.path.join(VKD3D_SRC, "include")]
-SOURCES = [os.path.join(REPO, "tools", "shaderaot.c"), os.path.join(RUNTIME, "gpu_shader.c"), os.path.join(RUNTIME, "gpu_shader_cfg.c"),
+SOURCES = [os.path.join(REPO, "tools", "shaderaot.c"), os.path.join(RUNTIME, "gpu_shader.c"), os.path.join(RUNTIME, "gpu_shader_decode.c"),
+           os.path.join(RUNTIME, "gpu_shader_cfg.c"),
            os.path.join(RUNTIME, "linux", "d3dcompile_vkd3d.c")]
 
 

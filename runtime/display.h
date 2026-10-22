@@ -34,11 +34,13 @@ float display_sharpness(void);                            /* fsr's sharpening in
 float display_scale(void);                                /* the render resolution scale: 0.5 to 2 (display.ini's scale %) */
 unsigned display_sync_interval(void);                     /* Present's: 1 with pacing = vsync, else 0 */
 int display_menu_enabled(void);                           /* display.ini's menu (SSBU_MENU overrides) */
+int display_renderer(void);                               /* Linux: display.ini's renderer, RENDERER_* (SSBU_RENDERER overrides) */
+enum { RENDERER_DXVK, RENDERER_VULKAN };
 
 /* The start-up menu's settings (gpu_menu.c): window is the window mode (0 windowed, 1 borderless,
  * 2 fullscreen). LOCK_*: set by an environment variable, not the menu's to change. */
-typedef struct DisplaySettings { int window; OperationMode operation; Upscale upscale; float sharpness; Pacing pacing; int scale; } DisplaySettings;
-enum { LOCK_WINDOW = 1, LOCK_MODE = 2, LOCK_UPSCALE = 4, LOCK_PACING = 8, LOCK_SCALE = 16 };
+typedef struct DisplaySettings { int window; OperationMode operation; Upscale upscale; float sharpness; Pacing pacing; int scale; int renderer; } DisplaySettings;
+enum { LOCK_WINDOW = 1, LOCK_MODE = 2, LOCK_UPSCALE = 4, LOCK_PACING = 8, LOCK_SCALE = 16, LOCK_RENDERER = 32 };
 void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed);
 void display_apply(const DisplaySettings *s);             /* before the game starts */
 int display_save(const DisplaySettings *s);               /* what changed from the file, into display.ini */

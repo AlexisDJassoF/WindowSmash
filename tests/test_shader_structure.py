@@ -31,7 +31,7 @@ def build(out, translator=False):
     sources = [ROOT / 'tests/shader_structure_test.c', ROOT / 'runtime/gpu_shader_cfg.c']
     flags = ['-O2', '-I', str(ROOT / 'runtime')]
     if translator:
-        sources.append(ROOT / 'runtime/gpu_shader.c')
+        sources += [ROOT / 'runtime/gpu_shader.c', ROOT / 'runtime/gpu_shader_decode.c']
         flags += ['-DWITH_TRANSLATOR', '-w', '-I', str(ROOT / 'runtime/linux/include'),
                   '-I', str(DXVK_INCLUDE / 'windows'), '-I', str(DXVK_INCLUDE / 'directx')]
     r = subprocess.run([CC, *flags, *map(str, sources), '-o', str(out)], capture_output=True, text=True)

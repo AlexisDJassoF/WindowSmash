@@ -11,6 +11,7 @@ the layout tools/linux/toolchain.py and README-LINUX.md describe:
   dxvk-headers/   DXVK's include/native, with mingw-directx-headers in its directx/ folder
   src/vkd3d-*/    the vkd3d source
   src/SPIRV-Headers-*/
+  src/Vulkan-Headers-*/
 Every download is checked before it is used. The jammy packages come from one fixed moment of
 snapshot.ubuntu.com (SNAPSHOT), so the sysroot is the same on every machine: the pocket's
 InRelease is checked with gpgv against the Ubuntu archive keyring, the Packages index against
@@ -65,6 +66,9 @@ RELEASES = (
      "7510146aff2adfb4ae07ab890701a607e5ff7c66e57100cfc9f630ec92eeda6a", "vkd3d-2.1", ""),
     ("src/SPIRV-Headers-vulkan-sdk-1.4.363.0", f"{GITHUB}/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz",
      "5b3a0d099f5c7649e29c0938476c462e71d66ad89a0bde42fa1ba3eb476956c9", "SPIRV-Headers-vulkan-sdk-1.4.363.0", ""),
+    # (the Vulkan renderer's API, of the same Vulkan SDK as SPIRV-Headers; libvulkan itself is loaded at run time)
+    ("src/Vulkan-Headers-vulkan-sdk-1.4.363.0", f"{GITHUB}/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz",
+     "4a078be12bef21cfebc09d878b77a63cff9d68f899254a0b00d0e37ef73e7f7e", "Vulkan-Headers-vulkan-sdk-1.4.363.0", ""),
 )
 
 
@@ -253,6 +257,13 @@ def extract(archive, inner, dest):
         tar.extractall(dest, members, **kwargs)
 
 
+def archive_name(url):
+    """The download's name: a GitHub source archive's carries its repository (two of them can both
+    be vulkan-sdk-1.4.363.0.tar.gz); anything else keeps its own."""
+    m = re.match(r"https://github\.com/[^/]+/([^/]+)/archive/(?:refs/tags/)?(.+)$", url)
+    return f"{m.group(1)}-{m.group(2)}" if m else None
+
+
 def fetch_releases():
     changed = False
     for folder in dict.fromkeys(r[0] for r in RELEASES):
@@ -261,7 +272,7 @@ def fetch_releases():
 
         def fill(staging, parts=parts):
             for _f, url, sha256, inner, where in parts:
-                extract(download(url, sha256), inner, os.path.join(staging, where))
+                extract(download(url, sha256, archive_name(url)), inner, os.path.join(staging, where))
         changed |= install(folder, identity, fill)
     return changed
 

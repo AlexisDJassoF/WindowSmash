@@ -175,6 +175,7 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 | Sharpness | FSR's sharpening, 0.0 (the most) to 2.0. Only with FSR. |
 | VSync | **On**: every frame at the monitor's next refresh, no tearing. **Off**: shown the moment it's ready (less latency; may tear in full screen). **VRR**: for FreeSync / G-Sync monitors. |
 | Window | **Windowed** or **Fullscreen**. |
+| Renderer | **DXVK** (Direct3D 11 through DXVK, as the game has always run) or **Vulkan (experimental)**: the port's own Vulkan renderer, with fewer steps from the game's shaders to the graphics card. It does not show videos, F4 captures or FSR yet. Choosing the other one restarts the game on it, straight past this menu. |
 
 Arrows or a pad's D-pad / left stick move and change; **Enter** or the pad's bottom button
 plays; **Esc** or the right one starts without changes; the mouse works too (a value's left or
@@ -182,7 +183,7 @@ right half steps it). Untouched for 10 seconds, the game starts with what was sa
 what changed into `display.ini`, keeping your own comments and other settings (the first time,
 the file as it was is kept as `display.ini.bak`). `menu = 0` in `display.ini`, or
 `SSBU_MENU=0 ./run.sh`, starts straight away. A setting an environment variable fixes
-(`SSBU_MODE`, `SSBU_UPSCALE`, `SSBU_PACING`, `SSBU_WINDOW`) is shown but can't be changed.
+(`SSBU_MODE`, `SSBU_UPSCALE`, `SSBU_PACING`, `SSBU_WINDOW`, `SSBU_RENDERER`) is shown but can't be changed.
 
 Two files in this folder, each written with its defaults and explanations the first time the game
 starts (delete one to get the defaults back). They mean the same as on Windows
@@ -201,6 +202,7 @@ log names each pad as it connects, with its type and GUID.
 | `mode = docked` (default) or `handheld` | What the menu's Mode sets; F7 switches while playing (not saved). `SSBU_MODE` overrides it. |
 | `upscale = linear` (default) or `fsr`, `sharpness = 0.2` | What the menu's Upscaling and Sharpness set. FSR is used only when the window is larger than the game's picture; `SSBU_UPSCALE` overrides it. |
 | `menu = 1` (default) | The start-up menu; `0` starts straight away. |
+| `renderer = dxvk` (default) or `vulkan` | What the menu's Renderer sets. `SSBU_RENDERER=dxvk` or `vulkan` overrides it. If the machine cannot run Vulkan, the game uses DXVK and says why in the log. |
 | `scale = 100` (default) | What the menu's Resolution scale sets: `50`, `75`, `100`, `150` or `200`. It holds for both modes, F7 included. `SSBU_SCALE` overrides it. |
 | `pacing = vsync` | The menu's VSync On: the 60-a-second clock, each frame presented at the monitor's next refresh. |
 | `pacing = clock` (default) | A steady 60 frames a second. DXVK presents each frame the moment it's ready; a compositing desktop shows it at its next refresh, and full screen without one may tear. To prevent that, start the game with `DXVK_CONFIG="dxgi.tearFree = True" ./run.sh`. |
@@ -281,7 +283,7 @@ the WindowSmash folder:
    ```
 
 3. **Fetch the third-party parts** into `linux-toolchain/`, next to the WindowSmash folder:
-   Ubuntu 22.04's libraries (the sysroot), DXVK, vkd3d and SPIRV-Headers. Each download is
+   Ubuntu 22.04's libraries (the sysroot), DXVK, vkd3d, SPIRV-Headers and Vulkan-Headers. Each download is
    checked before it is used. The libraries come from one fixed moment of the Ubuntu archive,
    checked against its signature, so every machine gets the same ones.
 
@@ -351,6 +353,7 @@ The third-party parts go in `linux-toolchain/`, next to the checkout (or in the 
 | `dxvk-headers/include/native/` | `include/native` from the DXVK 3.1.1 source, with mingw-directx-headers in its `directx/` folder (the commit DXVK 3.1.1 uses, `9df86f2`). |
 | `src/vkd3d-2.1/` | The vkd3d 2.1 source. |
 | `src/SPIRV-Headers-<version>/` | SPIRV-Headers, for example `vulkan-sdk-1.4.363.0`. |
+| `src/Vulkan-Headers-<version>/` | Vulkan-Headers of the same Vulkan SDK, for example `vulkan-sdk-1.4.363.0` (the Vulkan renderer's headers). |
 | `winflexbison/` | win_flex_bison 2.5.25 (`win_bison.exe`, `win_flex.exe` and `data/`), for vkd3d's parsers. |
 | `dxvk-win/dxvk-3.1.1/` | Optional: DXVK 3.1.1 for Windows, for `tools/linux/wintest.py`. |
 

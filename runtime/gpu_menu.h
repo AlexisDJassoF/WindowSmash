@@ -13,7 +13,7 @@ extern volatile int menu_active;
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */
 
 /* ---- the model, without a window (tests/test_gpu_menu.py drives it) ---------------------- */
-enum { ROW_MODE, ROW_SCALE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_PLAY, ROWS };
+enum { ROW_MODE, ROW_SCALE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_RENDERER, ROW_PLAY, ROWS };
 enum { MENU_OPEN, MENU_PLAY, MENU_KEEP };   /* MENU_KEEP: started as display.ini was (Esc, or no input in time) */
 typedef struct Menu {
     DisplaySettings s, initial;

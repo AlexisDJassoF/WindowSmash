@@ -1,18 +1,23 @@
 /* The start-up settings menu.
  *
  * Every start (unless display.ini's menu = 0 or SSBU_MENU=0), before the shaders' screen
- * (gpu_precompile.c) and the game: Mode, Resolution scale, Upscaling (and Sharpness with FSR), VSync and Window,
- * as display.ini has them, then Play. Up/down picks a row, left/right changes it, Enter / the
+ * (gpu_precompile.c) and the game: Mode, Resolution scale, Upscaling (and Sharpness with FSR), VSync, Window
+ * and Renderer, as display.ini has them, then Play. Up/down picks a row, left/right changes it, Enter / the
  * controller's south button plays, Esc / east starts with display.ini as it was; a click picks a
  * row, its value's left or right half steps it, Play plays. Untouched for 10 s, it starts as
  * display.ini was. Play writes what changed into display.ini (display_save: the user's comments
  * and other keys kept) and applies it to this start (display_apply). A setting an environment
- * variable fixes is shown, not changeable, and not written.
+ * variable fixes is shown, not changeable, and not written. The renderer is already drawing the
+ * menu: another one chosen starts the program again (the menu not shown then), on it.
  *
  * The window's thread (linux/window.c) feeds menu_input; this thread draws with gfx_menu. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <windows.h>
 
 #include "gpu_backend.h"
@@ -26,8 +31,8 @@ volatile int menu_active;
 /* ---- the model ------------------------------------------------------------------------------ */
 static const Pacing VSYNC_ORDER[] = {PACING_VSYNC, PACING_CLOCK, PACING_VRR};
 static const int SCALES[] = {50, 75, 100, 150, 200};
-static const unsigned ROW_LOCK[ROWS] = {LOCK_MODE, LOCK_SCALE, LOCK_UPSCALE, LOCK_UPSCALE, LOCK_PACING, LOCK_WINDOW, 0};
-static const char *const ROW_VAR[ROWS] = {"SSBU_MODE", "SSBU_SCALE", "SSBU_UPSCALE", "SSBU_UPSCALE", "SSBU_PACING", "SSBU_WINDOW", ""};
+static const unsigned ROW_LOCK[ROWS] = {LOCK_MODE, LOCK_SCALE, LOCK_UPSCALE, LOCK_UPSCALE, LOCK_PACING, LOCK_WINDOW, LOCK_RENDERER, 0};
+static const char *const ROW_VAR[ROWS] = {"SSBU_MODE", "SSBU_SCALE", "SSBU_UPSCALE", "SSBU_UPSCALE", "SSBU_PACING", "SSBU_WINDOW", "SSBU_RENDERER", ""};
 
 void menu_init(Menu *m, const DisplaySettings *now, unsigned locked, double now_s) {
     memset(m, 0, sizeof *m);
@@ -41,7 +46,7 @@ void menu_init(Menu *m, const DisplaySettings *now, unsigned locked, double now_
 int menu_visible(const Menu *m, int row) { return row != ROW_SHARPNESS || m->s.upscale == UPSCALE_FSR; }
 
 const char *menu_label(int row) {
-    static const char *const L[ROWS] = {"Mode", "Resolution scale", "Upscaling", "Sharpness", "VSync", "Window", "Play"};
+    static const char *const L[ROWS] = {"Mode", "Resolution scale", "Upscaling", "Sharpness", "VSync", "Window", "Renderer", "Play"};
     return row >= 0 && row < ROWS ? L[row] : "";
 }
 
@@ -63,6 +68,7 @@ void menu_value(const Menu *m, int row, char *out, unsigned n) {
         v = m->s.pacing == PACING_VSYNC ? "On" : m->s.pacing == PACING_VRR ? "VRR" : m->s.pacing == PACING_DISPLAY ? "Display" : "Off";
         break;
     case ROW_WINDOW: v = m->s.window == 0 ? "Windowed" : m->s.window == 1 ? "Borderless" : "Fullscreen"; break;
+    case ROW_RENDERER: v = m->s.renderer == RENDERER_VULKAN ? "Vulkan (experimental)" : "DXVK"; break;
     }
     if (row != ROW_PLAY && (m->locked & ROW_LOCK[row])) snprintf(out, n, "%s (set by %s)", v, ROW_VAR[row]);
     else snprintf(out, n, "%s", v);
@@ -86,6 +92,7 @@ static void step(Menu *m, int dir) {
         break;
     }
     case ROW_WINDOW: m->s.window = m->s.window == 0 ? 2 : 0; break;
+    case ROW_RENDERER: m->s.renderer = m->s.renderer == RENDERER_VULKAN ? RENDERER_DXVK : RENDERER_VULKAN; break;
     case ROW_SCALE: {
         int i = 0, n = (int)(sizeof SCALES / sizeof SCALES[0]);
         while (i < n && SCALES[i] != m->s.scale) i++;
@@ -146,6 +153,28 @@ void menu_input(int event, int x, int y) {
     head = h + 1;
 }
 
+/* ---- starting again on another renderer ----------------------------------------------------- */
+#ifndef _WIN32
+/* The program again, with the same arguments, the menu not shown: the renderer is chosen at its
+ * first frame (the menu's), and display.ini names the new one now. Returns only if it cannot. */
+static void start_again(void) {
+    static char args[65536];
+    char *argv[256];
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    size_t n = f ? fread(args, 1, sizeof args - 1, f) : 0;
+    if (f) fclose(f);
+    int argc = 0;
+    for (size_t at = 0; at < n && argc < 255; at += strlen(args + at) + 1) argv[argc++] = args + at;
+    argv[argc] = NULL;
+    if (!argc) return;
+    setenv("SSBU_MENU", "0", 1);
+    fprintf(stderr, "[menu] another renderer: starting again on it\n");
+    fflush(NULL);
+    execv("/proc/self/exe", argv);
+    fprintf(stderr, "[menu] cannot start again: the renderer changes at the next start\n");
+}
+#endif
+
 /* ---- the screen ----------------------------------------------------------------------------- */
 static double seconds(void) { return GetTickCount64() / 1000.0; }
 
@@ -195,8 +224,9 @@ void menu_run(void) {
         display_save(&m.s);
         display_apply(&m.s);
     }
-    fprintf(stderr, "[menu] %s: %s at %d%%, upscale %s, pacing %d, window %d\n", m.state == MENU_PLAY ? "play" : "as display.ini was",
+    fprintf(stderr, "[menu] %s: %s at %d%%, upscale %s, pacing %d, window %d, renderer %s\n", m.state == MENU_PLAY ? "play" : "as display.ini was",
             m.s.operation == OP_HANDHELD ? "handheld" : "docked", m.s.scale, m.s.upscale == UPSCALE_FSR ? "fsr" : "linear", (int)m.s.pacing,
-            m.s.window);
+            m.s.window, m.s.renderer == RENDERER_VULKAN ? "vulkan" : "dxvk");
+    if (m.state == MENU_PLAY && m.s.renderer != m.initial.renderer) start_again();
 #endif
 }

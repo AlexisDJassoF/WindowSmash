@@ -125,10 +125,10 @@ def tool_path():
 
 def build_tool(exe):
     sources = [os.path.join(ROOT, "tools", "shaderaot.c"), os.path.join(ROOT, "runtime", "gpu_shader.c"),
-               os.path.join(ROOT, "runtime", "gpu_shader_cfg.c")]
+               os.path.join(ROOT, "runtime", "gpu_shader_decode.c"), os.path.join(ROOT, "runtime", "gpu_shader_cfg.c")]
     if LINUX:
         sources.append(os.path.join(ROOT, "runtime", "linux", "d3dcompile_vkd3d.c"))
-    headers = [os.path.join(ROOT, "runtime", n) for n in ("gpu_shader.h", "gpu_shader_cache.h", "gpu_shader_cfg.h")]
+    headers = [os.path.join(ROOT, "runtime", n) for n in ("gpu_shader.h", "gpu_shader_cache.h", "gpu_shader_cfg.h", "gpu_shader_decode.h")]
     if os.path.exists(exe) and os.path.getmtime(exe) > max(os.path.getmtime(p) for p in sources + headers):
         return
     os.makedirs(os.path.dirname(exe), exist_ok=True)

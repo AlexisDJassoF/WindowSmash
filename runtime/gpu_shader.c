@@ -24,6 +24,7 @@
 
 #include "gpu_shader.h"
 #include "gpu_shader_cfg.h"
+#include "gpu_shader_decode.h"
 
 /* The Linux build compiles HLSL with vkd3d-shader, which lacks a few things fxc has
  * (CalculateLevelOfDetail, RWByteAddressBuffer.Load, gathers with four offsets): for it the
@@ -34,99 +35,6 @@
 #define VKD3D_FORMS 0
 #endif
 
-#define BITS(w, pos, n) ((u32)(((w) >> (pos)) & ((1ull << (n)) - 1)))
-#define RZ 255
-#define PT 7
-
-/* ---- opcodes ----------------------------------------------------------------------- */
-#define OPCODES(X) \
-    X(ALD, "1110111111011---") X(AST, "1110111111110---") X(BAR, "1111000010101---") \
-    X(BFE_reg, "0101110000000---") X(BFE_cbuf, "0100110000000---") X(BFE_imm, "0011100-00000---") \
-    X(BFI_reg, "0101101111110---") X(BFI_rc, "0101001111110---") X(BFI_cr, "0100101111110---") X(BFI_imm, "0011011-11110---") \
-    X(BRA, "111000100100----") X(BRK, "111000110100----") X(BRX, "111000100101----") \
-    X(DEPBAR, "1111000011110---") X(EXIT, "111000110000----") \
-    X(F2F_reg, "0101110010101---") X(F2F_cbuf, "0100110010101---") X(F2F_imm, "0011100-10101---") \
-    X(F2I_reg, "0101110010110---") X(F2I_cbuf, "0100110010110---") X(F2I_imm, "0011100-10110---") \
-    X(FADD_reg, "0101110001011---") X(FADD_cbuf, "0100110001011---") X(FADD_imm, "0011100-01011---") X(FADD32I, "000010----------") \
-    X(FFMA_reg, "010110011-------") X(FFMA_rc, "010100011-------") X(FFMA_cr, "010010011-------") X(FFMA_imm, "0011001-1-------") \
-    X(FFMA32I, "000011----------") \
-    X(FMNMX_reg, "0101110001100---") X(FMNMX_cbuf, "0100110001100---") X(FMNMX_imm, "0011100-01100---") \
-    X(FMUL_reg, "0101110001101---") X(FMUL_cbuf, "0100110001101---") X(FMUL_imm, "0011100-01101---") X(FMUL32I, "00011110--------") \
-    X(CSET, "0101000010011---") X(CSETP, "0101000010100---")     X(FSET_reg, "01011000--------") X(FSET_cbuf, "01001000--------") X(FSET_imm, "0011000---------") \
-    X(FSETP_reg, "010110111011----") X(FSETP_cbuf, "010010111011----") X(FSETP_imm, "0011011-1011----") \
-    X(HADD2_reg, "0101110100010---") X(HADD2_cbuf, "0111101-1-------") X(HADD2_imm, "0111101-0-------") X(HADD2_32I, "0010110---------") \
-    X(HFMA2_reg, "0101110100000---") X(HFMA2_rc, "01100---1-------") X(HFMA2_cr, "01110---1-------") X(HFMA2_imm, "01110---0-------") \
-    X(HFMA2_32I, "0010100---------") \
-    X(HSET2_reg, "0101110100011---") X(HSET2_cbuf, "0111110-1-------") X(HSET2_imm, "0111110-0-------")     X(HSETP2_reg, "0101110100100---") X(HSETP2_cbuf, "0111111-1-------") X(HSETP2_imm, "0111111-0-------")     X(HMUL2_reg, "0101110100001---") X(HMUL2_cbuf, "0111100-1-------") X(HMUL2_imm, "0111100-0-------") X(HMUL2_32I, "0010101---------") \
-    X(I2F_reg, "0101110010111---") X(I2F_cbuf, "0100110010111---") X(I2F_imm, "0011100-10111---") \
-    X(I2I_reg, "0101110011100---") X(I2I_cbuf, "0100110011100---") X(I2I_imm, "0011100-11100---") \
-    X(IADD_reg, "0101110000010---") X(IADD_cbuf, "0100110000010---") X(IADD_imm, "0011100-00010---") X(IADD32I, "0001110---------") \
-    X(IMNMX_reg, "0101110000100---") X(IMNMX_cbuf, "0100110000100---") X(IMNMX_imm, "0011100-00100---") \
-    X(IPA, "11100000--------") \
-    X(ISCADD_reg, "0101110000011---") X(ISCADD_cbuf, "0100110000011---") X(ISCADD_imm, "0011100-00011---") X(ISCADD32I, "000101----------") \
-    X(ISET_reg, "010110110101----") X(ISET_cbuf, "010010110101----") X(ISET_imm, "0011011-0101----") \
-    X(ISETP_reg, "010110110110----") X(ISETP_cbuf, "010010110110----") X(ISETP_imm, "0011011-0110----") \
-    X(KIL, "111000110011----") X(LDC, "1110111110010---") X(LDG, "1110111011010---") X(STG, "1110111011011---") X(LDS, "1110111101001---") X(STS, "1110111101011---") X(LDL, "1110111101000---") X(STL, "1110111101010---") \
-    X(LOP_reg, "0101110001000---") X(LOP_cbuf, "0100110001000---") X(LOP_imm, "0011100-01000---") X(LOP32I, "000001----------") \
-    X(LOP3_reg, "0101101111100---") X(LOP3_cbuf, "0000001---------") X(LOP3_imm, "001111----------") \
-    X(MEMBAR, "1110111110011---") \
-    X(MOV_reg, "0101110010011---") X(MOV_cbuf, "0100110010011---") X(MOV_imm, "0011100-10011---") X(MOV32I, "000000010000----") \
-    X(MUFU, "0101000010000---") X(NOP, "0101000010110---") X(PBK, "111000101010----") \
-    X(PSET, "0101000010001---") X(PSETP, "0101000010010---") \
-    X(R2P_reg, "0101110011110---") X(R2P_cbuf, "0100110011110---") X(R2P_imm, "0011100-11110---") \
-    X(IADD3_reg, "010111001100----") X(IADD3_cbuf, "010011001100----") X(IADD3_imm, "0011100-1100----") \
-    X(TMML, "1101111101011---") \
-    X(RRO_reg, "0101110010010---") X(RRO_cbuf, "0100110010010---") X(RRO_imm, "0011100-10010---") \
-    X(S2R, "1111000011001---") \
-    X(SEL_reg, "0101110010100---") X(SEL_cbuf, "0100110010100---") X(SEL_imm, "0011100-10100---") \
-    X(SHL_reg, "0101110001001---") X(SHL_cbuf, "0100110001001---") X(SHL_imm, "0011100-01001---") \
-    X(SHR_reg, "0101110000101---") X(SHR_cbuf, "0100110000101---") X(SHR_imm, "0011100-00101---") \
-    X(SSY, "111000101001----") X(SYNC, "1111000011111---") \
-    X(TEX, "11000-----------") X(TEXS, "1101-00---------") X(TLD4, "110010----------") X(TLD4S, "11011111-0------") \
-    X(TLDS, "1101-01---------") X(TXQ, "1101111101001---") \
-    X(VOTE, "0101000011011---") X(VOTE_vtg, "0101000011100---") \
-    X(XMAD_reg, "0101101100------") X(XMAD_rc, "010100010-------") X(XMAD_cr, "0100111---------") X(XMAD_imm, "0011011-00------")
-
-enum {
-    OP_UNKNOWN,
-#define ENUM(name, pat) OP_##name,
-    OPCODES(ENUM)
-#undef ENUM
-    OP_COUNT
-};
-static const struct { const char *name, *pattern; } OPS[] = {
-    {"?", ""},
-#define ROW(name, pat) {#name, pat},
-    OPCODES(ROW)
-#undef ROW
-};
-static struct { u16 mask, value, op, bits; } table[OP_COUNT];
-static u32 table_size;
-
-static int by_specificity(const void *a, const void *b) {
-    return (int)((const __typeof__(table[0]) *)b)->bits - (int)((const __typeof__(table[0]) *)a)->bits;
-}
-
-static void init_table(void) {
-    if (table_size) return;
-    for (u32 i = 1; i < OP_COUNT; i++) {
-        u16 mask = 0, value = 0;
-        for (int b = 0; b < 16; b++) {
-            char ch = OPS[i].pattern[b];
-            mask = (u16)(mask << 1 | (ch != '-'));
-            value = (u16)(value << 1 | (ch == '1'));
-        }
-        table[table_size++] = (__typeof__(table[0])){mask, value, (u16)i, (u16)__builtin_popcount(mask)};
-    }
-    qsort(table, table_size, sizeof table[0], by_specificity);
-}
-
-static u32 decode(u64 w) {
-    u16 top = (u16)(w >> 48);
-    for (u32 i = 0; i < table_size; i++)
-        if ((top & table[i].mask) == table[i].value) return table[i].op;
-    return OP_UNKNOWN;
-}
 
 /* ---- output text ----------------------------------------------------------------- */
 typedef struct Str { char *s; size_t n, cap; } Str;
@@ -159,7 +67,15 @@ static char *tmp(const char *fmt, ...) {
 }
 
 /* ---- translation context ------------------------------------------------------------- */
-typedef struct Insn { u32 addr; u64 w; u32 op; } Insn;
+typedef ShaderInsn Insn;
+#define imm20 shader_imm20
+#define fimm20 shader_fimm20
+#define form_of shader_form_of
+#define branch_offset shader_branch_offset
+#define align_target shader_align_target
+#define branch_target shader_branch_target
+#define is_branchy shader_is_branchy
+#define init_table shader_decode_init
 
 typedef struct Ctx {
     int stage;
@@ -197,9 +113,9 @@ static void line(Ctx *c, const char *fmt, ...) {
 
 static void unsupported(Ctx *c, const Insn *in, const char *why) {
     if (!c->info->unsupported[0])
-        snprintf(c->info->unsupported, sizeof c->info->unsupported, "%s at %#x (%016llx): %s", OPS[in->op].name, in->addr,
+        snprintf(c->info->unsupported, sizeof c->info->unsupported, "%s at %#x (%016llx): %s", shader_op_name(in->op), in->addr,
                  in->w, why);
-    line(c, "/* unsupported: %s %016llx (%s) */", OPS[in->op].name, in->w, why);
+    line(c, "/* unsupported: %s %016llx (%s) */", shader_op_name(in->op), in->w, why);
 }
 
 /* Registers: RZ reads as zero; writes to it vanish. */
@@ -240,11 +156,6 @@ static const char *cbuf(Ctx *c, u32 bank, u32 offset) {
     return tmp("cb%u.Load(%uu)", bank, offset & ~3u);
 }
 
-/* Operand forms. */
-enum { FORM_REG, FORM_CBUF, FORM_IMM, FORM_RC, FORM_CR, FORM_32I };
-
-static u32 imm20(u64 w) { u32 v = BITS(w, 20, 19); return BITS(w, 56, 1) ? v | 0xFFF80000u : v; }
-static u32 fimm20(u64 w) { return BITS(w, 20, 19) << 12 | BITS(w, 56, 1) << 31; }
 
 /* Operand B, as uint. */
 static const char *b_u(Ctx *c, u64 w, int form) {
@@ -273,20 +184,6 @@ static const char *absneg(const char *x, int abs, int neg) {
     if (abs) x = tmp("abs(%s)", x);
     if (neg) x = tmp("(-%s)", x);
     return x;
-}
-
-static int form_of(u32 op) {
-    const char *n = OPS[op].name, *u = strrchr(n, '_');
-    size_t len = strlen(n);
-    if (len > 3 && !strcmp(n + len - 3, "32I")) return FORM_32I;   /* IADD32I, FMUL32I, HADD2_32I, ... */
-    if (!u) return FORM_REG;
-    if (!strcmp(u, "_reg")) return FORM_REG;
-    if (!strcmp(u, "_cbuf")) return FORM_CBUF;
-    if (!strcmp(u, "_imm")) return FORM_IMM;
-    if (!strcmp(u, "_rc")) return FORM_RC;
-    if (!strcmp(u, "_cr")) return FORM_CR;
-    if (!strcmp(u, "_32I")) return FORM_32I;
-    return FORM_REG;
 }
 
 /* ---- comparisons ------------------------------------------------------------------ */
@@ -643,13 +540,6 @@ static void emit_exit(Ctx *c) {
 }
 
 /* ---- control flow ------------------------------------------------------------------- */
-static i32 branch_offset(u64 w) { i32 o = (i32)BITS(w, 20, 24); return o & 0x800000 ? o - 0x1000000 : o; }
-
-/* Every fourth word, from the code's start after the 0x50-byte header, holds scheduling
- * controls for the next three instructions; a branch to one goes to the first of them. */
-static u32 align_target(u32 t) { return (t & 31) == 0x10 ? t + 8 : t; }
-static u32 branch_target(const Insn *in) { return align_target(in->addr + 8 + (u32)branch_offset(in->w)); }
-
 /* A control instruction's flow test, as an expression; 0 when it can never pass. Tests on
  * the condition codes read the flags the CC forms of instructions set; the culling tests
  * (CSM/FCSM, fed by VOTE.VTG in vertex shaders) never pass, as nothing is culled early. */
@@ -1351,39 +1241,18 @@ static void emit_insn(Ctx *c, const Insn *in) {
 }
 
 /* ---- whole programs ------------------------------------------------------------------- */
-static int find(Ctx *c, u32 addr) {
-    for (u32 i = 0; i < c->n; i++) if (c->ins[i].addr == addr) return (int)i;
-    return -1;
-}
+static void decode_program(Ctx *c, const u8 *prog, u32 size) { c->ins = shader_decode_program(prog, size, &c->n); }
 
-static int is_branchy(u32 op) {
-    return op == OP_BRA || op == OP_BRX || op == OP_SSY || op == OP_PBK || op == OP_SYNC || op == OP_BRK;
-}
-
-/* Decode up to the end of the program: the 'BRA to self' padding, or an unconditional EXIT
- * that no branch target lies beyond. */
-static void decode_program(Ctx *c, const u8 *prog, u32 size) {
-    u32 cap = 256, furthest = 0;
-    c->ins = malloc(sizeof *c->ins * cap);
-    for (u32 a = 0x50; a + 8 <= size; a += 8) {
-        if (((a - 0x50) / 8) % 4 == 0) continue;   /* scheduling control word */
-        u64 w = *(const u64 *)(prog + a);
-        if (w == 0xE2400FFFFF87000Full) break;
-        if (c->n == cap) c->ins = realloc(c->ins, sizeof *c->ins * (cap *= 2));
-        Insn in = {a, w, decode(w)};
-        c->ins[c->n++] = in;
-        if (in.op == OP_BRA || in.op == OP_SSY || in.op == OP_PBK) {
-            u32 t = branch_target(&in);
-            if (t > furthest) furthest = t;
-        }
-        if (in.op == OP_BRX) furthest = size;
-        if (in.op == OP_EXIT && BITS(w, 16, 4) == 7 && BITS(w, 0, 5) == 15 && a >= furthest) break;
-    }
+/* What each instruction does to control flow (c->flow), as emit_flow acts on it. */
+static void describe_flow(Ctx *c) {
+    int reads_cc;
+    c->flow = shader_describe_flow(c->ins, c->n, c->info, c->read_cbuf, c->read_user, &c->targets, &c->ntargets, &reads_cc);
+    if (reads_cc) c->uses_cc = 1;
 }
 
 static void emit_guarded(Ctx *c, const Insn *in) {
     u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
-    line(c, "// %04x: %016llx %s%s%u %s", in->addr, in->w, p == PT && !neg ? "" : "@", neg ? "!P" : "P", p, OPS[in->op].name);
+    line(c, "// %04x: %016llx %s%s%u %s", in->addr, in->w, p == PT && !neg ? "" : "@", neg ? "!P" : "P", p, shader_op_name(in->op));
     if (p == PT && neg) return;   /* never executes */
     int guarded = p != PT;
     if (guarded) { line(c, "if (%s) {", PRED(c, p, neg)); c->indent++; }
@@ -1395,7 +1264,7 @@ static void emit_guarded(Ctx *c, const Insn *in) {
 static int emit_flow(Ctx *c, const Insn *in, u32 next) {
     u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
     line(c, "// %04x: %016llx %s%s%u %s (test %u)", in->addr, in->w, p == PT && !neg ? "" : "@", neg ? "!P" : "P", p,
-         OPS[in->op].name, BITS(in->w, 0, 5));
+         shader_op_name(in->op), BITS(in->w, 0, 5));
     if (p == PT && neg) return 0;
     const char *cond;
     int taken = flow_true(c, in, &cond);
@@ -1438,87 +1307,6 @@ static int emit_flow(Ctx *c, const Insn *in, u32 next) {
     return 0;
 }
 
-
-/* Jump tables of indirect branches. The compiler emits
- *     IMNMX.U32 rI, rI, N-1 ;  SHL rJ, rI, 2 ;  LDC rT, c[bank][rJ + off] ;  BRX rT - k
- * (rJ often rI) with the table's entries relative to the BRX. If every BRX of the program resolves, only
- * their targets need to be blocks; otherwise every instruction must be one. A resolved BRX's
- * targets go in its CfInsn. */
-static int brx_resolved(Ctx *c) {
-    if (!c->read_cbuf) return 0;
-    int all = 1;
-    for (u32 i = 0; i < c->n; i++) {
-        if (c->ins[i].op != OP_BRX) continue;
-        u32 r = BITS(c->ins[i].w, 8, 8), bank = 0, off = 0, index_reg = RZ, count = 0;
-        int j = (int)i - 1, found = 0;
-        for (; j >= 0 && j > (int)i - 24; j--)
-            if (c->ins[j].op == OP_LDC && BITS(c->ins[j].w, 0, 8) == r) {
-                bank = BITS(c->ins[j].w, 36, 5);
-                off = (u32)((i32)(BITS(c->ins[j].w, 20, 16) << 16) >> 16);
-                index_reg = BITS(c->ins[j].w, 8, 8);
-                found = 1;
-                break;
-            }
-        for (int k = j - 1; found && k >= 0 && k > j - 24; k--)
-            if (c->ins[k].op == OP_SHL_imm && BITS(c->ins[k].w, 0, 8) == index_reg) index_reg = BITS(c->ins[k].w, 8, 8);   /* (the index, scaled) */
-            else if ((c->ins[k].op == OP_IMNMX_imm) && BITS(c->ins[k].w, 0, 8) == index_reg) { count = imm20(c->ins[k].w) + 1; break; }
-        if (!found || !count || count > 256) { all = 0; continue; }
-        if (c->info->ntables < 4) {
-            c->info->table[c->info->ntables].bank = bank; c->info->table[c->info->ntables].offset = off;
-            c->info->table[c->info->ntables++].count = count;
-        }
-        u32 first = c->ntargets;
-        c->targets = realloc(c->targets, sizeof *c->targets * (c->ntargets + count));
-        for (u32 e = 0; e < count; e++) {
-            u32 t = align_target(c->read_cbuf(c->read_user, bank, off + 4 * e) + c->ins[i].addr + 8 + (u32)branch_offset(c->ins[i].w));
-            if (find(c, t) < 0) { all = 0; break; }
-            c->targets[c->ntargets++] = t;
-        }
-        if (c->ntargets - first == count) c->flow[i].ntable = count;
-        else c->ntargets = first;
-        c->flow[i].table = (const u32 *)(uintptr_t)first;   /* (an index until the last table is in) */
-    }
-    for (u32 i = 0; i < c->n; i++)
-        if (c->flow[i].ntable) c->flow[i].table = c->targets + (uintptr_t)c->flow[i].table;
-        else c->flow[i].table = NULL;
-    return all;
-}
-
-static int flow_kind(u32 op) {
-    switch (op) {
-    case OP_SSY: return CF_SSY;
-    case OP_PBK: return CF_PBK;
-    case OP_BRA: return CF_BRA;
-    case OP_SYNC: return CF_SYNC;
-    case OP_BRK: return CF_BRK;
-    case OP_EXIT: return CF_EXIT;
-    case OP_BRX: return CF_BRX;
-    }
-    return CF_PLAIN;
-}
-
-/* What each instruction does to control flow, as emit_flow acts on it. */
-static void describe_flow(Ctx *c) {
-    c->flow = calloc(c->n + 1, sizeof *c->flow);
-    int brx = 0;
-    for (u32 i = 0; i < c->n; i++) {
-        const Insn *in = &c->ins[i];
-        CfInsn *f = &c->flow[i];
-        f->addr = in->addr;
-        f->kind = (u8)flow_kind(in->op);
-        if (f->kind == CF_PLAIN) continue;
-        brx |= f->kind == CF_BRX;
-        if (f->kind == CF_SSY || f->kind == CF_PBK || f->kind == CF_BRA) f->target = branch_target(in);
-        u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
-        if (p == PT && neg) { f->cond = CF_NEVER; continue; }
-        const char *cond;
-        int taken = flow_true(c, in, &cond);
-        if (f->kind == CF_SSY || f->kind == CF_PBK || f->kind == CF_BRX) f->cond = CF_ALWAYS;   /* (whatever the predicate) */
-        else if (!taken) f->cond = CF_NEVER;
-        else f->cond = p == PT && !strcmp(cond, "true") ? CF_ALWAYS : CF_MAYBE;
-    }
-    if (brx) brx_resolved(c);
-}
 
 /* The dispatch loop: every block a case of a switch, in a loop driven by pc_. */
 static void emit_dispatch(Ctx *c) {
@@ -1602,7 +1390,7 @@ static void emit_tree(Ctx *c, const SNode *s) {
             if (c->flow[i].kind != CF_PLAIN) {
                 u32 p = BITS(in->w, 16, 3), neg = BITS(in->w, 19, 1);
                 line(c, "// %04x: %016llx %s%s%u %s (test %u)", in->addr, in->w, p == PT && !neg ? "" : "@", neg ? "!P" : "P", p,
-                     OPS[in->op].name, BITS(in->w, 0, 5));
+                     shader_op_name(in->op), BITS(in->w, 0, 5));
             } else emit_guarded(c, in);
         }
         break;
@@ -1970,23 +1758,3 @@ u32 shader_size(const u8 *program, u32 max) {
     return end;
 }
 
-CfInsn *shader_flow(const u8 *program, u32 size, CbufReader *read, void *user, u32 *n) {
-    init_table();
-    ShaderInfo info = {0};
-    Ctx ctx = {0}, *c = &ctx;
-    c->info = &info;
-    c->prog = program;
-    c->read_cbuf = read;
-    c->read_user = user;
-    decode_program(c, program, size);
-    describe_flow(c);
-    CfInsn *out = malloc(sizeof *out * (c->n + 1) + sizeof *c->targets * c->ntargets);
-    u32 *targets = (u32 *)(out + c->n + 1);
-    memcpy(out, c->flow, sizeof *out * (c->n + 1));
-    if (c->ntargets) memcpy(targets, c->targets, sizeof *targets * c->ntargets);
-    for (u32 i = 0; i < c->n; i++)
-        if (out[i].table) out[i].table = targets + (out[i].table - c->targets);
-    *n = c->n;
-    release(c);
-    return out;
-}

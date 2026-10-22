@@ -44,7 +44,8 @@ static struct {
     float sharpness;
     int menu;
     int scale;   /* percent */
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, 1, 100};
+    int renderer;
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, PACING_CLOCK, 0, OP_DOCKED, UPSCALE_LINEAR, 0.2f, 1, 100, RENDERER_DXVK};
 
 /* What the start-up menu shows and may write (gpu_menu.c): the file's own values (before the
  * environment's), and which of them a variable fixes */
@@ -111,6 +112,13 @@ static const char DEFAULT_INI[] =
     ";   each direction - 75 in handheld: 960 x 540 - its picture and menus as they are; less is lighter\n"
     ";   on the graphics card (best with upscale = fsr), more is sharper on a fast one.\n"
     "scale = 100\n"
+#ifndef _WIN32
+    "; renderer = dxvk | vulkan: the graphics engine the game draws with.\n"
+    ";   dxvk:   Direct3D 11 through DXVK, as the game has always run.\n"
+    ";   vulkan: the port's own Vulkan renderer: fewer steps from the game's shaders to the graphics\n"
+    ";           card (experimental: no videos, F4 captures or FSR yet).\n"
+    "renderer = dxvk\n"
+#endif
     "\n"
     "; menu = 1: the settings menu at every start (mode, upscale, vsync, window); 0: straight to the game.\n"
     "menu = 1\n";
@@ -147,6 +155,12 @@ static void parse_sharpness(const char *v) {
     float f = strtof(v, &end);
     if (end == v || *end) { fprintf(stderr, "[display] sharpness is a number from 0.0 to 2.0, not '%s'\n", v); return; }
     cfg.sharpness = f < 0 ? 0 : f > 2 ? 2 : f;
+}
+
+static void parse_renderer(const char *v) {
+    if (!_stricmp(v, "dxvk")) cfg.renderer = RENDERER_DXVK;
+    else if (!_stricmp(v, "vulkan")) cfg.renderer = RENDERER_VULKAN;
+    else fprintf(stderr, "[display] renderer is dxvk or vulkan, not '%s'\n", v);
 }
 
 static void parse_scale(const char *v) {
@@ -189,11 +203,12 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "sharpness")) parse_sharpness(value);
         else if (!_stricmp(key, "menu")) cfg.menu = atoi(value) != 0;
         else if (!_stricmp(key, "scale")) parse_scale(value);
+        else if (!_stricmp(key, "renderer")) parse_renderer(value);
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
     snprintf(ini_path, sizeof ini_path, "%s", path);
-    from_file = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing, cfg.scale};
+    from_file = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing, cfg.scale, cfg.renderer};
     if ((env = getenv("SSBU_WINDOW")) && *env) locked |= LOCK_WINDOW;
     if ((env = getenv("SSBU_PACING")) && *env) locked |= LOCK_PACING;
     if ((env = getenv("SSBU_MODE")) && *env) locked |= LOCK_MODE;
@@ -205,6 +220,7 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
     if ((env = getenv("SSBU_MODE")) && *env) parse_operation(env);
     if ((env = getenv("SSBU_UPSCALE")) && *env) parse_upscale(env);
+    if ((env = getenv("SSBU_RENDERER")) && *env) { locked |= LOCK_RENDERER; parse_renderer(env); }
     if (cfg.operation == OP_HANDHELD || cfg.upscale == UPSCALE_FSR)
         fprintf(stderr, "[display] %s, upscale %s (sharpness %.1f)\n", cfg.operation == OP_HANDHELD ? "handheld: 1280 x 720" : "docked",
                 cfg.upscale == UPSCALE_FSR ? "fsr" : "linear", cfg.sharpness);
@@ -257,11 +273,12 @@ int display_notice(char *out, unsigned n) {
 float display_scale(void) { load(); return cfg.scale / 100.0f; }
 unsigned display_sync_interval(void) { load(); return cfg.pacing == PACING_VSYNC ? 1 : 0; }
 int display_menu_enabled(void) { load(); return cfg.menu; }
+int display_renderer(void) { load(); return cfg.renderer; }
 
 /* ---- the start-up menu's settings (gpu_menu.c) ----------------------------------------- */
 void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed) {
     load();
-    *now = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing, cfg.scale};
+    *now = (DisplaySettings){cfg.mode, cfg.operation, cfg.upscale, cfg.sharpness, cfg.pacing, cfg.scale, cfg.renderer};
     if (file) *file = from_file;
     if (fixed) *fixed = locked;
 }
@@ -280,6 +297,7 @@ void display_apply(const DisplaySettings *s) {
     cfg.sharpness = s->sharpness < 0 ? 0 : s->sharpness > 2 ? 2 : s->sharpness;
     cfg.pacing = s->pacing;
     cfg.scale = s->scale;
+    cfg.renderer = s->renderer;
 }
 
 char *display_ini_rewrite(const char *text, const char *defaults, int n, const char *const keys[], const char *const values[]);
@@ -290,7 +308,7 @@ char *display_ini_rewrite(const char *text, const char *defaults, int n, const c
 int display_save(const DisplaySettings *s) {
     load();
     static const char *const WINDOW[] = {"windowed", "borderless", "fullscreen"}, *const PACE[] = {"clock", "vrr", "display", "vsync"};
-    const char *keys[6], *values[6];
+    const char *keys[7], *values[7];
     char sharp[16], scale[8];
     int n = 0;
     if (!(locked & LOCK_WINDOW) && s->window != from_file.window) keys[n] = "window", values[n++] = WINDOW[s->window];
@@ -305,6 +323,7 @@ int display_save(const DisplaySettings *s) {
         snprintf(scale, sizeof scale, "%d", s->scale);
         keys[n] = "scale", values[n++] = scale;
     }
+    if (!(locked & LOCK_RENDERER) && s->renderer != from_file.renderer) keys[n] = "renderer", values[n++] = s->renderer == RENDERER_VULKAN ? "vulkan" : "dxvk";
     if (!n) return 1;
     char *old = NULL;
     FILE *f = fopen(ini_path, "rb");

@@ -9,11 +9,13 @@ of the Windows objects, into <out>/<module>/. <port> is a game tree: the port's 
 build/ at its top) or a game version's folder of the same layout, e.g. v13.0.5 - the default when
 it is built (toolchain.default_port). Files with exception landing sites (guest C++ try/catch) are
 compiled as C++ (see recomp.h). The runtime is runtime/*.c with the Linux platform layer
-(runtime/linux), and the program links against DXVK (Direct3D 11 on Vulkan), SDL2, vkd3d-shader
-(built by build_vkd3d.py), libopus and libvpx, the last three statically.
+(runtime/linux), and the program links against SDL2, vkd3d-shader (built by build_vkd3d.py), libopus
+and libvpx, the last three statically. It holds two renderers: Direct3D 11 through DXVK, which it
+loads at run time when that one is chosen, and Vulkan (runtime/linux/gpu_vulkan*.c).
 Incremental: a file is compiled again when its source is newer than its object. <out> holds one
 tree's game (port.txt): build another tree's into another <out> (e.g. build-linux-11.0.0), or
 give --replace to start this one over."""
+import hashlib
 import os
 import re
 import shutil
@@ -23,6 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, LINKER, LLVM_NM, REPO, RUNTIME, SYSROOT, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC,
+                       SPIRV_INCLUDE, VULKAN_INCLUDE,
                        compile_each, default_port, read_port_stamp, run, same_path, write_port_stamp)
 
 
@@ -37,7 +40,7 @@ GEN = os.path.join(OUT, "gen")
 
 RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.path.join(DXVK_INCLUDE, "windows"),
                     "-I", os.path.join(DXVK_INCLUDE, "directx"), "-I", os.path.join(SYSROOT, "usr", "include", "SDL2"),
-                    "-I", os.path.join(VKD3D_SRC, "include"),
+                    "-I", os.path.join(VKD3D_SRC, "include"), "-I", VULKAN_INCLUDE, "-I", SPIRV_INCLUDE,
                     # (overlay_font.h, kept in the repository: before gen/, which may hold an older build's)
                     "-I", os.path.join(RUNTIME, "linux"), "-I", GEN]
 RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL2"]
@@ -144,16 +147,28 @@ def runtime_jobs():
     os.makedirs(GEN, exist_ok=True)
     rt_out = os.path.join(OUT, "rt")
     headers = [os.path.join(RUNTIME, n) for n in os.listdir(RUNTIME) if n.endswith(".h")] + \
-              [os.path.join(RUNTIME, "linux", "include", "windows.h"), os.path.join(RUNTIME, "linux", "overlay_font.h")]
+              [os.path.join(RUNTIME, "linux", n) for n in os.listdir(os.path.join(RUNTIME, "linux")) if n.endswith(".h")] + \
+              [os.path.join(RUNTIME, "linux", "include", "windows.h")]
     sources = [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME))
                if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
     sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
                 if n.endswith((".c", ".cpp"))]
+    # The SPIR-V translator's version, for the Vulkan renderer's disk cache (gpu_vk_draw.c): a hash of
+    # its sources, so that a changed translator never takes an older one's shaders
+    translator = [os.path.join(RUNTIME, "linux", n) for n in ("gpu_spirv.c", "gpu_spirv.h", "gpu_spirv_builder.c", "gpu_spirv_builder.h")] + \
+                 [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME)) if re.fullmatch(r"gpu_shader(_decode|_cfg)?\.[ch]", n)]
+    digest = hashlib.sha256(b"".join(open(p, "rb").read() for p in translator)).hexdigest()[:16]
+    version_h = os.path.join(GEN, "spirv_version.h")
+    write_if_changed(version_h, f'#define SPIRV_TRANSLATOR_VERSION "{digest}"\n')
+    headers.append(version_h)
     jobs = []
     for src in sources:
         obj = os.path.join(rt_out, os.path.basename(src).rsplit(".", 1)[0] + ".o")
+        # (gpu_d3d11.c's entry points renamed, so that the program holds it and the Vulkan renderer:
+        # linux/gpu_backend_select.c passes the gfx_* calls on to the one chosen at start)
+        renames = ["-include", os.path.join(RUNTIME, "linux", "gpu_d3d11_names.h")] if os.path.basename(src) == "gpu_d3d11.c" else []
         if needs(obj, src, *headers):
-            jobs.append((src, obj, "-O2", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+            jobs.append((src, obj, "-O2", RUNTIME_INCLUDES + RUNTIME_DEFINES + renames))
     names = hle_names()
     table = os.path.join(GEN, "hle_table.c")
     changed = write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
@@ -219,7 +234,7 @@ def link():
     t0 = time.time()
     code, out = run([CLANG, "--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT, *LINKER, "-no-pie", "@" + rsp, "-o", exe,
                      os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a"), os.path.join(lib, "libopus.a"), os.path.join(lib, "libvpx.a"),
-                     "-L" + DXVK_LIBS, "-l:libdxvk_d3d11.so.0", "-l:libdxvk_dxgi.so.0", "-l:libSDL2-2.0.so.0",
+                     "-l:libSDL2-2.0.so.0",   # (DXVK is loaded at run time, when it is the renderer: gpu_backend_select.c)
                      "-lstdc++", "-lm", "-lpthread", "-ldl", "-lrt",
                      "-Wl,-rpath,$ORIGIN/lib", "-Wl,--allow-shlib-undefined", "-Wl,-z,noexecstack", "-Wl,--build-id",
                      "-Wl,-Map=" + exe + ".map"])
