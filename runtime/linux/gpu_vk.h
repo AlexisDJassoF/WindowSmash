@@ -27,7 +27,7 @@
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) \
     X(vkCmdSetDepthBoundsTestEnable) X(vkResetDescriptorPool) X(vkCreatePipelineCache) X(vkCmdCopyBuffer) X(vkCreateComputePipelines) \
     X(vkCmdDispatch) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) \
-    X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) X(vkCmdSetColorWriteMaskEXT) X(vkCmdCopyImageToBuffer)
+    X(vkCmdSetColorBlendEnableEXT) X(vkCmdSetColorBlendEquationEXT) X(vkCmdSetColorWriteMaskEXT) X(vkCmdCopyImageToBuffer) X(vkCmdSetVertexInputEXT) X(vkCmdBindVertexBuffers2)
 
 #define VK_EXTERN(name) extern PFN_##name name;
 VK_INSTANCE_LEVEL_FNS(VK_EXTERN)
@@ -44,7 +44,7 @@ typedef struct Vk {
     uint32_t family;
     VkSemaphore timeline;      /* counts the submissions the GPU has finished */
     u64 submitted;             /* the timeline's value of the last submission */
-    struct { int eds3, gpl, unified_layouts, descriptor_buffer, custom_border, swapchain_maintenance; } has;
+    struct { int eds3, gpl, unified_layouts, descriptor_buffer, custom_border, swapchain_maintenance, vertex_input; } has;
 } Vk;
 extern Vk vk;
 

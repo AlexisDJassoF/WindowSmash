@@ -133,7 +133,7 @@ static void init(void) {
     for (u32 i = 0; i < VK_FRAMES; i++) {
         VkDeviceMemory mem;
         void *map;
-        slots[i].buf = vk_buffer(RING_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        slots[i].buf = vk_buffer(RING_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mem, &map);
         slots[i].map = map;
@@ -895,7 +895,8 @@ static int block_alloc(u32 size, Block *out) {
         if (nchunks == ARENA_CHUNKS) return 0;
         VkDeviceMemory mem;
         void *map;
-        chunks[nchunks].buf = vk_buffer(ARENA_CHUNK, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        chunks[nchunks].buf = vk_buffer(ARENA_CHUNK, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                         &mem, &map);
         chunks[nchunks].map = map;
@@ -1100,7 +1101,7 @@ static void gpu_read_back(void) {
 }
 
 static VkBuffer device_buffer(u32 size, VkDeviceMemory *mem) {
-    return vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    return vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mem, NULL);
 }
 
@@ -1463,6 +1464,8 @@ typedef struct Shader {
     VkPipeline compute;
     VkPipeline lib[2];                  /* (graphics pipeline libraries: vertex fill and lines, or pixel) */
     volatile int lib_state[2];          /* (0 not asked for, 1 compiling, 2 ready, 3 failed) */
+    u64 vin;                            /* (vertex: its attributes as vertex inputs, shader_spirv_ex's; 0 from the streams) */
+    struct Shader *variant[4];          /* (vertex, from the streams: its vertex-input versions) */
     char name[64];
     ShaderInfo info;
 } Shader;
@@ -1504,44 +1507,14 @@ static u64 fingerprint(int stage, const u8 *p, u32 size) {   /* (a compute progr
     return h;
 }
 
-/* The shader for the program at guest address g, translated now if it is new; NULL if it fails. */
-static Shader *get_shader(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
-    /* a compute program has no header: it is translated as if it had one (never read), as gpu_d3d11.c does */
-    const u8 *p = stage == SHADER_COMPUTE ? P(u8, g) - 0x50 : P(u8, g);
-    static const u32 no_local[3];
-    if (!local) local = no_local;
-    u64 key = (u64)stage | (u64)vs_outputs << 4 | (u64)(local[0] ^ local[1] << 10 ^ local[2] << 20 ^ shared << 5) << 36;
-#define SAME_COMPUTE(s) (!memcmp((s)->local, local, sizeof (s)->local) && (s)->shared == shared)
-    ShaderSlot *slot = &shader_slots[((g >> 4) * 0x9E3779B97F4A7C15ull ^ key) >> 50 & (SHADER_SLOTS - 1)];
-    CbufSource src = {stage_cb};
-    if (slot->s && slot->g == g && slot->key == key && slot->print == fingerprint(stage, p, slot->size) && SAME_COMPUTE(slot->s)) {
-        Shader *s = slot->s;
-        if (!s->info.ntables || s->table_hash == table_hash(&s->info, &src)) return s->failed ? NULL : s;
-    }
-    u32 size = shader_size(p, 0x40000);
-    u32 skip = stage == SHADER_COMPUTE ? 0x50 : 0;
-    u64 h = 1469598103934665603ull;   /* (gpu_d3d11.c's names: FNV-1a over the program, a compute one's code and launch shape) */
-    for (u32 i = skip; i < size; i++) h = (h ^ p[i]) * 1099511628211ull;
-    if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
-    for (u32 i = 0; i < shader_count; i++) {
-        Shader *s = shader_cache[i];
-        if (s->hash != h || s->stage != stage || (stage == SHADER_PIXEL && s->vs_outputs != vs_outputs) || !SAME_COMPUTE(s)) continue;
-        if (s->info.ntables && s->table_hash != table_hash(&s->info, &src)) continue;
-        *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s};
-        return s->failed ? NULL : s;
-    }
-    if (shader_count == shader_cap) shader_cache = realloc(shader_cache, sizeof *shader_cache * (shader_cap = shader_cap * 2 + 64));
-    Shader *s = calloc(1, sizeof *s);
-    shader_cache[shader_count++] = s;
-    s->hash = h; s->stage = stage; s->vs_outputs = vs_outputs;
-    memcpy(s->local, local, sizeof s->local);
-    s->shared = shared;
-    *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s};
-    snprintf(s->name, sizeof s->name, "%s_%016llx", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)h);
+/* The program at p translated into s (its key filled in), its module made and its SPIR-V in the
+ * disk cache */
+static void translate(Shader *s, const u8 *p, u32 size, CbufSource *src) {
     u32 words = 0;
     u64 t0 = rt_now_ns();
-    u32 *code = shader_spirv(p, size, stage, vs_outputs, stage == SHADER_COMPUTE ? local : NULL, shared, &s->info, read_cbuf_word, &src, 0, &words);
-    s->table_hash = table_hash(&s->info, &src);
+    u32 *code = shader_spirv_ex(p, size, s->stage, s->vs_outputs, s->stage == SHADER_COMPUTE ? s->local : NULL, s->shared, &s->info, read_cbuf_word,
+                                src, 0, s->vin, &words);
+    s->table_hash = table_hash(&s->info, src);
     if (s->info.unsupported[0]) fprintf(stderr, "[gfx] %s: %s\n", s->name, s->info.unsupported);
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)words * 4, code};
     u64 t1 = rt_now_ns();
@@ -1565,8 +1538,70 @@ static Shader *get_shader(u64 g, int stage, u32 vs_outputs, const CbBinding *sta
         if (f) { fwrite(code, 4, words, f); fclose(f); }
     }
     free(code);
+}
+
+/* The shader for the program at guest address g, translated now if it is new; NULL if it fails. */
+static Shader *get_shader(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, const u32 *local, u32 shared) {
+    /* a compute program has no header: it is translated as if it had one (never read), as gpu_d3d11.c does */
+    const u8 *p = stage == SHADER_COMPUTE ? P(u8, g) - 0x50 : P(u8, g);
+    static const u32 no_local[3];
+    if (!local) local = no_local;
+    u64 key = (u64)stage | (u64)vs_outputs << 4 | (u64)(local[0] ^ local[1] << 10 ^ local[2] << 20 ^ shared << 5) << 36;
+#define SAME_COMPUTE(s) (!memcmp((s)->local, local, sizeof (s)->local) && (s)->shared == shared)
+    ShaderSlot *slot = &shader_slots[((g >> 4) * 0x9E3779B97F4A7C15ull ^ key) >> 50 & (SHADER_SLOTS - 1)];
+    CbufSource src = {stage_cb};
+    if (slot->s && slot->g == g && slot->key == key && slot->print == fingerprint(stage, p, slot->size) && SAME_COMPUTE(slot->s)) {
+        Shader *s = slot->s;
+        if (!s->info.ntables || s->table_hash == table_hash(&s->info, &src)) return s->failed ? NULL : s;
+    }
+    u32 size = shader_size(p, 0x40000);
+    u32 skip = stage == SHADER_COMPUTE ? 0x50 : 0;
+    u64 h = 1469598103934665603ull;   /* (gpu_d3d11.c's names: FNV-1a over the program, a compute one's code and launch shape) */
+    for (u32 i = skip; i < size; i++) h = (h ^ p[i]) * 1099511628211ull;
+    if (stage == SHADER_COMPUTE) h = (h ^ ((u64)local[0] | (u64)local[1] << 16 | (u64)local[2] << 32 | (u64)shared << 40)) * 1099511628211ull;
+    for (u32 i = 0; i < shader_count; i++) {
+        Shader *s = shader_cache[i];
+        if (s->hash != h || s->stage != stage || s->vin || (stage == SHADER_PIXEL && s->vs_outputs != vs_outputs) || !SAME_COMPUTE(s)) continue;
+        if (s->info.ntables && s->table_hash != table_hash(&s->info, &src)) continue;
+        *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s};
+        return s->failed ? NULL : s;
+    }
+    if (shader_count == shader_cap) shader_cache = realloc(shader_cache, sizeof *shader_cache * (shader_cap = shader_cap * 2 + 64));
+    Shader *s = calloc(1, sizeof *s);
+    shader_cache[shader_count++] = s;
+    s->hash = h; s->stage = stage; s->vs_outputs = vs_outputs;
+    memcpy(s->local, local, sizeof s->local);
+    s->shared = shared;
+    *slot = (ShaderSlot){g, key, fingerprint(stage, p, size), size, s};
+    snprintf(s->name, sizeof s->name, "%s_%016llx", stage == SHADER_VERTEX ? "vs" : stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)h);
+    translate(s, p, size, &src);
     return s->failed ? NULL : s;
 #undef SAME_COMPUTE
+}
+
+/* The vertex-input version of vertex shader base (the program at g): attributes of these classes
+ * fetched by the device (vin, shader_spirv_ex's). NULL if it fails. */
+static Shader *vertex_variant(Shader *base, u64 g, const CbBinding *stage_cb, u64 vin) {
+    for (u32 i = 0; i < 4; i++)
+        if (base->variant[i] && base->variant[i]->vin == vin) return base->variant[i]->failed ? NULL : base->variant[i];
+    Shader *s = NULL;
+    for (u32 i = 0; i < shader_count && !s; i++) {   /* (from the disk cache) */
+        Shader *o = shader_cache[i];
+        if (o->vin == vin && o->hash == base->hash && o->stage == SHADER_VERTEX && o->table_hash == base->table_hash) s = o;
+    }
+    if (!s) {
+        const u8 *p = P(u8, g);
+        CbufSource src = {stage_cb};
+        if (shader_count == shader_cap) shader_cache = realloc(shader_cache, sizeof *shader_cache * (shader_cap = shader_cap * 2 + 64));
+        s = calloc(1, sizeof *s);
+        shader_cache[shader_count++] = s;
+        s->hash = base->hash; s->stage = SHADER_VERTEX; s->vin = vin;
+        memcpy(s->name, base->name, sizeof s->name);
+        translate(s, p, shader_size(p, 0x40000), &src);
+    }
+    memmove(base->variant + 1, base->variant, sizeof base->variant - sizeof *base->variant);   /* (the latest first) */
+    base->variant[0] = s;
+    return s->failed ? NULL : s;
 }
 
 /* ---- fixed-function state ------------------------------------------------------------------------ */
@@ -1683,7 +1718,10 @@ static VkDynamicState DYNAMIC[32] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE
                                          VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT, VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
 #define DYNAMIC_FIXED 14   /* (the ones every device has) */
 static VkPipelineDynamicStateCreateInfo DYNAMIC_INFO = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, DYNAMIC_FIXED, DYNAMIC};
-static void dynamic_init(void) { DYNAMIC_INFO.dynamicStateCount = DYNAMIC_FIXED + (vk.has.eds3 ? 3 : 0); }
+static void dynamic_init(void) {
+    DYNAMIC_INFO.dynamicStateCount = DYNAMIC_FIXED + (vk.has.eds3 ? 3 : 0);
+    if (vk.has.vertex_input) DYNAMIC[DYNAMIC_INFO.dynamicStateCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;   /* (the attributes' formats, as each draw has them) */
+}
 
 /* The fixed state's pieces, as each kind of pipeline (or library) takes them */
 static int topology_strip(VkPrimitiveTopology topo) {
@@ -2013,7 +2051,7 @@ typedef struct CacheRecord {
     u32 magic, words;
     int stage;
     u32 vs_outputs, local[3], shared;
-    u64 hash, table_hash;
+    u64 hash, table_hash, vin;
     ShaderInfo info;
 } CacheRecord;
 #define CACHE_MAGIC 0x56535053u   /* "SPSV" */
@@ -2028,7 +2066,7 @@ static void cache_dir(char *out, size_t n) {
 
 static void cache_add(const Shader *s, const u32 *code, u32 words) {
     if (!cache_file) return;
-    CacheRecord r = {CACHE_MAGIC, words, s->stage, s->vs_outputs, {s->local[0], s->local[1], s->local[2]}, s->shared, s->hash, s->table_hash, s->info};
+    CacheRecord r = {CACHE_MAGIC, words, s->stage, s->vs_outputs, {s->local[0], s->local[1], s->local[2]}, s->shared, s->hash, s->table_hash, s->vin, s->info};
     if (fwrite(&r, sizeof r, 1, cache_file) != 1 || fwrite(code, 4, words, cache_file) != words) { fclose(cache_file); cache_file = NULL; return; }
     fflush(cache_file);
 }
@@ -2058,12 +2096,12 @@ static void cache_load(void) {
         int dup = 0;
         for (u32 i = 0; i < shader_count && !dup; i++) {
             Shader *o = shader_cache[i];
-            dup = o->hash == r.hash && o->stage == r.stage && o->vs_outputs == r.vs_outputs && o->table_hash == r.table_hash &&
+            dup = o->hash == r.hash && o->stage == r.stage && o->vs_outputs == r.vs_outputs && o->table_hash == r.table_hash && o->vin == r.vin &&
                   !memcmp(o->local, r.local, sizeof r.local) && o->shared == r.shared;
         }
         if (dup) continue;
         Shader *s = calloc(1, sizeof *s);
-        s->hash = r.hash; s->stage = r.stage; s->vs_outputs = r.vs_outputs; s->table_hash = r.table_hash;
+        s->hash = r.hash; s->stage = r.stage; s->vs_outputs = r.vs_outputs; s->table_hash = r.table_hash; s->vin = r.vin;
         memcpy(s->local, r.local, sizeof s->local);
         s->shared = r.shared;
         s->info = r.info;
@@ -2136,6 +2174,133 @@ static int attachment_of(const Img *m) {
     for (u32 i = 0; i < cur_ncolor; i++) if (cur_color[i] && &cur_color[i]->img == m) return 1;
     return cur_depth && &cur_depth->img == m;
 }
+
+/* ---- vertex inputs ------------------------------------------------------------------------------ */
+/* With dynamic vertex input (VK_EXT_vertex_input_dynamic_state), a draw whose every attribute has a
+ * format the device fetches is drawn with the vertex shader's vertex-input version (vertex_variant):
+ * the device's vertex fetch reads and converts them, instead of the shader decoding each from its
+ * stream's words (fetch_attribute: every format's arithmetic, for every vertex). The formats are
+ * dynamic state, not the pipeline's. Any other draw reads its streams as before. */
+static VkPhysicalDeviceLimits vin_limits;
+static u64 vin_why[8];   /* (debug: why draws read their streams) */
+
+/* The attribute format word's Vulkan format, its class (0 float, 1 signed, 2 unsigned) and component
+ * size in bytes (alignment); VK_FORMAT_UNDEFINED if there is none the device fetches */
+static VkFormat vertex_format(u32 fmt, u32 *cls, u32 *comp) {
+    u32 size = (fmt >> 21) & 0x3F, type = (fmt >> 27) & 7, reverse = fmt >> 31;
+    u32 n = 0, bits = 0;
+    switch (size) {
+    case 0x01: n = 4; bits = 32; break; case 0x02: n = 3; bits = 32; break; case 0x03: n = 4; bits = 16; break;
+    case 0x04: n = 2; bits = 32; break; case 0x05: n = 3; bits = 16; break; case 0x0A: case 0x33: n = 4; bits = 8; break;
+    case 0x0F: n = 2; bits = 16; break; case 0x12: n = 1; bits = 32; break; case 0x13: n = 3; bits = 8; break;
+    case 0x18: case 0x32: n = 2; bits = 8; break; case 0x1B: n = 1; bits = 16; break; case 0x1D: case 0x34: n = 1; bits = 8; break;
+    case 0x30: n = 4; bits = 10; break;   /* (10-10-10-2) */
+    default: return VK_FORMAT_UNDEFINED;
+    }
+    /* by type: 1 snorm, 2 unorm, 3 sint, 4 uint, 5 uscaled, 6 sscaled, 7 float */
+    static const VkFormat f8[4][7] = {
+        {VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SINT, VK_FORMAT_R8_UINT, VK_FORMAT_R8_USCALED, VK_FORMAT_R8_SSCALED, 0},
+        {VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SINT, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8_SSCALED, 0},
+        {VK_FORMAT_R8G8B8_SNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8_SINT, VK_FORMAT_R8G8B8_UINT, VK_FORMAT_R8G8B8_USCALED, VK_FORMAT_R8G8B8_SSCALED, 0},
+        {VK_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SINT, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_USCALED,
+         VK_FORMAT_R8G8B8A8_SSCALED, 0}};
+    static const VkFormat f16[4][7] = {
+        {VK_FORMAT_R16_SNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SINT, VK_FORMAT_R16_UINT, VK_FORMAT_R16_USCALED, VK_FORMAT_R16_SSCALED, VK_FORMAT_R16_SFLOAT},
+        {VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SINT, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16_SSCALED,
+         VK_FORMAT_R16G16_SFLOAT},
+        {VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16_SINT, VK_FORMAT_R16G16B16_UINT, VK_FORMAT_R16G16B16_USCALED,
+         VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R16G16B16_SFLOAT},
+        {VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R16G16B16A16_UINT,
+         VK_FORMAT_R16G16B16A16_USCALED, VK_FORMAT_R16G16B16A16_SSCALED, VK_FORMAT_R16G16B16A16_SFLOAT}};
+    static const VkFormat f32[4][7] = {
+        {0, 0, VK_FORMAT_R32_SINT, VK_FORMAT_R32_UINT, 0, 0, VK_FORMAT_R32_SFLOAT},
+        {0, 0, VK_FORMAT_R32G32_SINT, VK_FORMAT_R32G32_UINT, 0, 0, VK_FORMAT_R32G32_SFLOAT},
+        {0, 0, VK_FORMAT_R32G32B32_SINT, VK_FORMAT_R32G32B32_UINT, 0, 0, VK_FORMAT_R32G32B32_SFLOAT},
+        {0, 0, VK_FORMAT_R32G32B32A32_SINT, VK_FORMAT_R32G32B32A32_UINT, 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT}};
+    static const VkFormat f1010102[7] = {VK_FORMAT_A2B10G10R10_SNORM_PACK32, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_SINT_PACK32,
+                                         VK_FORMAT_A2B10G10R10_UINT_PACK32, VK_FORMAT_A2B10G10R10_USCALED_PACK32, VK_FORMAT_A2B10G10R10_SSCALED_PACK32, 0};
+    static const VkFormat bgra8[7] = {VK_FORMAT_B8G8R8A8_SNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SINT, VK_FORMAT_B8G8R8A8_UINT,
+                                      VK_FORMAT_B8G8R8A8_USCALED, VK_FORMAT_B8G8R8A8_SSCALED, 0};
+    if (!type) return VK_FORMAT_UNDEFINED;
+    VkFormat f = bits == 10 ? f1010102[type - 1] : bits == 8 ? f8[n - 1][type - 1] : bits == 16 ? f16[n - 1][type - 1] : f32[n - 1][type - 1];
+    if (reverse) f = bits == 8 && n == 4 ? bgra8[type - 1] : VK_FORMAT_UNDEFINED;   /* (B and R swapped: only 8-8-8-8 has such a format) */
+    if (!f) return VK_FORMAT_UNDEFINED;
+    static u8 fetchable[256];   /* (0 not asked, 1 yes, 2 no; the formats here are all below 256) */
+    if ((u32)f < 256 && !fetchable[f]) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(vk.pd, f, &fp);
+        fetchable[f] = fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT ? 1 : 2;
+    }
+    if ((u32)f >= 256 || fetchable[f] != 1) return VK_FORMAT_UNDEFINED;
+    *cls = type == 3 ? 1 : type == 4 ? 2 : 0;
+    *comp = bits == 10 ? 4 : bits / 8;
+    return f;
+}
+
+typedef struct VertexInput {
+    u32 nbind, nattr;
+    VkVertexInputBindingDescription2EXT bind[32];
+    VkVertexInputAttributeDescription2EXT attr[32];
+    VkBuffer buf[32];
+    VkDeviceSize off[32], size[32];
+} VertexInput;
+
+/* The draw's attributes as vertex inputs (vin: shader_spirv_ex's), from its streams' buffers; 0 if
+ * one cannot be: an unknown or unfetchable format, an instance divisor, a misaligned attribute, past
+ * the device's limits. (The base instance is then the draw's firstInstance.) */
+static int vertex_inputs(const Shader *vs, const DrawParams *params, const VkDescriptorBufferInfo stream_of[32], const u32 stream_delta[32],
+                         VertexInput *vi, u64 *vin) {
+    static int off = -1;   /* debug: SSBU_VK_NO_VERTEX_INPUT=1 reads every draw's streams in the shader */
+    if (off < 0) off = getenv("SSBU_VK_NO_VERTEX_INPUT") != NULL;
+    if (off || !vk.has.vertex_input) return 0;
+    if (!vin_limits.maxVertexInputAttributes) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(vk.pd, &props);
+        vin_limits = props.limits;
+    }
+    u32 bind_of[33];
+    memset(bind_of, 0xFF, sizeof bind_of);
+    vi->nbind = vi->nattr = 0;
+    *vin = SPIRV_VERTEX_INPUTS;
+    for (u32 n = 0; n < 32; n++) {
+        if (!(vs->info.inputs >> n & 1)) continue;
+        if (n >= vin_limits.maxVertexInputAttributes) { vin_why[1]++; return 0; }
+        u32 fmt = params->attr[n][0], stride = params->attr[n][1], divisor = params->attr[n][2], j = fmt & 0x1F, at = (fmt >> 7) & 0x3FFF;
+        u32 cls = 0, comp = 4, key = j;
+        VkFormat f;
+        if (!params->attr[n][3] || (fmt & 0x40)) {   /* no stream (or a constant one): (0, 0, 0, 1), as from a null buffer */
+            f = VK_FORMAT_R32G32B32A32_SFLOAT;
+            key = 32;
+            at = 0;
+        } else {
+            f = vertex_format(fmt, &cls, &comp);
+            if (!f) {
+                static int shown;
+                if (shown++ < 20) fprintf(stderr, "[vin] format %#x: size %#x type %u reverse %u\n", fmt, (fmt >> 21) & 0x3F, (fmt >> 27) & 7, fmt >> 31);
+                vin_why[2]++; return 0;
+            }
+            if (divisor > 1) { vin_why[3]++; return 0; }
+            if (at > vin_limits.maxVertexInputAttributeOffset || stride > vin_limits.maxVertexInputBindingStride) { vin_why[4]++; return 0; }
+            if ((stream_of[j].offset + stream_delta[j] + at) % comp || stride % comp) { vin_why[5]++; return 0; }
+        }
+        if (bind_of[key] == 0xFFFFFFFF) {
+            if (vi->nbind >= vin_limits.maxVertexInputBindings) return 0;
+            u32 b = bind_of[key] = vi->nbind++;
+            vi->bind[b] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, b, key == 32 ? 0 : stride,
+                                                                 divisor && key != 32 ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, 1};
+            if (key == 32) { vi->buf[b] = VK_NULL_HANDLE; vi->off[b] = 0; vi->size[b] = VK_WHOLE_SIZE; }
+            else {
+                vi->buf[b] = stream_of[j].buffer;
+                vi->off[b] = stream_of[j].offset + stream_delta[j];
+                vi->size[b] = stream_of[j].range == VK_WHOLE_SIZE ? VK_WHOLE_SIZE : stream_of[j].range - stream_delta[j];
+            }
+        }
+        vi->attr[vi->nattr++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, n, bind_of[key], f, at};
+        *vin |= (u64)cls << (2 * n);
+    }
+    return 1;
+}
+u64 vk_stat_vertex_input_draws;
 
 /* ---- draws ------------------------------------------------------------------------------------------ */
 static u32 instance_counter;
@@ -2496,7 +2661,18 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     bind_stage(regs, cb, SHADER_VERTEX, vs, &params, &b[0]);
     if (ps) bind_stage(regs, cb, SHADER_PIXEL, ps, &params, &b[1]);
 
-    VkPipeline pipeline = get_pipeline(&key, vs, ps);
+    /* the attributes fetched by the device when they can be (the vertex-input version, once its
+     * library is ready: until then the draw reads its streams as before) */
+    VertexInput vi;
+    u64 vin = 0;
+    Shader *vsx = vs;
+    if (vertex_inputs(vs, &params, stream_of, stream_delta, &vi, &vin)) {
+        Shader *v = vertex_variant(vs, vs_g, cb[STAGE_VERTEX], vin);
+        if (v && (!vk.has.gpl || library_ready(v, key.polygon == VK_POLYGON_MODE_LINE))) vsx = v;
+    }
+    int use_vin = vsx != vs;
+    if (use_vin) { key.vs = vsx->module; vk_stat_vertex_input_draws++; }
+    VkPipeline pipeline = get_pipeline(&key, vsx, ps);
     if (!pipeline) { gfx_stat_skipped++; gfx_skip_shader++; vk_leave(); return; }
 
     /* the images' uses: the targets as attachments, the textures read (a texture that is one of the
@@ -2582,6 +2758,7 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         VkViewport vp; VkRect2D scissor; VkCullModeFlags cull; VkFrontFace front; u32 depth_test, depth_write, depth_op, stencil;
         u32 sfront[5], sback[5], two; float bc[4];
         BlendTarget blend[8]; u32 nblend;
+        u64 vin_hash;
     } have;
     if (!dyn_valid) { memset(&have, 0xFF, sizeof have); dyn_valid = 1; }
     VkViewport vp = {vx, vy + vh, vw, -vh, zmin, zmax};   /* (Direct3D's clip space: y up, the viewport turned over) */
@@ -2645,6 +2822,20 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         memcpy(have.blend, blend, ncolor * sizeof *blend);
         have.nblend = ncolor;
     }
+    if (vk.has.vertex_input) {   /* (the formats: set when they change; the buffers each draw) */
+        u64 h = 1;   /* (no attributes: 1) */
+        if (use_vin) {
+            h = 1469598103934665603ull ^ vi.nbind << 8 ^ vi.nattr;
+            for (u32 i = 0; i < vi.nbind; i++) h = (h ^ vi.bind[i].stride ^ (u64)vi.bind[i].inputRate << 32) * 1099511628211ull;
+            for (u32 i = 0; i < vi.nattr; i++) h = (h ^ vi.attr[i].location ^ (u64)vi.attr[i].binding << 8 ^ (u64)vi.attr[i].format << 16 ^ (u64)vi.attr[i].offset << 40) * 1099511628211ull;
+            if (h == 1) h = 2;
+        }
+        if (have.vin_hash != h) {
+            vkCmdSetVertexInputEXT(cmd, use_vin ? vi.nbind : 0, vi.bind, use_vin ? vi.nattr : 0, vi.attr);
+            have.vin_hash = h;
+        }
+        if (use_vin && vi.nbind) vkCmdBindVertexBuffers2(cmd, 0, vi.nbind, vi.buf, vi.off, vi.size, NULL);
+    }
     if (draw_logging) {
         fprintf(stderr, "[draw] programs: region %#llx vs +%#x ps +%#x\n", (unsigned long long)region, regs[M_PIPELINE(1) + 1], regs[M_PIPELINE(5) + 1]);
         u32 c0 = sel >> 4 & 7;
@@ -2698,12 +2889,12 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         if (!rendering) { begin_rendering(color, ncolor, depth); cmd = vk_cmd(); }
         vkCmdBindIndexBuffer(cmd, ib, ioff, isz == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
         gpu_times_before(cmd);
-        vkCmdDrawIndexed(cmd, n, 1, 0, (int32_t)regs[M_GLOBAL_BASE_VERTEX], 0);
+        vkCmdDrawIndexed(cmd, n, 1, 0, (int32_t)regs[M_GLOBAL_BASE_VERTEX], use_vin ? params.base[1] : 0);
     } else {
         gpu_times_before(cmd);
-        vkCmdDraw(cmd, regs[M_VERTEX_ARRAY_COUNT], 1, regs[M_VERTEX_ARRAY_START], 0);
+        vkCmdDraw(cmd, regs[M_VERTEX_ARRAY_COUNT], 1, regs[M_VERTEX_ARRAY_START], use_vin ? params.base[1] : 0);
     }
-    gpu_times_after(cmd, vs->name, ps ? ps->name : "-", rt_w, rt_h);
+    gpu_times_after(cmd, vsx->name, ps ? ps->name : "-", rt_w, rt_h);
     gfx_stat_drawn++;
     vk_leave();
 }
@@ -3051,8 +3242,14 @@ void vk_draw_presenting(void) {
                 (unsigned long long)vk_stat_compute_barriers);
         vk_stat_wait_ns = vk_stat_flushes = vk_stat_flush_waits = vk_stat_buffer_barriers = vk_stat_compute_barriers = 0;
         static u64 last_composed, last_pages;
-        fprintf(stderr, "[vk stats]   composed uploads %llu, resident pages taken %llu\n", (unsigned long long)(gfx_stat_composed - last_composed),
-                (unsigned long long)(gfx_stat_resident_pages - last_pages));
+        fprintf(stderr, "[vk stats]   composed uploads %llu, resident pages taken %llu; draws with vertex inputs %llu\n",
+                (unsigned long long)(gfx_stat_composed - last_composed), (unsigned long long)(gfx_stat_resident_pages - last_pages),
+                (unsigned long long)vk_stat_vertex_input_draws);
+        vk_stat_vertex_input_draws = 0;
+        fprintf(stderr, "[vk stats]   streams read: base instance %llu, attributes %llu, format %llu, divisor %llu, limits %llu, alignment %llu\n",
+                (unsigned long long)vin_why[0], (unsigned long long)vin_why[1], (unsigned long long)vin_why[2], (unsigned long long)vin_why[3],
+                (unsigned long long)vin_why[4], (unsigned long long)vin_why[5]);
+        memset(vin_why, 0, sizeof vin_why);
         last_composed = gfx_stat_composed;
         last_pages = gfx_stat_resident_pages;
         fprintf(stderr, "[vk stats]   device memory: %llu allocations, %.1f MB, %.0f ms; residents made %llu, input buffers made %llu, textures made %llu\n",

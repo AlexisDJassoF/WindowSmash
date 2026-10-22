@@ -33,3 +33,9 @@ enum {
  * instruction left out. */
 u32 *shader_spirv(const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared, ShaderInfo *info,
                   CbufReader *read, void *user, int flags, u32 *words);
+/* The same, a vertex program's attributes taken as vertex inputs (Location n) the device fetches,
+ * vin's bits 2n-2n+1 each one's class (0 float, 1 signed, 2 unsigned) and bit 63 set; vin 0 reads
+ * them from the streams, as shader_spirv. */
+#define SPIRV_VERTEX_INPUTS (1ull << 63)
+u32 *shader_spirv_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared, ShaderInfo *info,
+                     CbufReader *read, void *user, int flags, u64 vin, u32 *words);

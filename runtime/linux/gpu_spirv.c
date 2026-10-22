@@ -27,6 +27,7 @@ typedef struct Sx {
     u32 n;
     ShaderInfo *info;
     u32 vs_outputs, local[3], shared;
+    u64 vin;                                      /* vertex: attributes as vertex inputs (shader_spirv_ex), 0: from the streams */
     CbufReader *read_cbuf;
     void *read_user;
     int branchy;
@@ -461,6 +462,18 @@ static u32 load_in(Sx *c, u32 type, u32 var) { return SPV_VAL(B, SpvOpLoad, type
  * VERTEX_FETCH and fetchN, written here as selects: no branches, so that it can be in the prologue). */
 static void fetch_attribute(Sx *c, u32 n) {
     spv_prologue_enter(B);
+    if (c->vin) {   /* a vertex input the device fetches and converts (its class: float, signed or unsigned) */
+        u32 cls = (u32)(c->vin >> (2 * n)) & 3;
+        u32 t = cls == 1 ? spv_type_vector(B, c->t_i32, 4) : cls == 2 ? c->t_v4u : c->t_v4f;
+        u32 var = spv_global(B, spv_type_pointer(B, SpvStorageClassInput, t), SpvStorageClassInput);
+        decorate(c, var, SpvDecorationLocation, n);
+        add_interface(c, var);
+        u32 v = SPV_VAL(B, SpvOpLoad, t, var);
+        if (cls != 2) v = SPV_VAL(B, SpvOpBitcast, c->t_v4u, v);
+        for (u32 i = 0; i < 4; i++) c->attr_value[n][i] = SPV_VAL(B, SpvOpCompositeExtract, c->t_u32, v, i);
+        spv_prologue_leave(B);
+        return;
+    }
     if (!c->vid) {
         c->vid = builtin_in(c, c->t_i32, SpvBuiltInVertexIndex, 0);
         c->iid = builtin_in(c, c->t_i32, SpvBuiltInInstanceIndex, 0);
@@ -597,6 +610,7 @@ static u32 vs_input(Sx *c, u32 addr) {
             spv_prologue_leave(B);
         }
         if (addr == 0x2FC) return asuint(c, load_in(c, c->t_i32, c->vid));
+        if (c->vin) return asuint(c, load_in(c, c->t_i32, c->iid));   /* (the base instance is the draw's firstInstance then: InstanceIndex has it) */
         return iadd(c, asuint(c, load_in(c, c->t_i32, c->iid)), param(c, P_BASE, ~0u, 1, 0));
     }
     return c->c_u0;
@@ -1972,6 +1986,11 @@ static u32 *build(const Sx *base, int mode, u32 *words, u32 *out_attr_mask, int 
 
 u32 *shader_spirv(const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared, ShaderInfo *info,
                   CbufReader *read, void *user, int flags, u32 *words) {
+    return shader_spirv_ex(program, size, stage, vs_outputs, local, shared, info, read, user, flags, 0, words);
+}
+
+u32 *shader_spirv_ex(const u8 *program, u32 size, int stage, u32 vs_outputs, const u32 local[3], u32 shared, ShaderInfo *info,
+                     CbufReader *read, void *user, int flags, u64 vin, u32 *words) {
     shader_decode_init();
     memset(info, 0, sizeof *info);
     info->stage = stage;
@@ -1985,6 +2004,7 @@ u32 *shader_spirv(const u8 *program, u32 size, int stage, u32 vs_outputs, const 
     base.prog = program;
     base.info = info;
     base.vs_outputs = vs_outputs;
+    base.vin = stage == SHADER_VERTEX ? vin : 0;
     base.ins = shader_decode_program(program, size, &base.n);
     for (u32 i = 0; i < base.n; i++) base.branchy |= shader_is_branchy(base.ins[i].op);
     u32 out_attr_mask = 0, *out, *targets = NULL, ntargets = 0;

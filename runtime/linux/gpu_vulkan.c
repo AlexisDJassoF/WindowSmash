@@ -142,7 +142,7 @@ typedef struct DeviceInfo {
     const char *robustness;             /* the robustness2 extension's name: KHR's or EXT's */
     char missing[160];                  /* the first required thing it lacks, if any */
     char optional_missing[256];         /* the optional ones it lacks */
-    struct { int eds3, gpl, unified_layouts, descriptor_buffer, custom_border, swapchain_maintenance; } has;
+    struct { int eds3, gpl, unified_layouts, descriptor_buffer, custom_border, swapchain_maintenance, vertex_input; } has;   /* (as Vk's) */
     const char *swapchain_maintenance;  /* that extension's name, KHR's or EXT's */
 } DeviceInfo;
 
@@ -180,16 +180,17 @@ static void examine(VkPhysicalDevice pd, DeviceInfo *d) {
      * one with them off) */
     int eds3 = has_ext(e, n, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME), gpl = has_ext(e, n, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
     int unified = has_ext(e, n, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME), dbuf = has_ext(e, n, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
-    int border = has_ext(e, n, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    int border = has_ext(e, n, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME), vin = has_ext(e, n, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
     VkPhysicalDeviceDescriptorBufferFeaturesEXT dbuff = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT borderf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT rb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vinf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
     void *chain = NULL;
 #define CHAIN(have, s) if (have) { (s).pNext = chain; chain = &(s); }
-    CHAIN(eds3, eds3f) CHAIN(gpl, gplf) CHAIN(unified, unifiedf) CHAIN(dbuf, dbuff) CHAIN(border, borderf) CHAIN(d->robustness != NULL, rb)
+    CHAIN(eds3, eds3f) CHAIN(gpl, gplf) CHAIN(unified, unifiedf) CHAIN(dbuf, dbuff) CHAIN(border, borderf) CHAIN(d->robustness != NULL, rb) CHAIN(vin, vinf)
 #undef CHAIN
     VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, chain};
     VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
@@ -225,6 +226,7 @@ static void examine(VkPhysicalDevice pd, DeviceInfo *d) {
     d->has.eds3 = eds3 && eds3f.extendedDynamicState3ColorBlendEnable && eds3f.extendedDynamicState3ColorBlendEquation &&
                   eds3f.extendedDynamicState3ColorWriteMask;
     d->has.gpl = gpl && gplf.graphicsPipelineLibrary;
+    d->has.vertex_input = vin && vinf.vertexInputDynamicState;   /* (vertex attributes fetched by the device, their formats dynamic state) */
     d->has.unified_layouts = unified && unifiedf.unifiedImageLayouts;
     d->has.descriptor_buffer = dbuf && dbuff.descriptorBuffer;
     d->has.custom_border = border && borderf.customBorderColors && borderf.customBorderColorWithoutFormat;   /* (the colour as the header has it, for any format) */
@@ -233,6 +235,7 @@ static void examine(VkPhysicalDevice pd, DeviceInfo *d) {
     d->has.swapchain_maintenance = d->swapchain_maintenance != NULL;
     note_optional(d, d->has.eds3, "extended dynamic state 3 (blending)");
     note_optional(d, d->has.gpl, "graphics pipeline libraries");
+    note_optional(d, d->has.vertex_input, "dynamic vertex input");
     note_optional(d, d->has.unified_layouts, "unified image layouts");
     note_optional(d, d->has.descriptor_buffer, "descriptor buffers");
     note_optional(d, d->has.custom_border, "custom border colours");
@@ -275,7 +278,7 @@ static int choose_device(DeviceInfo *best, char *why, size_t why_size) {
 
 /* The logical device, with the required features and the optional ones the device has on. */
 static int make_device(const DeviceInfo *d, char *why, size_t why_size) {
-    const char *ext[8];
+    const char *ext[10];
     uint32_t n = 0;
     ext[n++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     ext[n++] = d->robustness;
@@ -283,6 +286,7 @@ static int make_device(const DeviceInfo *d, char *why, size_t why_size) {
     if (d->has.gpl) { ext[n++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME; ext[n++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME; }
     if (d->has.unified_layouts) ext[n++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
     if (d->has.custom_border) ext[n++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    if (d->has.vertex_input) ext[n++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
 
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     eds3.extendedDynamicState3ColorBlendEnable = eds3.extendedDynamicState3ColorBlendEquation = eds3.extendedDynamicState3ColorWriteMask = VK_TRUE;
@@ -294,9 +298,11 @@ static int make_device(const DeviceInfo *d, char *why, size_t why_size) {
     border.customBorderColors = border.customBorderColorWithoutFormat = VK_TRUE;
     VkPhysicalDeviceRobustness2FeaturesEXT robust = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     robust.robustBufferAccess2 = robust.nullDescriptor = VK_TRUE;
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vin = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
+    vin.vertexInputDynamicState = VK_TRUE;
     void *chain = &robust;
 #define CHAIN(have, s) if (have) { (s).pNext = chain; chain = &(s); }
-    CHAIN(d->has.eds3, eds3) CHAIN(d->has.gpl, gpl) CHAIN(d->has.unified_layouts, unified) CHAIN(d->has.custom_border, border)
+    CHAIN(d->has.eds3, eds3) CHAIN(d->has.gpl, gpl) CHAIN(d->has.unified_layouts, unified) CHAIN(d->has.custom_border, border) CHAIN(d->has.vertex_input, vin)
 #undef CHAIN
     VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, chain};
     v13.dynamicRendering = v13.synchronization2 = v13.maintenance4 = VK_TRUE;
