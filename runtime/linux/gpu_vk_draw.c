@@ -39,6 +39,26 @@ extern u64 gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_st
 
 static float f32_of(u32 bits) { float f; memcpy(&f, &bits, 4); return f; }
 static int draw_logging;   /* F4: this frame's draws to the log, as gpu_d3d11.c's [draw] lines */
+
+/* The CPU's writes the write watch found: per (hashed) page, the generation they were found in
+ * (the kept uploads look here: the watch's bit is gone once anyone resets it) */
+static u32 page_gen[1 << 20], gen_now;
+#define PAGE_SLOT(page) ((u32)((u64)(page) * 0x9E3779B97F4A7C15ull >> 44))
+/* The write watch over [lo, hi) reset, the pages it had found written noted first */
+static void watch_reset(u64 lo, u64 hi) {
+    static void *pages[4096];
+    u64 from = lo & ~0xFFFull, to = (hi + 0xFFF) & ~0xFFFull;
+    for (u64 at = from; at < to;) {
+        ULONG_PTR count = 4096;
+        ULONG granularity;
+        if (GetWriteWatch(0, (void *)at, to - at, pages, &count, &granularity) != 0 || !count) break;
+        ++gen_now;
+        for (ULONG_PTR k = 0; k < count; k++) page_gen[PAGE_SLOT((u64)pages[k] >> 12)] = gen_now;
+        if (count < 4096) break;
+        at = (u64)pages[count - 1] + 0x1000;   /* (more than the list holds: on from the last) */
+    }
+    ResetWriteWatch((void *)lo, hi - lo);
+}
 static u64 vk_stat_residents_made, vk_stat_inputs_made, vk_stat_textures_made;   /* (SSBU_LOG_STATS) */
 static u64 sb_bytes, texture_bytes;   /* (SSBU_LOG_STATS: storage buffers' and textures' uploads) */
 
@@ -149,6 +169,10 @@ void vk_draw_slot_start(unsigned slot) {
 /* Room in the slot's ring: the offset, and where to write. 0 (and *at NULL) when full: the frame
  * is flushed and the next slot's ring taken. */
 static VkDeviceSize ring_alloc(VkDeviceSize size, VkDeviceSize align, u8 **at, VkBuffer *buf);
+/* (SSBU_LOG_STATS: the ring's bytes by what they were for) */
+enum { RING_TEX, RING_GPU, RING_COPY, RING_READBACK, RING_PARAMS, RING_INDEX, RING_CS, RING_KINDS };
+static u64 ring_bytes[RING_KINDS];
+#define ring_alloc_for(kind, size, align, at, buf) (ring_bytes[kind] += (size), ring_alloc(size, align, at, buf))
 
 /* ---- images and their layouts ---------------------------------------------------------------- */
 typedef struct Img {
@@ -531,7 +555,7 @@ static void note_writes(void) {
         if (GetWriteWatch(0, (void *)t->guest, t->size, &page, &count, &granularity) == 0 && count) written[i] = 1;
     }
     for (u32 i = 0; i < ntextures; i++)
-        if (written[i]) { textures[i].stale = 1; ResetWriteWatch((void *)textures[i].guest, textures[i].size); }
+        if (written[i]) { textures[i].stale = 1; watch_reset(textures[i].guest, textures[i].guest + textures[i].size); }
     residents_sync_all();   /* (after the textures: they share the pages' write watch) */
     QueryPerformanceCounter(&t1);
     gfx_stat_watch_us += (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
@@ -607,7 +631,7 @@ static int upload_texture(Texture *t, const TextureDesc *d, u64 g, u32 levels, u
         u32 rowb = (d->width + d->bw - 1) / d->bw * d->bytes, rows = (d->height + d->bh - 1) / d->bh;
         u8 *at;
         VkBuffer buf;
-        VkDeviceSize off = ring_alloc((VkDeviceSize)rowb * rows * d->depth + 64, 16, &at, &buf);
+        VkDeviceSize off = ring_alloc_for(RING_TEX, (VkDeviceSize)rowb * rows * d->depth + 64, 16, &at, &buf);
         if (!at) return 0;
         texture_read_3d(d, g, at);
         VkBufferImageCopy copy = {off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {d->width, d->height, d->depth}};
@@ -619,7 +643,7 @@ static int upload_texture(Texture *t, const TextureDesc *d, u64 g, u32 levels, u
                 u32 bw = (w + d->bw - 1) / d->bw, bh = (h + d->bh - 1) / d->bh;
                 u8 *at;
                 VkBuffer buf;
-                VkDeviceSize off = ring_alloc((VkDeviceSize)bw * bh * d->bytes + 64, 16, &at, &buf);
+                VkDeviceSize off = ring_alloc_for(RING_TEX, (VkDeviceSize)bw * bh * d->bytes + 64, 16, &at, &buf);
                 if (!at) return 0;
                 texture_read(d, g, layer, l, at);
                 texture_bytes += (u64)bw * bh * d->bytes;
@@ -811,20 +835,29 @@ static VkDescriptorBufferInfo upload_gpu(u64 va, u32 size) {
     if (!padded || !va) padded = 16;
     u8 *at;
     VkBuffer buf;
-    VkDeviceSize off = ring_alloc(padded, storage_align, &at, &buf);
+    VkDeviceSize off = ring_alloc_for(RING_GPU, padded, storage_align, &at, &buf);
     if (!at) return (VkDescriptorBufferInfo){VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     if (va && size) read_gpu(va, size, at);
     if (padded > size || !va) memset(at + (va ? size : 0), 0, padded - (va ? size : 0));
     return (VkDescriptorBufferInfo){buf, off, padded};
 }
 
-/* Uploads kept for the frame: a buffer the frame has uploaded already is used again while neither
- * the CPU (the write watch, asked at its first use in each submission) nor the command stream
- * (gfx_stream_wrote) has written it - draw after draw, most of a frame's constant buffers are the
- * same memory (gpu_d3d11.c keeps them on the GPU for the same reason). Only memory in the watched
- * alias area is kept; anything else is uploaded each time. */
+/* Uploads kept from frame to frame: a buffer uploaded once (constant buffers, vertex streams,
+ * storage buffers of up to KEEP_MAX bytes) is used again, frame after frame, while neither the CPU
+ * nor the command stream (gfx_stream_wrote) has written it - most of a frame's buffers are the same
+ * memory as the frame before's, and on an integrated GPU sending them again takes the memory
+ * bandwidth the GPU draws with. Each lives in a block of the kept arena (host-visible memory that
+ * outlives the frame); one that changed is put in a new block, the old one freed once the GPU is done
+ * with the last submission that used it.
+ *
+ * The CPU's writes are found by the write watch, asked for a buffer's pages at its first use in each
+ * submission. The watch has one bit a page, reset by whoever finds it set: so what is found is noted
+ * by page (page_gen), for every buffer on that page to see - not just the one that asked. Only memory
+ * in the watched alias area is kept; anything else is uploaded each time. */
 extern u64 gpu_stat_batches;   /* (gpu.c: submissions so far) */
-typedef struct Kept { u64 va, guest, frame, checked, epoch; u32 size; int dirty; VkDescriptorBufferInfo info; } Kept;
+#define KEEP_MAX (4u << 20)
+typedef struct Block { VkBuffer buf; VkDeviceSize off; u8 *at; u32 cls; } Block;
+typedef struct Kept { u64 va, guest, checked, epoch, gen, last_use; u32 size, mapped; Block block; } Kept;
 #define KEPT_SETS 2048
 #define KEPT_WAYS 4
 static Kept kept[KEPT_SETS * KEPT_WAYS];
@@ -834,11 +867,87 @@ static volatile u64 block_written[1 << 16], stream_epoch;
 static u64 kept_clock[KEPT_SETS * KEPT_WAYS], kept_tick;
 u64 vk_stat_kept_reused;
 /* (SSBU_LOG_STATS: why uploads were not kept, and their bytes) */
-static u64 kept_miss[4], kept_miss_bytes[4];   /* not watched, new this frame, written, first time */
+static u64 kept_miss[4], kept_miss_bytes[4];   /* not watched or too large, no room in the arena, written, first time */
+
+
+/* The arena: blocks of a power of two from 256 bytes to KEEP_MAX, carved from 32 MB chunks (at most
+ * 16), each size's freed ones listed for reuse */
+#define ARENA_CHUNK (32u << 20)
+#define ARENA_CHUNKS 16
+#define BLOCK_CLASSES 15   /* (256 B ... 4 MB) */
+static struct { VkBuffer buf; u8 *map; VkDeviceSize used; } chunks[ARENA_CHUNKS];
+static u32 nchunks;
+static Block *free_blocks[BLOCK_CLASSES];
+static u32 nfree[BLOCK_CLASSES], free_cap[BLOCK_CLASSES];
+static struct { Block block; u64 value; } *retired;   /* freed once the timeline passes value */
+static u32 nretired, retired_cap;
+
+static u32 block_class(u32 size) {
+    u32 c = 0;
+    while ((256u << c) < size) c++;
+    return c;
+}
+
+static int block_alloc(u32 size, Block *out) {
+    u32 c = block_class(size), bytes = 256u << c;
+    if (nfree[c]) { *out = free_blocks[c][--nfree[c]]; return 1; }
+    if (!nchunks || chunks[nchunks - 1].used + bytes > ARENA_CHUNK) {
+        if (nchunks == ARENA_CHUNKS) return 0;
+        VkDeviceMemory mem;
+        void *map;
+        chunks[nchunks].buf = vk_buffer(ARENA_CHUNK, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                        &mem, &map);
+        chunks[nchunks].map = map;
+        chunks[nchunks++].used = 0;
+    }
+    VkDeviceSize off = (chunks[nchunks - 1].used + bytes - 1) & ~(VkDeviceSize)(bytes - 1);   /* (aligned to its size: past any descriptor's alignment) */
+    if (off + bytes > ARENA_CHUNK) return 0;
+    chunks[nchunks - 1].used = off + bytes;
+    *out = (Block){chunks[nchunks - 1].buf, off, chunks[nchunks - 1].map + off, c};
+    return 1;
+}
+
+static void block_retire(const Block *b, u64 last_use) {
+    if (!b->buf) return;
+    if (nretired == retired_cap) retired = realloc(retired, sizeof *retired * (retired_cap = retired_cap * 2 + 256));
+    retired[nretired].block = *b;
+    retired[nretired++].value = last_use;
+}
+
+/* (at each present) the blocks the GPU is done with, free again */
+static void blocks_release(void) {
+    u64 done = 0;
+    vkGetSemaphoreCounterValue(vk.dev, vk.timeline, &done);
+    u32 k = 0;
+    for (u32 i = 0; i < nretired; i++) {
+        if (retired[i].value > done) { retired[k++] = retired[i]; continue; }
+        Block *b = &retired[i].block;
+        if (nfree[b->cls] == free_cap[b->cls]) free_blocks[b->cls] = realloc(free_blocks[b->cls], sizeof(Block) * (free_cap[b->cls] = free_cap[b->cls] * 2 + 64));
+        free_blocks[b->cls][nfree[b->cls]++] = *b;
+    }
+    nretired = k;
+}
 
 static int stream_wrote_since(const Kept *e) {
     for (u64 b = e->va >> 16; b <= (e->va + e->size - 1) >> 16; b++)
         if (block_written[KEPT_BLOCK(b)] > e->epoch) return 1;
+    return 0;
+}
+
+/* Has the CPU written [g, g + n) since generation gen? The write watch is asked once a submission
+ * (checked); what it finds is noted by page for everyone. */
+static int cpu_wrote_since(u64 g, u32 n, u64 gen, u64 *checked) {
+    u64 lo = g & ~0xFFFull, hi = (g + n + 0xFFF) & ~0xFFFull;
+    if (*checked != gpu_stat_batches) {
+        void *page;
+        ULONG_PTR count = 1;
+        ULONG granularity;
+        if (GetWriteWatch(0, (void *)lo, hi - lo, &page, &count, &granularity) == 0 && count) watch_reset(lo, hi);   /* (noting each page) */
+        *checked = gpu_stat_batches;
+    }
+    for (u64 p = lo >> 12; p < hi >> 12; p++)
+        if (page_gen[PAGE_SLOT(p)] > gen) return 1;
     return 0;
 }
 
@@ -849,7 +958,7 @@ static VkDescriptorBufferInfo upload_kept(u64 va, u32 size) {
     u32 mapped = g ? 0x1000 - (u32)(va & 0xFFF) : 0;
     while (g && mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
     if (mapped > size) mapped = size;
-    if (!g || !watched(g, mapped)) {
+    if (!g || size > KEEP_MAX || !watched(g, mapped)) {
         kept_miss[0]++; kept_miss_bytes[0] += size;
         return upload_gpu(va, size);
     }
@@ -857,41 +966,53 @@ static VkDescriptorBufferInfo upload_kept(u64 va, u32 size) {
     Kept *ways = &kept[set * KEPT_WAYS], *e = NULL;
     u32 lru = 0;
     for (u32 w = 0; w < KEPT_WAYS && !e; w++) {
-        if (ways[w].va == va && ways[w].size == size && ways[w].guest == g) e = &ways[w];
+        if (ways[w].block.buf && ways[w].va == va && ways[w].size == size && ways[w].guest == g) e = &ways[w];
         else if (kept_clock[set * KEPT_WAYS + w] < kept_clock[set * KEPT_WAYS + lru]) lru = w;
     }
-    u64 frame = vk_frame_serial();
-    if (e && e->frame == frame && !e->dirty && stream_wrote_since(e)) e->dirty = 1;
-    if (e && e->frame == frame && !e->dirty) {
-        if (e->checked != gpu_stat_batches) {   /* first use in this submission: has the CPU written it since? */
-            void *page;
-            ULONG_PTR count = 1;
-            ULONG granularity;
-            if (GetWriteWatch(0, (void *)g, mapped, &page, &count, &granularity) == 0 && count) {
-                e->dirty = 1;
-                ResetWriteWatch((void *)g, mapped);
-            }
-            e->checked = gpu_stat_batches;
+    u32 padded = (size + 15) & ~15u;
+    if (e && !stream_wrote_since(e) && !cpu_wrote_since(g, mapped, e->gen, &e->checked)) {
+        static int verify = -1;   /* SSBU_KEPT_VERIFY (debugging): each reuse compared with memory, differences reported */
+        if (verify < 0) verify = getenv("SSBU_KEPT_VERIFY") != NULL;
+        if (verify && memcmp(e->block.at, P(void, g), mapped)) {
+            static u32 reported;
+            u32 o = 0;
+            while (o + 4 <= mapped && !memcmp(e->block.at + o, P(u8, g) + o, 4)) o += 4;
+            if (reported++ < 200)
+                fprintf(stderr, "[kept] va %#llx (%#x bytes) +%#x: kept %08x, memory %08x (submission %llu)\n", (unsigned long long)va, mapped, o,
+                        *(const u32 *)(e->block.at + o), ld32(g + o), (unsigned long long)gpu_stat_batches);
         }
-        if (!e->dirty) {
-            kept_clock[e - kept] = ++kept_tick;
-            vk_stat_kept_reused++;
-            return e->info;
-        }
+        kept_clock[e - kept] = ++kept_tick;
+        e->last_use = vk.submitted + 1;   /* (the submission being recorded) */
+        vk_stat_kept_reused++;
+        return (VkDescriptorBufferInfo){e->block.buf, e->block.off, padded};
     }
-    int why = !e ? 3 : e->frame != frame ? 1 : 2;
-    kept_miss[why]++; kept_miss_bytes[why] += size;
-    if (!e) {
+    int why = e ? 2 : 3;
+    if (!e) {   /* (the least recently used of the set gives its place: its block freed once unused) */
         e = &ways[lru];
-        e->va = va; e->size = size; e->guest = g;
+        block_retire(&e->block, e->last_use);
+        memset(e, 0, sizeof *e);
+        e->va = va; e->size = size; e->guest = g; e->mapped = mapped;
     }
-    e->epoch = __atomic_fetch_add(&stream_epoch, 0, __ATOMIC_ACQUIRE);   /* (before the copy: a write during it counts) */
-    e->info = upload_gpu(va, size);
-    e->frame = frame;
-    e->checked = gpu_stat_batches;
-    e->dirty = 0;
+    Block nb;
+    if (!block_alloc(padded, &nb)) {   /* (the arena is full: this frame's ring) */
+        block_retire(&e->block, e->last_use);
+        memset(&e->block, 0, sizeof e->block);
+        kept_miss[1]++; kept_miss_bytes[1] += size;
+        return upload_gpu(va, size);
+    }
+    kept_miss[why]++; kept_miss_bytes[why] += size;
+    block_retire(&e->block, e->last_use);
+    e->block = nb;
+    /* (the epoch and generation before the copy: a write during it counts) */
+    e->epoch = __atomic_fetch_add(&stream_epoch, 0, __ATOMIC_ACQUIRE);
+    if (e->checked != gpu_stat_batches) cpu_wrote_since(g, mapped, 0, &e->checked);   /* (the watch reset over it first) */
+    e->gen = gen_now;
+    read_gpu(va, size, nb.at);
+    if (padded > size) memset(nb.at + size, 0, padded - size);
+    gfx_stat_upload_bytes += size;
+    e->last_use = vk.submitted + 1;
     kept_clock[e - kept] = ++kept_tick;
-    return e->info;
+    return (VkDescriptorBufferInfo){nb.buf, nb.off, padded};
 }
 
 void vk_gfx_stream_wrote(u64 va, u64 bytes);
@@ -990,7 +1111,7 @@ static void buf_write(VkBuffer dst, VkDeviceSize off, const void *data, u64 n) {
         u32 part = n > (16u << 20) ? 16u << 20 : (u32)n;
         u8 *at;
         VkBuffer src;
-        VkDeviceSize so = ring_alloc(part, 16, &at, &src);
+        VkDeviceSize so = ring_alloc_for(RING_COPY, part, 16, &at, &src);
         if (!at) return;
         memcpy(at, data, part);
         VkBufferCopy r = {so, off, part};
@@ -1048,7 +1169,7 @@ static int resident_take_edge(Resident *r, u64 g, u8 *was, u32 n) {
 
 static void resident_watch_reset(Resident *r) {
     u64 lo = (r->guest + 0xFFF) & ~0xFFFull, hi = (r->guest + r->size) & ~0xFFFull;
-    if (lo < hi) ResetWriteWatch((void *)lo, hi - lo);
+    if (lo < hi) watch_reset(lo, hi);
 }
 
 /* What the CPU wrote inside the region since its GPU copy took guest memory: its whole pages the
@@ -1067,7 +1188,7 @@ static void resident_sync(Resident *r, int always) {
     ULONG_PTR count = 16384;
     ULONG granularity;
     if (GetWriteWatch(0, (void *)lo, hi - lo, pages, &count, &granularity) != 0 || !count) return;
-    ResetWriteWatch((void *)lo, hi - lo);   /* (before taking them: what the CPU writes meanwhile is seen next time) */
+    watch_reset(lo, hi);   /* (before taking them: what the CPU writes meanwhile is seen next time) */
     gpu_write_begin();
     for (ULONG_PTR k = 0; k < count; k++) {
         u64 pg = (u64)pages[k];
@@ -1209,7 +1330,7 @@ void vk_gfx_resident_flush(u64 va, u64 bytes) {
             gpu_write_begin();
             u8 *map;
             VkBuffer rb;
-            VkDeviceSize ro = ring_alloc(part, 16, &map, &rb);
+            VkDeviceSize ro = ring_alloc_for(RING_READBACK, part, 16, &map, &rb);
             if (!map) break;
             VkBufferCopy c = {at - r->va, ro, part};
             vkCmdCopyBuffer(vk_cmd(), r->buf, rb, 1, &c);
@@ -1309,7 +1430,7 @@ static int input_buffer(u64 va, u32 size, VkDescriptorBufferInfo *out) {
         ULONG_PTR count = 1;
         ULONG granularity;
         if (GetWriteWatch(0, (void *)g, size, &page, &count, &granularity) == 0 && count) {   /* written since: taken again */
-            ResetWriteWatch((void *)g, size);
+            watch_reset(g, g + size);
             gpu_write_begin();
             buf_write(b->buf, 0, P(void, g), size);
         }
@@ -1324,7 +1445,7 @@ static int input_buffer(u64 va, u32 size, VkDescriptorBufferInfo *out) {
         buf_write(b->buf, 0, init, cap);
         free(init);
         b->va = va; b->guest = g; b->size = size;
-        ResetWriteWatch((void *)g, size);
+        watch_reset(g, g + size);
     }
     b->used = ++input_clock;
     *out = (VkDescriptorBufferInfo){b->buf, 0, cap};
@@ -2419,11 +2540,26 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     u8 *at;
     VkBuffer pbuf;
     u32 poff;
+    /* (parameters a draw of this frame wrote already - another pass of the same mesh, say - used again:
+     * found by their hash, compared with a copy - the ring's memory is slow to read) */
+    static struct { u64 hash, frame; u32 off; DrawParams copy; } seen[2048];
     if (last_params_frame == vk_frame_serial() && !memcmp(&last_params, &params, sizeof params)) poff = last_poff;
     else {
-        poff = (u32)ring_alloc(sizeof params, uniform_align, &at, &pbuf);
-        if (!at) { vk_leave(); return; }
-        memcpy(at, &params, sizeof params);
+        u64 h = 1469598103934665603ull;
+        for (size_t i = 0; i < sizeof params / 8; i++) h = (h ^ ((const u64 *)&params)[i]) * 1099511628211ull;
+        u32 slot = (u32)(h >> 53);
+        u64 frame = vk_frame_serial();
+        if (seen[slot].frame == frame && seen[slot].hash == h && !memcmp(&seen[slot].copy, &params, sizeof params))
+            poff = seen[slot].off;
+        else {
+            poff = (u32)ring_alloc_for(RING_PARAMS, sizeof params, uniform_align, &at, &pbuf);
+            if (!at) { vk_leave(); return; }
+            memcpy(at, &params, sizeof params);
+            seen[slot].hash = h;
+            seen[slot].frame = vk_frame_serial();   /* (the ring's frame now: an allocation may have begun another) */
+            seen[slot].off = poff;
+            seen[slot].copy = params;
+        }
         last_params = params;
         last_params_frame = vk_frame_serial();
         last_poff = poff;
@@ -2538,25 +2674,18 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         u64 va = ((u64)regs[M_INDEX_BUFFER] << 32 | regs[M_INDEX_BUFFER + 1]) + (u64)first * isz;
         if (!n || n > (16u << 20)) { gfx_stat_skipped++; vk_leave(); return; }
         u32 unit = isz == 4 ? 4 : 2;
-        /* the same indices from the same place as the last indexed draw's, in this frame: used again */
-        static struct { u64 va, frame; u32 n, isz; VkDeviceSize off; VkBuffer buf; u8 copy[65536]; int ok; } last_ix;
-        u64 ig = isz != 1 && n * isz <= sizeof last_ix.copy ? gpu_va_to_guest(va) : 0;
-        const u8 *isrc = ig && gpu_va_to_guest(va + n * isz - 1) == ig + n * isz - 1 ? P(const u8, ig) : NULL;
         VkBuffer ib;
         VkDeviceSize ioff;
-        if (isrc && last_ix.ok && last_ix.frame == vk_frame_serial() && last_ix.va == va && last_ix.n == n && last_ix.isz == isz &&
-            !memcmp(isrc, last_ix.copy, n * isz)) {
-            ib = last_ix.buf;
-            ioff = last_ix.off;
+        if (isz != 1) {   /* 16- and 32-bit indices: kept from frame to frame, as the vertex streams (the meshes' own) */
+            VkDescriptorBufferInfo d = upload_kept(va, n * isz);
+            if (!d.buffer) { vk_leave(); return; }
+            ib = d.buffer;
+            ioff = d.offset;
             goto indices;
         }
-        ioff = ring_alloc((VkDeviceSize)n * unit, 4, &at, &ib);
+        ioff = ring_alloc_for(RING_INDEX, (VkDeviceSize)n * unit, 4, &at, &ib);
         if (!at) { vk_leave(); return; }
-        if (isrc) {
-            memcpy(last_ix.copy, isrc, n * isz);
-            memcpy(at, last_ix.copy, n * isz);
-            last_ix.va = va; last_ix.n = n; last_ix.isz = isz; last_ix.off = ioff; last_ix.buf = ib; last_ix.frame = vk_frame_serial(); last_ix.ok = 1;
-        } else if (isz == 1) {   /* 8-bit indices widen to 16 */
+        {   /* 8-bit indices widen to 16 */
             static u8 tmp8[1 << 16];
             for (u32 done = 0; done < n;) {
                 u32 k = n - done > sizeof tmp8 ? (u32)sizeof tmp8 : n - done;
@@ -2564,7 +2693,7 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
                 for (u32 i = 0; i < k; i++) ((u16 *)at)[done + i] = tmp8[i];
                 done += k;
             }
-        } else read_gpu(va, n * isz, at);
+        }
     indices:
         if (!rendering) { begin_rendering(color, ncolor, depth); cmd = vk_cmd(); }
         vkCmdBindIndexBuffer(cmd, ib, ioff, isz == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
@@ -2671,7 +2800,7 @@ void vk_gfx_dispatch(const u32 *regs, const u32 *q) {
         u32 padded = (size + 15) & ~15u;
         u8 *at;
         VkBuffer rb;
-        VkDeviceSize ro = ring_alloc(padded, storage_align, &at, &rb);
+        VkDeviceSize ro = ring_alloc_for(RING_CS, padded, storage_align, &at, &rb);
         if (!at) { b[0].sb[k] = upload_gpu(0, 0); continue; }
         read_gpu(va, size, at);
         memset(at + size, 0, padded - size);
@@ -2689,7 +2818,7 @@ void vk_gfx_dispatch(const u32 *regs, const u32 *q) {
 
     u8 *pat;
     VkBuffer pbuf;
-    u32 poff = (u32)ring_alloc(sizeof params, uniform_align, &pat, &pbuf);
+    u32 poff = (u32)ring_alloc_for(RING_PARAMS, sizeof params, uniform_align, &pat, &pbuf);
     if (!pat) { vk_leave(); return; }
     memcpy(pat, &params, sizeof params);
     const Shader *sh[2] = {cs, NULL};
@@ -2906,10 +3035,14 @@ void vk_draw_presenting(void) {
     static u32 frames;
     if (log_stats < 0) log_stats = getenv("SSBU_LOG_STATS") != NULL;
     if (log_stats && ++frames % 300 == 0) {
-        fprintf(stderr, "[vk stats] last 300 frames: kept %llu; not kept: unwatched %llu (%.1f MB), new frame %llu (%.1f MB), written %llu (%.1f MB), first %llu (%.1f MB); uploaded %.1f MB\n",
+        fprintf(stderr, "[vk stats] last 300 frames: kept %llu; not kept: unwatched or large %llu (%.1f MB), arena full %llu (%.1f MB), written %llu (%.1f MB), first %llu (%.1f MB); uploaded %.1f MB\n",
                 (unsigned long long)vk_stat_kept_reused, (unsigned long long)kept_miss[0], kept_miss_bytes[0] / 1048576.0, (unsigned long long)kept_miss[1],
                 kept_miss_bytes[1] / 1048576.0, (unsigned long long)kept_miss[2], kept_miss_bytes[2] / 1048576.0, (unsigned long long)kept_miss[3],
                 kept_miss_bytes[3] / 1048576.0, gfx_stat_upload_bytes / 1048576.0);
+        fprintf(stderr, "[vk stats]   ring: textures %.1f MB, uploads %.1f MB, copies %.1f MB, read back %.1f MB, draw parameters %.1f MB, indices %.1f MB, compute buffers %.1f MB\n",
+                ring_bytes[RING_TEX] / 1048576.0, ring_bytes[RING_GPU] / 1048576.0, ring_bytes[RING_COPY] / 1048576.0, ring_bytes[RING_READBACK] / 1048576.0,
+                ring_bytes[RING_PARAMS] / 1048576.0, ring_bytes[RING_INDEX] / 1048576.0, ring_bytes[RING_CS] / 1048576.0);
+        memset(ring_bytes, 0, sizeof ring_bytes);
         fprintf(stderr, "[vk stats]   storage buffers %.1f MB, textures %.1f MB; descriptor sets reused %llu\n", sb_bytes / 1048576.0,
                 texture_bytes / 1048576.0, (unsigned long long)vk_stat_sets_reused);
         extern u64 vk_stat_allocs, vk_stat_alloc_bytes, vk_stat_alloc_ns, vk_stat_wait_ns, vk_stat_flushes, vk_stat_flush_waits;
@@ -2943,6 +3076,7 @@ void vk_draw_presenting(void) {
     note_writes();
     gpu_times_frame();
     release_graves();
+    blocks_release();
 }
 
 int vk_draw_picture(VkCommandBuffer cb, VkImage dst, u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, u32 fx, u32 fy, u32 fw, u32 fh) {
