@@ -532,6 +532,10 @@ typedef struct Texture {
     VkFormat format;
     VkImageView views[8];  /* by the shader's texture type (TEX_*) */
     u64 used;
+    /* what its image was made as (an image given up goes to the pool, for another of the same) */
+    VkImageType type;
+    VkImageCreateFlags flags;
+    u32 w, h, depth, levels, layers;
 } Texture;
 static Texture textures[4096];
 static u32 ntextures;
@@ -676,11 +680,49 @@ static void texture_index_add(Texture *t) {
     texture_index_put(t);
 }
 
+/* Images of textures given up (their contents changed, or another took their place), kept with
+ * their views for a texture of the same kind: making one waits for the kernel (memory cleared,
+ * mapped) - a few milliseconds each, which a menu that changes its textures as the cursor moves
+ * did several times a second. A pooled image's last use is ordered before its next (one queue,
+ * and its layout and last access go with it); the oldest is freed when the pool is full. */
+#define IMAGE_POOL 128
+static struct { Img img; VkImageView views[8]; VkFormat format; VkImageType type; VkImageCreateFlags flags; u32 w, h, depth, levels, layers; } image_pool[IMAGE_POOL];
+static u32 nimage_pool;
+u64 vk_stat_images_reused;
+
 static void release_texture(Texture *t) {
-    for (u32 i = 0; i < 8; i++) bury(VK_NULL_HANDLE, t->views[i], VK_NULL_HANDLE);
-    bury(t->img.image, VK_NULL_HANDLE, t->img.memory);
+    if (t->img.image) {
+        if (nimage_pool == IMAGE_POOL) {   /* (the oldest freed, once the GPU is done with it) */
+            for (u32 i = 0; i < 8; i++) bury(VK_NULL_HANDLE, image_pool[0].views[i], VK_NULL_HANDLE);
+            bury(image_pool[0].img.image, VK_NULL_HANDLE, image_pool[0].img.memory);
+            memmove(image_pool, image_pool + 1, sizeof *image_pool * --nimage_pool);
+        }
+        image_pool[nimage_pool].img = t->img;
+        memcpy(image_pool[nimage_pool].views, t->views, sizeof t->views);
+        image_pool[nimage_pool].format = t->format;
+        image_pool[nimage_pool].type = t->type;
+        image_pool[nimage_pool].flags = t->flags;
+        image_pool[nimage_pool].w = t->w; image_pool[nimage_pool].h = t->h; image_pool[nimage_pool].depth = t->depth;
+        image_pool[nimage_pool].levels = t->levels; image_pool[nimage_pool].layers = t->layers;
+        nimage_pool++;
+    }
     memset(t->views, 0, sizeof t->views);
     memset(&t->img, 0, sizeof t->img);
+}
+
+/* An image of this kind from the pool, with its views, into t; 0 if there is none */
+static int pooled_image(Texture *t, VkImageType type, VkFormat format, u32 w, u32 h, u32 depth, u32 levels, u32 layers, VkImageCreateFlags flags) {
+    for (u32 i = nimage_pool; i-- > 0;) {   /* (the latest given up first) */
+        if (image_pool[i].format != format || image_pool[i].type != type || image_pool[i].flags != flags || image_pool[i].w != w || image_pool[i].h != h ||
+            image_pool[i].depth != depth || image_pool[i].levels != levels || image_pool[i].layers != layers)
+            continue;
+        t->img = image_pool[i].img;
+        memcpy(t->views, image_pool[i].views, sizeof t->views);
+        memmove(image_pool + i, image_pool + i + 1, sizeof *image_pool * (--nimage_pool - i));
+        vk_stat_images_reused++;
+        return 1;
+    }
+    return 0;
 }
 
 static void suspend_rendering(void);
@@ -777,12 +819,15 @@ static VkImageView get_texture(const u32 *tic, u32 shader_type, float *scale, Im
     VkImageCreateFlags flags = (d.type == TIC_CUBE || d.type == TIC_CUBE_ARRAY) && layers % 6 == 0 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     u32 w = d.width, h = type == VK_IMAGE_TYPE_1D ? 1 : d.height;
     if (d.bw > 1 && ((w % 4) || (h % 4))) { w = (w + 3) & ~3u; h = (h + 3) & ~3u; }   /* (block-compressed: whole blocks at level 0) */
-    vk_stat_textures_made++;
-    if (!make_image(&t->img, type, format, w, h, d.type == TIC_3D ? d.depth : 1, levels, layers,
-                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, flags, NULL, 0)) {
-        warn_texture(&d);
-        return VK_NULL_HANDLE;
+    u32 depth3d = d.type == TIC_3D ? d.depth : 1;
+    if (!pooled_image(t, type, format, w, h, depth3d, levels, layers, flags)) {
+        vk_stat_textures_made++;
+        if (!make_image(&t->img, type, format, w, h, depth3d, levels, layers, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, flags, NULL, 0)) {
+            warn_texture(&d);
+            return VK_NULL_HANDLE;
+        }
     }
+    t->type = type; t->flags = flags; t->w = w; t->h = h; t->depth = depth3d; t->levels = levels; t->layers = layers;
     t->img.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     t->format = format;
     t->guest = g; t->size = size; t->watched = watch; t->stale = 0;
@@ -922,8 +967,8 @@ extern u64 gpu_stat_batches;   /* (gpu.c: submissions so far) */
 #define KEEP_MAX (4u << 20)
 typedef struct Block { VkBuffer buf; VkDeviceSize off; u8 *at; u32 cls; } Block;
 typedef struct Kept { u64 va, guest, checked, epoch, gen, last_use; u32 size, mapped; Block block; } Kept;
-#define KEPT_SETS 2048
-#define KEPT_WAYS 4
+#define KEPT_SETS 4096   /* (32768 buffers: a character select after a battle uses ~10000 a frame, and 8192 thrashed) */
+#define KEPT_WAYS 8
 static Kept kept[KEPT_SETS * KEPT_WAYS];
 /* the command stream's writes: per (hashed) 64 KB block of GPU VA, the epoch of its last one */
 static volatile u64 block_written[1 << 16], stream_epoch;
@@ -1027,7 +1072,7 @@ static VkDescriptorBufferInfo upload_kept(u64 va, u32 size) {
         kept_miss[0]++; kept_miss_bytes[0] += size;
         return upload_gpu(va, size);
     }
-    u32 set = (u32)(((va >> 4) ^ size) * 0x9E3779B97F4A7C15ull >> 53) & (KEPT_SETS - 1);
+    u32 set = (u32)(((va >> 4) ^ size) * 0x9E3779B97F4A7C15ull >> 52) & (KEPT_SETS - 1);
     Kept *ways = &kept[set * KEPT_WAYS], *e = NULL;
     u32 lru = 0;
     for (u32 w = 0; w < KEPT_WAYS && !e; w++) {
@@ -1094,6 +1139,7 @@ void vk_gfx_stream_wrote(u64 va, u64 bytes);
  * CPU goes in through the upload ring and a copy, in the command buffer's order. */
 typedef struct Resident {
     u64 va, guest, checked;   /* (checked: the submission it was last checked against the write watch in) */
+    u64 written_at;           /* the present before the GPU last wrote it (a dispatch, a copy) */
     u32 size, cap, head, tail;
     VkBuffer buf;
     VkDeviceMemory mem;
@@ -1101,7 +1147,7 @@ typedef struct Resident {
 } Resident;
 static Resident residents[512];
 static u32 nresidents;
-extern u64 gfx_stat_residents, gfx_stat_resident_pages, gfx_stat_gpu_waits, gfx_stat_composed;
+extern u64 gfx_stat_residents, gfx_stat_resident_pages, gfx_stat_gpu_waits, gfx_stat_composed, gfx_stat_presented;
 static int gpu_wrote, gpu_read;   /* since the last buffer barrier: buffers written by the GPU; draws or dispatches */
 /* Since then, as well: whether all of it was dispatches (copies and draws are not followed range by
  * range), and those dispatches' storage buffers - so that a dispatch after others that touch other
@@ -1272,6 +1318,50 @@ static void residents_ranges(WatchRange *out, u32 *n, u32 cap) {
     }
 }
 
+/* Regions no dispatch (or copy) has written for 5 s - a battle's, once it is over - given back to
+ * guest memory and dropped: the game reuses that memory for other data, and every draw reading
+ * near a region it covers went the composed way (a copy, barriers, the rendering broken: hundreds
+ * a frame, the next battle at 40 FPS). What the CPU wrote in them is taken first, so what goes back
+ * is memory as the GPU and the CPU left it; all of them read back together, one wait. Every 2 s. */
+u64 vk_stat_residents_retired;
+static void residents_retire(void) {
+    static u64 last;
+    if (gfx_stat_presented - last < 120) return;
+    last = gfx_stat_presented;
+    static struct { u32 index; u8 *at; u64 lo, hi; } back[64];
+    u32 nback = 0;
+    u64 bytes = 0;
+    for (u32 i = 0; i < nresidents && nback < 64; i++) {
+        Resident *r = &residents[i];
+        if (gfx_stat_presented - r->written_at < 300 || bytes + r->cap > (64u << 20)) continue;
+        resident_sync(r, 1);
+        gpu_write_begin();
+        VkBuffer rb;
+        u8 *at;
+        VkDeviceSize ro = ring_alloc(r->cap, 16, &at, &rb);
+        if (!at) break;
+        VkBufferCopy c = {0, ro, r->cap};
+        vkCmdCopyBuffer(vk_cmd(), r->buf, rb, 1, &c);
+        back[nback++] = (typeof(back[0])){i, at, r->va, r->va + r->size};
+        bytes += r->cap;
+    }
+    if (!nback) return;
+    gpu_read_back();
+    for (u32 k = nback; k-- > 0;) {   /* (from the last: resident_drop moves the last region into the slot it frees) */
+        for (u64 a = back[k].lo; a < back[k].hi;) {   /* (a page at a time; only what differs written) */
+            u64 n = 0x1000 - (a & 0xFFF), g = gpu_va_to_guest(a);
+            if (n > back[k].hi - a) n = back[k].hi - a;
+            const u8 *src = back[k].at + (a - back[k].lo);
+            if (g && memcmp(P(void, g), src, n)) memcpy(P(void, g), src, n);
+            a += n;
+        }
+        Resident *r = &residents[back[k].index];
+        if (watched(r->guest, r->size)) watch_reset(r->guest, r->guest + r->size);   /* (our writes are no CPU writes for the kept uploads) */
+        resident_drop(r);
+        vk_stat_residents_retired++;
+    }
+}
+
 /* GPU-resident buffers the CPU has written to (those no draw has checked yet): once a frame */
 static void residents_sync_all(void) {
     for (u32 i = 0; i < nresidents; i++) resident_sync(&residents[i], 1);
@@ -1312,6 +1402,7 @@ static Resident *resident_create(u64 va, u32 size) {
     r->size = size;
     r->guest = gpu_va_to_guest(va);
     if (watched(r->guest, r->size)) resident_snapshot(r);
+    r->written_at = gfx_stat_presented;
     nresidents++;
     gfx_stat_residents++;
     vk_stat_residents_made++;
@@ -1458,6 +1549,7 @@ int vk_gfx_copy_resident(u64 dst_va, u64 src_va, u64 bytes) {
         return 0;
     }
     Resident *dst = resident_acquire(dst_va, (u32)bytes);   /* may merge regions: look the source up again */
+    if (dst) dst->written_at = gfx_stat_presented;
     src = resident_covering(src_va, src_va + bytes);
     if (!dst || !src) { vk_leave(); return 0; }
     gpu_write_begin();
@@ -1539,6 +1631,7 @@ typedef struct Shader {
     VkPipeline lib[2];                  /* (graphics pipeline libraries: vertex fill and lines, or pixel) */
     volatile int lib_state[2];          /* (0 not asked for, 1 compiling, 2 ready, 3 failed) */
     u64 vin;                            /* (vertex: its attributes as vertex inputs, shader_spirv_ex's; 0 from the streams) */
+    int from_cache;                     /* (read from the disk cache) */
     struct Shader *variant[4];          /* (vertex, from the streams: its vertex-input versions) */
     char name[64];
     ShaderInfo info;
@@ -1790,7 +1883,7 @@ static int topology(u32 t, VkPrimitiveTopology *out) {
 /* ---- pipelines ------------------------------------------------------------------------------------ */
 typedef struct BlendTarget { u8 enable, mask, src, dst, op, asrc, adst, aop; } BlendTarget;
 typedef struct PipelineKey {
-    VkShaderModule vs, ps;
+    const struct Shader *vs, *ps;      /* (the shaders themselves: a pixel shader's module is freed once its library is made) */
     VkFormat color[8], depth;
     u32 ncolor, topology, polygon;
     BlendTarget blend[8];
@@ -1855,10 +1948,10 @@ static void blend_attachments(const PipelineKey *k, VkPipelineColorBlendAttachme
 }
 
 /* The whole pipeline at once (no libraries) */
-static VkPipeline make_pipeline(const PipelineKey *k) {
+static VkPipeline make_pipeline(const PipelineKey *k, const Shader *vs, const Shader *ps) {
     VkPipelineShaderStageCreateInfo stages[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, k->vs, "main", NULL},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, k->ps, "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs->module, "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps ? ps->module : VK_NULL_HANDLE, "main", NULL},
     };
     VkPrimitiveTopology topo = (VkPrimitiveTopology)k->topology;
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, topo, topology_strip(topo) ? VK_TRUE : VK_FALSE};
@@ -1869,7 +1962,7 @@ static VkPipeline make_pipeline(const PipelineKey *k) {
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, 0, k->ncolor, att};
     VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncolor, k->color, k->depth,
                                         has_stencil(k->depth) ? k->depth : VK_FORMAT_UNDEFINED};
-    VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, k->ps ? 2 : 1, stages, &NO_VERTEX_INPUT, &ia, NULL, &ONE_VIEWPORT,
+    VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, ps ? 2 : 1, stages, &NO_VERTEX_INPUT, &ia, NULL, &ONE_VIEWPORT,
                                        &rs, &ONE_SAMPLE, &ds, &cbs, &DYNAMIC_INFO, layout};
     VkPipeline p = VK_NULL_HANDLE;
     u64 t0 = rt_now_ns();
@@ -2028,6 +2121,10 @@ static void *compiler(void *arg) {
         if (j.shader) {
             VkPipeline lib = shader_library(j.shader, j.polygon);
             j.shader->lib[j.polygon] = lib;
+            if (lib && j.shader->stage == SHADER_PIXEL) {   /* (its only library: the module, the SPIR-V the driver keeps, no longer needed) */
+                vkDestroyShaderModule(vk.dev, j.shader->module, NULL);
+                j.shader->module = VK_NULL_HANDLE;
+            }
             __atomic_store_n(&j.shader->lib_state[j.polygon], lib ? 2 : 3, __ATOMIC_RELEASE);
         } else {
             VkPipeline p = link_pipeline(j.pipe->libs, 1);
@@ -2136,7 +2233,7 @@ static VkPipeline get_pipeline(const PipelineKey *k, Shader *vs, Shader *ps) {
         p->fast = link_pipeline(p->libs, 0);
         if (p->fast) queue_job((Job){NULL, 0, p});
     } else
-        p->fast = make_pipeline(k);
+        p->fast = make_pipeline(k, vs, ps);
     if (!p->fast) { free(p); return VK_NULL_HANDLE; }
     pipelines[s] = (PipelineEntry){*k, p};
     npipelines++;
@@ -2169,15 +2266,98 @@ static void cache_dir(char *out, size_t n) {
     else snprintf(out, n, "%s/../spirvcache", rt_data_dir);
 }
 
-static void cache_add(const Shader *s, const u32 *code, u32 words) {
-    if (!cache_file) return;
-    CacheRecord r = {CACHE_MAGIC, words, s->stage, s->vs_outputs, {s->local[0], s->local[1], s->local[2]}, s->shared, s->hash, s->table_hash, s->vin, s->info};
-    if (fwrite(&r, sizeof r, 1, cache_file) != 1 || fwrite(code, 4, words, cache_file) != words) { fclose(cache_file); cache_file = NULL; return; }
+/* (while the file is being read: the shaders translated meanwhile, written once it is) */
+static struct { CacheRecord r; u32 *code; } *cache_pending;
+static u32 ncache_pending, cache_pending_cap;
+static int cache_loading;
+
+static void cache_write(const CacheRecord *r, const u32 *code) {
+    if (fwrite(r, sizeof *r, 1, cache_file) != 1 || fwrite(code, 4, r->words, cache_file) != r->words) { fclose(cache_file); cache_file = NULL; return; }
     fflush(cache_file);
 }
 
+static void cache_add(const Shader *s, const u32 *code, u32 words) {
+    CacheRecord r = {CACHE_MAGIC, words, s->stage, s->vs_outputs, {s->local[0], s->local[1], s->local[2]}, s->shared, s->hash, s->table_hash, s->vin, s->info};
+    if (cache_loading) {
+        if (ncache_pending == cache_pending_cap) cache_pending = realloc(cache_pending, sizeof *cache_pending * (cache_pending_cap = cache_pending_cap * 2 + 64));
+        cache_pending[ncache_pending].r = r;
+        cache_pending[ncache_pending].code = malloc(4 * (size_t)words);
+        memcpy(cache_pending[ncache_pending++].code, code, 4 * (size_t)words);
+        return;
+    }
+    if (cache_file) cache_write(&r, code);
+}
+
+/* The file read on a thread of its own (half a gigabyte of shaders took seconds, the renderer held
+ * meanwhile): each shader made a module there, and put in the cache, its library queued, under the
+ * renderer's lock - a batch at a time. A shader the game asks for first is translated as without the
+ * file; its copy from the file is then left out. */
+static char cache_path[1100];
+static void *cache_loader(void *arg) {
+    (void)arg;
+    FILE *f = fopen(cache_path, "rb");
+    long good = 0;   /* (where the last whole record ends: a write cut short is dropped) */
+    u32 *code = NULL, cap = 0, loaded = 0;
+    CacheRecord r;
+    Shader *batch[64];
+    u32 nbatch = 0;
+    for (int more = f != NULL; more || nbatch;) {
+        if (more && fread(&r, sizeof r, 1, f) == 1 && r.magic == CACHE_MAGIC && r.words && r.words < (16u << 20)) {
+            if (r.words > cap) code = realloc(code, 4 * (size_t)(cap = r.words));
+            if (fread(code, 4, r.words, f) != r.words) { more = 0; continue; }
+            good = ftell(f);
+            Shader *s = calloc(1, sizeof *s);
+            s->hash = r.hash; s->stage = r.stage; s->vs_outputs = r.vs_outputs; s->table_hash = r.table_hash; s->vin = r.vin;
+            memcpy(s->local, r.local, sizeof s->local);
+            s->shared = r.shared;
+            s->info = r.info;
+            s->from_cache = 1;
+            snprintf(s->name, sizeof s->name, "%s_%016llx", s->stage == SHADER_VERTEX ? "vs" : s->stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)s->hash);
+            VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)r.words * 4, code};
+            if (vkCreateShaderModule(vk.dev, &mi, NULL, &s->module) != VK_SUCCESS) { free(s); continue; }
+            batch[nbatch++] = s;
+            if (nbatch < 64) continue;
+        } else more = 0;
+        vk_enter();
+        for (u32 b = 0; b < nbatch; b++) {
+            Shader *s = batch[b];
+            int dup = 0;   /* (translated meanwhile, or twice in the file) */
+            if (s->vin) dup = variant_find(s->hash, s->table_hash, s->vin) != NULL;
+            else
+                for (u32 i = 0; i < shader_count && !dup; i++) {
+                    Shader *o = shader_cache[i];
+                    dup = o->hash == s->hash && o->stage == s->stage && !o->vin && o->vs_outputs == s->vs_outputs && o->table_hash == s->table_hash &&
+                          !memcmp(o->local, s->local, sizeof s->local) && o->shared == s->shared;
+                }
+            if (dup) { vkDestroyShaderModule(vk.dev, s->module, NULL); free(s); continue; }
+            if (shader_count == shader_cap) shader_cache = realloc(shader_cache, sizeof *shader_cache * (shader_cap = shader_cap * 2 + 64));
+            shader_cache[shader_count++] = s;
+            if (s->vin) variant_add(s);
+            gfx_stat_shaders++;
+            loaded++;
+            if (vk.has.gpl && s->stage != SHADER_COMPUTE) library_ready(s, 0);   /* (queued: compiled now, on the compiler threads) */
+        }
+        vk_leave();
+        nbatch = 0;
+    }
+    free(code);
+    vk_enter();   /* (the file whole again, then what was translated meanwhile) */
+    if (f) { fclose(f); truncate(cache_path, good); }
+    cache_file = fopen(cache_path, "ab");
+    cache_loading = 0;
+    for (u32 i = 0; i < ncache_pending; i++) {
+        if (cache_file) cache_write(&cache_pending[i].r, cache_pending[i].code);
+        free(cache_pending[i].code);
+    }
+    ncache_pending = 0;
+    vk_stat_cached_shaders = loaded;
+    if (loaded) fprintf(stderr, "[gfx] Vulkan: %u shaders from %s%s\n", loaded, cache_path, vk.has.gpl ? ", their libraries compiling" : "");
+    vk_leave();
+    return NULL;
+}
+
 static void cache_load(void) {
-    char dir[1024], path[1100], name[64];
+    char dir[1024], name[64], old[1100];
     cache_dir(dir, sizeof dir);
     if (!strcmp(dir, "0")) return;   /* (SSBU_SPIRV_CACHE=0: none) */
     mkdir(dir, 0755);
@@ -2185,46 +2365,15 @@ static void cache_load(void) {
     DIR *d = opendir(dir);   /* (an older translator's: gone) */
     for (struct dirent *e; d && (e = readdir(d));)
         if (!strncmp(e->d_name, "shaders_", 8) && strcmp(e->d_name, name)) {
-            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
-            unlink(path);
+            snprintf(old, sizeof old, "%s/%s", dir, e->d_name);
+            unlink(old);
         }
     if (d) closedir(d);
-    snprintf(path, sizeof path, "%s/%s", dir, name);
-    FILE *f = fopen(path, "rb");
-    long good = 0;   /* (where the last whole record ends: a write cut short is dropped) */
-    u32 *code = NULL, cap = 0;
-    CacheRecord r;
-    while (f && fread(&r, sizeof r, 1, f) == 1 && r.magic == CACHE_MAGIC && r.words && r.words < (16u << 20)) {
-        if (r.words > cap) code = realloc(code, 4 * (size_t)(cap = r.words));
-        if (fread(code, 4, r.words, f) != r.words) break;
-        good = ftell(f);
-        int dup = 0;
-        for (u32 i = 0; i < shader_count && !dup; i++) {
-            Shader *o = shader_cache[i];
-            dup = o->hash == r.hash && o->stage == r.stage && o->vs_outputs == r.vs_outputs && o->table_hash == r.table_hash && o->vin == r.vin &&
-                  !memcmp(o->local, r.local, sizeof r.local) && o->shared == r.shared;
-        }
-        if (dup) continue;
-        Shader *s = calloc(1, sizeof *s);
-        s->hash = r.hash; s->stage = r.stage; s->vs_outputs = r.vs_outputs; s->table_hash = r.table_hash; s->vin = r.vin;
-        memcpy(s->local, r.local, sizeof s->local);
-        s->shared = r.shared;
-        s->info = r.info;
-        snprintf(s->name, sizeof s->name, "%s_%016llx", s->stage == SHADER_VERTEX ? "vs" : s->stage == SHADER_PIXEL ? "ps" : "cs", (unsigned long long)s->hash);
-        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)r.words * 4, code};
-        if (vkCreateShaderModule(vk.dev, &mi, NULL, &s->module) != VK_SUCCESS) { free(s); continue; }
-        if (shader_count == shader_cap) shader_cache = realloc(shader_cache, sizeof *shader_cache * (shader_cap = shader_cap * 2 + 64));
-        shader_cache[shader_count++] = s;
-        if (s->vin) variant_add(s);
-        gfx_stat_shaders++;
-        vk_stat_cached_shaders++;
-        if (vk.has.gpl && s->stage != SHADER_COMPUTE) library_ready(s, 0);   /* (queued: compiled now, on the compiler threads) */
-    }
-    free(code);
-    if (f) { fclose(f); truncate(path, good); }
-    cache_file = fopen(path, "ab");
-    if (vk_stat_cached_shaders)
-        fprintf(stderr, "[gfx] Vulkan: %u shaders from %s%s\n", vk_stat_cached_shaders, path, vk.has.gpl ? ", their libraries compiling" : "");
+    snprintf(cache_path, sizeof cache_path, "%s/%s", dir, name);
+    cache_loading = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, cache_loader, NULL) != 0) { cache_loading = 0; cache_file = fopen(cache_path, "ab"); return; }
+    pthread_detach(t);
 }
 
 /* ---- rendering -------------------------------------------------------------------------------------- */
@@ -2688,8 +2837,8 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     /* the pipeline's fixed state */
     PipelineKey key;
     memset(&key, 0, sizeof key);
-    key.vs = vs->module;
-    key.ps = ps ? ps->module : VK_NULL_HANDLE;
+    key.vs = vs;
+    key.ps = ps;
     key.ncolor = ncolor;
     for (u32 i = 0; i < ncolor; i++) key.color[i] = color[i] ? color[i]->view_format : VK_FORMAT_UNDEFINED;
     key.depth = depth ? depth->view_format : VK_FORMAT_UNDEFINED;
@@ -2777,7 +2926,7 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
         if (v && (!vk.has.gpl || library_ready(v, key.polygon == VK_POLYGON_MODE_LINE))) vsx = v;
     }
     int use_vin = vsx != vs;
-    if (use_vin) { key.vs = vsx->module; vk_stat_vertex_input_draws++; }
+    if (use_vin) { key.vs = vsx; vk_stat_vertex_input_draws++; }
     VkPipeline pipeline = get_pipeline(&key, vsx, ps);
     if (!pipeline) { gfx_stat_skipped++; gfx_skip_shader++; vk_leave(); return; }
 
@@ -3089,6 +3238,7 @@ void vk_gfx_dispatch(const u32 *regs, const u32 *q) {
         Resident *over = resident_overlapping(va, size);
         if (learned) {
             Resident *res = written ? resident_acquire(va, size) : over ? resident_covering(va, va + size) : NULL;
+            if (res && written) res->written_at = gfx_stat_presented;
             if (res) { b[0].sb[k] = resident_desc(res, va, size, &params.sb[0][k][3]); continue; }
             if (!written && !over && input_buffer(va, size, &b[0].sb[k])) continue;   /* only read: kept */
         } else if (over)
@@ -3363,10 +3513,11 @@ void vk_draw_presenting(void) {
         memset(vin_why, 0, sizeof vin_why);
         last_composed = gfx_stat_composed;
         last_pages = gfx_stat_resident_pages;
-        fprintf(stderr, "[vk stats]   device memory: %llu allocations, %.1f MB, %.0f ms; residents made %llu, input buffers made %llu, textures made %llu\n",
+        fprintf(stderr, "[vk stats]   device memory: %llu allocations, %.1f MB, %.0f ms; residents made %llu (retired %llu), input buffers made %llu, textures made %llu (images reused %llu)\n",
                 (unsigned long long)vk_stat_allocs, vk_stat_alloc_bytes / 1048576.0, vk_stat_alloc_ns / 1e6, (unsigned long long)vk_stat_residents_made,
-                (unsigned long long)vk_stat_inputs_made, (unsigned long long)vk_stat_textures_made);
-        vk_stat_allocs = vk_stat_alloc_bytes = vk_stat_alloc_ns = vk_stat_residents_made = vk_stat_inputs_made = vk_stat_textures_made = 0;
+                (unsigned long long)vk_stat_residents_retired, (unsigned long long)vk_stat_inputs_made, (unsigned long long)vk_stat_textures_made, (unsigned long long)vk_stat_images_reused);
+        vk_stat_images_reused = 0;
+        vk_stat_allocs = vk_stat_alloc_bytes = vk_stat_alloc_ns = vk_stat_residents_made = vk_stat_inputs_made = vk_stat_textures_made = vk_stat_residents_retired = 0;
         fprintf(stderr, "[vk stats]   shaders translated %llu in %.0f ms (modules %.0f ms); pipelines made %llu, libraries %llu, in %.0f ms; "
                         "links %.0f ms, optimized ones %.0f ms; draws skipped compiling %llu; %ld compiles pending\n",
                 (unsigned long long)vk_stat_translated, vk_stat_translate_ns / 1e6, vk_stat_module_ns / 1e6, (unsigned long long)vk_stat_pipelines_made,
@@ -3382,6 +3533,7 @@ void vk_draw_presenting(void) {
         gfx_stat_upload_bytes = 0;
     }
     note_writes();
+    residents_retire();
     gpu_times_frame();
     release_graves();
     blocks_release();
