@@ -1318,22 +1318,22 @@ static void residents_ranges(WatchRange *out, u32 *n, u32 cap) {
     }
 }
 
-/* Regions no dispatch (or copy) has written for 5 s - a battle's, once it is over - given back to
+/* Regions no dispatch (or copy) has written for 2 s - a battle's, once it is over - given back to
  * guest memory and dropped: the game reuses that memory for other data, and every draw reading
  * near a region it covers went the composed way (a copy, barriers, the rendering broken: hundreds
  * a frame, the next battle at 40 FPS). What the CPU wrote in them is taken first, so what goes back
- * is memory as the GPU and the CPU left it; all of them read back together, one wait. Every 2 s. */
+ * is memory as the GPU and the CPU left it; all of them read back together, one wait. Every 0.5 s. */
 u64 vk_stat_residents_retired;
 static void residents_retire(void) {
     static u64 last;
-    if (gfx_stat_presented - last < 120) return;
+    if (gfx_stat_presented - last < 30) return;
     last = gfx_stat_presented;
     static struct { u32 index; u8 *at; u64 lo, hi; } back[64];
     u32 nback = 0;
     u64 bytes = 0;
     for (u32 i = 0; i < nresidents && nback < 64; i++) {
         Resident *r = &residents[i];
-        if (gfx_stat_presented - r->written_at < 300 || bytes + r->cap > (64u << 20)) continue;
+        if (gfx_stat_presented - r->written_at < 120 || bytes + r->cap > (64u << 20)) continue;
         resident_sync(r, 1);
         gpu_write_begin();
         VkBuffer rb;
