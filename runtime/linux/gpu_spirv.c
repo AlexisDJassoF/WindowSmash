@@ -687,6 +687,18 @@ static void emit_exit(Sx *c) {
             c->info->color_mask |= 1u << rt;
             u32 v[4];
             for (u32 k = 0; k < 4; k++) v[k] = m >> k & 1 ? F(c, reg++) : c->c_f0;
+            if (rt == 0) {   /* the fixed-function alpha test on target 0's alpha: DrawParams.base z its function (D3D's 1-8; 0 off), w its reference */
+                u32 func = param(c, P_BASE, ~0u, 2, 0), ref = asfloat(c, param(c, P_BASE, ~0u, 3, 0)), a = v[3];   /* (base is uint4: the reference's bits) */
+                static const SpvOp cmp[8] = {0, 0, SpvOpFOrdLessThan, SpvOpFOrdEqual, SpvOpFOrdLessThanEqual, SpvOpFOrdGreaterThan, SpvOpFOrdNotEqual,
+                                             SpvOpFOrdGreaterThanEqual};
+                u32 pass = lor(c, ieq(c, func, c->c_u0), ieq(c, func, U(c, 8)));
+                for (u32 f = 2; f < 8; f++) pass = lor(c, pass, land(c, ieq(c, func, U(c, f)), op2(c, cmp[f], c->t_bool, a, ref)));
+                spv_extension(B, "SPV_EXT_demote_to_helper_invocation");
+                spv_capability(B, SpvCapabilityDemoteToHelperInvocationEXT);
+                u32 merge = if_begin(c, SPV_VAL(B, SpvOpLogicalNot, c->t_bool, pass));
+                spv_do(B, SpvOpDemoteToHelperInvocationEXT, 0, NULL);
+                if_end(c, merge);
+            }
             SPV_DO(B, SpvOpStore, c->out_color[rt], SPV_VAL(B, SpvOpCompositeConstruct, c->t_v4f, v[0], v[1], v[2], v[3]));
         }
         if (flags & 2) { c->info->writes_depth = 1; SPV_DO(B, SpvOpStore, c->out_depth, F(c, reg + 1)); }

@@ -2911,6 +2911,11 @@ void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     }
     params.base[0] = regs[M_GLOBAL_BASE_VERTEX];
     params.base[1] = regs[M_GLOBAL_BASE_INSTANCE] + instance_counter;
+    if (regs[M_ALPHA_TEST] & 1) {   /* the alpha test (no such state in Vulkan: the pixel shader discards), its function as D3D's 1-8 */
+        u32 f = regs[M_ALPHA_FUNC];
+        params.base[2] = f >= 0x200 && f <= 0x207 ? f - 0x200 + 1 : f >= 1 && f <= 8 ? f : 8;
+        params.base[3] = regs[M_ALPHA_REF];
+    }
     Binding b[2];
     memset(b, 0, sizeof b);
     bind_stage(regs, cb, SHADER_VERTEX, vs, &params, &b[0]);
