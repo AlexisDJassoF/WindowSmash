@@ -52,6 +52,10 @@ u32 gpu_syncpt_min[SYNCPT_MAX], gpu_syncpt_max[SYNCPT_MAX];
 static u64 *page_dir[TOP_COUNT];
 static struct { u64 va, size; } *map_sizes;
 static u32 map_count, map_cap, next_handle = 1, next_syncpoint = 20;
+/* nvmap handles: how many Create/FromId references each has; one freed by its last reference goes to
+ * the next Create - the game makes and frees handles all the time, and a match uses thousands */
+static u16 map_refs[NVMAP_MAX];
+static u32 free_handles[NVMAP_MAX], nfree_handles;
 static u64 next_va = 0x100000000ull;   /* bump allocator for VA requests without a fixed address */
 
 static BOOL CALLBACK init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
@@ -249,13 +253,19 @@ static u32 address_space(u32 nr, u64 a, u32 request) {
 static u32 nvmap(u32 nr, u64 a, u32 request) {
     switch (nr) {
     case 0x01: {                                                          /* Create */
-        u32 h = next_handle++;
+        u32 h = nfree_handles ? free_handles[--nfree_handles] : next_handle++;
         if (h >= NVMAP_MAX) rt_fatal("nvdrv: out of nvmap handles");
         gpu_maps[h] = (NvMap){ld32(a), 0, 0x1000, 0};
+        map_refs[h] = 1;
         st32(a + 4, h);
         return NV_OK;
     }
-    case 0x03: st32(a + 4, ld32(a)); return NV_OK;                        /* FromId: ids are handles */
+    case 0x03: {                                                          /* FromId: ids are handles */
+        u32 h = ld32(a);
+        if (h && h < NVMAP_MAX && map_refs[h] && map_refs[h] < 0xFFFF) map_refs[h]++;
+        st32(a + 4, h);
+        return NV_OK;
+    }
     case 0x04: {                                                          /* Alloc */
         u32 h = ld32(a);
         if (!h || h >= NVMAP_MAX) return NV_BAD_PARAMETER;
@@ -270,6 +280,10 @@ static u32 nvmap(u32 nr, u64 a, u32 request) {
         st64(a + 8, gpu_maps[h].addr);
         st32(a + 16, (u32)gpu_maps[h].size);
         st32(a + 20, 0);
+        if (map_refs[h] && !--map_refs[h]) {
+            gpu_maps[h] = (NvMap){0};
+            free_handles[nfree_handles++] = h;
+        }
         return NV_OK;
     }
     case 0x09: {                                                          /* Param */
