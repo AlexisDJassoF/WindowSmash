@@ -18,7 +18,11 @@
  *   SSBU_NET_DIRECT=0       no direct connections: all of a room's traffic through the lobby, and the
  *                           lobby gives this player's internet address to nobody
  *   SSBU_NET_LOG=1          log every socket/network call (debugging)
- * With neither set the game stays offline, as before. */
+ *   SSBU_NET_LAN=1          LAN mode instead: no relay, no virtual LAN - the game's sockets are
+ *                           this PC's own, on its own network, where a Switch in the game's LAN
+ *                           mode (Local Wireless, then L+R+left stick) plays with it.
+ *                           SSBU_NET_LAN_IP picks the address (else the one the PC goes out on)
+ * With none set the game stays offline, as before. */
 #pragma once
 #include "recomp.h"
 
@@ -50,6 +54,20 @@ void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const voi
 /* (hle_net.c) Whether this player is in a local wireless network now, the player at ip one of its
  * nodes: only then do that player's direct packets reach the game. */
 int ldn_in_network(u32 ip);
+
+/* This player's network: the virtual LAN's, or in LAN mode the PC's own (host order). */
+u32 net_mask(void);
+u32 net_gateway(void);
+u32 net_broadcast(void);
+
+/* LAN mode: each of the game's datagram sockets (by its fd) is a socket of the PC's, bound to the
+ * same port on every address of the PC. */
+int net_lan(void);
+int net_lan_open(int fd, u16 *port);   /* bind to *port (0: one the system picks, written back): 0, or -1 */
+void net_lan_close(int fd);
+int net_lan_send(int fd, u32 dst_ip, u16 dst_port, const void *data, u32 len);   /* 0, or -1 */
+/* (hle_net.c) A datagram the PC's socket for fd (bound to port) received. */
+void vsock_lan_deliver(int fd, u16 port, u32 src_ip, u16 src_port, const void *data, u32 len);
 
 /* One line about the connection for the overlay (empty when netplay is off). */
 void net_status(char *out, size_t n);

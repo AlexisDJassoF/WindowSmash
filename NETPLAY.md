@@ -14,6 +14,7 @@ WindowSmash plays the game's **Local Wireless** mode over the internet. To the g
 - [Online lobby](#online-lobby)
 - [Direct connections and your internet address](#direct-connections-and-your-internet-address)
 - [Private room](#private-room)
+- [With a Switch on your network (LAN mode)](#with-a-switch-on-your-network-lan-mode)
 - [If a room doesn't appear](#if-a-room-doesnt-appear)
 - [Run your own lobby](#run-your-own-lobby)
 - [Logs and privacy](#logs-and-privacy)
@@ -27,10 +28,11 @@ WindowSmash plays the game's **Local Wireless** mode over the internet. To the g
 | [**Lobby code**](#friends-only-a-lobby-code) | Friends only, through the lobby | None | `Play SSBU.bat` |
 | [**Private room**](#private-room) | A group with one host | The host may need to open a port | `Host SSBU Netplay.bat` and `Join SSBU Netplay.bat` |
 | [**Your own lobby**](#run-your-own-lobby) | Communities with a server | The server's port | `Play SSBU.bat` |
+| [**LAN mode**](#with-a-switch-on-your-network-lan-mode) | A Switch (or PCs) on the same home network | None | `Play SSBU LAN.bat` |
 
 The online lobby is the easiest: nobody hosts anything outside the game, and nobody touches their router.
 
-On Linux ([README-LINUX.md](README-LINUX.md)), `run.sh`, `run-offline.sh`, `host-netplay.sh` and `join-netplay.sh` do what `Play SSBU.bat`, `Play SSBU Offline.bat`, `Host SSBU Netplay.bat` and `Join SSBU Netplay.bat` do. Windows and Linux players with the same game version play together.
+On Linux ([README-LINUX.md](README-LINUX.md)), `run.sh`, `run-offline.sh`, `run-lan.sh`, `host-netplay.sh` and `join-netplay.sh` do what `Play SSBU.bat`, `Play SSBU Offline.bat`, `Play SSBU LAN.bat`, `Host SSBU Netplay.bat` and `Join SSBU Netplay.bat` do. Windows and Linux players with the same game version play together.
 
 ## Before you play
 
@@ -145,6 +147,26 @@ Joining players don't need to change anything on their routers.
 
 If your internet provider uses carrier-grade NAT, or your router sits behind another router, forwarding a port at home may not be enough. A virtual LAN, a relay on a server, or the [online lobby](#online-lobby) is usually easier.
 
+## With a Switch on your network (LAN mode)
+
+> [!NOTE]
+> **Experimental, not yet tested against a console.** The PC side starts and uses the network; whether a Switch sees its rooms hasn't been verified.
+
+The game has a LAN mode of its own, made for tournaments: instead of the console's local wireless radio it plays over an ordinary network (Wi-Fi or cable). `Play SSBU LAN.bat` (`run-lan.sh` on Linux) gives the game this PC's own network instead of the virtual one the lobby builds, so a Switch on the same network can play with it. The Switch needs no modification, no homebrew and no Nintendo Switch Online.
+
+1. Connect the Switch to the same network as the PC (*System Settings > Internet*). The PC and the Switch have to be on the same subnet, for example both `192.168.1.x`.
+2. Make sure the Switch has the **same game version** as the PC (*Smash's* version, for example 13.0.x). Different versions don't see each other's rooms.
+3. Start the game on the PC with `Play SSBU LAN.bat` (or `bash run-lan.sh`, which uses the Vulkan renderer unless `SSBU_RENDERER` says otherwise).
+4. On **both** the Switch and the PC: in the main menu choose **Local Wireless**, then press **L + R + left stick (click)** together. The screen's title changes to **LAN mode**.
+5. One side creates a room, the other joins it from the room list.
+
+If the room doesn't show up:
+
+- Let the game through the PC's firewall: UDP, incoming, on your home network (on Windows, accept the prompt as *Private network*; on Linux, for example `sudo ufw allow from 192.168.1.0/24 proto udp`).
+- Some routers keep Wi-Fi devices apart (*AP isolation*, *client isolation*, a guest network). Turn it off, or connect the PC by cable.
+- On a PC with more than one network (VPN, virtual machines, Docker), set `SSBU_NET_LAN_IP` to the PC's address on the Switch's network. The overlay (<kbd>F2</kbd>) shows the address the game uses.
+- `SSBU_NET_LOG=2` logs every datagram the PC receives (`[net] lan: ...`).
+
 ## If a room doesn't appear
 
 | What you see | What to check |
@@ -202,6 +224,8 @@ The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG
 | `SSBU_NET_BIND` | Limit which address the built-in relay listens on; used by local tests. |
 | `SSBU_NET_DIRECT=0` | Online, send all traffic through the lobby. `Play SSBU.bat` sets it when `online_direct.txt` says `off`. |
 | `SSBU_NET_TEST_NAT=1`, `SSBU_NET_TEST_BLOCK=<seconds>` | Local tests: filter incoming packets as a router would, or cut direct paths that many seconds after the start. |
+| `SSBU_NET_LAN=1` | LAN mode: no lobby or relay, the game's sockets are the PC's own on its own network. `Play SSBU LAN.bat` sets it. |
+| `SSBU_NET_LAN_IP` | In LAN mode, the PC's address to use. Default: the one the PC reaches the internet by. |
 | `SSBU_NET_LOG=1` / `2` | Network logging: a summary, or more detail. |
 
 Without a host or relay setting, the game stays offline. `Play SSBU Offline.bat` clears both; `Play SSBU.bat` takes the relay from `online_server.txt`; the host and join launchers set their own.

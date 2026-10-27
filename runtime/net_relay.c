@@ -40,6 +40,7 @@
 #define _CRT_RAND_S
 #define COBJMACROS
 #ifdef _WIN32
+#define FD_SETSIZE 256   /* (LAN mode waits on every socket of the game's at once) */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
@@ -47,8 +48,10 @@
 #include <oleauto.h>
 #else
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -89,7 +92,7 @@ static u64 now_ms(void) { return GetTickCount64(); }
 static void header(u8 *p, int type) { p[0] = MAGIC0; p[1] = MAGIC1; p[2] = NET_PROTOCOL; p[3] = (u8)type; }
 
 /* ---- configuration ------------------------------------------------------------------ */
-static int configured = -1, hosting, logging;
+static int configured = -1, hosting, logging, lan_mode;
 static char relay_text[256], room[NAME_LEN + 1] = "smash", name[NAME_LEN + 1] = "Player";
 static u16 port = NET_DEFAULT_PORT;
 static int direct_ok = 1, test_nat;   /* SSBU_NET_DIRECT; SSBU_NET_TEST_NAT (tests) */
@@ -119,6 +122,7 @@ static void configure(void) {
     if ((v = getenv("SSBU_NET_NAME")) && *v) snprintf(name, sizeof name, "%s", v);
     if ((v = getenv("SSBU_NET_LOG"))) logging = atoi(v) > 0 ? atoi(v) : 1;
     if ((v = getenv("SSBU_NET_DIRECT")) && !strcmp(v, "0")) direct_ok = 0;
+    if ((v = getenv("SSBU_NET_LAN")) && *v && strcmp(v, "0")) { lan_mode = 1; hosting = 0; configured = 1; return; }
     /* (tests) SSBU_NET_TEST_NAT=1: let in direct packets only from addresses sent to lately, as a
      * router does; SSBU_NET_TEST_BLOCK=<seconds after the game started>: drop every direct packet
      * from then on, as if a firewall closed the path (0: from the start, as a symmetric NAT) */
@@ -416,8 +420,17 @@ static u64 nonce, cookie, last_pong, unjoined_since;
 static volatile LONG members, rooms_open, ping_ms = -1;
 static char reject_text[80], member_names[ROOM_MEMBERS][NAME_LEN + 1];
 
-u32 net_local_ip(void) { start(); return joined ? my_ip : 0; }
-int net_unreachable(void) { start(); return configured && !joined && now_ms() - unjoined_since > UNREACHABLE_MS; }
+static u32 lan_my_ip, lan_my_mask;   /* LAN mode: this PC's address and its network's mask */
+
+u32 net_local_ip(void) { start(); return lan_mode ? lan_my_ip : joined ? my_ip : 0; }
+int net_unreachable(void) {
+    start();
+    return lan_mode ? !lan_my_ip : configured && !joined && now_ms() - unjoined_since > UNREACHABLE_MS;
+}
+int net_lan(void) { configure(); return lan_mode; }
+u32 net_mask(void) { start(); return lan_mode ? lan_my_mask : NET_MASK; }
+u32 net_gateway(void) { start(); return lan_mode ? (lan_my_ip & lan_my_mask) | 1 : NET_GATEWAY; }   /* (LAN: a guess, x.x.x.1) */
+u32 net_broadcast(void) { start(); return lan_mode ? lan_my_ip | ~lan_my_mask : NET_BROADCAST; }
 int net_lobby(void) { start(); return joined && lobby; }
 
 /* ---- direct connections (the online lobby's rooms) -------------------------------------
@@ -930,6 +943,149 @@ static void leave(void) {
     sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
 }
 
+/* ---- LAN mode ------------------------------------------------------------------------
+ * No relay: each of the game's datagram sockets is one of this PC's, bound to the same port on
+ * every address (broadcasts reach it too), so the game meets consoles on the PC's own network
+ * as a console does - the game's LAN mode. A broadcast goes to the network's broadcast address
+ * (255.255.255.255 would leave by one interface alone). One thread waits on every socket and
+ * hands what arrives to the game's (vsock_lan_deliver); a closed socket is closed by that thread,
+ * after it has finished with it. */
+#define LAN_FDS 256
+static SOCKET lan_socks[LAN_FDS];
+static u16 lan_ports[LAN_FDS];
+static SOCKET lan_closing[LAN_FDS];   /* closed by the thread (each socket at most once in it) */
+static int lan_nclosing;
+static SRWLOCK lan_lock = SRWLOCK_INIT;
+
+static u32 interface_mask(u32 ip) {   /* the mask of the interface with this address, or 0 */
+    u32 mask = 0;
+#ifdef _WIN32
+    INTERFACE_INFO list[32];
+    DWORD bytes = 0;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s != INVALID_SOCKET && !WSAIoctl(s, SIO_GET_INTERFACE_LIST, NULL, 0, list, sizeof list, &bytes, NULL, NULL))
+        for (DWORD i = 0; i < bytes / sizeof list[0] && !mask; i++)
+            if (ntohl(list[i].iiAddress.AddressIn.sin_addr.s_addr) == ip) mask = ntohl(list[i].iiNetmask.AddressIn.sin_addr.s_addr);
+    if (s != INVALID_SOCKET) closesocket(s);
+#else
+    struct ifaddrs *all = NULL;
+    if (!getifaddrs(&all))
+        for (struct ifaddrs *i = all; i && !mask; i = i->ifa_next)
+            if (i->ifa_addr && i->ifa_netmask && i->ifa_addr->sa_family == AF_INET &&
+                ntohl(((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr) == ip)
+                mask = ntohl(((struct sockaddr_in *)i->ifa_netmask)->sin_addr.s_addr);
+    if (all) freeifaddrs(all);
+#endif
+    return mask;
+}
+
+static DWORD WINAPI lan_thread(LPVOID unused) {
+    static u8 buf[65536];
+    SOCKET s[LAN_FDS];
+    int fd[LAN_FDS];
+    u16 port[LAN_FDS];
+    (void)unused;
+    for (;;) {
+        int n = 0;
+        AcquireSRWLockExclusive(&lan_lock);
+        for (int i = 0; i < lan_nclosing; i++) closesocket(lan_closing[i]);
+        lan_nclosing = 0;
+        for (int i = 0; i < LAN_FDS; i++)
+            if (lan_socks[i] != INVALID_SOCKET) { s[n] = lan_socks[i]; fd[n] = i; port[n] = lan_ports[i]; n++; }
+        ReleaseSRWLockExclusive(&lan_lock);
+        if (!n) { Sleep(20); continue; }
+        fd_set ready;
+        FD_ZERO(&ready);
+        int top = 0;
+        for (int i = 0; i < n; i++) { FD_SET(s[i], &ready); if ((int)s[i] > top) top = (int)s[i]; }
+        struct timeval wait = {0, 20000};   /* (sockets opened meanwhile are waited on from the next round) */
+        if (select(top + 1, &ready, NULL, NULL, &wait) <= 0) continue;
+        for (int i = 0; i < n; i++) {
+            if (!FD_ISSET(s[i], &ready)) continue;
+            struct sockaddr_in from;
+            socklen_t flen = sizeof from;
+            int got = recvfrom(s[i], (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
+            if (got < 0 || from.sin_family != AF_INET) continue;
+            u32 src = ntohl(from.sin_addr.s_addr);
+            if (logging > 1) fprintf(stderr, "[net] lan: %d bytes from %u.%u.%u.%u:%u to port %u\n", got, src >> 24, src >> 16 & 255,
+                                     src >> 8 & 255, src & 255, ntohs(from.sin_port), port[i]);
+            vsock_lan_deliver(fd[i], port[i], src, ntohs(from.sin_port), buf, (u32)got);
+        }
+    }
+}
+
+static void lan_drop(int fd) {   /* (lan_lock held exclusively) */
+    if (lan_socks[fd] == INVALID_SOCKET) return;
+    if (lan_nclosing < LAN_FDS) lan_closing[lan_nclosing++] = lan_socks[fd];
+    else closesocket(lan_socks[fd]);
+    lan_socks[fd] = INVALID_SOCKET;
+}
+
+int net_lan_open(int fd, u16 *want) {
+    if (fd < 0 || fd >= LAN_FDS) return -1;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return -1;
+    int one = 1, big = 1 << 20;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);   /* (a port just closed can be taken again at once) */
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof big);
+    no_connreset(s);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(*want);
+    socklen_t len = sizeof a;
+    if (bind(s, (struct sockaddr *)&a, sizeof a) || getsockname(s, (struct sockaddr *)&a, &len)) {
+        if (logging) fprintf(stderr, "[net] lan: cannot bind UDP port %u (in use?)\n", *want);
+        closesocket(s);
+        return -1;
+    }
+    *want = ntohs(a.sin_port);
+    AcquireSRWLockExclusive(&lan_lock);
+    lan_drop(fd);
+    lan_socks[fd] = s;
+    lan_ports[fd] = *want;
+    ReleaseSRWLockExclusive(&lan_lock);
+    if (logging) fprintf(stderr, "[net] lan: socket %d on UDP port %u\n", fd, *want);
+    return 0;
+}
+
+void net_lan_close(int fd) {
+    if (fd < 0 || fd >= LAN_FDS) return;
+    AcquireSRWLockExclusive(&lan_lock);
+    lan_drop(fd);
+    ReleaseSRWLockExclusive(&lan_lock);
+}
+
+int net_lan_send(int fd, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
+    if (fd < 0 || fd >= LAN_FDS) return -1;
+    if (dst_ip == 0xFFFFFFFFu || dst_ip == NET_BROADCAST) dst_ip = net_broadcast();
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(dst_port);
+    a.sin_addr.s_addr = htonl(dst_ip);
+    AcquireSRWLockShared(&lan_lock);   /* (not closed meanwhile) */
+    SOCKET s = lan_socks[fd];
+    int r = s == INVALID_SOCKET ? -1 : sendto(s, (const char *)data, (int)len, 0, (const struct sockaddr *)&a, sizeof a);
+    ReleaseSRWLockShared(&lan_lock);
+    if (r < 0 && logging) fprintf(stderr, "[net] lan: send to %u.%u.%u.%u:%u failed\n", dst_ip >> 24, dst_ip >> 16 & 255, dst_ip >> 8 & 255, dst_ip & 255, dst_port);
+    return r < 0 ? -1 : 0;
+}
+
+static void lan_start(void) {
+    for (int i = 0; i < LAN_FDS; i++) lan_socks[i] = INVALID_SOCKET;
+    const char *v = getenv("SSBU_NET_LAN_IP");
+    struct in_addr chosen;
+    u32 ip = v && *v && inet_pton(AF_INET, v, &chosen) == 1 ? ntohl(chosen.s_addr) : outbound_address();
+    u32 mask = ip ? interface_mask(ip) : 0;
+    if (!mask) mask = 0xFFFFFF00u;   /* (not found: the usual home network's) */
+    lan_my_mask = mask;
+    lan_my_ip = ip;
+    if (!ip) fprintf(stderr, "[net] LAN mode: this PC has no network address (set SSBU_NET_LAN_IP) - playing offline\n");
+    else fprintf(stderr, "[net] LAN mode: address %u.%u.%u.%u, mask %u.%u.%u.%u\n", ip >> 24, ip >> 16 & 255, ip >> 8 & 255,
+                 ip & 255, mask >> 24, mask >> 16 & 255, mask >> 8 & 255, mask & 255);
+    CloseHandle(CreateThread(NULL, 0, lan_thread, NULL, 0, NULL));
+}
+
 /* Started on first use (the overlay asks every frame), once Winsock is up. */
 static void start(void) {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -945,6 +1101,7 @@ static void start(void) {
 #else
         struct timeval timeout = {0, 100000};
 #endif
+        if (lan_mode) { lan_start(); InitOnceComplete(&once, 0, NULL); return; }
         unsigned int r1, r2;
         rand_s(&r1); rand_s(&r2);
         nonce = (u64)r1 << 32 | r2;
@@ -985,6 +1142,13 @@ static void start(void) {
 void net_status(char *out, size_t n) {
     start();
     if (!configured) { if (n) out[0] = 0; return; }
+    if (lan_mode) {
+        u32 ip = lan_my_ip;
+        if (!ip) snprintf(out, n, "LAN mode: no network address - playing offline");
+        else snprintf(out, n, "LAN mode: %s at %u.%u.%u.%u - Local Wireless, then L+R+left stick for LAN play", name, ip >> 24,
+                      ip >> 16 & 255, ip >> 8 & 255, ip & 255);
+        return;
+    }
     if (reject_text[0] && !joined) { snprintf(out, n, "Netplay: %s", reject_text); return; }
     if (!joined && net_unreachable()) { snprintf(out, n, "Netplay: no answer from %s - playing offline (still trying)", relay_text); return; }
     if (!joined) { snprintf(out, n, "Netplay: connecting to %s...", relay_text); return; }

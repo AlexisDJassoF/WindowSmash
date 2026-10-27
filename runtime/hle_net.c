@@ -1,7 +1,9 @@
 /* The game's network, natively: nn::nifm (is there a network, which address is mine),
  * nn::ldn (local wireless: networks hosted, found and joined over the virtual LAN - what the
  * game's Local Wireless rooms run on) and nn::socket, the BSD socket API, here a small UDP
- * stack on the virtual LAN of runtime/net.h.
+ * stack on the virtual LAN of runtime/net.h - or in LAN mode (SSBU_NET_LAN) the same stack with
+ * each datagram socket carried by one of the PC's, on its own network, as the game's LAN play
+ * with consoles needs.
  *
  * Without netplay configured the network is unavailable, as on a console that is offline.
  *
@@ -55,7 +57,7 @@ HLE(_ZN2nn4nifm20CancelNetworkRequestEv) { (void)c; }
 HLE(_ZN2nn4nifm31HandleNetworkRequestErrorResultEv) { c->x[0] = network_up() ? 0 : R_UNAVAILABLE; }
 HLE(_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_) {   /* address, mask, gateway, two DNS servers */
     if (!network_up()) { c->x[0] = R_UNAVAILABLE; return; }
-    u32 v[5] = {net_local_ip(), NET_MASK, NET_GATEWAY, NET_GATEWAY, 0};
+    u32 v[5] = {net_local_ip(), net_mask(), net_gateway(), net_gateway(), 0};
     for (int i = 0; i < 5; i++) if (c->x[i]) st32(c->x[i], _byteswap_ulong(v[i]));
     if (net_log()) fprintf(stderr, "[net] nifm: address %u.%u.%u.%u\n", v[0] >> 24, v[0] >> 16 & 255, v[0] >> 8 & 255, v[0] & 255);
     c->x[0] = 0;
@@ -545,7 +547,7 @@ HLE(_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE) { LDN_TRACE;   /* intent
 HLE(_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE) { LDN_TRACE;
     if (!net_local_ip()) { c->x[0] = R_LDN_STATE; return; }
     st32(c->x[0], net_local_ip());
-    st32(c->x[1], NET_MASK);
+    st32(c->x[1], net_mask());
     c->x[0] = 0;
 }
 HLE(_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE) { LDN_TRACE;   /* data[16], session id[16] */
@@ -587,6 +589,7 @@ HLE(_ZN2nn3ldn32SetWirelessControllerRestrictionENS0_29WirelessControllerRestric
 typedef struct Datagram { struct Datagram *next; u32 src_ip, len; u16 src_port; u8 data[]; } Datagram;
 typedef struct VSock {
     int open, type, flags, nonblock, broadcast, reuse, shut_rd, shut_wr;
+    int lan;                  /* (LAN mode) carried by a socket of the PC's on its port */
     u32 ip, peer_ip;          /* bound address (0: any) and connected peer, host order */
     u16 port, peer_port;      /* bound port (0: not bound yet), connected peer's (0: none) */
     u32 rcvtimeo_ms, rcvbuf, sndbuf;
@@ -605,6 +608,7 @@ static VSock *sock_of(i32 fd) {
     if (fd < FD_BASE || fd >= FD_BASE + VSOCKS || !socks[fd - FD_BASE].open) return NULL;
     return &socks[fd - FD_BASE];
 }
+static i32 fd_of(const VSock *s) { return (i32)(s - socks) + FD_BASE; }
 
 static void set_errno(Cpu *c, int e) {
     u64 p = rt_symbol("__errno_location") ? rt_callsym(c, "__errno_location", 0) : 0;
@@ -656,10 +660,36 @@ static u16 ephemeral(const VSock *self) {
     return 0;
 }
 
+/* Bind s to port (0: an ephemeral one): in LAN mode a datagram socket takes the PC's own socket
+ * on it too. 0, or an errno. (lock held) */
+static int take_port(VSock *s, u16 port) {
+    if (port && port_taken(s, port)) return E_ADDRINUSE;
+    if (net_lan() && s->type == SOCK_DGRAM_) {
+        if (net_lan_open(fd_of(s), &port)) return E_ADDRINUSE;
+        s->lan = 1;
+    } else if (!port && !(port = ephemeral(s))) return E_ADDRINUSE;
+    s->port = port;
+    return 0;
+}
+
 static void drop_queue(VSock *s) {
     while (s->head) { Datagram *d = s->head; s->head = d->next; free(d); }
     s->tail = NULL;
     s->queued = s->queued_bytes = 0;
+}
+
+static int enqueue(VSock *s, u32 src_ip, u16 src_port, const void *data, u32 len) {   /* (lock held) 1: queued */
+    if (s->peer_port && (s->peer_ip != src_ip || s->peer_port != src_port)) return 0;   /* connected elsewhere */
+    if (s->queued >= 1024 || s->queued_bytes + len > QUEUE_BYTES) return 0;   /* (full: dropped, as a LAN would) */
+    Datagram *d = malloc(sizeof *d + len);
+    if (!d) return 0;
+    d->next = NULL; d->src_ip = src_ip; d->src_port = src_port; d->len = len;
+    memcpy(d->data, data, len);
+    if (s->tail) s->tail->next = d; else s->head = d;
+    s->tail = d;
+    s->queued++;
+    s->queued_bytes += len;
+    return 1;
 }
 
 void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
@@ -673,19 +703,18 @@ void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const voi
         VSock *s = &socks[i];
         if (!s->open || s->type != SOCK_DGRAM_ || s->port != dst_port || s->shut_rd) continue;
         if (!broadcast && s->ip && s->ip != dst_ip && s->ip != LOOPBACK) continue;   /* bound to another address */
-        if (s->peer_port && (s->peer_ip != src_ip || s->peer_port != src_port)) continue;   /* connected elsewhere */
-        if (s->queued >= 1024 || s->queued_bytes + len > QUEUE_BYTES) continue;   /* (full: dropped, as a LAN would) */
-        Datagram *d = malloc(sizeof *d + len);
-        if (!d) continue;
-        d->next = NULL; d->src_ip = src_ip; d->src_port = src_port; d->len = len;
-        memcpy(d->data, data, len);
-        if (s->tail) s->tail->next = d; else s->head = d;
-        s->tail = d;
-        s->queued++;
-        s->queued_bytes += len;
+        if (!enqueue(s, src_ip, src_port, data, len)) continue;
         delivered = 1;
         if (!broadcast && !s->reuse) break;
     }
+    ReleaseSRWLockExclusive(&lock);
+    if (delivered) WakeAllConditionVariable(&activity);
+}
+
+void vsock_lan_deliver(int fd, u16 port, u32 src_ip, u16 src_port, const void *data, u32 len) {
+    AcquireSRWLockExclusive(&lock);
+    VSock *s = sock_of(fd);
+    int delivered = s && s->lan && s->port == port && !s->shut_rd && enqueue(s, src_ip, src_port, data, len);
     ReleaseSRWLockExclusive(&lock);
     if (delivered) WakeAllConditionVariable(&activity);
 }
@@ -718,10 +747,9 @@ static void do_bind(Cpu *c, i32 fd, u64 addr, u32 len) {
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
     int err = !s ? E_BADF : !read_addr(addr, len, &ip, &port) ? E_INVAL : 0;
-    if (!err && ip && ip != LOOPBACK && ip != net_local_ip() && ip != ANY_BROADCAST && ip != NET_BROADCAST) err = E_ADDRNOTAVAIL;
-    if (!err && port && port_taken(s, port)) err = E_ADDRINUSE;
-    if (!err && !port && !(port = ephemeral(s))) err = E_ADDRINUSE;
-    if (!err) { s->ip = ip; s->port = port; }
+    if (!err && ip && ip != LOOPBACK && ip != net_local_ip() && ip != ANY_BROADCAST && ip != net_broadcast()) err = E_ADDRNOTAVAIL;
+    if (!err) err = take_port(s, port);
+    if (!err) { s->ip = ip; port = s->port; }
     ReleaseSRWLockExclusive(&lock);
     if (net_log()) fprintf(stderr, "[net] bind(%d, %s:%u) = %s%d\n", fd, ip_text(err ? 0 : ip, t), port, err ? "error " : "", err);
     if (err) fail(c, err); else c->x[0] = 0;
@@ -735,7 +763,7 @@ static void do_connect(Cpu *c, i32 fd, u64 addr, u32 len) {
     VSock *s = sock_of(fd);
     int err = !s ? E_BADF : !read_addr(addr, len, &ip, &port) ? E_INVAL : s->type == SOCK_STREAM_ ? E_CONNREFUSED : 0;
     if (!err) {
-        if (!s->port) s->port = ephemeral(s);
+        if (!s->port) take_port(s, 0);
         s->peer_ip = ip;
         s->peer_port = port;
     }
@@ -759,18 +787,21 @@ static void do_sendto(Cpu *c, i32 fd, u64 buf, u64 len, i32 flags, u64 addr, u32
     else if (s->peer_port) { dst = s->peer_ip; dport = s->peer_port; }
     else err = E_DESTADDRREQ;
     if (!err && len > 65507) err = E_MSGSIZE;
-    if (!err && !s->port && !(s->port = ephemeral(s))) err = E_ADDRINUSE;
+    if (!err && !s->port) err = take_port(s, 0);
     u16 sport = s && !err ? s->port : 0;
+    int lan = s && !err && s->lan;
     ReleaseSRWLockExclusive(&lock);
     u32 me = net_local_ip();
-    int broadcast = dst == ANY_BROADCAST || dst == NET_BROADCAST;
-    if (!err && !broadcast && dst != LOOPBACK && dst != me && ((dst & NET_MASK) != NET_SUBNET || !me)) err = E_NETUNREACH;
+    int broadcast = dst == ANY_BROADCAST || dst == net_broadcast();
+    if (!err && !lan && !broadcast && dst != LOOPBACK && dst != me && ((dst & NET_MASK) != NET_SUBNET || !me)) err = E_NETUNREACH;
     if (net_log() > 1 || (net_log() && err))
         fprintf(stderr, "[net] sendto(%d, %llu bytes, %s:%u) from port %u%s%d\n", fd, len, ip_text(dst, t), dport, sport, err ? ": error " : " ", err);
     if (err) { fail(c, err); return; }
     const void *data = P(void, buf);
     if (dst == LOOPBACK) vsock_deliver(LOOPBACK, sport, LOOPBACK, dport, data, (u32)len);
-    else {
+    else if (lan) {   /* (the PC's network: what reaches this PC's own sockets, broadcasts too, comes back by it) */
+        if (net_lan_send(fd, dst, dport, data, (u32)len)) { fail(c, E_NETUNREACH); return; }
+    } else {
         if (dst == me || broadcast) vsock_deliver(me, sport, dst, dport, data, (u32)len);   /* (a broadcast reaches this player's sockets too) */
         if (dst != me) net_send(me, sport, broadcast ? NET_BROADCAST : dst, dport, data, (u32)len);
     }
@@ -927,7 +958,7 @@ static void do_shutdown(Cpu *c, i32 fd, i32 how) {
 static void do_close(Cpu *c, i32 fd) {
     AcquireSRWLockExclusive(&lock);
     VSock *s = sock_of(fd);
-    if (s) { drop_queue(s); memset(s, 0, sizeof *s); }
+    if (s) { if (s->lan) net_lan_close(fd); drop_queue(s); memset(s, 0, sizeof *s); }
     ReleaseSRWLockExclusive(&lock);
     WakeAllConditionVariable(&activity);
     if (net_log()) fprintf(stderr, "[net] close(%d)%s\n", fd, s ? "" : ": not a socket");

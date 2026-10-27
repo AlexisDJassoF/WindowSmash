@@ -44,7 +44,7 @@ PORT = os.path.abspath(arg("--port") or read_port_stamp(BUILD) or default_port()
 OUT = os.path.abspath(arg("--out", os.path.join(REPO, "dist-linux")))
 BUNDLE = os.path.join(OUT, "ssbu-linux")
 LINK = "--link" in sys.argv
-EXECUTABLE = {"ssbu", "shaderaot", "run.sh", "run-offline.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
+EXECUTABLE = {"ssbu", "shaderaot", "run.sh", "run-offline.sh", "run-lan.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
 
 
 def unlink_dst(dst):
