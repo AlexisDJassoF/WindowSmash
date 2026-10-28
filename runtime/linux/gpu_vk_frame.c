@@ -321,9 +321,11 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
         if (keys & 8) {
             snprintf(path, sizeof path, "screenshots/frame_%s", stamp);
             mkdir(path, 0755);
+            char dir[160];
+            snprintf(dir, sizeof dir, "%s", path);
             strncat(path, "/screen.bmp", sizeof path - strlen(path) - 1);
             vk_draw_capture(guest, crop_x, crop_y, crop_w, crop_h, path);
-            vk_draw_log_begin();
+            vk_draw_log_begin(dir);
         }
     }
     capture(guest, crop_x, crop_y, crop_w, crop_h);

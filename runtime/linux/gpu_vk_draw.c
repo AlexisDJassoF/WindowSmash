@@ -420,6 +420,13 @@ typedef struct Surface {
     VkImageView view;                     /* as view_format (depth: depth and stencil) */
     VkImageView sampled[2][2];            /* [srgb][array]: read as a texture (depth: its depth) */
     u64 used;
+    /* read by a texture header smaller than it (the R8 mask of the team outline: a 512-wide target
+     * read as 480): that corner copied out, so normalized coordinates reach the texels they do on
+     * the hardware */
+    Img crop;
+    VkImageView crop_view[2];             /* [srgb] */
+    u32 crop_w, crop_h;
+    u64 crop_used;                        /* the surface's used when copied */
 } Surface;
 static Surface surfaces[2048];
 static u32 nsurfaces;
@@ -429,6 +436,8 @@ static void release_surface(Surface *s) {
     bury(VK_NULL_HANDLE, s->view, VK_NULL_HANDLE);
     for (u32 i = 0; i < 4; i++) bury(VK_NULL_HANDLE, s->sampled[i / 2][i % 2], VK_NULL_HANDLE);
     bury(s->img.image, VK_NULL_HANDLE, s->img.memory);
+    for (u32 i = 0; i < 2; i++) bury(VK_NULL_HANDLE, s->crop_view[i], VK_NULL_HANDLE);
+    if (s->crop.image) bury(s->crop.image, VK_NULL_HANDLE, s->crop.memory);
     memset(s, 0, sizeof *s);
 }
 
@@ -518,6 +527,45 @@ static VkImageView surface_sampled(Surface *s, int srgb, int array) {
     if (!*v) *v = make_view(&s->img, array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, f, s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 1);
     return *v;
 }
+/* The surface's top left w x h (the game's pixels), as a texture of that size (see Surface's crop),
+ * copied again when the surface was drawn since. VK_NULL_HANDLE if it cannot be made. */
+static void suspend_rendering(void);
+static VkImageView surface_cropped(Surface *s, u32 w, u32 h, int srgb) {
+    u32 cw = scaled_size(w, s->scale), ch = scaled_size(h, s->scale);
+    if (cw > s->pw) cw = s->pw;
+    if (ch > s->ph) ch = s->ph;
+    VkFormat other = other_gamma(s->storage);
+    srgb = srgb && other;
+    if (s->crop.image && (s->crop_w != cw || s->crop_h != ch)) {
+        for (u32 i = 0; i < 2; i++) { bury(VK_NULL_HANDLE, s->crop_view[i], VK_NULL_HANDLE); s->crop_view[i] = VK_NULL_HANDLE; }
+        bury(s->crop.image, VK_NULL_HANDLE, s->crop.memory);
+        memset(&s->crop, 0, sizeof s->crop);
+    }
+    if (!s->crop.image) {
+        VkFormat both[2] = {s->storage, other};
+        if (!make_image(&s->crop, VK_IMAGE_TYPE_2D, s->storage, cw, ch, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        other ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0, both, other ? 2 : 0))
+            return VK_NULL_HANDLE;
+        s->crop.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        s->crop_w = cw; s->crop_h = ch;
+        s->crop_used = 0;
+    }
+    if (s->crop_used != s->used) {
+        suspend_rendering();
+        VkCommandBuffer cb = vk_cmd();
+        use(&s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        use(&s->crop, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        flush_barriers(cb);
+        VkImageBlit blit = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
+                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}}};   /* (1:1: a copy) */
+        vkCmdBlitImage(cb, s->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->crop.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        s->crop_used = s->used;
+    }
+    VkImageView *v = &s->crop_view[srgb];
+    if (!*v) *v = make_view(&s->crop, VK_IMAGE_VIEW_TYPE_2D, srgb ? other : s->storage, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    return *v;
+}
+
 static VkImageLayout read_layout(const Img *m) {
     return m->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
@@ -785,6 +833,11 @@ static VkImageView get_texture(const u32 *tic, u32 shader_type, float *scale, Im
     if (rt) {   /* a render target at this address: the latest, read as the header says */
         *scale = rt->scale;
         if (shader_type != TEX_2D && shader_type != TEX_ARRAY_2D) return VK_NULL_HANDLE;
+        if (ok && !rt->depth && shader_type == TEX_2D && d.width && d.height && d.width <= rt->width && d.height <= rt->height &&
+            (d.width < rt->width || d.height < rt->height)) {
+            VkImageView v = surface_cropped(rt, d.width, d.height, (int)d.srgb);
+            if (v) { *img = &rt->crop; return v; }
+        }
         *img = &rt->img;
         return surface_sampled(rt, (int)d.srgb, shader_type == TEX_ARRAY_2D);
     }
@@ -2567,6 +2620,44 @@ typedef struct Binding {
     Img *tex_img[32];
 } Binding;
 
+/* F4: the render targets the logged draws read, saved beside the frame's picture (as gpu_d3d11.c's
+ * in_NNN_*.bmp) before the next draw or clear writes anything */
+int vk_draw_capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, const char *path);
+static char sampled_dir[160];
+static Surface *sampled_pending[16];
+static int sampled_seq_of[16];
+static u32 nsampled_pending;
+static struct { u64 guest, used; } sampled_saved[256];
+static u32 nsampled_saved;
+static int sampled_seq;
+
+static void note_sampled(Surface *s) {
+    if (!sampled_dir[0] || nsampled_saved >= 256) return;
+    for (u32 i = 0; i < nsampled_saved; i++)
+        if (sampled_saved[i].guest == s->guest && sampled_saved[i].used == s->used) return;   /* (unchanged since saved) */
+    for (u32 i = 0; i < nsampled_pending; i++) if (sampled_pending[i] == s) return;
+    if (nsampled_pending == 16) return;
+    sampled_saved[nsampled_saved].guest = s->guest;
+    sampled_saved[nsampled_saved++].used = s->used;
+    sampled_seq_of[nsampled_pending] = sampled_seq;
+    sampled_pending[nsampled_pending++] = s;
+    fprintf(stderr, "[draw]   (samples render target %#llx %ux%u fmt %#x: saved as in_%03d)\n", (unsigned long long)s->guest, s->width, s->height,
+            s->format, sampled_seq++);
+}
+
+static void save_sampled(void) {
+    for (u32 i = 0; i < nsampled_pending; i++) {
+        Surface *s = sampled_pending[i];
+        if (!s->img.image || s->depth) continue;
+        char path[300];
+        snprintf(path, sizeof path, "%s/in_%03d_%llx_fmt%x_%ux%u.bmp", sampled_dir, sampled_seq_of[i], (unsigned long long)s->guest, s->format, s->width,
+                 s->height);
+        vk_draw_capture(s->guest, 0, 0, 0, 0, path);
+    }
+    if (nsampled_pending) forget_state();
+    nsampled_pending = 0;
+}
+
 static void bind_stage(const u32 *regs, const CbBinding cb[STAGES][18], int stage, const Shader *s, DrawParams *params, Binding *b) {
     int mstage = stage == SHADER_VERTEX ? STAGE_VERTEX : STAGE_FRAGMENT, si = stage == SHADER_VERTEX ? 0 : 1;
     for (u32 k = 0; k < 18; k++) {
@@ -2608,6 +2699,15 @@ static void bind_stage(const u32 *regs, const CbBinding cb[STAGES][18], int stag
         VkSampler smp = get_sampler(tsc);
         b->tex[k] = (VkDescriptorImageInfo){smp ? smp : default_sampler(), view, img ? read_layout(img) : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         b->tex_img[k] = view ? img : NULL;
+        if (draw_logging) {   /* (as gpu_d3d11.c's: where each texture was read from) */
+            TextureDesc d;
+            tic_decode(tic, &d);
+            int rt = img && (const char *)img >= (const char *)surfaces && (const char *)img < (const char *)(surfaces + nsurfaces);
+            fprintf(stderr, "[draw]   %s tex%u: tic %u fmt %#x %ux%u guest %#llx swz %#x: %s\n", si ? "ps" : "vs", k, tic_index, d.format, d.width,
+                    d.height, (unsigned long long)gpu_va_to_guest(d.address), params->swz[si][k],
+                    !view ? "none" : rt ? "render target" : "memory");
+            if (view && rt) note_sampled(&surfaces[((const char *)img - (const char *)surfaces) / sizeof *surfaces]);
+        }
     }
 }
 
@@ -2768,6 +2868,7 @@ static void gpu_times_frame(void) {
 
 void vk_gfx_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     vk_enter();
+    if (draw_logging) save_sampled();
     u32 begin = regs[M_BEGIN];
     if (begin & (1u << 26)) instance_counter++;
     else if (!(begin & (1u << 27))) instance_counter = 0;
@@ -3422,6 +3523,7 @@ static void clear_surface(Surface *s, int color_, const float c[4], VkImageAspec
 
 void vk_gfx_clear(const u32 *regs, u32 arg) {
     vk_enter();
+    if (draw_logging) save_sampled();
     gfx_stat_clears++;
     u32 rt = (arg >> 6) & 0xF;
     if (draw_logging)
@@ -3673,12 +3775,16 @@ int vk_gfx_draw_logging(void) { return draw_logging; }
 
 /* F4 (gpu_vk_frame.c): the draws of the next two presents' worth - the game presents in the middle
  * of drawing a frame, so one would miss half - to the log */
-void vk_draw_log_begin(void) {
+void vk_draw_log_begin(const char *dir) {
     draw_logging = 2;
+    snprintf(sampled_dir, sizeof sampled_dir, "%s", dir);
+    nsampled_saved = 0;
+    sampled_seq = 0;
     fprintf(stderr, "[draw] -- frame start (F4)\n");
 }
 void vk_draw_log_present(u64 guest) {
     if (!draw_logging) return;
     fprintf(stderr, "[draw] -- frame presented from %#llx\n", (unsigned long long)guest);
     draw_logging--;
+    if (!draw_logging) { save_sampled(); sampled_dir[0] = 0; }
 }

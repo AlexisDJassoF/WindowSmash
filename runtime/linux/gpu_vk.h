@@ -146,6 +146,6 @@ void vk_fsr_rcas(VkFrameTarget *t, unsigned fit_x, unsigned fit_y, unsigned fit_
 /* (gpu_vk_draw.c) The picture (no overlay) at the game's resolution into a BMP; F4's draw log, begun
  * and counted down at each present */
 int vk_draw_capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, const char *path);
-void vk_draw_log_begin(void);
+void vk_draw_log_begin(const char *dir);
 void vk_draw_log_present(u64 guest);
 int vk_draw_picture_view(VkCommandBuffer cb, u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, VkImageView *view, u32 size[2], u32 pic[4]);
