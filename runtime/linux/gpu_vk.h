@@ -42,6 +42,7 @@ typedef struct Vk {
     VkDevice dev;
     VkQueue queue;
     uint32_t family;
+    uint32_t timestamp_bits;   /* the queue's timestampValidBits (0: no timestamps) */
     VkSemaphore timeline;      /* counts the submissions the GPU has finished */
     u64 submitted;             /* the timeline's value of the last submission */
     struct { int eds3, gpl, unified_layouts, descriptor_buffer, custom_border, swapchain_maintenance, vertex_input; } has;

@@ -28,6 +28,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "display.h"
 #include "host.h"
@@ -665,13 +666,30 @@ void display_wait_tick(void) {
     }
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    long long period = freq.QuadPart / 60;
-    if (now.QuadPart - (base.QuadPart + ticks * freq.QuadPart / 60) > 2 * period) {   /* late by two refreshes: skip, don't burst */
+    /* SSBU_BENCH_HZ=<hz>@<second> (benchmarks): from that second on, the clock runs at hz instead of
+     * 60 - the game with it, as fast as the machine lets it, so that frames a second measure the
+     * renderer's (or the game's) throughput instead of the clock */
+    static long long hz = 60, bench_hz = -1;
+    static double bench_at;
+    if (bench_hz < 0) {
+        const char *v = getenv("SSBU_BENCH_HZ");
+        bench_hz = v ? atoll(v) : 0;
+        const char *at = v ? strchr(v, '@') : NULL;
+        bench_at = at ? atof(at + 1) : 0;
+        if (bench_hz > 0) fprintf(stderr, "[display] benchmark: the clock at %lld Hz from %.0f s\n", bench_hz, bench_at);
+    }
+    if (bench_hz > 0 && hz != bench_hz && rt_now_ns() >= (u64)(bench_at * 1e9)) {
+        hz = bench_hz;
+        base = now;
+        ticks = 0;
+    }
+    long long period = freq.QuadPart / hz;
+    if (now.QuadPart - (base.QuadPart + ticks * freq.QuadPart / hz) > 2 * period) {   /* late by two refreshes: skip, don't burst */
         base = now;
         ticks = 0;
     }
     ticks++;
-    long long due = base.QuadPart + ticks * freq.QuadPart / 60;
+    long long due = base.QuadPart + ticks * freq.QuadPart / hz;
     for (;;) {
         QueryPerformanceCounter(&now);
         long long left = due - now.QuadPart;

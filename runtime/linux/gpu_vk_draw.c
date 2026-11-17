@@ -76,6 +76,12 @@ static VkPipelineLayout layout;
 static VkPipelineCache pipeline_cache;
 static VkDeviceSize uniform_align = 256, storage_align = 256;
 static int ready;
+static int cbuf_uniform;   /* set 0's constant buffers are uniform buffers (init: gpu_spirv.h's spirv_cbuf_uniform) */
+
+/* A buffer binding's descriptor type: set 0's constant buffers per cbuf_uniform, else storage */
+static VkDescriptorType buffer_type(u32 set, u32 binding) {
+    return set == 0 && binding < SPIRV_STREAM_BINDING && cbuf_uniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+}
 
 /* Objects freed once the GPU is done with the frame that last used them */
 typedef struct Grave { u64 value; VkImage image; VkImageView view; VkDeviceMemory memory; VkBuffer buffer; } Grave;
@@ -116,6 +122,14 @@ static void init(void) {
     vkGetPhysicalDeviceProperties(vk.pd, &props);
     if (props.limits.minUniformBufferOffsetAlignment > uniform_align) uniform_align = props.limits.minUniformBufferOffsetAlignment;
     if (props.limits.minStorageBufferOffsetAlignment > storage_align) storage_align = props.limits.minStorageBufferOffsetAlignment;
+    /* Constant buffers as uniform buffers (gpu_spirv.h) where the device takes 18 a stage (and
+     * DrawParams') of 64 KB; SSBU_VK_CBUF=storage keeps them storage buffers (for comparison) */
+    const char *cbuf_env = getenv("SSBU_VK_CBUF");
+    cbuf_uniform = props.limits.maxPerStageDescriptorUniformBuffers >= 19 && props.limits.maxDescriptorSetUniformBuffers >= 2 * 18 + 1 &&
+                   props.limits.maxUniformBufferRange >= 0x10000 && !(cbuf_env && !strcmp(cbuf_env, "storage"));
+    spirv_cbuf_uniform = cbuf_uniform;
+    if (cbuf_uniform && uniform_align > storage_align) storage_align = uniform_align;   /* (the same uploads are bound as either) */
+    fprintf(stderr, "[gfx] Vulkan: constant buffers as %s buffers\n", cbuf_uniform ? "uniform" : "storage");
     VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
     static const struct { VkDescriptorType type; u32 count; } sets[4] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SPIRV_STREAM_BINDING + 32}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
@@ -123,6 +137,11 @@ static void init(void) {
     for (u32 s = 0; s < 4; s++) {
         VkDescriptorSetLayoutBinding b[96];
         for (u32 i = 0; i < sets[s].count; i++) b[i] = (VkDescriptorSetLayoutBinding){i, sets[s].type, 1, stages, NULL};
+        if (s == 0 && cbuf_uniform)   /* (each stage sees only its own 18, within the per-stage limit) */
+            for (u32 i = 0; i < SPIRV_STREAM_BINDING; i++) {
+                b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                b[i].stageFlags = i < SPIRV_CBUF_BINDING_PIXEL ? stages & ~VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+            }
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, sets[s].count, b};
         vk_check(vkCreateDescriptorSetLayout(vk.dev, &li, NULL, &set_layout[s]), "a descriptor set layout");
     }
@@ -137,9 +156,9 @@ static void init(void) {
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mem, &map);
         slots[i].map = map;
-        VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 400000}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 200000},
-                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}};
-        VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 16384, 3, sizes};
+        VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 400000}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 200000},
+                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 300000}};
+        VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 16384, cbuf_uniform ? 4 : 3, sizes};
         vk_check(vkCreateDescriptorPool(vk.dev, &dpi, NULL, &slots[i].pool), "a descriptor pool");
         /* (set 3 lives in a pool of its own: the slot's pool is reset every frame) */
         VkDescriptorPoolSize psize = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1};
@@ -1098,16 +1117,40 @@ static int stream_wrote_since(const Kept *e) {
     return 0;
 }
 
+/* Pages the write watch was asked about in this submission (gpu_stat_batches), by page number: a
+ * buffer whose every page is here needs no kernel call of its own - what was found then is in
+ * page_gen (watch_reset), and what the CPU writes while a submission is being taken is for later
+ * work (the game wrote this one's data before submitting it). Many small buffers share a page. */
+#define PAGE_ASKED 65536
+static struct { u64 page, batch; } page_asked[PAGE_ASKED];
+#define PAGE_ASKED_SLOT(p) ((u32)((u64)(p) * 0x9E3779B97F4A7C15ull >> 48))
+static u64 vk_stat_watch_calls, vk_stat_watch_saved;   /* (SSBU_LOG_STATS) */
+
 /* Has the CPU written [g, g + n) since generation gen? The write watch is asked once a submission
- * (checked); what it finds is noted by page for everyone. */
+ * (checked; and once a page, page_asked); what it finds is noted by page for everyone. */
 static int cpu_wrote_since(u64 g, u32 n, u64 gen, u64 *checked) {
     u64 lo = g & ~0xFFFull, hi = (g + n + 0xFFF) & ~0xFFFull;
     if (*checked != gpu_stat_batches) {
-        void *page;
-        ULONG_PTR count = 1;
-        ULONG granularity;
-        if (GetWriteWatch(0, (void *)lo, hi - lo, &page, &count, &granularity) == 0 && count) watch_reset(lo, hi);   /* (noting each page) */
-        *checked = gpu_stat_batches;
+        static int memo = -1;   /* (SSBU_VK_WATCH_MEMO=0: every buffer asks, as before - for comparison) */
+        if (memo < 0) memo = !getenv("SSBU_VK_WATCH_MEMO") || atoi(getenv("SSBU_VK_WATCH_MEMO")) != 0;
+        u64 batch = gpu_stat_batches, p = lo >> 12;
+        for (; memo && p < hi >> 12; p++) {
+            u32 k = PAGE_ASKED_SLOT(p);
+            if (page_asked[k].page != p || page_asked[k].batch != batch) break;
+        }
+        if (p < hi >> 12) {   /* (a page not asked about yet in this submission) */
+            void *page;
+            ULONG_PTR count = 1;
+            ULONG granularity;
+            vk_stat_watch_calls++;
+            if (GetWriteWatch(0, (void *)lo, hi - lo, &page, &count, &granularity) == 0 && count) watch_reset(lo, hi);   /* (noting each page) */
+            for (p = lo >> 12; p < hi >> 12; p++) {
+                u32 k = PAGE_ASKED_SLOT(p);
+                page_asked[k].page = p;
+                page_asked[k].batch = batch;
+            }
+        } else vk_stat_watch_saved++;
+        *checked = batch;
     }
     for (u64 p = lo >> 12; p < hi >> 12; p++)
         if (page_gen[PAGE_SLOT(p)] > gen) return 1;
@@ -2414,7 +2457,7 @@ static void cache_load(void) {
     cache_dir(dir, sizeof dir);
     if (!strcmp(dir, "0")) return;   /* (SSBU_SPIRV_CACHE=0: none) */
     mkdir(dir, 0755);
-    snprintf(name, sizeof name, "shaders_%s.bin", SPIRV_TRANSLATOR_VERSION);
+    snprintf(name, sizeof name, "shaders_%s%s.bin", SPIRV_TRANSLATOR_VERSION, cbuf_uniform ? "_u" : "");   /* (gpu_spirv.h: per mode) */
     DIR *d = opendir(dir);   /* (an older translator's: gone) */
     for (struct dirent *e; d && (e = readdir(d));)
         if (!strncmp(e->d_name, "shaders_", 8) && strcmp(e->d_name, name)) {
@@ -2723,11 +2766,35 @@ typedef struct SetContent {
 static SetContent last_content[3];
 static VkDescriptorSet last_set[3];
 static u64 last_set_frame;
-u64 vk_stat_sets_reused;
+u64 vk_stat_sets_reused, vk_stat_sets_written;
+
+/* Only the bindings a set's masks name are compared or written: the rest of a SetContent
+ * is whatever an earlier draw left there. */
+static int set_same(const SetContent *a, const SetContent *b, u32 i) {
+    if (i == 1) {
+        if (a->images != b->images) return 0;
+        for (u64 m = a->images; m; m &= m - 1)
+            if (memcmp(&a->img[__builtin_ctzll(m)], &b->img[__builtin_ctzll(m)], sizeof *a->img)) return 0;
+        return 1;
+    }
+    if (a->buffers != b->buffers || a->more != b->more) return 0;
+    for (u64 m = a->buffers; m; m &= m - 1)
+        if (memcmp(&a->buf[__builtin_ctzll(m)], &b->buf[__builtin_ctzll(m)], sizeof *a->buf)) return 0;
+    for (u32 m = a->more; m; m &= m - 1)
+        if (memcmp(&a->buf[64 + __builtin_ctz(m)], &b->buf[64 + __builtin_ctz(m)], sizeof *a->buf)) return 0;
+    return 1;
+}
+
+static void set_copy(SetContent *to, const SetContent *from, u32 i) {
+    to->buffers = from->buffers; to->more = from->more; to->images = from->images; to->nimages = from->nimages;
+    if (i == 1) { for (u64 m = from->images; m; m &= m - 1) to->img[__builtin_ctzll(m)] = from->img[__builtin_ctzll(m)]; return; }
+    for (u64 m = from->buffers; m; m &= m - 1) to->buf[__builtin_ctzll(m)] = from->buf[__builtin_ctzll(m)];
+    for (u32 m = from->more; m; m &= m - 1) to->buf[64 + __builtin_ctz(m)] = from->buf[64 + __builtin_ctz(m)];
+}
 
 static void write_sets(const Shader *const sh[2], const Binding *b, const VkDescriptorBufferInfo streams[32], VkDescriptorSet sets[3]) {
     static SetContent want[3];
-    memset(want, 0, sizeof want);
+    for (u32 i = 0; i < 3; i++) want[i].buffers = want[i].more = want[i].images = want[i].nimages = 0;
     for (u32 st = 0; st < 2; st++) {
         const Shader *s = sh[st];
         if (!s) continue;
@@ -2748,11 +2815,12 @@ static void write_sets(const Shader *const sh[2], const Binding *b, const VkDesc
     VkWriteDescriptorSet w[256];
     u32 n = 0;
     for (u32 i = 0; i < 3; i++) {
-        if (last_set_frame == frame && last_set[i] && !memcmp(&want[i], &last_content[i], sizeof want[i])) {
+        if (last_set_frame == frame && last_set[i] && set_same(&want[i], &last_content[i], i)) {
             sets[i] = last_set[i];
             vk_stat_sets_reused++;
             continue;
         }
+        vk_stat_sets_written++;
         VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, slots[vk_slot()].pool, 1, &set_layout[i]};
         if (vkAllocateDescriptorSets(vk.dev, &ai, &sets[i]) != VK_SUCCESS) {   /* the pool is full: the frame's work goes, the next slot's pool */
             vk_flush(0);
@@ -2769,7 +2837,7 @@ static void write_sets(const Shader *const sh[2], const Binding *b, const VkDesc
                 const SetContent *c = &want[j];
                 for (u32 k = 0; k < 68; k++)
                     if (j != 1 && (k < 64 ? c->buffers >> k & 1 : c->more >> (k - 64) & 1))
-                        w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[j], k, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &c->buf[k], NULL};
+                        w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[j], k, 0, 1, buffer_type(j, k), NULL, &c->buf[k], NULL};
                     else if (j == 1 && k < 64 && c->images >> k & 1)
                         w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[j], k, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &c->img[k], NULL, NULL};
             }
@@ -2777,10 +2845,10 @@ static void write_sets(const Shader *const sh[2], const Binding *b, const VkDesc
         const SetContent *c = &want[i];
         for (u32 k = 0; k < 68; k++)
             if (i != 1 && (k < 64 ? c->buffers >> k & 1 : c->more >> (k - 64) & 1))
-                w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[i], k, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &c->buf[k], NULL};
+                w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[i], k, 0, 1, buffer_type(i, k), NULL, &c->buf[k], NULL};
             else if (i == 1 && k < 64 && c->images >> k & 1)
                 w[n++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[i], k, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &c->img[k], NULL, NULL};
-        last_content[i] = want[i];
+        set_copy(&last_content[i], &want[i], i);
         last_set[i] = sets[i];
     }
     last_set_frame = frame;
@@ -3597,13 +3665,24 @@ void vk_draw_presenting(void) {
                 ring_bytes[RING_TEX] / 1048576.0, ring_bytes[RING_GPU] / 1048576.0, ring_bytes[RING_COPY] / 1048576.0, ring_bytes[RING_READBACK] / 1048576.0,
                 ring_bytes[RING_PARAMS] / 1048576.0, ring_bytes[RING_INDEX] / 1048576.0, ring_bytes[RING_CS] / 1048576.0);
         memset(ring_bytes, 0, sizeof ring_bytes);
-        fprintf(stderr, "[vk stats]   storage buffers %.1f MB, textures %.1f MB; descriptor sets reused %llu\n", sb_bytes / 1048576.0,
-                texture_bytes / 1048576.0, (unsigned long long)vk_stat_sets_reused);
+        fprintf(stderr, "[vk stats]   storage buffers %.1f MB, textures %.1f MB; descriptor sets reused %llu, written %llu\n", sb_bytes / 1048576.0,
+                texture_bytes / 1048576.0, (unsigned long long)vk_stat_sets_reused, (unsigned long long)vk_stat_sets_written);
+        vk_stat_sets_written = 0;
         extern u64 vk_stat_allocs, vk_stat_alloc_bytes, vk_stat_alloc_ns, vk_stat_wait_ns, vk_stat_flushes, vk_stat_flush_waits;
         fprintf(stderr, "[vk stats]   GPU waits %.0f ms; submissions in the middle of a frame %llu (%llu waited for); buffer barriers %llu, compute ones %llu\n",
                 vk_stat_wait_ns / 1e6, (unsigned long long)vk_stat_flushes, (unsigned long long)vk_stat_flush_waits, (unsigned long long)vk_stat_buffer_barriers,
                 (unsigned long long)vk_stat_compute_barriers);
         vk_stat_wait_ns = vk_stat_flushes = vk_stat_flush_waits = vk_stat_buffer_barriers = vk_stat_compute_barriers = 0;
+        extern u64 vk_stat_gpu_busy_ns;
+        static u64 last_busy;
+        fprintf(stderr, "[vk stats]   GPU busy %.2f ms a frame; write watch asked by buffers %llu times (%llu saved: their pages asked already)\n",
+                (vk_stat_gpu_busy_ns - last_busy) / 1e6 / 300, (unsigned long long)vk_stat_watch_calls, (unsigned long long)vk_stat_watch_saved);
+        vk_stat_watch_calls = vk_stat_watch_saved = 0;
+        extern u64 vk_stat_present_held_ns, vk_stat_present_queue_ns;
+        fprintf(stderr, "[vk stats]   presents held the renderer %.2f ms a frame (submitting and presenting %.2f ms)\n", vk_stat_present_held_ns / 1e6 / 300,
+                vk_stat_present_queue_ns / 1e6 / 300);
+        vk_stat_present_held_ns = vk_stat_present_queue_ns = 0;
+        last_busy = vk_stat_gpu_busy_ns;
         static u64 last_composed, last_pages;
         fprintf(stderr, "[vk stats]   write watch: scan %.0f ms, textures %.0f ms, residents %.0f ms (%.0f ranges asked, %llu pages written, list %s)\n",
                 watch_split_ns[0] / 1e6, watch_split_ns[1] / 1e6, watch_split_ns[2] / 1e6, (double)watch_span, (unsigned long long)watch_pages,
@@ -3760,8 +3839,18 @@ int vk_draw_capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch, const char *path)
 }
 
 void vk_draw_describe(char *out, size_t n) {
-    snprintf(out, n, "Vulkan: draws %llu  skipped %llu  uploads reused %llu\nshaders %llu  pipelines %llu  textures %u  surfaces %u", (unsigned long long)gfx_stat_drawn,
-             (unsigned long long)gfx_stat_skipped, (unsigned long long)vk_stat_kept_reused, (unsigned long long)gfx_stat_shaders, (unsigned long long)vk_stat_pipelines, ntextures, nsurfaces);
+    /* (the GPU's busy time a frame, over the last half second's frames) */
+    extern u64 vk_stat_gpu_busy_ns;
+    static u64 at_ns, at_busy, at_frames;
+    static double busy_ms;
+    u64 now = rt_now_ns();
+    if (now - at_ns >= 500000000ull) {
+        if (gfx_stat_presented > at_frames) busy_ms = (vk_stat_gpu_busy_ns - at_busy) / 1e6 / (double)(gfx_stat_presented - at_frames);
+        at_ns = now; at_busy = vk_stat_gpu_busy_ns; at_frames = gfx_stat_presented;
+    }
+    snprintf(out, n, "Vulkan: draws %llu  skipped %llu  uploads reused %llu  GPU %.1f ms a frame\nshaders %llu  pipelines %llu  textures %u  surfaces %u",
+             (unsigned long long)gfx_stat_drawn, (unsigned long long)gfx_stat_skipped, (unsigned long long)vk_stat_kept_reused, busy_ms,
+             (unsigned long long)gfx_stat_shaders, (unsigned long long)vk_stat_pipelines, ntextures, nsurfaces);
 }
 
 /* The command stream wrote guest memory at [va, va + bytes): kept uploads there are taken again. */

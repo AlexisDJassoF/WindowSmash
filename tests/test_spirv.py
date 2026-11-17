@@ -56,7 +56,8 @@ class Builder(unittest.TestCase):
                      'needs a C compiler, spirv-val, the toolchain and the program pack (dump/aot/programs.pack)')
 class Corpus(unittest.TestCase):
     """Every translation of the pack through both translators; each module validated, then deleted
-    (thousands of them would not fit in /tmp at once)."""
+    (thousands of them would not fit in /tmp at once). Constant buffers as storage buffers."""
+    ARGS = []
 
     @classmethod
     def setUpClass(cls):
@@ -75,7 +76,7 @@ class Corpus(unittest.TestCase):
             path.unlink()
             return None if ok else (path.name, why)
 
-        proc = subprocess.Popen([str(exe), str(PACK), *([LIMIT] if LIMIT else []), '--spirv', str(spv)], stdout=subprocess.PIPE, text=True)
+        proc = subprocess.Popen([str(exe), str(PACK), *([LIMIT] if LIMIT else []), '--spirv', str(spv), *cls.ARGS], stdout=subprocess.PIPE, text=True)
         with ThreadPoolExecutor(os.cpu_count() or 4) as pool:
             for line in proc.stdout:
                 if not line.startswith('spirv '):
@@ -107,6 +108,11 @@ class Corpus(unittest.TestCase):
         self.assertTrue(made, 'no module made')
         self.assertFalse(self.invalid, f'{len(self.invalid)} of {made} modules are not valid; the first:\n' +
                          '\n'.join(f'{name}: {why[:600]}' for name, why in self.invalid[:3]))
+
+
+class CorpusUniform(Corpus):
+    """The same with constant buffers as uniform buffers (gpu_spirv.h's spirv_cbuf_uniform)."""
+    ARGS = ['--uniform']
 
 
 if __name__ == '__main__':

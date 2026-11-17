@@ -37,7 +37,7 @@ typedef struct Sx {
     u32 c_true, c_false, c_u0, c_f0, c_f1;
     /* variables */
     u32 reg[256], pred[8], cc_c, cc_z, cc_s;
-    u32 sb_struct, cbuf_var[18], stream_var[32], params, tex_var[32];
+    u32 sb_struct, ubo_struct, cbuf_var[18], stream_var[32], params, tex_var[32];
     u32 gload_fn, gstore_fn, smem, lmem;          /* global memory's functions; shared and local memory */
     u32 decode_fn;                                /* a vertex attribute's decoding */
     u32 vid, iid, frag_coord, front, local_id, group_id;
@@ -205,9 +205,44 @@ static u32 load_word(Sx *c, u32 buffer, u32 index) {
     return SPV_VAL(B, SpvOpLoad, c->t_u32, p);
 }
 
+int spirv_cbuf_uniform;
+
+/* A constant buffer as a uniform buffer: a block of 4096 uvec4 (std140's stride, 64 KB - a Maxwell
+ * bank's most). Reads at constant offsets from one can be pushed into the program's registers by
+ * the driver (Intel's and AMD's do), where a storage buffer's are always memory loads. */
+static u32 cbuf_ubo_struct(Sx *c) {
+    if (!c->ubo_struct) {
+        u32 arr = spv_type_array(B, c->t_v4u, 4096);
+        decorate(c, arr, SpvDecorationArrayStride, 16);
+        c->ubo_struct = spv_type_struct(B, 1, &arr);
+        decorate0(c, c->ubo_struct, SpvDecorationBlock);
+        spv_member_decorate(B, c->ubo_struct, 0, SpvDecorationOffset, 1, (u32[]){0});
+    }
+    return c->ubo_struct;
+}
+
 static u32 cbuf_var(Sx *c, u32 bank) {
-    if (!c->cbuf_var[bank]) c->cbuf_var[bank] = word_buffer(c, SPIRV_SET_BUFFERS, (c->stage == SHADER_PIXEL ? SPIRV_CBUF_BINDING_PIXEL : 0) + bank);
+    if (!c->cbuf_var[bank]) {
+        u32 binding = (c->stage == SHADER_PIXEL ? SPIRV_CBUF_BINDING_PIXEL : 0) + bank;
+        if (spirv_cbuf_uniform) {
+            u32 v = spv_global(B, spv_type_pointer(B, SpvStorageClassUniform, cbuf_ubo_struct(c)), SpvStorageClassUniform);
+            decorate(c, v, SpvDecorationDescriptorSet, SPIRV_SET_BUFFERS);
+            decorate(c, v, SpvDecorationBinding, binding);
+            c->cbuf_var[bank] = v;
+        } else c->cbuf_var[bank] = word_buffer(c, SPIRV_SET_BUFFERS, binding);
+    }
     return c->cbuf_var[bank];
+}
+
+/* Word `word` of a constant buffer (word_id its value; constant: word_id is ~0u, and the vector
+ * and component of a uniform buffer are constants too) */
+static u32 cbuf_word(Sx *c, u32 bank, u32 word_id, u32 word) {
+    u32 var = cbuf_var(c, bank);
+    if (!spirv_cbuf_uniform) return load_word(c, var, word_id == ~0u ? U(c, word) : word_id);
+    u32 vec = word_id == ~0u ? U(c, word >> 2) : shr(c, word_id, U(c, 2));
+    u32 comp = word_id == ~0u ? U(c, word & 3) : band(c, word_id, U(c, 3));
+    u32 p = SPV_VAL(B, SpvOpAccessChain, c->p_uni_u32, var, c->c_u0, vec, comp);
+    return SPV_VAL(B, SpvOpLoad, c->t_u32, p);
 }
 
 /* The word of constant buffer bank at a byte offset (as the HLSL translator's cbuf: noted alike). */
@@ -219,10 +254,10 @@ static u32 cbuf(Sx *c, u32 bank, u32 offset) {
         while (k < c->info->sb_count && c->info->sb_offset[k] != o) k++;
         if (k == c->info->sb_count && k < 16) c->info->sb_offset[c->info->sb_count++] = o;
     }
-    return load_word(c, cbuf_var(c, bank), U(c, offset >> 2));
+    return cbuf_word(c, bank, ~0u, offset >> 2);
 }
 /* (at a byte address computed by the program) */
-static u32 cbuf_at(Sx *c, u32 bank, u32 addr) { return load_word(c, cbuf_var(c, bank), shr(c, addr, U(c, 2))); }
+static u32 cbuf_at(Sx *c, u32 bank, u32 addr) { return cbuf_word(c, bank, shr(c, addr, U(c, 2)), 0); }
 
 /* DrawParams (gpu_shader.h) as Vulkan's std140 lays it out: every member 16-byte aligned. */
 enum { P_ATTR, P_FIX, P_FRAG, P_BASE, P_SWZ, P_SB, P_RTSCALE, P_TEXSCALE };

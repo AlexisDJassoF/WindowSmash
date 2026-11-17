@@ -137,6 +137,48 @@ static int make_swapchain(int vsync) {
 }
 
 /* ---- the frame's command buffer ------------------------------------------------------------ */
+/* The GPU's busy time: a timestamp at the start and at the end of every slot's command buffer, read
+ * back when the slot is used again (the GPU is done with it then: no wait). A command buffer that
+ * starts before the one before it ends counts from that one's end, so overlaps are not counted
+ * twice. vk_stat_gpu_busy_ns grows by it (SSBU_LOG_STATS' lines, F2's details). */
+u64 vk_stat_gpu_busy_ns;
+static VkQueryPool busy_pool;
+static int busy_on;                   /* 0: not yet made, 1: on, -1: the queue has no timestamps */
+static int busy_written[VK_FRAMES];
+static u64 busy_last_end, busy_mask;
+static double busy_period;            /* nanoseconds a tick */
+
+static void busy_begin(unsigned slot, VkCommandBuffer cb) {
+    if (!busy_on) {
+        u32 bits = vk.timestamp_bits;
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(vk.pd, &props);
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * VK_FRAMES, 0};
+        busy_on = bits && props.limits.timestampPeriod > 0 && vkCreateQueryPool(vk.dev, &qi, NULL, &busy_pool) == VK_SUCCESS ? 1 : -1;
+        busy_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+        busy_period = props.limits.timestampPeriod;
+    }
+    if (busy_on < 0) return;
+    if (busy_written[slot]) {
+        u64 t[2];
+        if (vkGetQueryPoolResults(vk.dev, busy_pool, 2 * slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            u64 start = t[0] & busy_mask, end = t[1] & busy_mask;
+            if (busy_last_end > start && busy_last_end <= end) start = busy_last_end;
+            if (end > start && (end - start) * busy_period < 1e9) vk_stat_gpu_busy_ns += (u64)((end - start) * busy_period);
+            if (end > busy_last_end) busy_last_end = end;
+        }
+        busy_written[slot] = 0;
+    }
+    vkCmdResetQueryPool(cb, busy_pool, 2 * slot, 2);
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, busy_pool, 2 * slot);
+}
+
+static void busy_end(unsigned slot, VkCommandBuffer cb) {
+    if (busy_on <= 0) return;
+    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, busy_pool, 2 * slot + 1);
+    busy_written[slot] = 1;
+}
+
 /* Everything of a frame is recorded into one command buffer, from the first draw after the last
  * present to the next present, which submits it. vk_cmd begins it in the next frame slot, once the
  * GPU is done with what that slot held. */
@@ -155,6 +197,7 @@ VkCommandBuffer vk_cmd(void) {
         vkResetCommandPool(vk.dev, frames[slot].pool, 0);
         VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
         vkBeginCommandBuffer(frames[slot].cb, &bi);
+        busy_begin(slot, frames[slot].cb);
         recording = 1;
         cur_slot = slot;
         vk_draw_slot_start(slot);
@@ -171,6 +214,7 @@ void vk_flush(int wait) {
     vk_stat_flushes++;
     vk_stat_flush_waits += wait != 0;
     vk_draw_suspend();
+    busy_end(cur_slot, frames[cur_slot].cb);
     vkEndCommandBuffer(frames[cur_slot].cb);
     u64 value = ++vk.submitted;
     frame_value[cur_slot] = value;
@@ -226,6 +270,7 @@ void vk_frame_end(VkFrameTarget *t) {
     vkCmdEndRendering(t->cb);
     vk_image_barrier(t->cb, t->image, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    busy_end(t->slot, t->cb);
     vkEndCommandBuffer(t->cb);
     u64 value = ++vk.submitted;
     frame_value[t->slot] = value;
@@ -294,10 +339,12 @@ static void capture(u64 guest, u32 cx, u32 cy, u32 cw, u32 ch) {
     if (vk_draw_capture(guest, cx, cy, cw, ch, path)) count++;
 }
 
+u64 vk_stat_present_held_ns, vk_stat_present_queue_ns;   /* (SSBU_LOG_STATS: the renderer's lock held by presents; of it, submitting and presenting) */
 void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     static const float black[4] = {0, 0, 0, 1};
     VkFrameTarget t;
     vk_enter();
+    u64 held_from = rt_now_ns();
     watchdog_present();
     hitch_present();
     gfx_stat_presented++;
@@ -362,7 +409,7 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     static double profile_at = -1;   /* SSBU_PROFILE_AT: the second to start a profile at (debug runs) */
     if (profile_at == -1) profile_at = getenv("SSBU_PROFILE_AT") ? atof(getenv("SSBU_PROFILE_AT")) : -2;
     if (profile_at >= 0 && rt_now_ns() > (u64)(profile_at * 1e9)) { profile_at = -2; keys |= 32; }
-    if (keys & 32) profile_start(10.0);   /* F6: 10 seconds' sampling profile */
+    if (keys & 32) profile_start(getenv("SSBU_PROFILE_SECONDS") ? atof(getenv("SSBU_PROFILE_SECONDS")) : 10.0);   /* F6: a sampling profile, 10 s (SSBU_PROFILE_SECONDS) */
     char detail[512];
     vk_draw_describe(detail, sizeof detail);
     if (overlay_build_present(overlay, details ? detail : "F2 details")) vk_overlay_draw(&t, fit_x, fit_y, fit_w, fit_h);
@@ -378,6 +425,10 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
         vk_overlay_draw(&t, 0, 0, t.w, t.h);
         display_note_bar_button(button[0], button[1], button[2], button[3]);
     }
+    u64 ending_at = rt_now_ns();
     vk_frame_end(&t);
+    u64 now = rt_now_ns();
+    vk_stat_present_held_ns += now - held_from;
+    vk_stat_present_queue_ns += now - ending_at;
     vk_leave();
 }

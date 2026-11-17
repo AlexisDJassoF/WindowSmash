@@ -3,7 +3,7 @@
  * on its own, a pixel program for each output mask of the vertex programs packed with it - both
  * as it comes (structured where it can be) and as a dispatch loop (SHADER_DISPATCH).
  *
- * Usage: shader_corpus <pack> [limit] [--spirv <dir>]
+ * Usage: shader_corpus <pack> [limit] [--spirv <dir>] [--uniform]
  * Prints a line per translation: "<vs|ps> <program hash> <vs outputs> <s|d> <FNV-1a of the HLSL>
  * <ShaderInfo's hash>" or "... failed <why>", sorted by nothing but the pack's order. Run on two
  * builds of the translator, the lines say whether they generate the same (tests/test_shader_corpus.py).
@@ -12,7 +12,8 @@
  * SPIR-V translator (with the same flags), a line "spirv <key> same|differs|unsupported <why>": its
  * ShaderInfo against the HLSL translator's (unsupported-by-both: neither can), and the module into
  * <dir>/<key>.spv when it is complete,
- * for spirv-val (tests/test_spirv.py). */
+ * for spirv-val (tests/test_spirv.py). --uniform: constant buffers as uniform buffers (gpu_spirv.h's
+ * spirv_cbuf_uniform), as the renderer has them on most devices. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <setjmp.h>
 #include <stdarg.h>
@@ -91,10 +92,13 @@ static int translate(Program *p, u32 vs_outputs, int flags, u32 *outputs) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: shader_corpus <pack> [limit] [--spirv <dir>]\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: shader_corpus <pack> [limit] [--spirv <dir>] [--uniform]\n"); return 2; }
     u32 limit = 0xFFFFFFFFu;
     for (int a = 2; a < argc; a++) {
         if (!strcmp(argv[a], "--spirv") && a + 1 < argc) spirv_dir = argv[++a];
+#ifdef WITH_SPIRV
+        else if (!strcmp(argv[a], "--uniform")) spirv_cbuf_uniform = 1;
+#endif
         else limit = (u32)strtoul(argv[a], NULL, 0);
     }
     FILE *f = fopen(argv[1], "rb");

@@ -139,6 +139,7 @@ typedef struct DeviceInfo {
     VkPhysicalDeviceProperties2 props;
     VkPhysicalDeviceDriverProperties driver;
     uint32_t queue;                     /* the family that draws, computes and presents */
+    uint32_t timestamp_bits;
     const char *robustness;             /* the robustness2 extension's name: KHR's or EXT's */
     char missing[160];                  /* the first required thing it lacks, if any */
     char optional_missing[256];         /* the optional ones it lacks */
@@ -208,6 +209,7 @@ static void examine(VkPhysicalDevice pd, DeviceInfo *d) {
         if ((q[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) && present)
             d->queue = i;
     }
+    d->timestamp_bits = d->queue < nq ? q[d->queue].timestampValidBits : 0;
     free(q);
 
     const char *lack = !v13.dynamicRendering ? "dynamic rendering"
@@ -337,6 +339,7 @@ static int make_device(const DeviceInfo *d, char *why, size_t why_size) {
     VK_DEVICE_FNS(VK_LOAD_DEVICE)
     vk.pd = d->pd;
     vk.family = d->queue;
+    vk.timestamp_bits = d->timestamp_bits;
     vkGetPhysicalDeviceMemoryProperties(vk.pd, &vk.memory);
     vkGetDeviceQueue(vk.dev, vk.family, 0, &vk.queue);
     memcpy(&vk.has, &d->has, sizeof vk.has);

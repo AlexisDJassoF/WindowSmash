@@ -1,9 +1,9 @@
 /* The sampling profiler behind F6, on Linux (debug_profile.c is the Windows one, and this
  * writes the same report). For a few seconds, every millisecond, each of the process's threads
  * is interrupted by a signal and notes where it is (and, while busy, its call stack); then the
- * busiest functions (named from ssbu.syms next to the program, which the build writes),
+ * busiest functions (named from <program>.syms or ssbu.syms next to it, which the build writes),
  * modules and threads go to build/profile_<time>.txt, and its top lines to the log. A thread
- * stopped right after a `syscall` instruction counts as waiting.
+ * stopped right after a `syscall` instruction (or on one, about to be restarted) counts as waiting.
  * Also, with the same signal: every thread's stack for freeze reports (profile_dump_threads)
  * and the hitch log (SSBU_HITCH=<ms>: what made each frame over that long late). */
 #define _GNU_SOURCE 1
@@ -97,16 +97,22 @@ static void list_modules(void) {
     dl_iterate_phdr(one_module, NULL);
 }
 
-/* The program's symbols: "<address> <type> <name>" lines, sorted (llvm-nm -n), in ssbu.syms. */
+/* The program's symbols: "<address> <type> <name>" lines, sorted (llvm-nm -n), in <program>.syms
+ * next to it (another build kept beside the game, e.g. ssbu-vk and ssbu-vk.syms), else ssbu.syms. */
 static int load_symbols(void) {
     if (sym_va) return 1;
     char path[4096];
-    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 8);
+    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 16);
     if (n <= 0) return 0;
     path[n] = 0;
-    char *dot = strrchr(path, '/');
-    snprintf(dot ? dot + 1 : path, sizeof path - (size_t)((dot ? dot + 1 : path) - path), "ssbu.syms");
+    snprintf(path + n, sizeof path - (size_t)n, ".syms");
     FILE *map = fopen(path, "r");
+    if (!map) {
+        path[n] = 0;
+        char *dot = strrchr(path, '/');
+        snprintf(dot ? dot + 1 : path, sizeof path - (size_t)((dot ? dot + 1 : path) - path), "ssbu.syms");
+        map = fopen(path, "r");
+    }
     if (!map) return 0;
     U32 cap = 1 << 18;
     size_t pool_used = 0, pool_cap = 1 << 22;
@@ -328,7 +334,7 @@ static void report(U64 total, U64 busy) {
     for (U32 m = 0; m <= nmodules; m++)
         if (per_module[m] * 1000 >= busy && busy)
             fprintf(f, "  %5.1f%%  %s\n", 100.0 * per_module[m] / busy, m < nmodules ? modules[m].name : "(no module)");
-    if (!load_symbols()) fprintf(f, "\n(ssbu.syms not found next to the program: functions unnamed)\n");
+    if (!load_symbols()) fprintf(f, "\n(neither <program>.syms nor ssbu.syms next to the program: functions unnamed)\n");
     for (U32 i = 0; i < n; i++) s[i].name = symbol_of(s[i].rip);
     Entry *e = malloc(sizeof *e * (n ? n : 1));
     fprintf(f, "\nBusiest code (%% of busy samples):\n");
@@ -370,7 +376,9 @@ static void on_sample(int sig, siginfo_t *si, void *ucv) {
     U64 rip = (U64)uc->uc_mcontext.gregs[REG_RIP];
     const unsigned char *at = (const unsigned char *)rip;
     shot.s.rip = rip;
-    shot.s.waiting = (rip & 0xFFF) >= 2 && at[-2] == 0x0F && at[-1] == 0x05;   /* (stopped just after a `syscall`) */
+    /* (stopped just after a `syscall` - or on it: a blocking call the signal interrupted is restarted,
+     * the kernel moving the thread back onto the instruction) */
+    shot.s.waiting = ((rip & 0xFFF) >= 2 && at[-2] == 0x0F && at[-1] == 0x05) || ((rip & 0xFFF) <= 0xFFE && at[0] == 0x0F && at[1] == 0x05);
     shot.s.depth = shot.want_stack ? rt_guarded_backtrace(shot.s.frames, STACK_DEPTH + 8) : 0;   /* (host.c: a walk that faults gives none) */
     sem_post(&shot_done);
     errno = saved;
@@ -447,7 +455,7 @@ static DWORD WINAPI sampler(void *arg) {
             if (!shoot(tids[i], ts && nstacks < MAX_STACKS, &s)) continue;
             total++;
             busy += !s.waiting;
-            add(s.rip, ts ? (U32)(ts - threads) : 511);
+            if (!s.waiting) add(s.rip, ts ? (U32)(ts - threads) : 511);   /* (the busiest code: busy samples only) */
             if (ts) {
                 ts->samples++;
                 ts->waiting += s.waiting;

@@ -5,7 +5,8 @@
  * range, 0), vertex attributes pulled from the vertex streams and decoded from each Maxwell format.
  *
  * Resources (one layout for every program, so the renderer needs no table per shader):
- *   set 0  binding  0..17   constant buffers 0..17 of a vertex or compute program  (storage buffers of uint, read only)
+ *   set 0  binding  0..17   constant buffers 0..17 of a vertex or compute program  (storage buffers of uint, read only;
+ *                           uniform buffers of 4096 uvec4 with spirv_cbuf_uniform)
  *          binding 18..35   constant buffers 0..17 of a pixel program
  *          binding 36..67   vertex streams 0..31                                    (storage buffers of uint, read only)
  *   set 1  binding  0..31   textures 0..31 of a vertex program's texture table      (combined image samplers)
@@ -26,6 +27,11 @@ enum {
     SPIRV_SET_BUFFERS = 0, SPIRV_SET_TEXTURES = 1, SPIRV_SET_STORAGE = 2, SPIRV_SET_PARAMS = 3,
     SPIRV_CBUF_BINDING_PIXEL = 18, SPIRV_STREAM_BINDING = 36, SPIRV_TEXTURE_BINDING_PIXEL = 32, SPIRV_STORAGE_BINDING_PIXEL = 16,
 };
+
+/* 1: constant buffers are uniform buffers (std140, uvec4[4096]) instead of storage buffers - reads at
+ * constant offsets the driver can push into registers. Set by the renderer before translating any
+ * program, from the device's limits; the modules differ, so the disk cache is kept per mode. */
+extern int spirv_cbuf_uniform;
 
 /* One program to SPIR-V (malloc'd, *words long), its ShaderInfo filled as shader_translate's;
  * the arguments as shader_translate's (gpu_shader.h). A program it cannot translate fills
