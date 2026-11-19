@@ -17,6 +17,7 @@
 # This PC's settings, written on the first start (docs/PLAYING.md)
 /controllers.ini
 /display.ini
+/netplay.ini
 # Crash, freeze and stop reports with their minidumps (docs/PLAYING.md)
 /reports/
 # Third-party packages as downloaded (SDL3 for controllers: docs/BUILDING.md)

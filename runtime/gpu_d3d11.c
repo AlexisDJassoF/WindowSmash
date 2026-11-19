@@ -3749,7 +3749,7 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
         last_inflight = gfx_stat_inflight; last_inflight_frames = gfx_stat_inflight_frames; last_present_ticks = gfx_stat_present_ticks;
     }
     overlay_present(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, overlay, details ? detail : hint);
-    char note[48];
+    char note[96];
     if (display_notice(note, sizeof note)) overlay_notice(dev, ctx, rtv, fit_x, fit_y, fit_w, fit_h, note);   /* (F7's mode) */
     unsigned bar = display_bar_height();
     if (bar && bar < back_desc.Height) {   /* (the mode bar of a window) */

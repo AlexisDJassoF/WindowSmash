@@ -2,7 +2,7 @@
 """Put the Linux build together as a folder to copy into a Linux machine (your own: the folder
 holds the game's code and data, so it is not for sharing).
 
-Usage: package_linux.py [--port <dir>] [--build <build-linux dir>] [--out <dir>] [--tar | --link] [--no-save] [--replace]
+Usage: package_linux.py [--port <dir>] [--build <build-linux dir>] [--out <dir>] [--tar | --link] [--no-save] [--no-cache] [--replace]
 
 <out>/ssbu-linux/ (default <out>: dist-linux in this checkout) gets the program and its DXVK
 libraries, the module images, fonts, the add-on content list and shader cache from the game
@@ -16,6 +16,9 @@ in the files it is read from on Windows (romfs.cfg: an NCA, or for an update the
 the update's romfs_patch.bin, pieced together by the layer map the package carries); the
 launchers find them, by name and size, on the Linux side.
 --tar also writes ssbu-linux.tar beside it, which keeps the programs' executable bits.
+--no-cache leaves the compiled shaders (dump/shadercache) out of the folder and the tar: a smaller
+package, whose game compiles each shader the first time it is used (or at the start-up screen,
+from the shader index, which stays in). Shaders already in the folder stay there, outside the tar.
 --link makes the folder to play on this machine instead, without copying the build: the program,
 its symbols, the DXVK libraries, the module images, main, the fonts and the layer map are
 symbolic links to the build and the tree, and dump/shadercache is a link to the tree's, so the
@@ -44,6 +47,7 @@ PORT = os.path.abspath(arg("--port") or read_port_stamp(BUILD) or default_port()
 OUT = os.path.abspath(arg("--out", os.path.join(REPO, "dist-linux")))
 BUNDLE = os.path.join(OUT, "ssbu-linux")
 LINK = "--link" in sys.argv
+NO_CACHE = "--no-cache" in sys.argv
 EXECUTABLE = {"ssbu", "shaderaot", "run.sh", "run-offline.sh", "run-lan.sh", "host-netplay.sh", "join-netplay.sh", "install-deps.sh", "unlock-all-fighters.sh"}
 
 
@@ -216,6 +220,8 @@ def main():
     if LINK:   # (the tree's own: what the game compiles while played from here is kept there)
         os.makedirs(cache, exist_ok=True)
         link(cache, os.path.join(BUNDLE, "dump", "shadercache"))
+    elif NO_CACHE:
+        os.makedirs(os.path.join(BUNDLE, "dump", "shadercache"), exist_ok=True)   # (where the game keeps what it compiles)
     else:
         copied += copy_tree(cache, os.path.join(BUNDLE, "dump", "shadercache"),
                             lambda f: f.startswith(f"v{version}_") and os.path.getmtime(os.path.join(cache, f)) >= PLAYED_AFTER)
@@ -263,6 +269,8 @@ def main():
         tar_path = os.path.join(OUT, "ssbu-linux.tar")
 
         def mode(info):
+            if NO_CACHE and info.name.startswith("ssbu-linux/dump/shadercache/"):
+                return None   # (--no-cache: the folder only, empty)
             name = os.path.basename(info.name)
             info.mode = 0o755 if info.isdir() or name in EXECUTABLE else 0o644
             info.uid = info.gid = 0

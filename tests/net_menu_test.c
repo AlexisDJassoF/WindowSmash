@@ -1,0 +1,66 @@
+/* runtime/net_menu.c without a window: tests/test_net_menu.py builds this with it.
+ *   net_menu_test <script>   one letter each: u d l r a (up down left right accept), k<c> (type c),
+ *                            e (Backspace), f (a room found on the LAN: 192.168.1.9:39420 "dojo" by Kim),
+ *                            p<0-4> (what the network looks like: NET_UPNP_*, LAN 192.168.1.5, VPN from TEST_VPN),
+ *                            S (the launcher's variables kept aside), W (remembered and saved), A (applied).
+ * netplay.ini: SSBU_NETPLAY_INI. Prints the page and the SSBU_NET_* variables, '|' between them. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "gpu_menu.h"
+#include "net_menu.h"
+
+static const char *env(const char *k) { const char *v = getenv(k); return v ? v : "(unset)"; }
+
+int main(int argc, char **argv) {
+    NetSettings s;
+    const char *script = argc > 1 ? argv[1] : "";
+    if (*script == 'S') { net_launch_snapshot(); script++; }
+    net_settings_load(&s);
+    NetMenu m;
+    net_menu_init(&m, &s);
+    net_launch_describe(m.launched, sizeof m.launched);
+    int plays = 0;
+    NetChoice room = {"192.168.1.9:39420", "dojo", "Kim", 1};
+    for (const char *p = script; *p; p++) {
+        switch (*p) {
+        case 'u': net_menu_event(&m, MENU_UP, 0); break;
+        case 'd': net_menu_event(&m, MENU_DOWN, 0); break;
+        case 'l': net_menu_event(&m, MENU_LEFT, 0); break;
+        case 'r': net_menu_event(&m, MENU_RIGHT, 0); break;
+        case 'a': plays += net_menu_event(&m, MENU_ACCEPT, 0) == NET_EV_PLAY; break;
+        case 'e': net_menu_event(&m, MENU_ERASE, 0); break;
+        case 'k': if (p[1]) net_menu_event(&m, MENU_CHAR, *++p); break;
+        case 'f': net_menu_set_found(&m, &room, 1); break;
+        case 'p': {
+            NetProbe probe = {0};
+            probe.upnp = p[1] ? *++p - '0' : 0;
+            strcpy(probe.lan_ip, "192.168.1.5");
+            if (getenv("TEST_VPN")) strcpy(probe.vpn_ip, getenv("TEST_VPN"));
+            strcpy(probe.wan, getenv("TEST_WAN") ? getenv("TEST_WAN") : "203.0.113.7");
+            net_menu_describe(&m, &probe);
+            break;
+        }
+        case 'W': {   /* (as gpu_menu.c saves: an unchanged mode leaves netplay.ini's) */
+            net_settings_remember(&m.s);
+            NetSettings keep = m.s;
+            if (keep.mode == m.initial.mode) keep.mode = keep.file_mode;
+            net_settings_save(&keep);
+            break;
+        }
+        case 'A': net_settings_apply(&m.s); break;
+        }
+    }
+    char v[NROWS][160];
+    for (int r = 0; r < NROWS; r++) {
+        net_menu_value(&m, r, v[r], sizeof v[r]);
+        if (v[r][0] == '\1') memmove(v[r], v[r] + 1, strlen(v[r]));
+    }
+    printf("plays=%d|row=%s|mode=%s|name=%s|room=%s|port=%s|host=%s|addrs=%s|router=%s|lan=%s|tip=%s|launched=%s|text=%d|recent=%d|"
+           "HOST=%s|RELAY=%s|ROOM=%s|PORT=%s|NAME=%s|LAN=%s|MENU_MODE=%s\n",
+           plays, net_menu_label(m.row), v[NROW_MODE], m.s.name, m.s.room, m.s.port, m.s.host, v[NROW_ADDRS], v[NROW_ROUTER], v[NROW_LAN],
+           v[NROW_TIP], m.launched, net_menu_text_row(&m), m.s.nrecent, env("SSBU_NET_HOST"), env("SSBU_NET_RELAY"), env("SSBU_NET_ROOM"),
+           env("SSBU_NET_PORT"), env("SSBU_NET_NAME"), env("SSBU_NET_LAN"), env("SSBU_NET_MENU_MODE"));
+    return 0;
+}

@@ -9,6 +9,7 @@ find_game_data || exit 1
 check_libraries || exit 1
 unset SSBU_NET_RELAY SSBU_NET_HOST
 export SSBU_NET_LAN=1 SSBU_RENDERER="${SSBU_RENDERER:-vulkan}"   # (the Vulkan renderer unless asked otherwise)
+export SSBU_NET_MODE=launcher   # (this launcher's choice, not netplay.ini's: the menu's Network page starts on As launched)
 mkdir -p build
 echo "Starting the game in LAN mode (log: build/play.log)..."
 echo "In the game: Local Wireless, then L+R+left stick (click) to switch to LAN mode - on the Switch too."

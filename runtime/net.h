@@ -34,6 +34,17 @@
 #define NET_PROTOCOL    2
 #define NET_LDN_PORT    65511         /* local wireless's own messages (hle_net.c): always through the relay */
 
+/* Finding private rooms on the LAN (the start-up menu's Network page, net_discover.c): a NET_FIND_QUERY
+ * datagram to a network's broadcast address on the relay's port; a hosting relay answers one from a
+ * private address with NET_FIND_ANSWER, its port (2 bytes, big-endian), its room and its host's
+ * name (NET_FIND_TEXT bytes each, zero-padded). SSBU_NET_ANNOUNCE=0: the relay does not answer. */
+#define NET_FIND_QUERY  "SSBUNET?"
+#define NET_FIND_ANSWER "SSBUNET!"
+#define NET_FIND_TEXT   32
+#define NET_FIND_SIZE   (8 + 2 + 2 * NET_FIND_TEXT)
+
+void net_stop(void);                 /* leave the relay and close the router's port (before the program starts again) */
+
 int net_configured(void);            /* netplay asked for (host or join) */
 int net_log(void);                   /* SSBU_NET_LOG */
 u32 net_local_ip(void);              /* this player's virtual address (host order), 0 until the relay gives one */

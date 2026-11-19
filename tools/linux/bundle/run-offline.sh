@@ -6,6 +6,7 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 find_game_data || exit 1
 check_libraries || exit 1
 unset SSBU_NET_RELAY SSBU_NET_HOST
+export SSBU_NET_MODE=launcher   # (this launcher's choice, not netplay.ini's: the menu's Network page starts on As launched)
 mkdir -p build
 echo "Starting the game offline (log: build/play.log)..."
 ./ssbu dump/modules --status 30 "$@" 2>&1 | tee build/play.log

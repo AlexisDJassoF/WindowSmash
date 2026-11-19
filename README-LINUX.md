@@ -156,6 +156,7 @@ SDL mappings for pads SDL doesn't know.
 | F5 | Depth sampling on or off |
 | F6 | 10-second profile (`build/profile_*.txt`) |
 | F7 | Switch between docked (1080p) and handheld (720p) while playing; the new mode shows on screen for 2 seconds |
+| F8, twice within 3 seconds | Start the game again on the settings menu's **Network** page, to host, join or go back to what the launcher chose (the match in progress ends) |
 | F11 or Alt+Enter | Switch between a window and full screen |
 
 In a window, a bar above the picture shows the mode: click it to switch, as F7 does. It isn't
@@ -184,6 +185,33 @@ what changed into `display.ini`, keeping your own comments and other settings (t
 the file as it was is kept as `display.ini.bak`). `menu = 0` in `display.ini`, or
 `SSBU_MENU=0 ./run.sh`, starts straight away. A setting an environment variable fixes
 (`SSBU_MODE`, `SSBU_UPSCALE`, `SSBU_PACING`, `SSBU_WINDOW`, `SSBU_RENDERER`) is shown but can't be changed.
+
+### Network page
+
+**Tab** (a pad's L or R, or a click on the menu's title) switches to the **Network** page: how this
+start goes online, without picking another launcher. It is saved in `netplay.ini` and used at
+every start with `run.sh`, until you set **Connection** back to **As launched**. `host-netplay.sh`,
+`join-netplay.sh`, `run-lan.sh` and `run-offline.sh` are a choice of their own: with them the page starts
+on **As launched**, and what `netplay.ini` saved stays for the next `run.sh`.
+
+| Setting | Values |
+| :--- | :--- |
+| Connection | **As launched**: what the script you started chose (`run.sh` the online lobby, `run-offline.sh` offline, `run-lan.sh` LAN mode...). **Create a room (host)**: host a private room here. **Join a room**: join the private room at an address. |
+| Your name | The name other players see. Type it. |
+| Room name | The private room's name: the same for everyone in it. Type it. |
+| UDP port | Hosting: the port the room listens on (39420). Type it or step it with < >. |
+| Host address | Joining: the host's `address:port`. Type it, or pick with < > among the rooms **found on your network** and the last 5 joined. Picking one fills the room name too. |
+
+Hosting, the page shows this PC's addresses to give the others (the home network's, and a VPN's
+such as Tailscale or ZeroTier when there is one), checks whether the router opens the port by
+itself (UPnP) or sits behind your provider's NAT (CGNAT), and suggests which address to share.
+Joining, it looks for rooms hosted on the same network: it asks on the room port (39420), which
+the host already lets through, so nothing else needs opening. `SSBU_NET_ANNOUNCE=0` on the host
+keeps its room from answering.
+
+On a text row, typing edits it, Backspace erases, and Space types a space. Play with Join and no
+address goes to Host address first. Esc starts with `netplay.ini` as it was. In the game, F8
+twice starts the program again on this page (the game in progress ends; the room you left is told).
 
 Two files in this folder, each written with its defaults and explanations the first time the game
 starts (delete one to get the defaults back). They mean the same as on Windows

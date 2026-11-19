@@ -25,7 +25,7 @@ class MenuTests(unittest.TestCase):
         flags = ['-O1', '-w', '-D_GNU_SOURCE', '-I', str(ROOT / 'runtime'), '-I', str(ROOT / 'runtime/linux/include'),
                  '-I', str(DXVK_INCLUDE / 'windows'), '-I', str(DXVK_INCLUDE / 'directx')]
         r = subprocess.run([CC, *flags, str(ROOT / 'tests/gpu_menu_test.c'), str(ROOT / 'runtime/gpu_menu.c'),
-                            str(ROOT / 'runtime/gpu_scale.c'), '-lm', '-o', str(cls.exe)],
+                            str(ROOT / 'runtime/gpu_scale.c'), str(ROOT / 'runtime/net_menu.c'), '-lm', '-o', str(cls.exe)],
                            capture_output=True, text=True)
         if r.returncode:
             raise AssertionError(f'compiling the test failed:\n{r.stdout}{r.stderr}')

@@ -114,6 +114,19 @@ class PackageTests(unittest.TestCase):
                           if 'romfs.bin|' in line)
         self.assertIn(f'romfs.bin|5|{self.game.parent}', files_line)
 
+    def test_tar_without_shader_cache(self):
+        self.assertEqual(self.package().returncode, 0)
+        (self.bundle / 'dump/shadercache').mkdir(exist_ok=True)
+        (self.bundle / 'dump/shadercache/v1_played.bin').write_bytes(b'played')   # (compiled while played from the folder)
+        r = self.package('--tar', '--no-cache')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with tarfile.open(self.out / 'ssbu-linux.tar') as tar:
+            names = tar.getnames()
+        self.assertIn('ssbu-linux/dump/shadercache', names)   # (the folder, for the game to fill)
+        self.assertFalse([n for n in names if n.startswith('ssbu-linux/dump/shadercache/')])
+        self.assertIn('ssbu-linux/ssbu', names)
+        self.assertTrue((self.bundle / 'dump/shadercache/v1_played.bin').exists())   # (the folder's own kept)
+
     def test_tar_after_link_has_no_links_and_keeps_tree(self):
         self.assertEqual(self.package('--link').returncode, 0)
         (self.tree / 'dump/shadercache/v1_new.bin').write_bytes(b'shader')

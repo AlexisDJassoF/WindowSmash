@@ -2,11 +2,13 @@
  * does there, by hand. Find the router (SSDP: a multicast M-SEARCH, answered with the address of
  * its description), read which control URL its WAN connection service has, and ask it with
  * SOAP to forward a UDP port to this machine (and for its outside address); the mapping is
- * removed again at exit. */
+ * removed again at exit. One at a time (the start-up menu's check, rt_upnp_check, may still be
+ * asking when the game's relay starts). */
 #define _GNU_SOURCE 1
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,8 +157,10 @@ static void delete_mapping(u16 port) {
     soap("DeletePortMapping", args, reply, sizeof reply);
 }
 
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* 1 mapped (public_ip filled when the router says), 2 no UPnP router, 3 the router refused. */
-int rt_upnp_add(u16 port, const char *lan_ip, const char *what, char *public_ip, size_t n) {
+static int add(u16 port, const char *lan_ip, const char *what, char *public_ip, size_t n) {
     if (!discover()) return 2;
     delete_mapping(port);   /* (a stale one from an earlier run) */
     char args[1024], reply[8192];
@@ -171,7 +175,30 @@ int rt_upnp_add(u16 port, const char *lan_ip, const char *what, char *public_ip,
     return 1;
 }
 
-void rt_upnp_remove(void) {
+int rt_upnp_add(u16 port, const char *lan_ip, const char *what, char *public_ip, size_t n) {
+    pthread_mutex_lock(&lock);
+    int r = add(port, lan_ip, what, public_ip, n);
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+static void remove_mapping(void) {
     if (mapped_port) delete_mapping(mapped_port);
     mapped_port = 0;
+}
+
+void rt_upnp_remove(void) {
+    pthread_mutex_lock(&lock);
+    remove_mapping();
+    pthread_mutex_unlock(&lock);
+}
+
+/* Whether the router would open the port (rt_upnp_add's answer), the mapping removed again at once:
+ * the start-up menu's Network page asks before hosting. */
+int rt_upnp_check(u16 port, const char *lan_ip, char *public_ip, size_t n) {
+    pthread_mutex_lock(&lock);
+    int r = add(port, lan_ip, "SSBU netplay (check)", public_ip, n);
+    if (r == 1) remove_mapping();
+    pthread_mutex_unlock(&lock);
+    return r;
 }

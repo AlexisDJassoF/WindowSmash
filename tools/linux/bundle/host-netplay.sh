@@ -11,6 +11,7 @@ read -r -p "Your player name [$USER]: " SSBU_NET_NAME
 read -r -p "Room name - the other players use the same one [smash]: " SSBU_NET_ROOM
 read -r -p "UDP port [39420]: " SSBU_NET_PORT
 export SSBU_NET_NAME="${SSBU_NET_NAME:-$USER}" SSBU_NET_ROOM="${SSBU_NET_ROOM:-smash}" SSBU_NET_PORT="${SSBU_NET_PORT:-39420}" SSBU_NET_HOST=1
+export SSBU_NET_MODE=launcher   # (this launcher's choice, not netplay.ini's: the menu's Network page starts on As launched)
 rm -f netplay_address.txt
 mkdir -p build
 ./ssbu dump/modules --status 30 > build/play.log 2>&1 &

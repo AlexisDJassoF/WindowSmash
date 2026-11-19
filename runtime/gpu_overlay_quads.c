@@ -184,7 +184,7 @@ void overlay_build_progress(unsigned w, unsigned h, const char *title, unsigned 
 }
 
 /* The start-up menu (gpu_menu.c): a title, then a row per shown item - its label, and its value
- * between < > - the selected one lit, the button row (Play) as a button, and a footer; centred
+ * between < > (as it is when it starts with '\1') - the selected one lit, the button row (Play) as a button, and a footer; centred
  * in the w x h back buffer. Each row's place goes to rects (x, y, w, h; 0 for a row not shown),
  * and where the values start to *value_x, for clicks. */
 void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],
@@ -192,8 +192,15 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     nverts = 0;
     int rows = 0;
     for (int i = 0; i < n; i++) rows += shown[i] != 0;
-    /* (labels up to 17 characters, values up to 26: "<  75% (1440 x 810)  >", "(set by SSBU_...)") */
-    float row_h = CELL_H + 14, pw = 46 * CELL_W + 48, ph = (rows + 1) * row_h + 3 * CELL_H + 40;
+    /* (labels up to 17 characters, values up to 26: "<  75% (1440 x 810)  >", "(set by SSBU_...)"; wider
+     * for longer values - the Network page's) */
+    size_t widest = 26;
+    for (int i = 0; i < n; i++)
+        if (shown[i] && i != button) {
+            size_t l = values[i][0] == '\1' ? strlen(values[i]) - 1 : strlen(values[i]) + 6;
+            if (l > widest) widest = l;
+        }
+    float row_h = CELL_H + 14, pw = (20 + widest) * CELL_W + 48, ph = (rows + 1) * row_h + 3 * CELL_H + 40;
     if (pw > w - 16.0f) pw = w - 16.0f;
     float px = (w - pw) / 2, py = (h - ph) / 2, lx = px + 24, vx = px + 24 + 18 * CELL_W;
     rect(px, py, pw, ph, RGBA(24, 24, 28, 235));
@@ -214,8 +221,9 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         } else {
             if (sel) rect(px + 8, y - 4, pw - 16, row_h - 6, RGBA(70, 90, 140, 200));
             text(lx, y + 2, RGBA(225, 225, 225, 255), labels[i]);
-            char v[96];
-            snprintf(v, sizeof v, "<  %s  >", values[i]);
+            char v[160];
+            if (values[i][0] == '\1') snprintf(v, sizeof v, "%s", values[i] + 1);   /* (as it is: text typed, information) */
+            else snprintf(v, sizeof v, "<  %s  >", values[i]);
             text(vx, y + 2, sel ? RGBA(255, 255, 255, 255) : RGBA(190, 200, 220, 255), v);
             r[0] = px + 8, r[1] = y - 4, r[2] = pw - 16, r[3] = row_h - 6;
         }

@@ -10,6 +10,7 @@ if [ -z "$SSBU_NET_RELAY" ]; then echo "An address is needed - ask the host for 
 read -r -p "Your player name [$USER]: " SSBU_NET_NAME
 read -r -p "Room name - the same as the host's [smash]: " SSBU_NET_ROOM
 export SSBU_NET_RELAY SSBU_NET_NAME="${SSBU_NET_NAME:-$USER}" SSBU_NET_ROOM="${SSBU_NET_ROOM:-smash}"
+export SSBU_NET_MODE=launcher   # (this launcher's choice, not netplay.ini's: the menu's Network page starts on As launched)
 mkdir -p build
 echo
 echo "Starting the game, joining room \"$SSBU_NET_ROOM\" at $SSBU_NET_RELAY..."

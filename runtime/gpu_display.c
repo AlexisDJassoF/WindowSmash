@@ -253,18 +253,32 @@ void oe_notify(u32 message);   /* hle_env.c */
 /* F7: docked <-> handheld while playing, told to the game as the console tells it (messages 30
  * and 31). Not written to display.ini: the start-up menu decides the next start. */
 static volatile ULONGLONG toggled_at;
+/* Another key's notice (F8's), shown as F7's is: the latest one wins. */
+static char shown_text[96];
+static volatile ULONGLONG shown_at, shown_for;
 
 void display_toggle_operation_mode(void) {
     load();
     cfg.operation = cfg.operation == OP_HANDHELD ? OP_DOCKED : OP_HANDHELD;
     toggled_at = GetTickCount64();
+    shown_at = 0;
     fprintf(stderr, "[display] F7: %s\n", cfg.operation == OP_HANDHELD ? "handheld (720p)" : "docked (1080p)");
     oe_notify(30);   /* OperationModeChanged */
     oe_notify(31);   /* PerformanceModeChanged */
 }
 
+
+void display_show_notice(const char *text, unsigned ms) {
+    snprintf(shown_text, sizeof shown_text, "%s", text);
+    shown_for = ms;
+    shown_at = GetTickCount64();
+    toggled_at = 0;
+}
+
 /* The 2 s after F7: what to show over the picture ("Handheld (720p)"); 0 the rest of the time */
 int display_notice(char *out, unsigned n) {
+    ULONGLONG s = shown_at;
+    if (s && GetTickCount64() - s <= shown_for) { snprintf(out, n, "%s", shown_text); return 1; }
     ULONGLONG at = toggled_at;
     if (!at || GetTickCount64() - at > 2000) return 0;
     snprintf(out, n, "%s", cfg.operation == OP_HANDHELD ? "Handheld (720p)" : "Docked (1080p)");

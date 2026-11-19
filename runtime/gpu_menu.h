@@ -8,9 +8,17 @@
 void menu_run(void);
 
 /* The window's thread: while menu_active, its input, here instead of to the game. */
-enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_ACCEPT, MENU_BACK, MENU_CLICK };
+enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_ACCEPT, MENU_BACK, MENU_CLICK,
+       MENU_TAB,     /* the other page: Display <-> Network (Tab, a controller's shoulder buttons) */
+       MENU_CHAR,    /* a typed character (x), for the Network page's text rows */
+       MENU_ERASE }; /* Backspace */
 extern volatile int menu_active;
+extern volatile int menu_typing;            /* the selected row takes text: Space types, not plays */
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */
+
+/* In the game (F8 twice): the program started again on the Network page, its menu shown. Linux;
+ * returns only if it cannot. */
+void menu_restart_network(void);
 
 /* ---- the model, without a window (tests/test_gpu_menu.py drives it) ---------------------- */
 enum { ROW_MODE, ROW_SCALE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_RENDERER, ROW_PLAY, ROWS };

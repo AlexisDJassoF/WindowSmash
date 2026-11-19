@@ -413,7 +413,7 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     char detail[512];
     vk_draw_describe(detail, sizeof detail);
     if (overlay_build_present(overlay, details ? detail : "F2 details")) vk_overlay_draw(&t, fit_x, fit_y, fit_w, fit_h);
-    char note[48];
+    char note[96];
     if (display_notice(note, sizeof note)) {   /* (F7's mode) */
         overlay_build_notice(fit_w, fit_h, note);
         vk_overlay_draw(&t, fit_x, fit_y, fit_w, fit_h);

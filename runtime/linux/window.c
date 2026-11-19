@@ -4,7 +4,8 @@
  * with GetAsyncKeyState. Here the main thread creates an SDL window at start-up (DXVK presents
  * into it: its HWND is the SDL_Window) and then runs the event loop for good, keeping what the
  * rest of the runtime asks for up to date: the keyboard (behind GetAsyncKeyState), focus, the
- * debug keys F1-F6 and the window's close button. Game controllers are hle_pad.c's: its input
+ * debug keys F1-F6, F8 twice (the start-up menu's Network page, the program started again) and the
+ * window's close button. Game controllers are hle_pad.c's: its input
  * thread reads them (SDL starts them here, with their events off).
  *
  * display.ini (gpu_display.c) sizes the window and picks its mode: windowed, or SDL's desktop
@@ -191,7 +192,8 @@ static void menu_pads_poll(Uint64 now) {
         }
     }
     /* every pad's buttons together: a direction (D-pad or stick past half way), accept, back */
-    int dir = -1, accept = 0, back = 0;
+    int dir = -1, accept = 0, back = 0, page = 0;
+    static int was_page;
     for (int i = 0; i < 8; i++) {
         SDL_GameController *gp = menu_pads[i];
         if (!gp) continue;
@@ -202,6 +204,7 @@ static void menu_pads_poll(Uint64 now) {
         else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || x > 16000) dir = MENU_RIGHT;
         accept |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_A);   /* (positional: the south button) */
         back |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_B);     /* (the east one) */
+        page |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) | SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     }
     if (dir != held) {   /* a new press: now, then again after 400 ms held, every 120 ms */
         held = dir;
@@ -213,8 +216,10 @@ static void menu_pads_poll(Uint64 now) {
     }
     if (accept && !was_accept) menu_input(MENU_ACCEPT, 0, 0);
     if (back && !was_back) menu_input(MENU_BACK, 0, 0);
+    if (page && !was_page) menu_input(MENU_TAB, 0, 0);   /* (L or R: the other page) */
     was_accept = accept;
     was_back = back;
+    was_page = page;
 }
 
 /* 1 if the menu took the event */
@@ -227,13 +232,21 @@ static int menu_event_of(const SDL_Event *e) {
         case SDL_SCANCODE_DOWN: menu_input(MENU_DOWN, 0, 0); return 1;
         case SDL_SCANCODE_LEFT: menu_input(MENU_LEFT, 0, 0); return 1;
         case SDL_SCANCODE_RIGHT: menu_input(MENU_RIGHT, 0, 0); return 1;
-        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE:
+        case SDL_SCANCODE_TAB: if (!e->key.repeat) menu_input(MENU_TAB, 0, 0); return 1;
+        case SDL_SCANCODE_BACKSPACE: menu_input(MENU_ERASE, 0, 0); return 1;
+        case SDL_SCANCODE_SPACE: if (menu_typing) return 1;   /* (a space typed: SDL_TEXTINPUT brings it) */
+            /* fall through */
+        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER:
             if (e->key.keysym.mod & KMOD_ALT) return 0;   /* (Alt+Enter: full screen) */
             if (!e->key.repeat) menu_input(MENU_ACCEPT, 0, 0);
             return 1;
         case SDL_SCANCODE_ESCAPE: if (!e->key.repeat) menu_input(MENU_BACK, 0, 0); return 1;
         default: return 0;
         }
+    case SDL_TEXTINPUT:   /* the Network page's names and addresses (printable ASCII: the overlay's font) */
+        for (const char *t = e->text.text; *t; t++)
+            if (*t >= 32 && *t <= 126) menu_input(MENU_CHAR, *t, 0);
+        return 1;
     case SDL_MOUSEBUTTONDOWN: {
         if (e->button.button != SDL_BUTTON_LEFT) return 0;
         int ww = 1, wh = 1, dw = 1, dh = 1;   /* (window units to the drawable's pixels: they differ on a scaled desktop) */
@@ -253,6 +266,11 @@ void rt_window_loop(int every, void (*status)(void)) {
         SDL_Event e;
         if (menu_active) menu_pads_poll(SDL_GetTicks64());
         else if (menu_pads_open) menu_pads_stop();
+        static int text_on = -1;   /* typed text for the menu only (no IME in the game's way) */
+        if (window && text_on != (menu_active != 0)) {
+            text_on = menu_active != 0;
+            if (text_on) SDL_StartTextInput(); else SDL_StopTextInput();
+        }
         int request = display_take_window_request();   /* (the menu's Window setting) */
         if (request >= 0 && window) set_mode(request);
         int got = window ? SDL_WaitEventTimeout(&e, 8) : (SDL_Delay(50), 0);
@@ -286,6 +304,13 @@ void rt_window_loop(int every, void (*status)(void)) {
                 if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F6)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
                 if (e.key.keysym.scancode == SDL_SCANCODE_F7 && !menu_active && !precompile_active) display_toggle_operation_mode();
+                if (e.key.keysym.scancode == SDL_SCANCODE_F8 && !menu_active && !precompile_active) {   /* twice: the Network page */
+                    static Uint64 f8_at;
+                    Uint64 t = SDL_GetTicks64();
+                    if (f8_at && t - f8_at < 3000) menu_restart_network();
+                    else display_show_notice("F8 again: network settings (restarts the game)", 3000);
+                    f8_at = t;
+                }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 ||
                     (e.key.keysym.scancode == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT))) {
                     int full = display_window_mode() == DISPLAY_FULLSCREEN ? DISPLAY_FULLSCREEN : DISPLAY_BORDERLESS;

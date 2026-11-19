@@ -46,6 +46,7 @@ void display_apply(const DisplaySettings *s);             /* before the game sta
 int display_save(const DisplaySettings *s);               /* what changed from the file, into display.ini */
 void display_toggle_operation_mode(void);                  /* F7: docked <-> handheld while playing, told to the game */
 int display_notice(char *out, unsigned n);                /* for 2 s after F7: the mode, to show over the picture */
+void display_show_notice(const char *text, unsigned ms);  /* another notice over the picture for ms (F8's) */
 /* The mode bar at the top of a window (its button switches as F7 does): its height in the drawable's
  * pixels (0: none, in full screen), and its button's place, drawn by the renderer and clicked in the window */
 void display_note_bar(unsigned px);

@@ -10,6 +10,11 @@
  * variable fixes is shown, not changeable, and not written. The renderer is already drawing the
  * menu: another one chosen starts the program again (the menu not shown then), on it.
  *
+ * Tab (a controller's shoulder buttons, or a click on the title) shows the other page, Network
+ * (net_menu.c): how this start goes online - as the launcher chose, hosting a room or joining one -
+ * saved in netplay.ini and set up before the game's network starts. F8 twice in the game starts
+ * the program again on that page (menu_restart_network).
+ *
  * The window's thread (linux/window.c) feeds menu_input; this thread draws with gfx_menu. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
@@ -23,10 +28,13 @@
 #include "gpu_backend.h"
 #include "gpu_menu.h"
 #include "gpu_scale.h"
+#include "net.h"
+#include "net_discover.h"
+#include "net_menu.h"
 
 #define WAIT_S 10.0
 
-volatile int menu_active;
+volatile int menu_active, menu_typing;
 
 /* ---- the model ------------------------------------------------------------------------------ */
 static const Pacing VSYNC_ORDER[] = {PACING_VSYNC, PACING_CLOCK, PACING_VRR};
@@ -153,11 +161,13 @@ void menu_input(int event, int x, int y) {
     head = h + 1;
 }
 
-/* ---- starting again on another renderer ----------------------------------------------------- */
+/* ---- starting again ------------------------------------------------------------------------ */
 #ifndef _WIN32
-/* The program again, with the same arguments, the menu not shown: the renderer is chosen at its
- * first frame (the menu's), and display.ini names the new one now. Returns only if it cannot. */
-static void start_again(void) {
+/* The program again, with the same arguments: for another renderer (chosen at its first frame, the
+ * menu's; display.ini names the new one now) without the menu, or on the Network page with it (F8 in
+ * the game). The environment goes along: the network the menu set up, the launcher's kept aside.
+ * Returns only if it cannot. */
+static void start_again(int network) {
     static char args[65536];
     char *argv[256];
     FILE *f = fopen("/proc/self/cmdline", "rb");
@@ -167,30 +177,89 @@ static void start_again(void) {
     for (size_t at = 0; at < n && argc < 255; at += strlen(args + at) + 1) argv[argc++] = args + at;
     argv[argc] = NULL;
     if (!argc) return;
-    setenv("SSBU_MENU", "0", 1);
-    fprintf(stderr, "[menu] another renderer: starting again on it\n");
+    if (network) {
+        setenv("SSBU_MENU", "1", 1);
+        setenv("SSBU_MENU_PAGE", "network", 1);
+        net_stop();   /* (the relay told, the router's port closed: exit's work, which execv skips) */
+    } else setenv("SSBU_MENU", "0", 1);
+    fprintf(stderr, network ? "[menu] F8: starting again on the Network page\n" : "[menu] another renderer: starting again on it\n");
     fflush(NULL);
     execv("/proc/self/exe", argv);
-    fprintf(stderr, "[menu] cannot start again: the renderer changes at the next start\n");
+    fprintf(stderr, "[menu] cannot start again: %s\n", network ? "change the network at the next start" : "the renderer changes at the next start");
 }
 #endif
 
+void menu_restart_network(void) {
+#ifndef _WIN32
+    start_again(1);
+#endif
+}
+
 /* ---- the screen ----------------------------------------------------------------------------- */
 static double seconds(void) { return GetTickCount64() / 1000.0; }
+
+#ifndef _WIN32
+/* A click on the Network page: a row picked, its value's halves stepping it (as menu_click does) */
+static int net_click(NetMenu *nm, const MenuRect rects[NROWS], float value_x, float x, float y) {
+    for (int row = 0; row < NROWS; row++) {
+        const MenuRect *r = &rects[row];
+        if (!net_menu_visible(nm, row) || r->w <= 0 || x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) continue;
+        if (!net_menu_selectable(nm, row)) return NET_EV_NONE;
+        nm->row = row;
+        if (row == NROW_PLAY) return net_menu_event(nm, MENU_ACCEPT, 0);
+        if (x >= value_x) return net_menu_event(nm, x < value_x + (r->x + r->w - value_x) / 2 ? MENU_LEFT : MENU_RIGHT, 0);
+        return NET_EV_NONE;
+    }
+    return NET_EV_NONE;
+}
+
+/* A click just above the first row (on the title): the other page */
+static int title_click(const MenuRect *rects, int n, float x, float y) {
+    for (int i = 0; i < n; i++)
+        if (rects[i].w > 0) return x >= rects[i].x && x < rects[i].x + rects[i].w && y < rects[i].y && y >= rects[i].y - 60;
+    return 0;
+}
+
+static void net_refresh(NetMenu *nm) {
+    NetChoice found[NET_CHOICES];
+    int n = nm->s.mode == NET_MODE_JOIN ? net_discover_found(found, NET_CHOICES) : 0;
+    net_menu_set_found(nm, found, n);
+    if (nm->s.mode == NET_MODE_HOST) net_discover_check_router(nm->s.port[0] ? nm->s.port : "39420");
+    NetProbe p;
+    net_discover_probe(&p);
+    net_menu_describe(nm, &p);
+}
+#endif
 
 void menu_run(void) {
 #ifdef _WIN32
     return;   /* (no start-up phase on Windows: display.ini is edited there) */
 #else
-    if (!display_menu_enabled()) return;
+    net_launch_snapshot();   /* (what the launcher asked for, kept for "As launched") */
+    NetSettings ns;
+    net_settings_load(&ns);
+    const char *page_env = getenv("SSBU_MENU_PAGE");
+    int page = page_env && !strcmp(page_env, "network");   /* 0 Display, 1 Network */
+    unsetenv("SSBU_MENU_PAGE");
+    if (!display_menu_enabled()) {
+        net_settings_apply(&ns);
+        return;
+    }
     DisplaySettings now;
     unsigned locked;
     display_get_settings(&now, NULL, &locked);
     Menu m;
     menu_init(&m, &now, locked, seconds());
-    MenuRect rects[ROWS];
-    float value_x = 0;
+    NetMenu nm;
+    net_menu_init(&nm, &ns);
+    net_launch_describe(nm.launched, sizeof nm.launched);
+    if (page) { m.touched = 1; nm.row = NROW_MODE; }   /* (F8: here to change the network - no countdown) */
+    int searching = 0;
+    double refreshed = 0;
+    MenuRect rects[ROWS], nrects[NROWS];
+    float value_x = 0, nvalue_x = 0;
     memset(rects, 0, sizeof rects);
+    memset(nrects, 0, sizeof nrects);
     tail = head;
     menu_active = 1;
     while (m.state == MENU_OPEN) {
@@ -198,35 +267,76 @@ void menu_run(void) {
             Input in = queue[tail & 63];
             MemoryBarrier();
             tail++;
-            if (in.event == MENU_CLICK) menu_click(&m, rects, value_x, (float)in.x, (float)in.y, seconds());
-            else menu_event(&m, in.event, seconds());
+            int ev = in.event;
+            if (ev == MENU_CLICK && title_click(page ? nrects : rects, page ? NROWS : ROWS, (float)in.x, (float)in.y)) ev = MENU_TAB;
+            if (ev == MENU_TAB) { page = !page; m.touched = 1; refreshed = 0; continue; }
+            if (ev == MENU_BACK) { menu_event(&m, MENU_BACK, seconds()); nm.s = nm.initial; break; }
+            if (!page) {
+                if (ev == MENU_CLICK) menu_click(&m, rects, value_x, (float)in.x, (float)in.y, seconds());
+                else if (ev != MENU_CHAR && ev != MENU_ERASE) menu_event(&m, ev, seconds());
+                continue;
+            }
+            m.touched = 1;
+            int mode = nm.s.mode;
+            int r = ev == MENU_CLICK ? net_click(&nm, nrects, nvalue_x, (float)in.x, (float)in.y) : net_menu_event(&nm, ev, in.x);
+            if (r == NET_EV_PLAY) m.state = MENU_PLAY;
+            if (nm.s.mode != mode) refreshed = 0;
         }
         menu_tick(&m, seconds());
+        /* Play from the Display page with Join and no address: the Network page first */
+        if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN && !nm.s.host[0]) { m.state = MENU_OPEN; page = 1; nm.row = NROW_HOST; }
         if (m.state != MENU_OPEN) break;
-        const char *labels[ROWS];
-        char values[ROWS][64], footer[96];
-        int shown[ROWS];
-        for (int r = 0; r < ROWS; r++) {
-            labels[r] = menu_label(r);
-            menu_value(&m, r, values[r], sizeof values[r]);
-            shown[r] = menu_visible(&m, r);
-        }
+        if (page && !searching) { net_discover_start(); searching = 1; }
+        if (page && seconds() - refreshed >= 0.5) { refreshed = seconds(); net_refresh(&nm); }
+        menu_typing = page && net_menu_text_row(&nm);
+        char footer[128];
         if (!m.touched) snprintf(footer, sizeof footer, "Starting in %.0f s - press any key to change settings", m.deadline - seconds() + 0.5);
+        else if (page) snprintf(footer, sizeof footer, "Type to edit   < >: change   Enter: play   Esc: no changes");
         else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "FSR recommended below 100%%   -   Enter: play   Esc: no changes");
         else snprintf(footer, sizeof footer, "Enter: play    Esc: play without changes");
-        const char *vp[ROWS];
-        for (int r = 0; r < ROWS; r++) vp[r] = values[r];
-        if (!gfx_menu("Settings", ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
+        if (!page) {
+            const char *labels[ROWS], *vp[ROWS];
+            char values[ROWS][64];
+            int shown[ROWS];
+            for (int r = 0; r < ROWS; r++) {
+                labels[r] = menu_label(r);
+                menu_value(&m, r, values[r], sizeof values[r]);
+                vp[r] = values[r];
+                shown[r] = menu_visible(&m, r);
+            }
+            if (!gfx_menu("[ Display ]   Network  (Tab)", ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
+        } else {
+            const char *labels[NROWS], *vp[NROWS];
+            char values[NROWS][160];
+            int shown[NROWS];
+            for (int r = 0; r < NROWS; r++) {
+                labels[r] = net_menu_label(r);
+                net_menu_value(&nm, r, values[r], sizeof values[r]);
+                vp[r] = values[r];
+                shown[r] = net_menu_visible(&nm, r);
+            }
+            if (!gfx_menu("Display  (Tab)   [ Network ]", NROWS, labels, vp, shown, nm.row, NROW_PLAY, footer, (float *)nrects, &nvalue_x)) Sleep(30);
+        }
         Sleep(16);
     }
+    menu_typing = 0;
     menu_active = 0;
+    if (searching) net_discover_stop();
     if (m.state == MENU_PLAY) {
         display_save(&m.s);
         display_apply(&m.s);
+        net_settings_remember(&nm.s);
+        NetSettings keep = nm.s;   /* (a launcher's own choice, As launched untouched, leaves netplay.ini's mode as it was) */
+        if (keep.mode == nm.initial.mode) keep.mode = keep.file_mode;
+        if (!net_settings_save(&keep)) fprintf(stderr, "[menu] cannot write netplay.ini\n");
     }
+    net_settings_apply(&nm.s);   /* (Esc: as netplay.ini was; untouched: as it is) */
     fprintf(stderr, "[menu] %s: %s at %d%%, upscale %s, pacing %d, window %d, renderer %s\n", m.state == MENU_PLAY ? "play" : "as display.ini was",
             m.s.operation == OP_HANDHELD ? "handheld" : "docked", m.s.scale, m.s.upscale == UPSCALE_FSR ? "fsr" : "linear", (int)m.s.pacing,
             m.s.window, m.s.renderer == RENDERER_VULKAN ? "vulkan" : "dxvk");
-    if (m.state == MENU_PLAY && m.s.renderer != m.initial.renderer) start_again();
+    char launched[96];
+    net_launch_describe(launched, sizeof launched);
+    fprintf(stderr, "[menu] network: %s\n", nm.s.mode == NET_MODE_HOST ? "hosting a room" : nm.s.mode == NET_MODE_JOIN ? "joining a room" : launched);
+    if (m.state == MENU_PLAY && m.s.renderer != m.initial.renderer) start_again(0);
 #endif
 }

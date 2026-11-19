@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "gpu_menu.h"
+#include "net_discover.h"
 
 /* (what gpu_menu.c's screen loop calls, not used by the model) */
 ULONGLONG GetTickCount64(void) { return 0; }
@@ -15,6 +16,12 @@ int display_menu_enabled(void) { return 1; }
 void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed) { (void)now; (void)file; (void)fixed; }
 void display_apply(const DisplaySettings *s) { (void)s; }
 int display_save(const DisplaySettings *s) { (void)s; return 1; }
+void net_stop(void) {}
+void net_discover_start(void) {}
+void net_discover_stop(void) {}
+int net_discover_found(NetChoice *out, int max) { (void)out; (void)max; return 0; }
+void net_discover_check_router(const char *port) { (void)port; }
+void net_discover_probe(NetProbe *p) { memset(p, 0, sizeof *p); }
 int gfx_menu(const char *t, int n, const char *const l[], const char *const v[], const int s[], int sel, int b, const char *f, float *r, float *x) {
     (void)t; (void)n; (void)l; (void)v; (void)s; (void)sel; (void)b; (void)f; (void)r; (void)x;
     return 0;

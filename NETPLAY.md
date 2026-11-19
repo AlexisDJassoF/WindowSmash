@@ -32,6 +32,8 @@ WindowSmash plays the game's **Local Wireless** mode over the internet. To the g
 
 The online lobby is the easiest: nobody hosts anything outside the game, and nobody touches their router.
 
+On Linux, the start-up menu's **Network** page (Tab in the settings menu, or F8 twice in the game) does what the host and join launchers do, without them: it hosts or joins a private room, remembers the name, room, port and the last rooms joined in `netplay.ini`, shows the host's addresses and whether the router opens the port, and lists the rooms hosted on the same network so nobody types an address. See [README-LINUX.md](README-LINUX.md#network-page).
+
 On Linux ([README-LINUX.md](README-LINUX.md)), `run.sh`, `run-offline.sh`, `run-lan.sh`, `host-netplay.sh` and `join-netplay.sh` do what `Play SSBU.bat`, `Play SSBU Offline.bat`, `Play SSBU LAN.bat`, `Host SSBU Netplay.bat` and `Join SSBU Netplay.bat` do. Windows and Linux players with the same game version play together.
 
 ## Before you play
@@ -227,5 +229,7 @@ The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG
 | `SSBU_NET_LAN=1` | LAN mode: no lobby or relay, the game's sockets are the PC's own on its own network. `Play SSBU LAN.bat` sets it. |
 | `SSBU_NET_LAN_IP` | In LAN mode, the PC's address to use. Default: the one the PC reaches the internet by. |
 | `SSBU_NET_LOG=1` / `2` | Network logging: a summary, or more detail. |
+| `SSBU_NET_ANNOUNCE=0` | A hosted room does not answer the Network page's search for rooms on the same network (Linux and Windows hosts answer it by default, only from private addresses). |
+| `SSBU_NETPLAY_INI` | Linux: the Network page's settings file instead of `netplay.ini`. |
 
 Without a host or relay setting, the game stays offline. `Play SSBU Offline.bat` clears both; `Play SSBU.bat` takes the relay from `online_server.txt`; the host and join launchers set their own.
