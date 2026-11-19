@@ -30,6 +30,7 @@
 # Linux build outputs (tools/linux)
 /build-linux*/
 /dist-linux*/
+/dist-tar*/
 *.keys
 *.nca
 *.nsp
