@@ -37,11 +37,15 @@
 /* Finding private rooms on the LAN (the start-up menu's Network page, net_discover.c): a NET_FIND_QUERY
  * datagram to a network's broadcast address on the relay's port; a hosting relay answers one from a
  * private address with NET_FIND_ANSWER, its port (2 bytes, big-endian), its room and its host's
- * name (NET_FIND_TEXT bytes each, zero-padded). SSBU_NET_ANNOUNCE=0: the relay does not answer. */
+ * name (NET_FIND_TEXT bytes each, zero-padded), then (newer relays) the room's players and its most
+ * (a byte each). A query padded to NET_FIND_ANSWER_SIZE bytes - the menu asking one address, the last
+ * room joined - is answered from anywhere: its answer is no bigger than it. SSBU_NET_ANNOUNCE=0: the
+ * relay does not answer. */
 #define NET_FIND_QUERY  "SSBUNET?"
 #define NET_FIND_ANSWER "SSBUNET!"
 #define NET_FIND_TEXT   32
 #define NET_FIND_SIZE   (8 + 2 + 2 * NET_FIND_TEXT)
+#define NET_FIND_ANSWER_SIZE (NET_FIND_SIZE + 2)
 
 void net_stop(void);                 /* leave the relay and close the router's port (before the program starts again) */
 

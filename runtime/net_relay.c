@@ -174,7 +174,7 @@ static void drop_member(Room *r, int i) {
     tell_members(r);
 }
 
-/* A private (or loopback) address: only those are told about the room (no answer goes back to the internet). */
+/* A private (or loopback) address: only those are told about the room by the short query (a padded one, no bigger than its answer, is answered from anywhere). */
 static int private_address(u32 a) {   /* (host order) */
     return (a >> 24) == 10 || (a >> 24) == 127 || (a >> 20) == (172u << 4 | 1) || (a >> 16) == (192u << 8 | 168) || (a >> 16) == (169u << 8 | 254) ||
            (a >> 22) == (100u << 2 | 1);
@@ -182,21 +182,26 @@ static int private_address(u32 a) {   /* (host order) */
 
 /* The start-up menu's Network page on another PC of this network asks which rooms are hosted here
  * (net.h's NET_FIND_*): this relay's port, room and host. */
-static void answer_find(const struct sockaddr_in *from) {
+static void answer_find(const struct sockaddr_in *from, int padded) {
     static int announce = -1;
     if (announce < 0) announce = !getenv("SSBU_NET_ANNOUNCE") || strcmp(getenv("SSBU_NET_ANNOUNCE"), "0");
-    if (!announce || !private_address(ntohl(from->sin_addr.s_addr))) return;
-    u8 out[NET_FIND_SIZE];
+    if (!announce || (!padded && !private_address(ntohl(from->sin_addr.s_addr)))) return;   /* (padded: no bigger answer, from anywhere) */
+    u8 out[NET_FIND_ANSWER_SIZE];
     memset(out, 0, sizeof out);
     memcpy(out, NET_FIND_ANSWER, 8);
     put16(out + 8, port);
     strncpy((char *)out + 10, room, NET_FIND_TEXT);
     strncpy((char *)out + 10 + NET_FIND_TEXT, name, NET_FIND_TEXT);
+    int players = 0;   /* (the hosted room's players: a full room is not offered to join) */
+    for (int i = 0; i < ROOMS; i++)
+        if (rooms[i].count && !strcmp(rooms[i].name, room)) players = rooms[i].count;
+    out[NET_FIND_SIZE] = (u8)players;
+    out[NET_FIND_SIZE + 1] = ROOM_MEMBERS;
     sendto(relay_sock, (const char *)out, sizeof out, 0, (const struct sockaddr *)from, sizeof *from);
 }
 
 static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
-    if (n == 8 && !memcmp(p, NET_FIND_QUERY, 8)) { answer_find(from); return; }
+    if ((n == 8 || n >= NET_FIND_ANSWER_SIZE) && !memcmp(p, NET_FIND_QUERY, 8)) { answer_find(from, n >= NET_FIND_ANSWER_SIZE); return; }
     if (n < 4 || p[0] != MAGIC0 || p[1] != MAGIC1) return;
     u8 out[4 + 8 + 4 + 8 + 1 + 1 + ROOM_MEMBERS * (4 + NAME_LEN)];
     if (p[2] != NET_PROTOCOL) {   /* another version of the game's netplay: say so */

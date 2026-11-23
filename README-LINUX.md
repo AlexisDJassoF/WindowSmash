@@ -200,7 +200,7 @@ on **As launched**, and what `netplay.ini` saved stays for the next `run.sh`.
 | Your name | The name other players see. Type it. |
 | Room name | The private room's name: the same for everyone in it. Type it. |
 | UDP port | Hosting: the port the room listens on (39420). Type it or step it with < >. |
-| Host address | Joining: the host's `address:port`. Type it, or pick with < > among the rooms **found on your network** and the last 5 joined. Picking one fills the room name too. |
+| Host address | Joining: the host's `address:port`. Until you type or pick one, Join chooses it: the **last room joined** if it answers (asked directly, so a VPN or internet address works too), else - saying *No room exists at ...* - the **first room found on your network** that is not full. Type it, or pick with < > among the rooms found and the last 5 joined; this PC's own addresses are never offered. Picking one fills the room name too. |
 
 Hosting, the page shows this PC's addresses to give the others (the home network's, and a VPN's
 such as Tailscale or ZeroTier when there is one), checks whether the router opens the port by

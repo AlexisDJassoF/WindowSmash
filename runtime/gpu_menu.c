@@ -213,20 +213,31 @@ static int net_click(NetMenu *nm, const MenuRect rects[NROWS], float value_x, fl
     return NET_EV_NONE;
 }
 
-/* A click just above the first row (on the title): the other page */
+/* A click on the tabs, just above the first row (overlay_build_menu draws them across the rows'
+ * width: Display on the left half, Network on the right): the page clicked, 1 + its number; else 0 */
 static int title_click(const MenuRect *rects, int n, float x, float y) {
     for (int i = 0; i < n; i++)
-        if (rects[i].w > 0) return x >= rects[i].x && x < rects[i].x + rects[i].w && y < rects[i].y && y >= rects[i].y - 60;
+        if (rects[i].w > 0) {
+            if (x < rects[i].x || x >= rects[i].x + rects[i].w || y >= rects[i].y || y < rects[i].y - 64) return 0;
+            return 1 + (x >= rects[i].x + rects[i].w / 2);
+        }
     return 0;
 }
 
 static void net_refresh(NetMenu *nm) {
-    NetChoice found[NET_CHOICES];
-    int n = nm->s.mode == NET_MODE_JOIN ? net_discover_found(found, NET_CHOICES) : 0;
-    net_menu_set_found(nm, found, n);
-    if (nm->s.mode == NET_MODE_HOST) net_discover_check_router(nm->s.port[0] ? nm->s.port : "39420");
     NetProbe p;
     net_discover_probe(&p);
+    net_menu_set_self(nm, &p);   /* (this PC's addresses: never offered to join) */
+    NetChoice found[NET_CHOICES];
+    int join = nm->s.mode == NET_MODE_JOIN;
+    int n = join ? net_discover_found(found, NET_CHOICES) : 0;
+    net_menu_set_found(nm, found, n);
+    if (join) {   /* the address asked directly; Join's own choice while it is not typed or picked */
+        int self = net_menu_is_self(nm, nm->s.host);
+        net_menu_auto_host(nm, net_discover_watch(self ? "" : nm->s.host));
+        if (!net_menu_is_self(nm, nm->s.host)) net_discover_watch(nm->s.host);   /* (the address it chose now) */
+    } else net_discover_watch("");
+    if (nm->s.mode == NET_MODE_HOST) net_discover_check_router(nm->s.port[0] ? nm->s.port : "39420");
     net_menu_describe(nm, &p);
 }
 #endif
@@ -268,7 +279,10 @@ void menu_run(void) {
             MemoryBarrier();
             tail++;
             int ev = in.event;
-            if (ev == MENU_CLICK && title_click(page ? nrects : rects, page ? NROWS : ROWS, (float)in.x, (float)in.y)) ev = MENU_TAB;
+            if (ev == MENU_CLICK) {
+                int tab = title_click(page ? nrects : rects, page ? NROWS : ROWS, (float)in.x, (float)in.y);
+                if (tab) { if (tab - 1 != page) ev = MENU_TAB; else { m.touched = 1; continue; } }
+            }
             if (ev == MENU_TAB) { page = !page; m.touched = 1; refreshed = 0; continue; }
             if (ev == MENU_BACK) { menu_event(&m, MENU_BACK, seconds()); nm.s = nm.initial; break; }
             if (!page) {
@@ -286,14 +300,18 @@ void menu_run(void) {
         /* Play from the Display page with Join and no address: the Network page first */
         if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN && !nm.s.host[0]) { m.state = MENU_OPEN; page = 1; nm.row = NROW_HOST; }
         if (m.state != MENU_OPEN) break;
-        if (page && !searching) { net_discover_start(); searching = 1; }
-        if (page && seconds() - refreshed >= 0.5) { refreshed = seconds(); net_refresh(&nm); }
+        /* (Join looks for rooms from the start, on either page: its address chosen before Play) */
+        int network = page || nm.s.mode == NET_MODE_JOIN;
+        if (network && !searching) { net_discover_start(); searching = 1; }
+        if (network && seconds() - refreshed >= 0.5) { refreshed = seconds(); net_refresh(&nm); }
         menu_typing = page && net_menu_text_row(&nm);
-        char footer[128];
-        if (!m.touched) snprintf(footer, sizeof footer, "Starting in %.0f s - press any key to change settings", m.deadline - seconds() + 0.5);
-        else if (page) snprintf(footer, sizeof footer, "Type to edit   < >: change   Enter: play   Esc: no changes");
-        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "FSR recommended below 100%%   -   Enter: play   Esc: no changes");
-        else snprintf(footer, sizeof footer, "Enter: play    Esc: play without changes");
+        /* the footer, for overlay_build_menu: '\t' between hints, "key=what" a key's, '#' a countdown's fraction */
+        char footer[160];
+        double left = m.deadline - seconds();
+        if (!m.touched) snprintf(footer, sizeof footer, "#%.3f\tStarting in %.0f s - press any key to change settings", left / WAIT_S, left + 0.5);
+        else if (page) snprintf(footer, sizeof footer, "Type=edit\t< >=change\tTab=display\tEnter=play\tEsc=no changes");
+        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\tEnter=play\tEsc=no changes");
+        else snprintf(footer, sizeof footer, "< >=change\tTab=network\tEnter=play\tEsc=play without changes");
         if (!page) {
             const char *labels[ROWS], *vp[ROWS];
             char values[ROWS][64];
@@ -304,7 +322,7 @@ void menu_run(void) {
                 vp[r] = values[r];
                 shown[r] = menu_visible(&m, r);
             }
-            if (!gfx_menu("[ Display ]   Network  (Tab)", ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
+            if (!gfx_menu("*Display\tNetwork", ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
         } else {
             const char *labels[NROWS], *vp[NROWS];
             char values[NROWS][160];
@@ -315,7 +333,7 @@ void menu_run(void) {
                 vp[r] = values[r];
                 shown[r] = net_menu_visible(&nm, r);
             }
-            if (!gfx_menu("Display  (Tab)   [ Network ]", NROWS, labels, vp, shown, nm.row, NROW_PLAY, footer, (float *)nrects, &nvalue_x)) Sleep(30);
+            if (!gfx_menu("Display\t*Network", NROWS, labels, vp, shown, nm.row, NROW_PLAY, footer, (float *)nrects, &nvalue_x)) Sleep(30);
         }
         Sleep(16);
     }

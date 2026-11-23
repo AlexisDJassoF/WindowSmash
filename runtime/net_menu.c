@@ -31,6 +31,8 @@ void net_menu_init(NetMenu *m, const NetSettings *s) {
     memset(m, 0, sizeof *m);
     m->s = m->initial = *s;
     m->row = NROW_PLAY;
+    m->host_auto = 1;
+    m->tip_kind = '\5';
     net_menu_set_found(m, NULL, 0);
 }
 
@@ -65,17 +67,17 @@ void net_menu_value(const NetMenu *m, int row, char *out, unsigned n) {
     case NROW_MODE:
         snprintf(out, n, "%s", m->s.mode == NET_MODE_HOST ? "Create a room (host)" : m->s.mode == NET_MODE_JOIN ? "Join a room" : "As launched");
         return;
-    case NROW_NAME: snprintf(out, n, "\1%s%s", m->s.name, cursor); return;
-    case NROW_ROOM: snprintf(out, n, "\1%s%s", m->s.room, cursor); return;
+    case NROW_NAME: snprintf(out, n, "\2%s%s", m->s.name, cursor); return;
+    case NROW_ROOM: snprintf(out, n, "\2%s%s", m->s.room, cursor); return;
     case NROW_PORT: snprintf(out, n, "%s%s", m->s.port, cursor); return;   /* (< >: a step) */
     case NROW_HOST:
-        if (!m->nchoices) snprintf(out, n, "\1%s%s", m->s.host[0] || row == m->row ? m->s.host : "(type it)", cursor);
+        if (!m->nchoices) snprintf(out, n, "\2%s%s", m->s.host[0] || row == m->row ? m->s.host : "(type it)", cursor);
         else snprintf(out, n, "%s%s", m->s.host[0] || row == m->row ? m->s.host : "(< > or type)", cursor);
         return;
     case NROW_ADDRS: snprintf(out, n, "\1%s", m->addrs); return;
     case NROW_ROUTER: snprintf(out, n, "\1%s", m->router); return;
     case NROW_LAN: snprintf(out, n, "\1%s", m->lan); return;
-    case NROW_TIP: snprintf(out, n, "\1%s", m->tip); return;
+    case NROW_TIP: snprintf(out, n, "%c%s", m->tip_kind ? m->tip_kind : '\5', m->tip); return;
     default: if (n) out[0] = 0; return;
     }
 }
@@ -106,6 +108,7 @@ static void step(NetMenu *m, int dir) {
     }
     case NROW_HOST:
         if (!m->nchoices) break;
+        m->host_auto = 0;   /* (picked: Join chooses no more) */
         if (m->choice < 0) pick(m, dir > 0 ? 0 : m->nchoices - 1);
         else pick(m, ((m->choice + dir) % m->nchoices + m->nchoices) % m->nchoices);
         break;
@@ -128,7 +131,7 @@ static void type(NetMenu *m, int c) {
         t[l] = (char)c;
         t[l + 1] = 0;
     } else return;
-    if (m->row == NROW_HOST) m->choice = -1;
+    if (m->row == NROW_HOST) { m->choice = -1; m->host_auto = 0; }   /* (typed: Join chooses no more) */
 }
 
 int net_menu_event(NetMenu *m, int event, int c) {
@@ -150,27 +153,123 @@ int net_menu_event(NetMenu *m, int event, int c) {
     return NET_EV_NONE;
 }
 
+/* An address's host and port, for comparing: "10.0.0.2" is "10.0.0.2:39420" */
+static void address_key(const char *a, char *host, size_t n, long *port) {
+    const char *colon = strrchr(a, ':');
+    int one = colon && strchr(a, ':') == colon;   /* (one ':': host:port - more is IPv6's own) */
+    size_t l = one ? (size_t)(colon - a) : strlen(a);
+    if (l >= n) l = n - 1;
+    for (size_t i = 0; i < l; i++) host[i] = (char)tolower((unsigned char)a[i]);
+    host[l] = 0;
+    *port = one ? strtol(colon + 1, NULL, 10) : 0;
+    if (*port <= 0) *port = strtol(DEFAULT_PORT, NULL, 10);
+}
+
+static int same_address(const char *a, const char *b) {
+    char ha[NET_ADDR], hb[NET_ADDR];
+    long pa, pb;
+    address_key(a, ha, sizeof ha, &pa);
+    address_key(b, hb, sizeof hb, &pb);
+    return pa == pb && !strcmp(ha, hb);
+}
+
+int net_menu_is_self(const NetMenu *m, const char *addr) {
+    char h[NET_ADDR];
+    long port;
+    if (!addr || !*addr) return 0;
+    address_key(addr, h, sizeof h, &port);
+    if (!strcmp(h, "localhost") || !strncmp(h, "127.", 4) || !strcmp(h, "0.0.0.0") || !strcmp(h, "::1") || !strcmp(h, "[::1]")) return 1;
+    for (int i = 0; i < m->nself; i++)
+        if (m->self[i][0] && !strcmp(h, m->self[i])) return 1;
+    return 0;
+}
+
+void net_menu_set_self(NetMenu *m, const NetProbe *p) {
+    m->nself = 0;
+    for (int i = 0; i < p->nself && m->nself < NET_SELF; i++) copy(m->self[m->nself++], NET_ADDR, p->self[i]);
+    if (p->lan_ip[0] && m->nself < NET_SELF) copy(m->self[m->nself++], NET_ADDR, p->lan_ip);
+    if (p->vpn_ip[0] && m->nself < NET_SELF) copy(m->self[m->nself++], NET_ADDR, p->vpn_ip);
+}
+
 void net_menu_set_found(NetMenu *m, const NetChoice *found, int n) {
     m->nchoices = 0;
     for (int i = 0; i < n && m->nchoices < NET_CHOICES; i++) {
+        if (net_menu_is_self(m, found[i].addr)) continue;   /* (this PC's own room: not one to join) */
         m->choices[m->nchoices] = found[i];
         m->choices[m->nchoices++].found = 1;
     }
     for (int i = 0; i < m->s.nrecent && m->nchoices < NET_CHOICES; i++) {
-        int dup = 0;
-        for (int j = 0; j < m->nchoices && !dup; j++) dup = !strcmp(m->choices[j].addr, m->s.recent[i].addr);
+        int dup = net_menu_is_self(m, m->s.recent[i].addr);
+        for (int j = 0; j < m->nchoices && !dup; j++) dup = same_address(m->choices[j].addr, m->s.recent[i].addr);
         if (dup) continue;
         m->choices[m->nchoices] = m->s.recent[i];
+        m->choices[m->nchoices].players = m->choices[m->nchoices].most = 0;
         m->choices[m->nchoices++].found = 0;
     }
     m->choice = -1;
     for (int j = 0; j < m->nchoices; j++)
-        if (m->s.host[0] && !strcmp(m->choices[j].addr, m->s.host)) { m->choice = j; break; }
+        if (m->s.host[0] && same_address(m->choices[j].addr, m->s.host)) { m->choice = j; break; }
+}
+
+const char *net_menu_last(const NetMenu *m) {
+    if (m->initial.host[0] && !net_menu_is_self(m, m->initial.host)) return m->initial.host;
+    for (int i = 0; i < m->s.nrecent; i++)
+        if (m->s.recent[i].addr[0] && !net_menu_is_self(m, m->s.recent[i].addr)) return m->s.recent[i].addr;
+    return NULL;
+}
+
+static int joinable(const NetChoice *c) { return c->found && (c->most <= 0 || c->players < c->most); }
+
+static int found_at(const NetMenu *m, const char *addr) {   /* the choice answering at addr now, -1 if none */
+    for (int i = 0; i < m->nchoices; i++)
+        if (m->choices[i].found && same_address(m->choices[i].addr, addr)) return i;
+    return -1;
+}
+
+static void auto_set(NetMenu *m, const char *addr) {   /* the address, Join's choice (and the room found there) */
+    int i = found_at(m, addr);
+    char keep[NET_ADDR];
+    copy(keep, sizeof keep, addr);
+    copy(m->s.host, sizeof m->s.host, keep);
+    m->choice = -1;
+    for (int j = 0; j < m->nchoices && m->choice < 0; j++)
+        if (same_address(m->choices[j].addr, keep)) m->choice = j;
+    if (i >= 0 && m->choices[i].room[0]) copy(m->s.room, sizeof m->s.room, m->choices[i].room);
+}
+
+void net_menu_auto_host(NetMenu *m, int watch) {
+    m->watch = watch;
+    if (m->s.mode != NET_MODE_JOIN || !m->host_auto) { m->auto_state = NET_AUTO_NONE; return; }
+    const char *last = net_menu_last(m);
+    int first = -1;
+    for (int i = 0; i < m->nchoices && first < 0; i++)
+        if (joinable(&m->choices[i])) first = i;
+    int on_last = last && same_address(m->s.host, last);
+    int up = m->s.host[0] && (found_at(m, m->s.host) >= 0 || watch == NET_WATCH_UP);
+    if (last && on_last && up) { m->last_down = 0; auto_set(m, last); m->auto_state = NET_AUTO_LAST; return; }   /* (back, or there) */
+    if (last && !m->last_down) {
+        if (!on_last) { auto_set(m, last); m->auto_state = found_at(m, last) >= 0 ? NET_AUTO_LAST : NET_AUTO_CHECKING; return; }
+        if (watch != NET_WATCH_DOWN) { m->auto_state = NET_AUTO_CHECKING; return; }
+        m->last_down = 1;   /* (no room at the last address: the first one found instead) */
+    }
+    if (first >= 0) {
+        int keep = m->choice >= 0 && !on_last && joinable(&m->choices[m->choice]);   /* (the one chosen before, still open) */
+        auto_set(m, m->choices[keep ? m->choice : first].addr);
+        m->auto_state = NET_AUTO_FIRST;
+    } else if (last) {
+        if (!on_last) auto_set(m, last);
+        m->auto_state = NET_AUTO_LAST_DOWN;
+    } else {
+        m->s.host[0] = 0;
+        m->choice = -1;
+        m->auto_state = NET_AUTO_NONE;
+    }
 }
 
 void net_menu_describe(NetMenu *m, const NetProbe *p) {
     const char *port = m->s.port[0] ? m->s.port : DEFAULT_PORT;
     m->addrs[0] = m->router[0] = m->lan[0] = m->tip[0] = 0;
+    m->tip_kind = '\5';
     switch (m->s.mode) {
     case NET_MODE_LAUNCHER:
         snprintf(m->tip, sizeof m->tip, "%s. Create or join a room: < > on Connection", m->launched[0] ? m->launched : "The launcher decides");
@@ -205,10 +304,44 @@ void net_menu_describe(NetMenu *m, const NetProbe *p) {
         for (int i = 0; i < m->nchoices; i++) found += m->choices[i].found;
         if (found) snprintf(m->lan, sizeof m->lan, "%d room%s found - < > on Host address", found, found == 1 ? "" : "s");
         else snprintf(m->lan, sizeof m->lan, "%s", p->searching ? "searching..." : "no rooms found");
-        if (m->choice >= 0 && m->choices[m->choice].found)
-            snprintf(m->tip, sizeof m->tip, "%s's room \"%s\" on your network", m->choices[m->choice].who[0] ? m->choices[m->choice].who : "A",
-                     m->choices[m->choice].room);
+        const NetChoice *c = m->choice >= 0 ? &m->choices[m->choice] : NULL;
+        const char *last = net_menu_last(m);
+        char room[96] = "";
+        if (c && c->found) {
+            if (c->most > 0) snprintf(room, sizeof room, "%s's room \"%s\" (%d/%d players)", c->who[0] ? c->who : "A", c->room, c->players, c->most);
+            else snprintf(room, sizeof room, "%s's room \"%s\"", c->who[0] ? c->who : "A", c->room);
+        }
+        if (m->s.host[0] && net_menu_is_self(m, m->s.host)) {
+            m->tip_kind = '\3';
+            snprintf(m->tip, sizeof m->tip, "%s is this PC: join another PC's room", m->s.host);
+        } else if (m->auto_state == NET_AUTO_CHECKING) {
+            snprintf(m->tip, sizeof m->tip, "Looking for the last room, at %s...", m->s.host);
+        } else if (m->auto_state == NET_AUTO_LAST) {
+            m->tip_kind = '\4';
+            if (room[0]) snprintf(m->tip, sizeof m->tip, "Last room: %s is open", room);
+            else snprintf(m->tip, sizeof m->tip, "Last room: open at %s", m->s.host);
+        } else if (m->auto_state == NET_AUTO_FIRST && m->last_down && last) {
+            m->tip_kind = '\3';
+            snprintf(m->tip, sizeof m->tip, "No room exists at %s - %s instead", last, room[0] ? room : m->s.host);
+        } else if (m->auto_state == NET_AUTO_FIRST) {
+            m->tip_kind = '\4';
+            snprintf(m->tip, sizeof m->tip, "%s on your network", room[0] ? room : m->s.host);
+        } else if (m->auto_state == NET_AUTO_LAST_DOWN && last) {
+            m->tip_kind = '\3';
+            snprintf(m->tip, sizeof m->tip, "No room exists at %s - is its host playing? Searching...", last);
+        } else if (c && c->found && c->most > 0 && c->players >= c->most) {
+            m->tip_kind = '\3';
+            snprintf(m->tip, sizeof m->tip, "That room is full (%d/%d players)", c->players, c->most);
+        } else if (c && c->found)
+            snprintf(m->tip, sizeof m->tip, "%s's room \"%s\" on your network", c->who[0] ? c->who : "A", c->room);
         else if (!m->s.host[0]) snprintf(m->tip, sizeof m->tip, found ? "Pick a room found on your LAN, or type an address" : "Type the host's address (their Network page shows it)");
+        else if (m->watch == NET_WATCH_DOWN) {
+            m->tip_kind = '\3';
+            snprintf(m->tip, sizeof m->tip, "No room exists at %s", m->s.host);
+        } else if (m->watch == NET_WATCH_UP) {
+            m->tip_kind = '\4';
+            snprintf(m->tip, sizeof m->tip, "A room answers at %s - in the game: Local Wireless", m->s.host);
+        } else if (m->watch == NET_WATCH_CHECKING) snprintf(m->tip, sizeof m->tip, "Looking for a room at %s...", m->s.host);
         else snprintf(m->tip, sizeof m->tip, "In the game: Local Wireless, then the host's room");
         break;
     }

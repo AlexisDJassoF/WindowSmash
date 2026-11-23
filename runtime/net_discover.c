@@ -5,6 +5,7 @@ typedef int net_discover_unused;   /* (nothing here on Windows) */
 #else
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -33,6 +34,14 @@ static volatile int running, searching;
 static pthread_t searcher;
 static int upnp = NET_UPNP_UNKNOWN, upnp_busy;
 static char upnp_port[6], wan[NET_ADDR];
+static u32 self_ips[NET_SELF];   /* this PC's IPv4 addresses (host order): its own rooms are not offered */
+static int nself;
+/* The address asked directly (the room Join chose: the last one joined, maybe outside the LAN) */
+static char watch_text[NET_ADDR];
+static u32 watch_ip;              /* (host order; 0 until looked up) */
+static u16 watch_port;
+static int watch_failed, watch_asks;
+static u64 watch_heard;
 
 static u64 now_ms(void) {
     struct timespec t;
@@ -69,6 +78,28 @@ static u32 outbound_address(void) {   /* the address this PC goes out on, host o
 }
 
 static void ip_text(u32 ip, char *out, size_t n) { snprintf(out, n, "%u.%u.%u.%u", ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255); }
+
+static int local_ips(u32 *out, int max) {   /* every IPv4 address of this PC's interfaces, host order */
+    int n = 0;
+    struct ifaddrs *all = NULL;
+    if (getifaddrs(&all)) return 0;
+    for (struct ifaddrs *i = all; i && n < max; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+        u32 ip = ntohl(((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr);
+        if ((ip >> 24) == 127) continue;   /* (the loopback: always this PC, checked apart) */
+        int dup = 0;
+        for (int j = 0; j < n && !dup; j++) dup = out[j] == ip;
+        if (!dup) out[n++] = ip;
+    }
+    freeifaddrs(all);
+    return n;
+}
+
+static int is_self(u32 ip) {   /* (lock held) */
+    if ((ip >> 24) == 127 || !ip) return 1;
+    for (int i = 0; i < nself; i++) if (self_ips[i] == ip) return 1;
+    return 0;
+}
 
 /* The address friends on this network join (the one the PC goes out on, unless that is a VPN's),
  * and a VPN's when there is one. */
@@ -134,13 +165,61 @@ void net_discover_check_router(const char *port) {
 }
 
 /* ---- rooms on the LAN ----------------------------------------------------------------------- */
-static void ask(int s) {   /* the query, to every network's broadcast address (and this PC itself) */
+/* The watched address looked up (outside the lock: a name may take a while), then asked: the
+ * short query (older relays, on a private network) and the padded one (answered from anywhere). */
+static void ask_watched(int s) {
+    char text[NET_ADDR];
+    pthread_mutex_lock(&lock);
+    snprintf(text, sizeof text, "%s", watch_text);
+    u32 ip = watch_ip;
+    u16 port = watch_port;
+    int failed = watch_failed;
+    pthread_mutex_unlock(&lock);
+    if (!text[0] || failed) return;
+    if (!ip) {
+        char host[NET_ADDR];
+        snprintf(host, sizeof host, "%s", text);
+        char *colon = strrchr(host, ':');
+        port = NET_DEFAULT_PORT;
+        if (colon && strchr(host, ':') == colon) { *colon = 0; long p = strtol(colon + 1, NULL, 10); if (p > 0 && p < 65536) port = (u16)p; }
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        int ok = !getaddrinfo(host, NULL, &hints, &res) && res;
+        if (ok) ip = ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr);
+        if (res) freeaddrinfo(res);
+        pthread_mutex_lock(&lock);
+        if (!strcmp(text, watch_text)) {   /* (unless another address is watched now) */
+            if (ok) { watch_ip = ip; watch_port = port; } else watch_failed = 1;
+        }
+        pthread_mutex_unlock(&lock);
+        if (!ok) return;
+    }
+    struct sockaddr_in to = {0};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    to.sin_addr.s_addr = htonl(ip);
+    u8 padded[NET_FIND_ANSWER_SIZE];
+    memset(padded, 0, sizeof padded);
+    memcpy(padded, NET_FIND_QUERY, 8);
+    sendto(s, NET_FIND_QUERY, 8, 0, (struct sockaddr *)&to, sizeof to);
+    sendto(s, padded, sizeof padded, 0, (struct sockaddr *)&to, sizeof to);
+    pthread_mutex_lock(&lock);
+    if (!strcmp(text, watch_text)) watch_asks++;
+    pthread_mutex_unlock(&lock);
+}
+
+static void ask(int s) {   /* the query, to every network's broadcast address */
+    u32 mine[NET_SELF];
+    int n = local_ips(mine, NET_SELF);
+    pthread_mutex_lock(&lock);
+    memcpy(self_ips, mine, sizeof mine[0] * (size_t)n);
+    nself = n;
+    pthread_mutex_unlock(&lock);
     struct sockaddr_in to = {0};
     to.sin_family = AF_INET;
     to.sin_port = htons(NET_DEFAULT_PORT);
     to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    sendto(s, NET_FIND_QUERY, 8, 0, (struct sockaddr *)&to, sizeof to);
-    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* (a host in another window of this PC) */
     sendto(s, NET_FIND_QUERY, 8, 0, (struct sockaddr *)&to, sizeof to);
     struct ifaddrs *all = NULL;
     if (getifaddrs(&all)) return;
@@ -160,27 +239,38 @@ static void heard(const u8 *p, int n, const struct sockaddr_in *from) {
     memset(&c, 0, sizeof c);
     char ip[32];
     inet_ntop(AF_INET, &from->sin_addr, ip, sizeof ip);
-    snprintf(c.addr, sizeof c.addr, "%s:%u", ip, (unsigned)(p[8] << 8 | p[9]));
+    u16 port = (u16)(p[8] << 8 | p[9]);
+    snprintf(c.addr, sizeof c.addr, "%s:%u", ip, (unsigned)port);
     memcpy(c.room, p + 10, NET_FIND_TEXT);
     memcpy(c.who, p + 10 + NET_FIND_TEXT, NET_FIND_TEXT);
     c.room[NET_FIND_TEXT] = c.who[NET_FIND_TEXT] = 0;
     for (char *t = c.room; *t; t++) if (*t < 32 || *t > 126) *t = '?';
     for (char *t = c.who; *t; t++) if (*t < 32 || *t > 126) *t = '?';
+    if (n >= NET_FIND_ANSWER_SIZE) { c.players = p[NET_FIND_SIZE]; c.most = p[NET_FIND_SIZE + 1]; }
     c.found = 1;
-    int loopback = (ntohl(from->sin_addr.s_addr) >> 24) == 127;
+    u32 from_ip = ntohl(from->sin_addr.s_addr);
     pthread_mutex_lock(&lock);
+    if (is_self(from_ip)) { pthread_mutex_unlock(&lock); return; }   /* (this PC's own room: not one to join) */
+    if (watch_ip && from_ip == watch_ip && ntohs(from->sin_port) == watch_port) watch_heard = now_ms();
     int at = -1;
     for (int i = 0; i < nfound && at < 0; i++) {
         if (!strcmp(found[i].addr, c.addr)) at = i;
-        /* (the same host heard at two of its addresses - the loopback, its LAN's, a VPN's: the first
-         * network address kept) */
+        /* (the same host heard at two of its addresses - its LAN's, a VPN's: the first one kept) */
         else if (!strcmp(found[i].room, c.room) && !strcmp(found[i].who, c.who) && !strcmp(strchr(found[i].addr, ':'), strchr(c.addr, ':'))) {
-            if (!loopback && !strncmp(found[i].addr, "127.", 4)) at = i;
-            else { found_at[i] = now_ms(); pthread_mutex_unlock(&lock); return; }
+            found_at[i] = now_ms();
+            found[i].players = c.players;
+            found[i].most = c.most;
+            pthread_mutex_unlock(&lock);
+            return;
         }
     }
     if (at < 0 && nfound < FOUND_MAX) at = nfound++;
-    if (at >= 0) { found[at] = c; found_at[at] = now_ms(); }
+    if (at < 0) {   /* (full: the one unheard longest makes room) */
+        at = 0;
+        for (int i = 1; i < nfound; i++) if (found_at[i] < found_at[at]) at = i;
+    }
+    found[at] = c;
+    found_at[at] = now_ms();
     pthread_mutex_unlock(&lock);
 }
 
@@ -195,7 +285,7 @@ static void *search(void *unused) {
     u64 asked = 0;
     u8 buf[512];
     while (running) {
-        if (now_ms() - asked >= 1000) { asked = now_ms(); ask(s); }
+        if (now_ms() - asked >= 1000) { asked = now_ms(); ask(s); ask_watched(s); }
         struct sockaddr_in from;
         socklen_t flen = sizeof from;
         int n = (int)recvfrom(s, buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
@@ -218,6 +308,24 @@ void net_discover_stop(void) {
     searching = 0;
 }
 
+int net_discover_watch(const char *addr) {
+    u64 t = now_ms();
+    pthread_mutex_lock(&lock);
+    if (!addr) addr = "";
+    if (strcmp(addr, watch_text)) {   /* (another address: asked from the start) */
+        snprintf(watch_text, sizeof watch_text, "%s", addr);
+        watch_ip = 0;
+        watch_port = 0;
+        watch_failed = watch_asks = 0;
+        watch_heard = 0;
+    }
+    int state = !watch_text[0] ? NET_WATCH_NONE
+              : watch_heard && t - watch_heard < FOUND_FOR_MS ? NET_WATCH_UP
+              : watch_failed || watch_asks >= 3 ? NET_WATCH_DOWN : NET_WATCH_CHECKING;
+    pthread_mutex_unlock(&lock);
+    return state;
+}
+
 int net_discover_found(NetChoice *out, int max) {
     int n = 0;
     u64 t = now_ms();
@@ -230,14 +338,18 @@ int net_discover_found(NetChoice *out, int max) {
 
 void net_discover_probe(NetProbe *p) {
     static char lan[NET_ADDR], vpn[NET_ADDR];
+    static u32 mine[NET_SELF];
+    static int nmine;
     static u64 looked;
     if (!looked || now_ms() - looked > 3000) {   /* (the addresses change rarely: looked at every few seconds) */
         looked = now_ms();
         addresses(lan, vpn, sizeof lan);
+        nmine = local_ips(mine, NET_SELF);
     }
     memset(p, 0, sizeof *p);
     snprintf(p->lan_ip, sizeof p->lan_ip, "%s", lan);
     snprintf(p->vpn_ip, sizeof p->vpn_ip, "%s", vpn);
+    for (int i = 0; i < nmine; i++) ip_text(mine[i], p->self[p->nself++], NET_ADDR);
     pthread_mutex_lock(&lock);
     p->upnp = upnp;
     snprintf(p->wan, sizeof p->wan, "%s", wan);

@@ -148,5 +148,45 @@ class NetMenuTests(unittest.TestCase):
         self.assertIn('Type the host', self.run_menu('drrp0')['tip'])
 
 
+    def test_own_address_never_offered(self):
+        out = self.run_menu('drrg')   # (this PC's room left out: the full one and "dojo")
+        self.assertEqual(out['choices'], '2')
+        self.ini.write_text('mode = join\nhost = 192.168.1.5:39420\nrecent = 127.0.0.1:39420 x\n')
+        out = self.run_menu('gj0p0')   # (the last one is this PC: not chosen, nor offered)
+        self.assertEqual((out['host'], out['choices']), ('192.168.1.9:39420', '2'))
+        self.ini.unlink()
+        out = self.run_menu('drrddd' + self.type('192.168.1.5') + 'p0')
+        self.assertEqual(out['kind'], '3')
+        self.assertIn('is this PC', out['tip'])
+
+    def test_join_chooses_the_first_open_room(self):
+        out = self.run_menu('drrgj0p0')   # (no last room: the first found with room for another, not the full one)
+        self.assertEqual((out['host'], out['room'], out['auto'], out['kind']), ('192.168.1.9:39420', 'dojo', '3', '4'))
+        self.assertIn('(2/8 players)', out['tip'])
+        self.assertEqual(self.run_menu('drrgj0dddda')['plays'], '1')
+
+    def test_join_chooses_the_last_room(self):
+        self.ini.write_text('mode = join\nhost = 10.0.0.2\nroom = club\nrecent = 10.0.0.2 club\n')
+        out = self.run_menu('gj1p0')   # (asked, no answer yet)
+        self.assertEqual((out['host'], out['auto'], out['kind']), ('10.0.0.2', '1', '5'))
+        self.assertIn('Looking for the last room', out['tip'])
+        out = self.run_menu('gj2p0')   # (it answers)
+        self.assertEqual((out['host'], out['room'], out['auto'], out['kind']), ('10.0.0.2', 'club', '2', '4'))
+        out = self.run_menu('gj3p0')   # (no room there: said, and the first open one instead)
+        self.assertEqual((out['host'], out['auto'], out['kind']), ('192.168.1.9:39420', '3', '3'))
+        self.assertIn('No room exists at 10.0.0.2', out['tip'])
+        out = self.run_menu('j3p0')   # (no room there, none found either)
+        self.assertEqual((out['host'], out['auto'], out['kind']), ('10.0.0.2', '4', '3'))
+        self.assertIn('No room exists at 10.0.0.2', out['tip'])
+        out = self.run_menu('j3j2p0')   # (back: chosen again)
+        self.assertEqual((out['host'], out['auto']), ('10.0.0.2', '2'))
+
+    def test_typed_address_is_kept_and_checked(self):
+        out = self.run_menu('drrddd' + self.type('10.0.0.9') + 'gj3p0')
+        self.assertEqual((out['host'], out['auto'], out['kind']), ('10.0.0.9', '0', '3'))
+        self.assertEqual(out['tip'], 'No room exists at 10.0.0.9')
+        out = self.run_menu('drrddd' + self.type('10.0.0.9') + 'gj2p0')
+        self.assertEqual(out['kind'], '4')
+
 if __name__ == '__main__':
     unittest.main()

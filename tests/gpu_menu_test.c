@@ -20,6 +20,7 @@ void net_stop(void) {}
 void net_discover_start(void) {}
 void net_discover_stop(void) {}
 int net_discover_found(NetChoice *out, int max) { (void)out; (void)max; return 0; }
+int net_discover_watch(const char *addr) { (void)addr; return NET_WATCH_NONE; }
 void net_discover_check_router(const char *port) { (void)port; }
 void net_discover_probe(NetProbe *p) { memset(p, 0, sizeof *p); }
 int gfx_menu(const char *t, int n, const char *const l[], const char *const v[], const int s[], int sel, int b, const char *f, float *r, float *x) {
