@@ -309,9 +309,9 @@ void menu_run(void) {
         char footer[160];
         double left = m.deadline - seconds();
         if (!m.touched) snprintf(footer, sizeof footer, "#%.3f\tStarting in %.0f s - press any key to change settings", left / WAIT_S, left + 0.5);
-        else if (page) snprintf(footer, sizeof footer, "Type=edit\t< >=change\tTab=display\tEnter=play\tEsc=no changes");
+        else if (page) snprintf(footer, sizeof footer, "Type=edit\tEnter=play\tEsc=play without changes");
         else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\tEnter=play\tEsc=no changes");
-        else snprintf(footer, sizeof footer, "< >=change\tTab=network\tEnter=play\tEsc=play without changes");
+        else snprintf(footer, sizeof footer, "Enter=play\tEsc=play without changes");
         if (!page) {
             const char *labels[ROWS], *vp[ROWS];
             char values[ROWS][64];

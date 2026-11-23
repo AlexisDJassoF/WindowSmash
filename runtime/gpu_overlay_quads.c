@@ -264,16 +264,6 @@ static void soft(float x, float y, float w, float h, float s, unsigned color) {
             tri(cx[k], cy[k], color, cx[k] + cosf(a) * s, cy[k] + sinf(a) * s, out, cx[k] + cosf(b) * s, cy[k] + sinf(b) * s, out);
         }
 }
-/* A glow: an ellipse fading from color in the middle to nothing */
-static void glow(float cx, float cy, float rx, float ry, unsigned color) {
-    unsigned mid = fade(color, 0.45f), out = fade(color, 0);
-    for (int i = 0; i < 40; i++) {
-        float a = i * 2 * PI_F / 40, b = a + 2 * PI_F / 40, ca = cosf(a), sa = sinf(a), cb = cosf(b), sb = sinf(b);
-        tri(cx, cy, color, cx + ca * rx * 0.5f, cy + sa * ry * 0.5f, mid, cx + cb * rx * 0.5f, cy + sb * ry * 0.5f, mid);
-        tri(cx + ca * rx * 0.5f, cy + sa * ry * 0.5f, mid, cx + ca * rx, cy + sa * ry, out, cx + cb * rx * 0.5f, cy + sb * ry * 0.5f, mid);
-        tri(cx + cb * rx * 0.5f, cy + sb * ry * 0.5f, mid, cx + ca * rx, cy + sa * ry, out, cx + cb * rx, cy + sb * ry, out);
-    }
-}
 static void disc(float cx, float cy, float r, unsigned color) {   /* (its rim smoothed by a fading ring) */
     unsigned out = fade(color, 0);
     for (int i = 0; i < 24; i++) {
@@ -328,25 +318,6 @@ static const char *fit(const char *s, float max, char *out, size_t n) {
     return out;
 }
 
-/* ---- icons, size px tall ---- */
-static void icon_display(float x, float y, float s, unsigned c) {   /* a monitor */
-    float w = s * 1.3f, h = s * 0.8f, t = s > 16 ? 2 : 1.5f;
-    rbox(x, y, w, h, 2, c, c);
-    rbox(x + t, y + t, w - 2 * t, h - 2 * t, 1, RGBA(0, 0, 0, 120), RGBA(0, 0, 0, 120));
-    quad4(x + w / 2 - t, y + h, 2 * t, s * 0.12f, c, c, c, c);
-    rbox(x + w * 0.28f, y + h + s * 0.12f, w * 0.44f, t + 1, 1, c, c);
-}
-static void icon_network(float x, float y, float s, unsigned c) {   /* signal bars */
-    float bw = s * 0.24f, gap = s * 0.12f;
-    for (int i = 0; i < 4; i++) {
-        float bh = s * (0.3f + 0.233f * i);
-        rbox(x + i * (bw + gap), y + s - bh, bw, bh, 1.5f, c, c);
-    }
-}
-static void arrow(float cx, float cy, float s, int dir, unsigned c) {   /* a chevron-like triangle, dir -1 left, 1 right */
-    tri(cx + dir * s * 0.55f, cy, c, cx - dir * s * 0.45f, cy - s * 0.7f, c, cx - dir * s * 0.45f, cy + s * 0.7f, c);
-}
-static void icon_play(float cx, float cy, float s, unsigned c) { tri(cx + s * 0.6f, cy, c, cx - s * 0.45f, cy - s * 0.7f, c, cx - s * 0.45f, cy + s * 0.7f, c); }
 static void icon_warning(float cx, float cy, float s, unsigned c) {
     tri(cx, cy - s * 0.62f, c, cx + s * 0.62f, cy + s * 0.5f, c, cx - s * 0.62f, cy + s * 0.5f, c);
     rbox(cx - 1.5f, cy - s * 0.22f, 3, s * 0.42f, 1.5f, RGBA(30, 20, 0, 255), RGBA(30, 20, 0, 255));
@@ -372,12 +343,26 @@ static void icon_lock(float x, float y, float s, unsigned c) {
     line(x + w * 0.5f, y + s * 0.02f, x + w * 0.79f, y + s * 0.24f, 2, c);
     rbox(x, y + s * 0.45f, w, s * 0.55f, 2, c, c);
 }
-/* A key: its cap, a little raised */
+
+/* The menu's colours: near black, dark greys, one green */
+#define M_BG_TOP RGBA(13, 13, 16, 255)
+#define M_BG_BOTTOM RGBA(7, 7, 9, 255)
+#define M_PANEL RGBA(24, 25, 29, 252)
+#define M_PANEL_EDGE RGBA(58, 61, 68, 255)
+#define M_INNER RGBA(15, 16, 19, 255)
+#define M_INNER_EDGE RGBA(34, 36, 41, 255)
+#define M_ROW RGBA(27, 28, 32, 255)
+#define M_ROW_EDGE RGBA(36, 38, 43, 255)
+#define M_TEXT RGBA(226, 229, 234, 255)
+#define M_DIM RGBA(150, 154, 162, 255)
+#define M_GREEN RGBA(98, 226, 74, 255)
+#define M_GREEN_DARK RGBA(18, 38, 18, 255)
+
+/* A key: its cap, outlined */
 static float keycap(float x, float y, const char *key) {
-    float w = text_w(key, 1, 0) + 16, h = CELL_H + 4;
-    rbox(x, y + 2, w, h, 6, RGBA(70, 74, 96, 255), RGBA(50, 52, 70, 255));
-    rbox(x, y, w, h, 6, RGBA(226, 230, 245, 255), RGBA(176, 182, 204, 255));
-    text_ex(x + 8, y + 2, 1, 0, RGBA(26, 28, 40, 255), RGBA(26, 28, 40, 255), 0, key);
+    float w = text_w(key, 1, 0) + 18, h = CELL_H + 8;
+    rbox_border(x, y - 4, w, h, 7, RGBA(92, 96, 106, 255), RGBA(42, 44, 50, 255), RGBA(30, 32, 37, 255));
+    text_ex(x + 9, y, 1, 0, M_TEXT, M_TEXT, 0, key);
     return w;
 }
 
@@ -393,55 +378,51 @@ static float hints(float x, float y, const char *footer, int draw, float *countd
         if (next) *next++ = 0;
         if (!*tok) continue;
         if (*tok == '#') { if (countdown) *countdown = (float)atof(tok + 1); continue; }
-        if (!first) cx += 26;
+        if (!first) cx += 48;
         first = 0;
         char *eq = strchr(tok, '=');
         if (*tok == '!') {
-            if (draw) icon_warning(cx + 9, y + CELL_H / 2.0f + 2, 16, RGBA(255, 196, 70, 255));
+            if (draw) icon_warning(cx + 9, y + CELL_H / 2.0f, 16, RGBA(255, 196, 70, 255));
             cx += 24;
-            if (draw) text_ex(cx, y + 2, 1, 0, RGBA(255, 214, 120, 255), RGBA(255, 214, 120, 255), 150, tok + 1);
+            if (draw) text_ex(cx, y, 1, 0, RGBA(255, 214, 120, 255), RGBA(255, 214, 120, 255), 0, tok + 1);
             cx += text_w(tok + 1, 1, 0);
         } else if (eq && eq != tok) {
             *eq = 0;
-            if (draw) cx += keycap(cx, y, tok); else cx += text_w(tok, 1, 0) + 16;
-            cx += 8;
-            if (draw) text_ex(cx, y + 2, 1, 0, RGBA(170, 176, 200, 255), RGBA(150, 156, 180, 255), 150, eq + 1);
+            if (draw) cx += keycap(cx, y, tok); else cx += text_w(tok, 1, 0) + 18;
+            cx += 6;
+            if (draw) text_ex(cx, y, 1, 0, M_DIM, M_DIM, 0, ":");
+            cx += CELL_W + 12;
+            if (draw) text_ex(cx, y, 1, 0, RGBA(196, 200, 208, 255), RGBA(196, 200, 208, 255), 0, eq + 1);
             cx += text_w(eq + 1, 1, 0);
         } else {
-            if (draw) text_ex(cx, y + 2, 1, 0, RGBA(190, 196, 220, 255), RGBA(160, 166, 190, 255), 150, tok);
+            if (draw) text_ex(cx, y, 1, 0, RGBA(196, 200, 208, 255), RGBA(196, 200, 208, 255), 0, tok);
             cx += text_w(tok, 1, 0);
         }
     }
     return cx - x;
 }
 
-/* The screen behind the menu: a deep gradient, light from two corners, slanted bands and a vignette */
+/* The screen behind the menu: plain, near black, its edges a little darker */
 static void backdrop(float w, float h) {
-    vgrad(0, 0, w, h, RGBA(20, 22, 44, 255), RGBA(6, 6, 14, 255));
-    glow(w * 0.16f, h * 0.10f, w * 0.55f, h * 0.65f, RGBA(96, 70, 255, 70));
-    glow(w * 0.88f, h * 0.95f, w * 0.50f, h * 0.60f, RGBA(255, 84, 50, 52));
-    glow(w * 0.5f, h * 0.5f, w * 0.45f, h * 0.45f, RGBA(60, 120, 255, 26));
-    static const float band[][3] = {{-0.10f, 0.10f, 14}, {0.06f, 0.025f, 10}, {0.62f, 0.16f, 9}, {0.80f, 0.04f, 14}};
-    for (unsigned i = 0; i < sizeof band / sizeof band[0]; i++) {   /* (from the bottom, leaning right) */
-        float x0 = band[i][0] * w, bw = band[i][1] * w, lean = h * 0.45f;
-        unsigned c = RGBA(255, 255, 255, (unsigned)band[i][2]), c0 = fade(c, 0.2f);
-        tri(x0, h, c0, x0 + bw, h, c0, x0 + lean, 0, c);
-        tri(x0 + lean, 0, c, x0 + bw, h, c0, x0 + bw + lean, 0, c);
-    }
-    unsigned dark = RGBA(0, 0, 0, 130), none = RGBA(0, 0, 0, 0);
-    vgrad(0, 0, w, h * 0.18f, dark, none);
-    vgrad(0, h * 0.82f, w, h * 0.18f, none, dark);
-    hgrad(0, 0, w * 0.12f, h, dark, none);
-    hgrad(w * 0.88f, 0, w * 0.12f, h, none, dark);
+    vgrad(0, 0, w, h, M_BG_TOP, M_BG_BOTTOM);
+    unsigned dark = RGBA(0, 0, 0, 90), none = RGBA(0, 0, 0, 0);
+    hgrad(0, 0, w * 0.15f, h, dark, none);
+    hgrad(w * 0.85f, 0, w * 0.15f, h, none, dark);
 }
 
-/* The start-up menu (gpu_menu.c), centred in the w x h back buffer: a logo, the pages' tabs (title:
- * their names, '\t' between them, '*' before the one shown - else a plain title), a row per shown
- * item - its label, and its value: between arrows, or as it is when it starts with a control
- * character ('\1' information, '\2' a text field, '\3' a warning, '\4' good news, '\5' a note) - the
- * selected one lit, the button row (Play) as a button, and the footer's hints (see hints). Each row's
+/* A box with a border t px thick: border, then fill */
+static void rbox_edge(float x, float y, float w, float h, float r, float t, unsigned border, unsigned fill) {
+    rbox(x, y, w, h, r, border, border);
+    rbox(x + t, y + t, w - 2 * t, h - 2 * t, r - t > 0 ? r - t : 0, fill, fill);
+}
+
+/* The start-up menu (gpu_menu.c), centred in the w x h back buffer: the pages' tabs (title: their
+ * names, '\t' between them, '*' before the one shown - else a plain title), a row per shown item -
+ * its label, and its value: between arrows, or as it is when it starts with a control character
+ * ('\1' information, '\2' a text field, '\3' a warning, '\4' good news, '\5' a note) - the selected
+ * one outlined, the button row (Play) as a button, and the footer's hints (see hints). Each row's
  * place goes to rects (x, y, w, h; 0 for a row not shown), and where the values start to *value_x,
- * for clicks; the tabs are across the rows' width, just above the first one. */
+ * for clicks; the tabs are just above the first row (Display left of the middle, Network right). */
 void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],
                         const int shown[], int selected, int button, const char *footer, float *rects, float *value_x) {
     static unsigned frame;
@@ -453,86 +434,71 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     int rows = 0;
     for (int i = 0; i < n; i++) rows += shown[i] && i != button;
     /* widths: the label's column, values (the arrows' room too), callouts across the row */
-    float label_w = 18.0f * CELL_W, value_w = 26.0f * CELL_W + 72, callout_w = 0;
+    float label_w = 18.0f * CELL_W, value_w = 24.0f * CELL_W + 100, callout_w = 0;
     for (int i = 0; i < n; i++) {
         if (!shown[i] || i == button) continue;
         unsigned char k = (unsigned char)values[i][0];
         float l = text_w(values[i] + (k < 32), 1, 0);
         if (k >= 3 && k <= 5) { if (l + 72 > callout_w) callout_w = l + 72; }
         else if (k == 1 || k == 2) { if (l + 32 > value_w) value_w = l + 32; }
-        else if (l + 72 > value_w) value_w = l + 72;
+        else if (l + 100 > value_w) value_w = l + 100;
     }
     float countdown = -1, footer_w = footer ? hints(0, 0, footer, 0, &countdown) : 0;
-    float pw = 32 + label_w + value_w + 32;
-    if (callout_w + 64 > pw) pw = callout_w + 64;
+    float pw = 16 + 16 + label_w + value_w + 16;
+    if (callout_w + 48 > pw) pw = callout_w + 48;
     if (footer_w + 64 > pw) pw = footer_w + 64;
     if (pw < 720) pw = 720;
     if (pw > W - 32) pw = W - 32;
 
     /* heights: shrunk to fit a small window */
     int tabs = title && strchr(title, '\t');
-    float row_h = 46, logo = 2.0f, tabs_h = 44, play_h = 54, footer_h = 56;
-    float logo_h = CELL_H * logo + 32;
-    float ph = 22 + (tabs ? tabs_h + 18 : CELL_H + 18) + rows * row_h + 14 + play_h + 18 + footer_h;
-    if (logo_h + ph + 24 > H) { row_h = 38; logo = 1.5f; logo_h = CELL_H * logo + 18; play_h = 46; ph -= rows * 8 + 8; }
-    if (logo_h + ph + 16 > H) logo_h = 0;
-    float px = floorf((W - pw) / 2), py = floorf((H - ph - logo_h) / 2 + logo_h);
+    float row_h = 46, gap = 4, tabs_h = 46, play_h = 52, footer_h = 58;
+    float ph = 8 + tabs_h + 10 + rows * (row_h + gap) + 14 + play_h + 16 + footer_h;
+    if (ph + 16 > H) { row_h = 36; play_h = 44; footer_h = 48; ph = 8 + tabs_h + 10 + rows * (row_h + gap) + 14 + play_h + 16 + footer_h; }
+    float px = floorf((W - pw) / 2), py = floorf((H - ph) / 2);
     if (py < 8) py = 8;
 
-    /* the logo */
-    if (logo_h > 0) {
-        const char *a = "WINDOW", *b = "SMASH";
-        float sp = logo * 2, tw = text_w(a, logo, sp) + sp * 3 + text_w(b, logo, sp), lx = (W - tw) / 2, ly = py - logo_h + 2;
-        glow(W / 2, ly + CELL_H * logo / 2, tw * 0.75f, CELL_H * logo * 1.4f, RGBA(255, 110, 60, 34));
-        float x = text_ex(lx, ly, logo, sp, RGBA(255, 255, 255, 255), RGBA(176, 186, 230, 255), 200, a);
-        text_ex(x + sp * 2, ly, logo, sp, RGBA(255, 198, 80, 255), RGBA(255, 72, 54, 255), 200, b);
-        float uy = ly + CELL_H * logo + 4;
-        hgrad(lx, uy, tw / 2, 3, RGBA(255, 120, 60, 0), RGBA(255, 120, 60, 230));
-        hgrad(lx + tw / 2, uy, tw / 2, 3, RGBA(255, 120, 60, 230), RGBA(255, 120, 60, 0));
-    }
+    /* the panel, and the darker box the rows and the button are in */
+    soft(px + 8, py + 10, pw - 16, ph - 8, 24, RGBA(0, 0, 0, 110));
+    rbox_edge(px, py, pw, ph, 8, 2, M_PANEL_EDGE, M_PANEL);
+    float ix = px + 8, iw = pw - 16, iy = py + 8 + tabs_h, ih = ph - footer_h - 8 - tabs_h - 4;
+    rbox_edge(ix, iy, iw, ih, 6, 1, M_INNER_EDGE, M_INNER);
 
-    /* the panel */
-    soft(px + 6, py + 12, pw - 12, ph - 6, 28, RGBA(0, 0, 0, 120));
-    rbox_border(px, py, pw, ph, 20, RGBA(92, 100, 150, 150), RGBA(34, 37, 60, 238), RGBA(18, 19, 32, 246));
-    hgrad(px + 24, py + 1, (pw - 48) / 2, 1, RGBA(160, 170, 255, 0), RGBA(170, 180, 255, 160));   /* (the top edge, lit) */
-    hgrad(px + pw / 2, py + 1, (pw - 48) / 2, 1, RGBA(170, 180, 255, 160), RGBA(160, 170, 255, 0));
-
-    float rx = px + 16, rw = pw - 32, y = py + 22;
-    /* the tabs */
+    /* the tabs: side by side in the middle, just above the box */
+    float y = py + 8;
     if (tabs) {
         char buf[128];
         snprintf(buf, sizeof buf, "%s", title);
         char *name[2] = {buf, strchr(buf, '\t') + 1};
         name[1][-1] = 0;
-        rbox_border(rx, y, rw, tabs_h, tabs_h / 2, RGBA(70, 76, 112, 200), RGBA(12, 13, 24, 230), RGBA(20, 22, 36, 230));
+        char shown_name[2][48];
+        float tw = 0;
         for (int t = 0; t < 2; t++) {
             int on = name[t][0] == '*';
-            const char *label = name[t] + on;
-            char up[32];
-            size_t l = 0;
-            for (; label[l] && l < sizeof up - 1; l++) up[l] = (char)(label[l] >= 'a' && label[l] <= 'z' ? label[l] - 32 : label[l]);
-            up[l] = 0;
-            float tx = rx + 4 + t * (rw - 8) / 2, tw = (rw - 8) / 2;
-            if (on) {
-                soft(tx + 10, y + 10, tw - 20, tabs_h - 16, 14, RGBA(90, 90, 255, 60));
-                rbox(tx, y + 4, tw, tabs_h - 8, (tabs_h - 8) / 2, RGBA(120, 132, 255, 255), RGBA(84, 72, 220, 255));
-                rbox(tx + 2, y + 5, tw - 4, (tabs_h - 8) / 2 - 2, (tabs_h - 8) / 2 - 2, RGBA(255, 255, 255, 40), RGBA(255, 255, 255, 6));
-            }
-            unsigned c = on ? RGBA(255, 255, 255, 255) : RGBA(150, 156, 190, 255);
-            float lw = text_w(up, 1, 2), iw = 22, cx = tx + (tw - lw - iw - 10) / 2, cy = y + (tabs_h - CELL_H) / 2;
-            if (t == 0) icon_display(cx, cy + 3, 15, c); else icon_network(cx + 2, cy + 3, 17, c);
-            text_ex(cx + iw + 10, cy, 1, 2, c, on ? RGBA(222, 226, 255, 255) : c, on ? 150 : 0, up);
+            if (on) snprintf(shown_name[t], sizeof shown_name[t], "[ %s ]", name[t] + 1);
+            else snprintf(shown_name[t], sizeof shown_name[t], "%s (Tab)", name[t]);
+            float l = text_w(shown_name[t], 1, 1) + 56;
+            if (l > tw) tw = l;
         }
-        y += tabs_h + 18;
-    } else {
-        text_c(W / 2, y, 1, 0, RGBA(240, 240, 240, 255), title ? title : "");
-        y += CELL_H + 18;
-    }
+        float tx0 = floorf(W / 2 - tw), th = tabs_h - 6;
+        rbox(tx0 - 4, y, 2 * tw + 8, th + 4, 8, M_INNER, M_INNER);
+        for (int t = 0; t < 2; t++) {
+            int on = name[t][0] == '*';
+            float tx = tx0 + t * tw;
+            if (on) {
+                rbox(tx, y + 2, tw, th, 6, RGBA(30, 32, 37, 255), RGBA(26, 28, 32, 255));
+                rbox(tx + 14, y + th - 1, tw - 28, 3, 1.5f, M_GREEN, M_GREEN);
+            }
+            unsigned c = on ? M_GREEN : M_DIM;
+            text_ex(tx + (tw - text_w(shown_name[t], 1, 1)) / 2, y + 2 + (th - CELL_H) / 2 - 1, 1, 1, c, c, 0, shown_name[t]);
+        }
+    } else text_c(W / 2, y + (tabs_h - CELL_H) / 2, 1, 0, M_TEXT, title ? title : "");
+    y = iy + 10;
 
     /* the rows */
+    float rx = ix + 10, rw = iw - 20;
     float vx = rx + 16 + label_w, vw = rx + rw - 12 - vx;
     if (vw < 160) { vx = rx + rw - 172; vw = 160; }
-    int drawn = 0;
     for (int i = 0; i < n; i++) {
         float *r = rects + 4 * i;
         r[0] = r[1] = r[2] = r[3] = 0;
@@ -545,78 +511,64 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         size_t vl = strlen(val);
         int caret = sel && vl && val[vl - 1] == '_';   /* (the model's cursor: drawn as a caret) */
         if (caret) val[--vl] = 0;
-        float ry = y, rh = row_h - 6, mid = ry + rh / 2, ty = mid - CELL_H / 2.0f;
+        float ry = y, rh = row_h, mid = ry + rh / 2, ty = mid - CELL_H / 2.0f;
         r[0] = rx, r[1] = ry, r[2] = rw, r[3] = rh;
-        if (drawn++ && !sel && i - 1 != selected) hgrad(rx + 16, ry - 3, rw - 32, 1, RGBA(255, 255, 255, 0), RGBA(255, 255, 255, 18));
 
         if (kind >= 3 && kind <= 5) {   /* a callout across the row */
-            unsigned edge = kind == 3 ? RGBA(255, 180, 60, 255) : kind == 4 ? RGBA(90, 220, 140, 255) : RGBA(110, 150, 255, 255);
-            rbox(rx + 4, ry, rw - 8, rh, 10, fade(edge, 0.16f), fade(edge, 0.07f));
-            rbox(rx + 4, ry + 4, 4, rh - 8, 2, edge, fade(edge, 0.6f));
-            if (kind == 3) icon_warning(rx + 32, mid, 20, edge);
-            else if (kind == 4) icon_ok(rx + 32, mid, 20, edge);
-            else icon_info(rx + 32, mid, 20, edge);
-            unsigned tc = kind == 3 ? RGBA(255, 226, 170, 255) : kind == 4 ? RGBA(190, 255, 214, 255) : RGBA(206, 216, 255, 255);
-            text_ex(rx + 54, ty, 1, 0, tc, mix(tc, RGBA(150, 150, 170, 255), 0.25f), 160, fit(val, rw - 70, cut, sizeof cut));
-            y += row_h;
+            unsigned edge = kind == 3 ? RGBA(255, 180, 60, 255) : kind == 4 ? M_GREEN : RGBA(120, 160, 255, 255);
+            rbox_edge(rx, ry, rw, rh, 4, 1, fade(edge, 0.35f), mix(M_ROW, edge, 0.08f));
+            rbox(rx + 4, ry + 5, 3, rh - 10, 1.5f, edge, edge);
+            if (kind == 3) icon_warning(rx + 28, mid, 20, edge);
+            else if (kind == 4) icon_ok(rx + 28, mid, 20, edge);
+            else icon_info(rx + 28, mid, 20, edge);
+            unsigned tc = kind == 3 ? RGBA(255, 226, 170, 255) : kind == 4 ? RGBA(200, 250, 190, 255) : RGBA(206, 216, 255, 255);
+            text_ex(rx + 50, ty, 1, 0, tc, tc, 0, fit(val, rw - 66, cut, sizeof cut));
+            y += row_h + gap;
             continue;
         }
-        if (sel) {
-            soft(rx + 8, ry + 6, rw - 16, rh - 10, 12, RGBA(80, 100, 255, 46));
-            rbox(rx, ry, rw, rh, 12, RGBA(70, 84, 170, 150), RGBA(44, 52, 120, 150));
-            rbox(rx + 6, ry + 7, 4, rh - 14, 2, RGBA(150, 170, 255, 255), RGBA(110, 100, 255, 255));
-        }
-        unsigned lc = kind == 1 ? RGBA(140, 148, 180, 255) : sel ? RGBA(255, 255, 255, 255) : RGBA(214, 218, 236, 255);
-        text_ex(rx + 22, ty, 1, 0, lc, mix(lc, RGBA(120, 124, 150, 255), 0.3f), 150, labels[i]);
+        if (sel) rbox_edge(rx - 1, ry - 1, rw + 2, rh + 2, 5, 3, M_GREEN, M_GREEN_DARK);
+        else rbox_edge(rx, ry, rw, rh, 4, 1, M_ROW_EDGE, M_ROW);
+        unsigned lc = kind == 1 ? M_DIM : sel ? RGBA(255, 255, 255, 255) : M_TEXT;
+        text_ex(rx + 18, ty, 1, 0, lc, lc, 0, labels[i]);
         if (kind == 1) {   /* information: as it is */
-            disc(vx + 4, mid, 3, RGBA(110, 130, 200, 255));
-            text_ex(vx + 16, ty, 1, 0, RGBA(176, 188, 224, 255), RGBA(146, 156, 196, 255), 150, fit(val, vw - 16, cut, sizeof cut));
+            text_ex(vx + 8, ty, 1, 0, RGBA(176, 182, 192, 255), RGBA(176, 182, 192, 255), 0, fit(val, vw - 16, cut, sizeof cut));
         } else if (kind == 2) {   /* a text field */
             float fh = rh - 10;
-            rbox_border(vx, mid - fh / 2, vw, fh, 8, sel ? RGBA(130, 150, 255, 255) : RGBA(70, 76, 110, 255), RGBA(8, 9, 16, 240),
-                        RGBA(16, 18, 30, 240));
+            rbox_edge(vx, mid - fh / 2, vw, fh, 4, 1, sel ? M_GREEN : RGBA(64, 68, 76, 255), RGBA(10, 11, 13, 255));
             const char *t = fit(val, vw - 30, cut, sizeof cut);
-            float end = text_ex(vx + 12, ty, 1, 0, RGBA(240, 242, 255, 255), RGBA(200, 206, 230, 255), 0, t);
-            if (caret && (frame / 30) % 2 == 0) rbox(end + 1, mid - CELL_H / 2.0f + 2, 2, CELL_H - 4, 1, RGBA(150, 170, 255, 255), RGBA(150, 170, 255, 255));
-        } else {   /* a choice: a pill between arrows */
+            float end = text_ex(vx + 12, ty, 1, 0, M_TEXT, M_TEXT, 0, t);
+            if (caret && (frame / 30) % 2 == 0) rbox(end + 1, mid - CELL_H / 2.0f + 2, 2, CELL_H - 4, 1, M_GREEN, M_GREEN);
+        } else {   /* a choice: between arrows */
             int locked = strstr(val, "(set by ") != NULL;
-            float fh = rh - 10, fy = mid - fh / 2;
-            unsigned border = sel ? RGBA(140, 160, 255, 255) : RGBA(66, 72, 106, 255);
-            rbox_border(vx, fy, vw, fh, fh / 2, border, sel ? RGBA(34, 40, 82, 245) : RGBA(14, 15, 26, 235),
-                        sel ? RGBA(24, 26, 56, 245) : RGBA(22, 24, 38, 235));
-            const char *t = fit(val, vw - 80, cut, sizeof cut);
-            float tw = text_w(t, 1, 0), tx = vx + (vw - tw) / 2;
-            unsigned tc = locked ? RGBA(150, 154, 176, 255) : sel ? RGBA(255, 255, 255, 255) : RGBA(200, 208, 232, 255);
-            if (locked) icon_lock(vx + 16, mid - 8, 16, RGBA(150, 154, 176, 255));
+            const char *t = fit(val, vw - 96, cut, sizeof cut);
+            unsigned tc = locked ? M_DIM : sel ? RGBA(255, 255, 255, 255) : M_TEXT;
+            if (locked) icon_lock(vx + 4, mid - 8, 16, M_DIM);
             else {
-                unsigned ac = sel ? RGBA(170, 186, 255, 255) : RGBA(96, 104, 146, 255);
-                arrow(vx + 20, mid, 7, -1, ac);
-                arrow(vx + vw - 20, mid, 7, 1, ac);
+                unsigned ac = sel ? RGBA(255, 255, 255, 255) : M_TEXT;
+                text_ex(vx + 4, ty, 1, 0, ac, ac, 0, "<");
+                text_ex(vx + vw - 4 - CELL_W, ty, 1, 0, ac, ac, 0, ">");
             }
-            float end = text_ex(tx, ty, 1, 0, tc, mix(tc, RGBA(140, 146, 180, 255), 0.3f), 150, t);
-            if (caret && (frame / 30) % 2 == 0) rbox(end + 1, mid - CELL_H / 2.0f + 2, 2, CELL_H - 4, 1, RGBA(150, 170, 255, 255), RGBA(150, 170, 255, 255));
+            float end = text_ex(vx + 64, ty, 1, 0, tc, tc, 0, t);
+            if (caret && (frame / 30) % 2 == 0) rbox(end + 1, mid - CELL_H / 2.0f + 2, 2, CELL_H - 4, 1, M_GREEN, M_GREEN);
         }
-        y += row_h;
+        y += row_h + gap;
     }
 
     /* the button */
     if (button >= 0 && button < n && shown[button]) {
         int sel = selected == button;
-        y += 14;
-        float bw = 300, bh = play_h, bx = floorf((W - bw) / 2);
+        y += 10;
+        float bw = 250, bh = play_h, bx = floorf((W - bw) / 2);
         if (sel) {
-            soft(bx + 16, y + 10, bw - 32, bh - 12, 26, RGBA(60, 230, 120, 70));
-            rbox(bx, y, bw, bh, bh / 2, RGBA(120, 240, 150, 255), RGBA(30, 160, 84, 255));
-            rbox(bx + 3, y + 2, bw - 6, bh / 2 - 2, bh / 2 - 3, RGBA(255, 255, 255, 70), RGBA(255, 255, 255, 10));
-        } else rbox_border(bx, y, bw, bh, bh / 2, RGBA(80, 190, 120, 220), RGBA(32, 46, 48, 240), RGBA(20, 28, 30, 240));
-        char up[32];
-        size_t l = 0;
-        for (; labels[button][l] && l < sizeof up - 1; l++) up[l] = (char)(labels[button][l] >= 'a' && labels[button][l] <= 'z' ? labels[button][l] - 32 : labels[button][l]);
-        up[l] = 0;
-        float lw = text_w(up, 1.25f, 4), cx = bx + (bw - lw - 30) / 2, cy = y + bh / 2;
-        unsigned c = sel ? RGBA(8, 40, 20, 255) : RGBA(170, 240, 196, 255);
-        icon_play(cx + 8, cy, 11, c);
-        text_ex(cx + 30, cy - CELL_H * 1.25f / 2, 1.25f, 4, c, c, sel ? 0 : 160, up);
+            soft(bx + 10, y + 8, bw - 20, bh - 12, 16, RGBA(70, 220, 60, 50));
+            rbox(bx, y, bw, bh, 6, RGBA(120, 236, 96, 255), RGBA(120, 236, 96, 255));
+            rbox(bx + 2, y + 2, bw - 4, bh - 4, 5, RGBA(64, 176, 48, 255), RGBA(40, 140, 34, 255));
+            rbox(bx + 2, y + bh - 5, bw - 4, 3, 1.5f, RGBA(24, 90, 22, 255), RGBA(24, 90, 22, 255));
+        } else rbox_edge(bx, y, bw, bh, 6, 2, RGBA(54, 120, 46, 255), RGBA(22, 48, 22, 255));
+        const char *label = labels[button];
+        float ls = 1.25f, lw = text_w(label, ls, 1);
+        unsigned c = sel ? RGBA(244, 255, 240, 255) : RGBA(150, 220, 140, 255);
+        text_ex(bx + (bw - lw) / 2, y + (bh - CELL_H * ls) / 2 - 1, ls, 1, c, c, sel ? 140 : 0, label);
         float *r = rects + 4 * button;
         r[0] = bx, r[1] = y, r[2] = bw, r[3] = bh;
         y += bh;
@@ -625,14 +577,12 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         r[0] = r[1] = r[2] = r[3] = 0;
     }
 
-    /* the footer: a line, the countdown's bar, the hints */
+    /* the footer: the countdown's bar, the hints */
     float fy = py + ph - footer_h;
-    hgrad(px + 24, fy, (pw - 48) / 2, 1, RGBA(255, 255, 255, 0), RGBA(255, 255, 255, 30));
-    hgrad(px + pw / 2, fy, (pw - 48) / 2, 1, RGBA(255, 255, 255, 30), RGBA(255, 255, 255, 0));
     if (countdown >= 0) {
         float f = countdown > 1 ? 1 : countdown, tw = pw - 96;
-        rbox(px + 48, fy + 8, tw, 4, 2, RGBA(255, 255, 255, 26), RGBA(255, 255, 255, 26));
-        if (f > 0) rbox(px + 48, fy + 8, tw * f, 4, 2, RGBA(255, 190, 80, 255), RGBA(255, 100, 60, 255));
+        rbox(px + 48, fy + 4, tw, 3, 1.5f, RGBA(255, 255, 255, 22), RGBA(255, 255, 255, 22));
+        if (f > 0) rbox(px + 48, fy + 4, tw * f, 3, 1.5f, M_GREEN, M_GREEN);
     }
     if (footer) hints(floorf((W - footer_w) / 2), fy + (footer_h - CELL_H) / 2 + 2, footer, 1, NULL);
     *value_x = vx;
