@@ -440,41 +440,45 @@ static void ring(float cx, float cy, float rx, float ry, float t, unsigned c) { 
 /* A pad's face button, PAD_BUTTON across, its left end at x and its middle at mid: kind X (Xbox and
  * most pads: A B X Y on coloured buttons), P (PlayStation: cross, circle, square, triangle) or N
  * (Nintendo: B A Y X, by position); where S, E, W or N, the button's place in the diamond */
-static void pad_button(float x, float mid, char kind, char where) {
-    float r = PAD_BUTTON / 2, cx = x + r;
+static void pad_face(float cx, float mid, float r, char kind, char where, int shadow) {
     int at = where == 'S' ? 0 : where == 'E' ? 1 : where == 'W' ? 2 : 3;
-    soft(cx - r * 0.5f, mid - r * 0.4f, r, r, 6, RGBA(0, 0, 0, 70));
+    float ts = r / (PAD_BUTTON / 2);   /* (the letters' size) */
+    if (shadow) soft(cx - r * 0.5f, mid - r * 0.4f, r, r, 6, RGBA(0, 0, 0, 70));
     if (kind == 'P') {
         static const unsigned SYMBOL[4] = {RGBA(128, 176, 240, 255), RGBA(240, 112, 112, 255), RGBA(228, 136, 208, 255), RGBA(96, 212, 176, 255)};
         unsigned c = SYMBOL[at];
+        float lw = 3 * ts < 2 ? 2 : 3 * ts;
         disc(cx, mid, r, RGBA(118, 122, 132, 255));
         disc(cx, mid, r - 2, RGBA(36, 38, 44, 255));
         float s = r * 0.42f;
-        if (at == 0) { line(cx - s, mid - s, cx + s, mid + s, 3, c); line(cx - s, mid + s, cx + s, mid - s, 3, c); }
-        else if (at == 1) { disc(cx, mid, s * 1.1f + 1.3f, c); disc(cx, mid, s * 1.1f - 1.3f, RGBA(36, 38, 44, 255)); }
+        if (at == 0) { line(cx - s, mid - s, cx + s, mid + s, lw, c); line(cx - s, mid + s, cx + s, mid - s, lw, c); }
+        else if (at == 1) { disc(cx, mid, s * 1.1f + lw * 0.45f, c); disc(cx, mid, s * 1.1f - lw * 0.45f, RGBA(36, 38, 44, 255)); }
         else if (at == 2) {
-            line(cx - s, mid - s, cx + s, mid - s, 2.6f, c); line(cx + s, mid - s, cx + s, mid + s, 2.6f, c);
-            line(cx + s, mid + s, cx - s, mid + s, 2.6f, c); line(cx - s, mid + s, cx - s, mid - s, 2.6f, c);
+            line(cx - s, mid - s, cx + s, mid - s, lw, c); line(cx + s, mid - s, cx + s, mid + s, lw, c);
+            line(cx + s, mid + s, cx - s, mid + s, lw, c); line(cx - s, mid + s, cx - s, mid - s, lw, c);
         } else {
             float t = s * 1.15f;
-            line(cx, mid - t, cx + t, mid + t * 0.75f, 2.6f, c); line(cx + t, mid + t * 0.75f, cx - t, mid + t * 0.75f, 2.6f, c);
-            line(cx - t, mid + t * 0.75f, cx, mid - t, 2.6f, c);
+            line(cx, mid - t, cx + t, mid + t * 0.75f, lw, c); line(cx + t, mid + t * 0.75f, cx - t, mid + t * 0.75f, lw, c);
+            line(cx - t, mid + t * 0.75f, cx, mid - t, lw, c);
         }
         return;
     }
     static const char XBOX[4] = {'A', 'B', 'X', 'Y'}, NINTENDO[4] = {'B', 'A', 'Y', 'X'};
     char letter[2] = {kind == 'N' ? NINTENDO[at] : XBOX[at], 0};
+    float lx = cx - CELL_W * ts / 2, ly = mid - CELL_H * ts / 2;
     if (kind == 'N') {   /* (dark buttons, white letters) */
         disc(cx, mid, r, RGBA(150, 154, 164, 255));
         disc(cx, mid, r - 2, RGBA(44, 46, 52, 255));
-        text_ex(cx - CELL_W / 2.0f, mid - CELL_H / 2.0f, 1, 0, RGBA(246, 247, 250, 255), RGBA(246, 247, 250, 255), 0, letter);
+        text_ex(lx, ly, ts, 0, RGBA(246, 247, 250, 255), RGBA(246, 247, 250, 255), 0, letter);
         return;
     }
     static const unsigned FILL[4] = {RGBA(84, 178, 64, 255), RGBA(222, 64, 56, 255), RGBA(48, 120, 226, 255), RGBA(236, 182, 28, 255)};
     disc(cx, mid, r, FILL[at]);
-    disc(cx, mid - 1, r - 3, mix(FILL[at], RGBA(255, 255, 255, 255), 0.12f));
-    text_ex(cx - CELL_W / 2.0f, mid - CELL_H / 2.0f, 1, 0, RGBA(255, 255, 255, 255), RGBA(240, 240, 240, 255), 110, letter);
+    disc(cx, mid - 1, r - 3 * ts, mix(FILL[at], RGBA(255, 255, 255, 255), 0.12f));
+    text_ex(lx, ly, ts, 0, RGBA(255, 255, 255, 255), RGBA(240, 240, 240, 255), 110, letter);
 }
+
+static void pad_button(float x, float mid, char kind, char where) { pad_face(x + PAD_BUTTON / 2, mid, PAD_BUTTON / 2, kind, where, 1); }
 
 static void icon_globe(float cx, float cy, float r, unsigned c) {
     ring(cx, cy, r, r, 2.2f, c);
@@ -622,6 +626,212 @@ static void list_pages(float x, float y, float w, float h, float vx, float vw, i
     text_ex(cx - tw / 2, mid - CELL_H / 2.0f, 1, 1, M_TEXT, M_TEXT, 0, label);
 }
 
+/* ---- the Controls page's picture of the pad ---- */
+enum { P_SOUTH, P_EAST, P_WEST, P_NORTH, P_BACK, P_GUIDE, P_START, P_LSTICK, P_RSTICK, P_LSHOULDER, P_RSHOULDER,
+       P_DPUP, P_DPDOWN, P_DPLEFT, P_DPRIGHT, P_LTRIGGER = 26, P_RTRIGGER, P_CONTROLS };   /* (pad_menu.h's PC_*) */
+#define P_GREEN_GLOW RGBA(98, 226, 74, 70)
+
+/* The console button a control presses, by its tag, in a small label at (x, y): its middle there, or
+ * (side -1) its right end or (side 1) its left end */
+static void pad_tag(float x, float y, int side, const char *tag, int lit) {
+    if (!*tag) return;
+    float s = 0.75f, w = text_w(tag, s, 0) + 14, h = CELL_H * s + 6;
+    float left = side < 0 ? x - w : side > 0 ? x : x - w / 2;
+    rbox_edge(left, y - h / 2, w, h, h / 2, 1, lit ? M_GREEN : RGBA(84, 88, 98, 255), lit ? RGBA(26, 60, 24, 255) : RGBA(30, 32, 37, 255));
+    unsigned c = lit ? RGBA(214, 255, 200, 255) : RGBA(214, 218, 226, 255);
+    text_ex(left + 7, y - CELL_H * s / 2, s, 0, c, c, 0, tag);
+}
+
+/* The sticks' test, in (x, y, w x h): each stick's whole travel as a circle, its dead zone the ring
+ * inside, where the stick is (white) and what the game gets of it (green, past the dead zone and
+ * stretched over the rest - hle_pad.c's stick()), in figures under it */
+static void stick_test(float x, float y, float w, float h, const int dzs[2], const int axes[4], const int game[4], const int fix[2],
+                       const int flash[2]) {
+    float r = (w - 80) / 4, top = y + 56;
+    if (r > (h - 76 - 3 * (CELL_H + 4) - 16) / 2) r = (h - 76 - 3 * (CELL_H + 4) - 16) / 2;   /* (its three lines of figures under it) */
+    if (r < 40) r = 40;
+    for (int side = 0; side < 2; side++) {
+        float cx = x + w * (side ? 0.75f : 0.25f), cy = top + 20 + r;
+        int dz = dzs[side];
+        text_c(cx, top - 30, 1, 0, M_TEXT, side ? "Right stick" : "Left stick");
+        disc(cx, cy, r + 2, RGBA(84, 88, 98, 255));
+        disc(cx, cy, r, RGBA(26, 27, 31, 255));
+        line(cx - r, cy, cx + r, cy, 1, RGBA(255, 255, 255, 26));
+        line(cx, cy - r, cx, cy + r, 1, RGBA(255, 255, 255, 26));
+        for (int q = 1; q < 4; q++) ring(cx, cy, r * q / 4, r * q / 4, 1, RGBA(255, 255, 255, 14));
+        float rz = r * dz / 100.0f;
+        if (dz > 0) { disc(cx, cy, rz, RGBA(240, 186, 60, 46)); ring(cx, cy, rz, rz, 2, RGBA(240, 186, 60, 230)); }
+        float ax = axes[side * 2] / 32767.0f, ay = axes[side * 2 + 1] / 32767.0f, mag = sqrtf(ax * ax + ay * ay);
+        if (mag > 1) { ax /= mag; ay /= mag; mag = 1; }
+        /* what the game gets: the snapback fix's sticks (as the raw ones when it is off), past the dead zone */
+        float bx = game[side * 2] / 32767.0f, by = game[side * 2 + 1] / 32767.0f, gm = sqrtf(bx * bx + by * by);
+        if (gm > 1) { bx /= gm; by /= gm; gm = 1; }
+        float out = gm * 100 <= dz || gm == 0 ? 0 : (gm - dz / 100.0f) / (1 - dz / 100.0f);
+        float gx = gm > 0 ? bx / gm * out : 0, gy = gm > 0 ? by / gm * out : 0;
+        if (out > 0) line(cx, cy, cx + gx * r, cy + gy * r, 3, RGBA(98, 226, 74, 200));
+        disc(cx + ax * r, cy + ay * r, 7, RGBA(236, 238, 244, 255));
+        if (out > 0) disc(cx + gx * r, cy + gy * r, 6, M_GREEN);
+        char figures[64];
+        snprintf(figures, sizeof figures, "Stick %3d%%", (int)(mag * 100 + 0.5f));
+        text_c(cx, cy + r + 18, 1, 0, RGBA(220, 224, 232, 255), figures);
+        unsigned fc = out > 0 ? M_GREEN : RGBA(240, 186, 60, 255);
+        if (flash[side]) { snprintf(figures, sizeof figures, "Bounce ignored"); fc = RGBA(110, 190, 255, 255); }
+        else if (out > 0) snprintf(figures, sizeof figures, "Game  %3d%%", (int)(out * 100 + 0.5f));
+        else snprintf(figures, sizeof figures, mag > 0.005f ? "Game: ignored" : "Game    0%%");
+        text_c(cx, cy + r + 18 + CELL_H + 4, 1, 0, fc, figures);
+        if (flash[side]) ring(cx, cy, r + 5, r + 5, 2.5f, RGBA(110, 190, 255, 220));
+        snprintf(figures, sizeof figures, "Dead zone %d%%%s", dz, fix[side] ? ", snapback fix" : "");
+        text_c(cx, cy + r + 18 + 2 * (CELL_H + 4), 0.8f, 0, M_DIM, figures);
+    }
+}
+
+/* fields: the kind (0 Xbox, 1 PlayStation, 2 Nintendo), the control lit (or -1), listening, the left and
+ * right sticks' dead zones, the sticks "lx,ly,rx,ry", each control's tag ("," between), the line under
+ * the picture, 1 for the sticks' test instead */
+static void pad_picture(float x, float y, float w, float h, const char *fields) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", fields);
+    char *f[12] = {0};
+    char *p = buf;
+    for (int i = 0; i < 12 && p; i++) {
+        f[i] = p;
+        p = strchr(p, '\t');
+        if (p && i < 11) *p++ = 0;
+    }
+    if (!f[11]) return;
+    int game[4] = {0}, fix[2] = {0}, flash[2] = {0};
+    sscanf(f[9], "%d,%d,%d,%d", &game[0], &game[1], &game[2], &game[3]);
+    sscanf(f[10], "%d,%d", &fix[0], &fix[1]);
+    sscanf(f[11], "%d,%d", &flash[0], &flash[1]);
+    int kind = atoi(f[0]), lit = atoi(f[1]), listening = atoi(f[2]), dzs[2] = {atoi(f[3]), atoi(f[4])}, test = atoi(f[8]);
+    int axes[4] = {0};
+    sscanf(f[5], "%d,%d,%d,%d", &axes[0], &axes[1], &axes[2], &axes[3]);
+    const char *tag[P_CONTROLS];
+    for (int c = 0; c < P_CONTROLS; c++) tag[c] = "";
+    char *t = f[6];
+    for (int c = 0; c < P_CONTROLS && t; c++) {
+        char *comma = strchr(t, ',');
+        if (comma) *comma++ = 0;
+        tag[c] = t;
+        t = comma;
+    }
+    rbox_edge(x, y, w, h, 6, 1, M_ROW_EDGE, RGBA(20, 21, 25, 255));
+    if (test) {   /* the sticks' test instead of the pad */
+        stick_test(x, y, w, h - 50, dzs, axes, game, fix, flash);
+        char cut[160];
+        text_c(x + w / 2, y + h - 34, 1, 0, RGBA(206, 210, 220, 255), fit(f[7], w - 24, cut, sizeof cut));
+        return;
+    }
+
+    /* as large as the column lets it be, in the middle of it (above the line under it) */
+    float bw = w - 110 < 520 ? w - 110 : 520, bh = bw * 0.6f;
+    if (bh * 0.92f + 110 > h - 50) { bh = (h - 160) / 0.92f; bw = bh / 0.6f; }
+    float cx = x + w / 2, cy = y + (h - 50) / 2 - 0.06f * bh + 25;
+    unsigned edge = RGBA(96, 100, 110, 255), top = RGBA(52, 55, 62, 255), bottom = RGBA(38, 40, 46, 255);
+    char face_kind = kind == 1 ? 'P' : kind == 2 ? 'N' : 'X';
+    const char *sh_l = kind == 1 ? "L1" : kind == 2 ? "L" : "LB", *sh_r = kind == 1 ? "R1" : kind == 2 ? "R" : "RB";
+    const char *tr_l = kind == 1 ? "L2" : kind == 2 ? "ZL" : "LT", *tr_r = kind == 1 ? "R2" : kind == 2 ? "ZR" : "RT";
+
+    /* the triggers and shoulder buttons, behind the body's top */
+    for (int side = -1; side <= 1; side += 2) {
+        float sx = cx + side * bw * 0.30f, sw = bw * 0.22f, tw2 = bw * 0.17f, by = cy - bh * 0.40f;
+        int trig = side < 0 ? P_LTRIGGER : P_RTRIGGER, shoulder = side < 0 ? P_LSHOULDER : P_RSHOULDER;
+        if (lit == trig) rbox(sx - tw2 / 2 - 5, by - 46, tw2 + 10, 30, 9, P_GREEN_GLOW, P_GREEN_GLOW);
+        rbox_edge(sx - tw2 / 2, by - 41, tw2, 22, 7, 2, lit == trig ? M_GREEN : edge, RGBA(44, 46, 52, 255));
+        text_c(sx, by - 41 + (22 - CELL_H * 0.7f) / 2 - 1, 0.7f, 0, RGBA(190, 194, 204, 255), side < 0 ? tr_l : tr_r);
+        if (lit == shoulder) rbox(sx - sw / 2 - 5, by - 21, sw + 10, 24, 8, P_GREEN_GLOW, P_GREEN_GLOW);
+        rbox_edge(sx - sw / 2, by - 16, sw, 16, 6, 2, lit == shoulder ? M_GREEN : edge, RGBA(48, 50, 57, 255));
+        text_c(sx, by - 16 + (16 - CELL_H * 0.6f) / 2, 0.6f, 0, RGBA(190, 194, 204, 255), side < 0 ? sh_l : sh_r);
+        pad_tag(sx + side * (tw2 / 2 + 8), by - 30, side, tag[trig], lit == trig);
+        pad_tag(sx + side * (sw / 2 + 8), by - 8, side, tag[shoulder], lit == shoulder);
+    }
+    /* the body: two grips and the middle, an outline first */
+    for (int pass = 0; pass < 2; pass++) {
+        float o = pass ? 0 : 2;
+        unsigned a = pass ? top : edge, b = pass ? bottom : edge;
+        for (int side = -1; side <= 1; side += 2) {
+            disc(cx + side * bw * 0.33f, cy + bh * 0.22f, bh * 0.30f + o, b);
+            disc(cx + side * bw * 0.36f, cy + bh * 0.02f, bh * 0.26f + o, mix(a, b, 0.4f));
+        }
+        rbox(cx - bw * 0.44f - o, cy - bh * 0.40f - o, bw * 0.88f + 2 * o, bh * 0.56f + 2 * o, bh * 0.22f, a, mix(a, b, 0.7f));
+    }
+
+    /* where the sticks, the D-pad and the face buttons are */
+    float ux = bw * 0.27f, uy = -bh * 0.13f, lx2 = bw * 0.13f, ly2 = bh * 0.16f;
+    float lstick_x = cx - (kind == 1 ? lx2 : ux), lstick_y = cy + (kind == 1 ? ly2 : uy);
+    float dpad_x = cx - (kind == 1 ? ux : lx2), dpad_y = cy + (kind == 1 ? uy : ly2);
+    float rstick_x = cx + lx2, rstick_y = cy + ly2, face_x = cx + ux, face_y = cy + uy;
+
+    /* the sticks: the dead zone a ring inside, where the stick is now a dot */
+    for (int side = 0; side < 2; side++) {
+        float sx = side ? rstick_x : lstick_x, sy = side ? rstick_y : lstick_y, r = bh * 0.13f;
+        int control = side ? P_RSTICK : P_LSTICK;
+        if (lit == control) disc(sx, sy, r + 8, P_GREEN_GLOW);
+        disc(sx, sy, r + 2, lit == control ? M_GREEN : edge);
+        disc(sx, sy, r, RGBA(26, 27, 31, 255));
+        disc(sx, sy, r * 0.72f, RGBA(40, 42, 48, 255));
+        int dz = dzs[side];
+        if (dz > 0) ring(sx, sy, r * dz / 100.0f, r * dz / 100.0f, 1.6f, RGBA(240, 186, 60, 220));
+        float ax = axes[side * 2] / 32767.0f, ay = axes[side * 2 + 1] / 32767.0f, mag = sqrtf(ax * ax + ay * ay);
+        int moved = mag * 100 > dz && mag > 0.02f;
+        disc(sx + ax * r, sy + ay * r, 4, moved ? M_GREEN : RGBA(150, 154, 164, 255));
+        pad_tag(sx, sy + r + 16, 0, tag[control], lit == control);
+    }
+    /* the D-pad */
+    {
+        float a = bh * 0.10f, t2 = bh * 0.07f;
+        rbox(dpad_x - t2 / 2 - 2, dpad_y - a - 2, t2 + 4, 2 * a + 4, 3, edge, edge);
+        rbox(dpad_x - a - 2, dpad_y - t2 / 2 - 2, 2 * a + 4, t2 + 4, 3, edge, edge);
+        rbox(dpad_x - t2 / 2, dpad_y - a, t2, 2 * a, 2, RGBA(30, 31, 36, 255), RGBA(30, 31, 36, 255));
+        rbox(dpad_x - a, dpad_y - t2 / 2, 2 * a, t2, 2, RGBA(30, 31, 36, 255), RGBA(30, 31, 36, 255));
+        static const int DIR[4] = {P_DPUP, P_DPDOWN, P_DPLEFT, P_DPRIGHT};
+        static const float DX[4] = {0, 0, -1, 1}, DY[4] = {-1, 1, 0, 0};
+        for (int d = 0; d < 4; d++) {
+            const char *tg = tag[DIR[d]];
+            int plain = !strcmp(tg, "^") || !strcmp(tg, "v") || !strcmp(tg, "<") || !strcmp(tg, ">");
+            if (lit == DIR[d]) disc(dpad_x + DX[d] * a * 0.6f, dpad_y + DY[d] * a * 0.6f, t2 * 0.6f, M_GREEN);
+            if (!plain || lit == DIR[d]) pad_tag(dpad_x + DX[d] * (a + 22), dpad_y + DY[d] * (a + 14), (int)DX[d], tg, lit == DIR[d]);
+        }
+    }
+    /* the face buttons, in their diamond */
+    {
+        float r = bh * 0.075f, d = r * 2.15f;
+        static const char WHERE[4] = {'S', 'E', 'W', 'N'};
+        static const float DX[4] = {0, 1, -1, 0}, DY[4] = {1, 0, 0, -1};
+        for (int i = 0; i < 4; i++) {
+            float bx = face_x + DX[i] * d, by = face_y + DY[i] * d;
+            if (lit == i) disc(bx, by, r + 7, P_GREEN_GLOW);
+            pad_face(bx, by, r, face_kind, WHERE[i], 0);
+            if (lit == i) ring(bx, by, r + 3, r + 3, 2, M_GREEN);
+        }
+        /* their tags, beside each one (outward: clear of the shoulders above) */
+        pad_tag(face_x + r + 6, face_y + d, 1, tag[P_SOUTH], lit == P_SOUTH);
+        pad_tag(face_x + d + r + 6, face_y, 1, tag[P_EAST], lit == P_EAST);
+        pad_tag(face_x - d - r - 6, face_y, -1, tag[P_WEST], lit == P_WEST);
+        pad_tag(face_x + r + 6, face_y - d, 1, tag[P_NORTH], lit == P_NORTH);
+    }
+    /* back and start, between */
+    for (int side = -1; side <= 1; side += 2) {
+        int control = side < 0 ? P_BACK : P_START;
+        float bx = cx + side * bw * 0.09f, by = cy - bh * 0.22f;
+        if (lit == control) disc(bx, by, 13, P_GREEN_GLOW);
+        rbox(bx - 8, by - 5, 16, 10, 5, lit == control ? M_GREEN : RGBA(150, 154, 164, 255), lit == control ? M_GREEN : RGBA(150, 154, 164, 255));
+        pad_tag(bx, by - 22, 0, tag[control], lit == control);
+    }
+
+    /* the line under it */
+    float ly3 = y + h - 34;
+    unsigned lc = listening ? RGBA(255, 214, 120, 255) : RGBA(206, 210, 220, 255);
+    char cut[160];
+    const char *line_text = fit(f[7], w - 24, cut, sizeof cut);
+    if (listening) { rbox_edge(x + 10, ly3 - 6, w - 20, CELL_H + 12, 6, 1, RGBA(255, 196, 70, 180), RGBA(60, 46, 16, 255)); }
+    text_c(cx, ly3, 1, 0, lc, line_text);
+}
+
+static float tab_x0, tab_w;   /* the last menu's tabs (overlay_menu_tabs) */
+static int tab_count;
+void overlay_menu_tabs(float *x0, float *w, int *count) { *x0 = tab_x0; *w = tab_w; *count = tab_count; }
+
 /* A pad's shoulder button by the tabs, as a cap: its left end at x, its middle at mid */
 static void shoulder_cap(float x, float mid, const char *label) {
     float w = text_w(label, 1, 0.5f) + 26, h = CELL_H + 8;
@@ -645,21 +855,22 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     float W = (float)w, H = (float)h;
     backdrop(W, H);
 
-    /* rows: the plain ones, and the taller ones of the Network page's list (its heading, rooms) */
-    int rows = 0, tall = 0, list = 0;
+    /* rows: the plain ones, the taller ones of the Network page's list (its heading, rooms), and a
+     * picture ('\16': the Controls page's pad) drawn in a column of its own beside the others */
+    int list = 0, pic = -1;
     for (int i = 0; i < n; i++) {
         if (!shown[i] || i == button) continue;
         unsigned char k = (unsigned char)values[i][0];
-        rows++;
-        tall += k == 6 || k == 7;
         list |= k >= 6 && k <= 8;
+        if (k == 14 && pic < 0) pic = i;
     }
     /* widths: the label's column, values (the arrows' room too), callouts across the row */
-    float label_w = 18.0f * CELL_W, value_w = 24.0f * CELL_W + 100, callout_w = 0;
+    float label_w = 18.0f * CELL_W, value_w = 24.0f * CELL_W + 100, callout_w = 0, side_w = pic >= 0 ? 520 : 0;
     for (int i = 0; i < n; i++) {
         if (!shown[i] || i == button) continue;
         unsigned char k = (unsigned char)values[i][0];
         if (k >= 6 && k <= 8) continue;
+        if (k == 14) continue;
         float l = text_w(values[i] + (k < 32), 1, 0);
         if (k >= 3 && k <= 5) { if (l + 72 > callout_w) callout_w = l + 72; }
         else if (k == 1 || k == 2) { if (l + 32 > value_w) value_w = l + 32; }
@@ -668,18 +879,51 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     float countdown = -1, footer_w = footer ? hints(0, 0, footer, 0, &countdown) : 0;
     float pw = 16 + 16 + label_w + value_w + 16;
     if (callout_w + 48 > pw) pw = callout_w + 48;
-    if (footer_w + 64 > pw) pw = footer_w + 64;
     if (pw < (list ? 880 : 720)) pw = list ? 880 : 720;
+    pw += side_w;
+    if (footer_w + 64 > pw) pw = footer_w + 64;
     if (pw > W - 32) pw = W - 32;
 
-    /* heights: shrunk to fit a small window */
+    /* heights: shrunk to fit a small window; rows that still do not fit scroll, the selected one shown */
     int tabs = title && strchr(title, '\t');
     float row_h = 46, gap = 4, tabs_h = 46, play_h = 52, footer_h = 58, more = 18;   /* (more: a tall row's) */
-    float ph = 8 + tabs_h + 10 + rows * (row_h + gap) + tall * more + 14 + play_h + 16 + footer_h;
-    if (ph + 16 > H) {
-        row_h = 36; play_h = 44; footer_h = 48; more = 14;
-        ph = 8 + tabs_h + 10 + rows * (row_h + gap) + tall * more + 14 + play_h + 16 + footer_h;
+    float pic_h = pic >= 0 ? 400 : 0;   /* (the picture's least height) */
+    int first = 0, last = n - 1;        /* the rows drawn */
+    float rows_h = 0, fixed = 0;
+    int has_button = button >= 0 && button < n && shown[button];
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass) { row_h = 36; play_h = 44; footer_h = 48; more = 14; pic_h = pic >= 0 ? 340 : 0; }
+        rows_h = 0;
+        for (int i = 0; i < n; i++)
+            if (shown[i] && i != button && i != pic)
+                rows_h += row_h + gap + ((unsigned char)values[i][0] == 6 || (unsigned char)values[i][0] == 7 ? more : 0);
+        fixed = 8 + tabs_h + 10 + (has_button ? 14 + play_h : 0) + 16 + footer_h;   /* (a page without the button: no room for it) */
+        if (fixed + (rows_h > pic_h ? rows_h : pic_h) + 16 <= H) break;
     }
+    float room_h = H - 16 - fixed;
+    if (rows_h > room_h && room_h > 0) {   /* scrolling: the window of rows around the selected one */
+        float tall_of[256];
+        int count = n < 256 ? n : 256;
+        for (int i = 0; i < count; i++)
+            tall_of[i] = shown[i] && i != button && i != pic
+                         ? row_h + gap + ((unsigned char)values[i][0] == 6 || (unsigned char)values[i][0] == 7 ? more : 0) : 0;
+        int anchor = selected >= 0 && selected < count && tall_of[selected] > 0 ? selected : count - 1;
+        static int keep_first;   /* (the window moves only as far as the selection makes it) */
+        first = keep_first < count ? keep_first : 0;
+        if (anchor < first) first = anchor;
+        for (;;) {   /* the selected row inside: first moved down until it fits */
+            float used = 0;
+            for (int i = first; i <= anchor; i++) used += tall_of[i];
+            if (used <= room_h || first >= anchor) break;
+            first++;
+        }
+        float used = 0;
+        last = first - 1;
+        while (last + 1 < count && used + tall_of[last + 1] <= room_h) used += tall_of[++last];
+        keep_first = first;
+        rows_h = used;
+    }
+    float ph = fixed + (rows_h > pic_h ? rows_h : pic_h);
     float px = floorf((W - pw) / 2), py = floorf((H - ph) / 2);
     if (py < 8) py = 8;
 
@@ -689,32 +933,38 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     float ix = px + 8, iw = pw - 16, iy = py + 8 + tabs_h, ih = ph - footer_h - 8 - tabs_h - 4;
     rbox_edge(ix, iy, iw, ih, 6, 1, M_INNER_EDGE, M_INNER);
 
-    /* the tabs: side by side in the middle, just above the box */
+    /* the tabs: side by side in the middle, just above the box. Their names, '\t' between them, '*'
+     * before the one shown; then optionally a field "@" and the key that changes pages - "Tab" after the
+     * name of the page it goes to, or a pad's shoulder buttons ("@LB|RB"), each in a cap beside the tabs */
     float y = py + 8;
+    tab_count = 0;
     if (tabs) {
-        char buf[128];
+        char buf[160];
         snprintf(buf, sizeof buf, "%s", title);
-        char *name[2] = {buf, strchr(buf, '\t') + 1};
-        name[1][-1] = 0;
-        /* a third field: the key that changes pages - "Tab" after the other page's name, or a pad's
-         * shoulder buttons ("LB|RB"), each in a cap beside the tabs */
-        char *key = strchr(name[1], '\t'), *right = NULL;
-        if (key) *key++ = 0;
-        if (!key || !*key) key = "Tab";
+        char *name[4], *key = "Tab", *right = NULL;
+        int nt = 0, on_at = 0;
+        for (char *t = buf, *next; t && nt < 4; t = next) {
+            next = strchr(t, '\t');
+            if (next) *next++ = 0;
+            if (*t == '@') { if (t[1]) key = t + 1; continue; }
+            if (*t == '*') on_at = nt;
+            name[nt++] = t;
+        }
         if ((right = strchr(key, '|'))) *right++ = 0;
-        char shown_name[2][48];
+        char shown_name[4][48];
         float tw = 0;
-        for (int t = 0; t < 2; t++) {
+        for (int t = 0; t < nt; t++) {
             int on = name[t][0] == '*';
             if (on) snprintf(shown_name[t], sizeof shown_name[t], "[ %s ]", name[t] + 1);
-            else if (right) snprintf(shown_name[t], sizeof shown_name[t], "%s", name[t]);
-            else snprintf(shown_name[t], sizeof shown_name[t], "%s (%s)", name[t], key);
-            float l = text_w(shown_name[t], 1, 1) + 56;
+            else if (!right && t == (on_at + 1) % nt) snprintf(shown_name[t], sizeof shown_name[t], "%s (%s)", name[t], key);
+            else snprintf(shown_name[t], sizeof shown_name[t], "%s", name[t]);
+            float l = text_w(shown_name[t], 1, 1) + 48;
             if (l > tw) tw = l;
         }
-        float tx0 = floorf(W / 2 - tw), th = tabs_h - 6;
-        rbox(tx0 - 4, y, 2 * tw + 8, th + 4, 8, M_INNER, M_INNER);
-        for (int t = 0; t < 2; t++) {
+        float tx0 = floorf(W / 2 - tw * nt / 2), th = tabs_h - 6;
+        tab_x0 = tx0, tab_w = tw, tab_count = nt;
+        rbox(tx0 - 4, y, nt * tw + 8, th + 4, 8, M_INNER, M_INNER);
+        for (int t = 0; t < nt; t++) {
             int on = name[t][0] == '*';
             float tx = tx0 + t * tw;
             if (on) {
@@ -727,19 +977,32 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         if (right) {   /* the shoulder buttons' caps: the left one before the tabs, the right one after */
             float mid = y + (th + 4) / 2;
             shoulder_cap(tx0 - 4 - 16 - (text_w(key, 1, 0.5f) + 26), mid, key);
-            shoulder_cap(tx0 + 2 * tw + 4 + 16, mid, right);
+            shoulder_cap(tx0 + nt * tw + 4 + 16, mid, right);
         }
     } else text_c(W / 2, y + (tabs_h - CELL_H) / 2, 1, 0, M_TEXT, title ? title : "");
     y = iy + 10;
-
+    if (first > 0 || last < n - 1) {   /* (scrolling: a bar at the right edge of the rows) */
+        int all = 0, before = 0, seen = 0;
+        for (int i = 0; i < n; i++)
+            if (shown[i] && i != button && i != pic) { all++; before += i < first; seen += i >= first && i <= last; }
+        float bx = ix + iw - side_w - 7, top = iy + 10, len = rows_h - gap;
+        rbox(bx, top, 3, len, 1.5f, RGBA(255, 255, 255, 18), RGBA(255, 255, 255, 18));
+        if (all) rbox(bx, top + len * before / all, 3, len * seen / all, 1.5f, M_DIM, M_DIM);
+    }
     /* the rows */
-    float rx = ix + 10, rw = iw - 20;
+    float rx = ix + 10, rw = iw - 20 - (side_w ? side_w + 4 : 0) - (first > 0 || last < n - 1 ? 8 : 0);
     float vx = rx + 16 + label_w, vw = rx + rw - 12 - vx;
     if (vw < 160) { vx = rx + rw - 172; vw = 160; }
+    if (pic >= 0) {   /* the picture: the column right of the rows, as tall as they are */
+        float *r = rects + 4 * pic, sx = ix + iw - side_w - 4, sh = (rows_h > pic_h ? rows_h : pic_h) - gap;
+        pad_picture(sx, iy + 10, side_w - 6, sh, values[pic] + 1);
+        r[0] = sx, r[1] = iy + 10, r[2] = side_w - 6, r[3] = sh;
+    }
     for (int i = 0; i < n; i++) {
         float *r = rects + 4 * i;
+        if (i == pic) continue;
         r[0] = r[1] = r[2] = r[3] = 0;
-        if (!shown[i] || i == button) continue;
+        if (!shown[i] || i == button || i < first || i > last) continue;
         int sel = i == selected;
         unsigned char kind = (unsigned char)values[i][0];
         const char *v = values[i] + (kind < 32);
@@ -787,10 +1050,10 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
             const char *t = fit(val, vw - 96, cut, sizeof cut);
             unsigned tc = locked ? M_DIM : sel ? RGBA(255, 255, 255, 255) : M_TEXT;
             if (locked) icon_lock(vx + 4, mid - 8, 16, M_DIM);
-            else {
+            else {   /* ('\21': a row that opens something - its arrow only) */
                 unsigned ac = sel ? RGBA(255, 255, 255, 255) : M_TEXT;
-                text_ex(vx + 4, ty, 1, 0, ac, ac, 0, "<");
-                text_ex(vx + vw - 4 - CELL_W, ty, 1, 0, ac, ac, 0, ">");
+                if (kind != 17) text_ex(vx + 4, ty, 1, 0, ac, ac, 0, "<");
+                text_ex(vx + vw - 4 - CELL_W, ty, 1, 0, kind == 17 && sel ? M_GREEN : ac, kind == 17 && sel ? M_GREEN : ac, 0, ">");
             }
             float end = text_ex(vx + 64, ty, 1, 0, tc, tc, 0, t);
             if (caret && (frame / 30) % 2 == 0) rbox(end + 1, mid - CELL_H / 2.0f + 2, 2, CELL_H - 4, 1, M_GREEN, M_GREEN);
@@ -802,7 +1065,7 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     if (button >= 0 && button < n && shown[button]) {
         int sel = selected == button;
         y += 10;
-        float bw = 250, bh = play_h, bx = floorf((W - bw) / 2);
+        float bw = 250, bh = play_h, bx = floorf(side_w ? rx + (rw - bw) / 2 : (W - bw) / 2);   /* (under the rows, beside a picture) */
         if (sel) {
             soft(bx + 10, y + 8, bw - 20, bh - 12, 16, RGBA(70, 220, 60, 50));
             rbox(bx, y, bw, bh, 6, RGBA(120, 236, 96, 255), RGBA(120, 236, 96, 255));

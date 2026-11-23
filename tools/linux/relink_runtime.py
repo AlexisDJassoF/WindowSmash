@@ -45,7 +45,7 @@ def runtime_jobs():
               [os.path.join(R, "linux", n) for n in os.listdir(os.path.join(R, "linux")) if n.endswith(".h")] + \
               [os.path.join(R, "linux", "include", "windows.h")]
     sources = [os.path.join(R, n) for n in sorted(os.listdir(R))
-               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
+               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|pad_menu|debug_watchdog)\.c", n)]
     sources += [os.path.join(R, "linux", n) for n in sorted(os.listdir(os.path.join(R, "linux"))) if n.endswith((".c", ".cpp"))]
     jobs = []
     for src in sources:

@@ -2,7 +2,7 @@
  *   net_menu_test <script>   one letter each: u d l r a (up down left right accept), k<c> (type c),
  *                            e (Backspace), f (a room found on the LAN: 192.168.1.9:39420 "dojo" by Kim),
  *                            g (rooms found: this PC's own 192.168.1.5:39420, a full one 192.168.1.7, then "dojo"),
- *                            m (rooms found: six, room0..room5 at 10.0.0.1..6 - two pages of the list),
+ *                            N (no Play row, as the start-up menu's page), m (rooms found: six, room0..room5 at 10.0.0.1..6 - two pages of the list),
  *                            j<0-3> (Join chooses, the address answering NET_WATCH_*),
  *                            p<0-4> (what the network looks like: NET_UPNP_*, LAN 192.168.1.5, VPN from TEST_VPN),
  *                            S (the launcher's variables kept aside), W (remembered and saved), A (applied).
@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
         case 'f': net_menu_set_found(&m, &room, 1); break;
         case 'g': net_menu_set_found(&m, rooms, 3); break;
         case 'm': net_menu_set_found(&m, many, 6); break;
+        case 'N': m.no_play = 1; break;   /* (as the start-up menu has it: no Play row) */
         case 'j': net_menu_auto_host(&m, p[1] ? *++p - '0' : 0); break;
         case 'p': {
             NetProbe probe = {0};

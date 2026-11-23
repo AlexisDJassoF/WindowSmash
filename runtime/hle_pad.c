@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 #include "pad.h"
+#include "pad_snap.h"
 #include "gpu_menu.h"   /* (F9's Network window: menu_modal, menu_input, menu_device) */
 #ifdef SSBU_HAVE_SDL3
 #include <SDL3/SDL_init.h>
@@ -130,6 +131,8 @@ typedef struct DevCfg {
     char match[96];               /* GUID, name or type of the pad ("" = [device default]) */
     int layout;                   /* -1 unset, 0 positional, 1 labels */
     int deadzone, rumble, trigger;   /* percent; -1 unset */
+    int deadzone_left, deadzone_right;   /* (each stick's own, over deadzone; -1 unset) */
+    int snapback_left, snapback_right;   /* the snapback fix on a stick (pad_snap.h): 1 on, 0 off, -1 unset */
     Source map[16][MAXSRC]; u8 nmap[16], has_map[16];
 } DevCfg;
 
@@ -140,7 +143,7 @@ static struct {
     DevCfg def, dev[32];
     int ndev;
     char path[MAX_PATH];
-} cfg = {.keyboard_slot = 0, .background = 1, .def = {"", -1, -1, -1, -1}};
+} cfg = {.keyboard_slot = 0, .background = 1, .def = {"", -1, -1, -1, -1, -1, -1, -1, -1}};
 
 static const char DEFAULT_INI[] =
     "; controllers.ini: how pads become players. Read when the game starts.\n"
@@ -166,7 +169,12 @@ static const char DEFAULT_INI[] =
     ";          labels: by the letter printed on the pad (an Xbox pad's A is A). PlayStation pads stay positional.\n"
     "layout = positional\n"
     "; deadzone = 0-50, percent of the stick's travel ignored around the centre. 0: only the game's own.\n"
+    ";   deadzone_left, deadzone_right: one stick's own, over deadzone.\n"
     "deadzone = 0\n"
+    "; snapback_left, snapback_right = on | off: a stick let go fast from far out bounces past the centre;\n"
+    ";   on, the bounce is ignored (a flick the other way within 60 ms then counts only when pushed far).\n"
+    "snapback_left = off\n"
+    "snapback_right = off\n"
     "; rumble = 0-100, percent strength. 0: off.\n"
     "rumble = 100\n"
     "; trigger_threshold = 1-99, percent: how far a trigger is pulled to press ZL / ZR.\n"
@@ -183,6 +191,8 @@ static const char DEFAULT_INI[] =
     "; Types: xbox360 xboxone ps3 ps4 ps5 switchpro joyconpair gamecube ...\n"
     "; [device ps5]\n"
     "; rumble = 60\n";
+
+const char *pad_default_ini(void) { return DEFAULT_INI; }   /* (the start-up menu's Controls page, pad_menu.c) */
 
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -212,6 +222,15 @@ static void config_line(DevCfg *dc, const char *key, char *value, int line) {
         else if (!_stricmp(value, "labels")) dc->layout = 1;
         else fprintf(stderr, "[input] controllers.ini line %d: layout is positional or labels, not '%s'\n", line, value);
     } else if (!_stricmp(key, "deadzone")) dc->deadzone = atoi(value) < 0 ? 0 : atoi(value) > 50 ? 50 : atoi(value);
+    else if (!_stricmp(key, "deadzone_left")) dc->deadzone_left = atoi(value) < 0 ? 0 : atoi(value) > 50 ? 50 : atoi(value);
+    else if (!_stricmp(key, "deadzone_right")) dc->deadzone_right = atoi(value) < 0 ? 0 : atoi(value) > 50 ? 50 : atoi(value);
+    else if (!_stricmp(key, "snapback_left") || !_stricmp(key, "snapback_right")) {
+        int on = !_stricmp(value, "on") || !_stricmp(value, "1") || !_stricmp(value, "true") || !_stricmp(value, "yes");
+        if (!on && _stricmp(value, "off") && strcmp(value, "0") && _stricmp(value, "false") && _stricmp(value, "no"))
+            fprintf(stderr, "[input] controllers.ini line %d: %s is on or off, not '%s'\n", line, key, value);
+        else if (!_stricmp(key, "snapback_left")) dc->snapback_left = on;
+        else dc->snapback_right = on;
+    }
     else if (!_stricmp(key, "rumble")) dc->rumble = atoi(value) < 0 ? 0 : atoi(value) > 100 ? 100 : atoi(value);
     else if (!_stricmp(key, "trigger_threshold")) dc->trigger = atoi(value) < 1 ? 1 : atoi(value) > 99 ? 99 : atoi(value);
     else if ((b = npad_button(key)) >= 0) {
@@ -249,7 +268,8 @@ static void config_parse(FILE *f) {
                 else if (cfg.ndev < (int)(sizeof cfg.dev / sizeof *cfg.dev)) {
                     dc = &cfg.dev[cfg.ndev++];
                     memset(dc, 0, sizeof *dc);
-                    dc->layout = dc->deadzone = dc->rumble = dc->trigger = -1;
+                    dc->layout = dc->deadzone = dc->rumble = dc->trigger = dc->deadzone_left = dc->deadzone_right = -1;
+                    dc->snapback_left = dc->snapback_right = -1;
                     snprintf(dc->match, sizeof dc->match, "%s", what);
                 } else dc = NULL;
             } else fprintf(stderr, "[input] controllers.ini line %d: unknown section [%s]\n", line, name);
@@ -296,7 +316,9 @@ typedef struct Dev {
     SDL_GameController *gp;
 #endif
     char guid[40], name[96], type[24], serial[64], path[192];
-    int deadzone, rumble, trigger;
+    int deadzone_left, deadzone_right, rumble, trigger;   /* (percent) */
+    int snapback[2];              /* the snapback fix on the left and right sticks */
+    PadSnap snap[2];
     Mapping map;
     u16 sent_low, sent_high;      /* rumble last sent, and when */
     ULONGLONG sent_at;
@@ -323,11 +345,16 @@ static void dev_configure(Dev *d, const int labels[4]) {
         }
     const DevCfg *layers[2] = {&cfg.def, best};
     int layout = 0;
-    d->deadzone = 0; d->rumble = 100; d->trigger = 25;
+    d->deadzone_left = d->deadzone_right = 0; d->rumble = 100; d->trigger = 25;
+    d->snapback[0] = d->snapback[1] = 0;
     for (int l = 0; l < 2; l++) {
         if (!layers[l]) continue;
         if (layers[l]->layout >= 0) layout = layers[l]->layout;
-        if (layers[l]->deadzone >= 0) d->deadzone = layers[l]->deadzone;
+        if (layers[l]->deadzone >= 0) d->deadzone_left = d->deadzone_right = layers[l]->deadzone;
+        if (layers[l]->deadzone_left >= 0) d->deadzone_left = layers[l]->deadzone_left;
+        if (layers[l]->deadzone_right >= 0) d->deadzone_right = layers[l]->deadzone_right;
+        if (layers[l]->snapback_left >= 0) d->snapback[0] = layers[l]->snapback_left;
+        if (layers[l]->snapback_right >= 0) d->snapback[1] = layers[l]->snapback_right;
         if (layers[l]->rumble >= 0) d->rumble = layers[l]->rumble;
         if (layers[l]->trigger >= 0) d->trigger = layers[l]->trigger;
     }
@@ -390,6 +417,13 @@ static void dev_remember(const Dev *d) {
     e->slot = d->slot;
 }
 
+/* The snapback fix (pad_snap.h) on the sticks it is on for */
+static void snapback(Dev *d, Raw *raw) {
+    ULONGLONG now = GetTickCount64();
+    if (d->snapback[0]) pad_snapback(&d->snap[0], &raw->axis[RA_LEFTX], &raw->axis[RA_LEFTY], now);
+    if (d->snapback[1]) pad_snapback(&d->snap[1], &raw->axis[RA_RIGHTX], &raw->axis[RA_RIGHTY], now);
+}
+
 /* A pad's raw report in the console's terms. */
 static void stick(int deadzone, i32 x, i32 y_down, i32 *ox, i32 *oy) {
     double fx = x, fy = -(double)y_down, r = sqrt(fx * fx + fy * fy), max = 32767.0, dz = deadzone / 100.0 * max;
@@ -412,8 +446,8 @@ static void dev_state(const Dev *d, const Raw *raw, PadState *o) {
                 break;
             }
         }
-    stick(d->deadzone, raw->axis[RA_LEFTX], raw->axis[RA_LEFTY], &o->lx, &o->ly);
-    stick(d->deadzone, raw->axis[RA_RIGHTX], raw->axis[RA_RIGHTY], &o->rx, &o->ry);
+    stick(d->deadzone_left, raw->axis[RA_LEFTX], raw->axis[RA_LEFTY], &o->lx, &o->ly);
+    stick(d->deadzone_right, raw->axis[RA_RIGHTX], raw->axis[RA_RIGHTY], &o->rx, &o->ry);
 }
 
 /* ---- the slot table, shared with guest threads ------------------------------------- */
@@ -521,6 +555,7 @@ static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         Raw raw;
         xinput_raw(&s.pad, &raw);
         note_combo(&raw, d->type);
+        snapback(d, &raw);
         dev_state(d, &raw, &fresh[i]);
         snprintf(names[i], sizeof names[i], "%s", d->name);
         u16 low, high;
@@ -639,6 +674,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
             if (p_SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = p_SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a);
         note_combo(&raw, d->type);
+        snapback(d, &raw);
         dev_state(d, &raw, &fresh[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
@@ -748,6 +784,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
             if (SDL_GameControllerGetButton(d->gp, (SDL_GameControllerButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = SDL_GameControllerGetAxis(d->gp, (SDL_GameControllerAxis)a);
         note_combo(&raw, d->type);
+        snapback(d, &raw);
         dev_state(d, &raw, &fresh[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;

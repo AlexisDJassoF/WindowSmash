@@ -18,7 +18,7 @@ static int failures, checks;
 static void load_text(const char *text) {
     memset(&cfg, 0, sizeof cfg);
     cfg.keyboard_slot = 0; cfg.background = 1;
-    cfg.def.layout = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = -1;
+    cfg.def.layout = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.deadzone_left = cfg.def.deadzone_right = cfg.def.snapback_left = cfg.def.snapback_right = -1;
     char path[MAX_PATH], dir[MAX_PATH];
     GetTempPathA(sizeof dir, dir);
     GetTempFileNameA(dir, "pad", 0, path);

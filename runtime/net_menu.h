@@ -49,6 +49,7 @@ typedef struct NetMenu {
     NetChoice choices[NET_CHOICES];   /* the Host row's < >: rooms found on the LAN, then recent ones */
     int nchoices, choice;             /* (choice: -1 while the address is typed) */
     int page;                         /* Join's list: the page of NET_PAGE rooms shown */
+    int no_play;                      /* no Play row (the start-up menu plays from its Display page): Join picks the room only */
     int host_auto;                    /* the address is Join's own choice still (not typed, not picked) */
     int auto_state, last_down;        /* NET_AUTO_*; the last room joined did not answer */
     int watch;                        /* NET_WATCH_*: whether a room answers at the address */

@@ -32,6 +32,7 @@
 #include "net.h"
 #include "net_discover.h"
 #include "net_menu.h"
+#include "pad_menu.h"
 
 #define WAIT_S 10.0
 
@@ -163,6 +164,9 @@ static Input queue[64];
 static LONG head, tail;   /* (writers: the window's thread and, in the game, hle_pad.c's; one reader) */
 static SRWLOCK queue_lock = SRWLOCK_INIT;
 volatile int menu_device;
+char menu_pad_name[96];
+volatile int menu_axes[4], menu_listening, menu_sticks_still, menu_pad_kind_seen = MENU_PAD_XBOX;
+volatile int menu_snapback[2], menu_axes_game[4], menu_snap_count[2];
 
 void menu_input(int event, int x, int y) {
     AcquireSRWLockExclusive(&queue_lock);
@@ -254,16 +258,39 @@ static int net_click(NetMenu *nm, const MenuRect rects[NROWS], float value_x, fl
     return NET_EV_NONE;
 }
 
-/* A click on the tabs, just above the first row (overlay_build_menu draws them across the rows'
- * width: Display on the left half, Network on the right): the page clicked, 1 + its number; else 0 */
+/* A click on the tabs, just above the first row (where overlay_build_menu drew them last): the page
+ * clicked, 1 + its number; else 0 */
 static int title_click(const MenuRect *rects, int n, float x, float y) {
+    float x0, w;
+    int count;
+    overlay_menu_tabs(&x0, &w, &count);
     for (int i = 0; i < n; i++)
         if (rects[i].w > 0) {
-            if (x < rects[i].x || x >= rects[i].x + rects[i].w || y >= rects[i].y || y < rects[i].y - 64) return 0;
-            return 1 + (x >= rects[i].x + rects[i].w / 2);
+            if (!count || w <= 0 || y >= rects[i].y || y < rects[i].y - 64 || x < x0 || x >= x0 + w * count) return 0;
+            return 1 + (int)((x - x0) / w);
         }
     return 0;
 }
+
+/* A click on the Controls page: a row picked, its value's halves stepping it; a button row's value
+ * clicked again (selected already) waits for a control pressed */
+static int pad_click(PadMenu *pm, const MenuRect rects[CROWS], float value_x, float x, float y) {
+    for (int row = 0; row < CROWS; row++) {
+        const MenuRect *r = &rects[row];
+        if (!pad_menu_visible(pm, row) || r->w <= 0 || x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) continue;
+        if (!pad_menu_selectable(pm, row)) return PAD_EV_NONE;
+        int again = pm->row == row;
+        pm->row = row;
+        if (row == CROW_PLAY || row == CROW_RESET || row == CROW_DEADZONE || row == CROW_DZ_TEST || row == CROW_DZ_BACK ||
+            (again && pad_menu_row_button(row) >= 0 && x < value_x))
+            return pad_menu_event(pm, MENU_ACCEPT, 0);
+        if (x >= value_x) return pad_menu_event(pm, x < value_x + (r->x + r->w - value_x) / 2 ? MENU_LEFT : MENU_RIGHT, 0);
+        return PAD_EV_NONE;
+    }
+    return PAD_EV_NONE;
+}
+
+static int pad_kind_of(int device) { return device == MENU_PAD_PS ? PK_PS : device == MENU_PAD_NINTENDO ? PK_NINTENDO : PK_XBOX; }
 
 static void net_refresh(NetMenu *nm) {
     NetProbe p;
@@ -291,7 +318,8 @@ void menu_run(void) {
     NetSettings ns;
     net_settings_load(&ns);
     const char *page_env = getenv("SSBU_MENU_PAGE");
-    int page = page_env && !strcmp(page_env, "network");   /* 0 Display, 1 Network */
+    enum { P_DISPLAY, P_NETWORK, P_CONTROLS, PAGES };
+    int page = page_env && !strcmp(page_env, "network") ? P_NETWORK : P_DISPLAY;
     unsetenv("SSBU_MENU_PAGE");
     if (!display_menu_enabled()) {
         net_settings_apply(&ns);
@@ -304,27 +332,50 @@ void menu_run(void) {
     menu_init(&m, &now, locked, seconds());
     NetMenu nm;
     net_menu_init(&nm, &ns);
+    nm.no_play = 1;   /* (Play is the Display page's alone) */
+    nm.row = NROW_MODE;
     net_launch_describe(nm.launched, sizeof nm.launched);
     if (page) { m.touched = 1; nm.row = NROW_MODE; }   /* (F8: here to change the network - no countdown) */
+    PadSettings ps;
+    pad_settings_load(&ps);
+    PadMenu pm;
+    pad_menu_init(&pm, &ps);
+    pm.no_play = 1;
     int searching = 0;
     double refreshed = 0;
-    MenuRect rects[ROWS], nrects[NROWS];
-    float value_x = 0, nvalue_x = 0;
+    MenuRect rects[ROWS], nrects[NROWS], prects[CROWS];
+    float value_x = 0, nvalue_x = 0, pvalue_x = 0;
     memset(rects, 0, sizeof rects);
     memset(nrects, 0, sizeof nrects);
+    memset(prects, 0, sizeof prects);
     drop_inputs();
     menu_active = 1;
     while (m.state == MENU_OPEN) {
         Input in;
         while (next_input(&in)) {
             int ev = in.event;
-            if (ev == MENU_CLICK) {
-                int tab = title_click(page ? nrects : rects, page ? NROWS : ROWS, (float)in.x, (float)in.y);
-                if (tab) { if (tab - 1 != page) ev = MENU_TAB; else { m.touched = 1; continue; } }
+            if (page == P_CONTROLS && pm.listening) {   /* (waiting for a control: that, or going back, only) */
+                m.touched = 1;
+                if (ev == MENU_PADKEY || ev == MENU_BACK || ev == MENU_ACCEPT || ev == MENU_CLICK) pad_menu_event(&pm, ev == MENU_CLICK ? MENU_BACK : ev, in.x);
+                continue;
             }
-            if (ev == MENU_TAB) { page = !page; m.touched = 1; refreshed = 0; continue; }
-            if (ev == MENU_BACK) { menu_event(&m, MENU_BACK, seconds()); nm.s = nm.initial; break; }
-            if (!page) {
+            if (ev == MENU_PADKEY) continue;
+            if (ev == MENU_CLICK) {
+                int tab = page == P_DISPLAY ? title_click(rects, ROWS, (float)in.x, (float)in.y)
+                        : page == P_NETWORK ? title_click(nrects, NROWS, (float)in.x, (float)in.y) : title_click(prects, CROWS, (float)in.x, (float)in.y);
+                if (tab) { m.touched = 1; refreshed = 0; page = (tab - 1) % PAGES; continue; }
+            }
+            if (ev == MENU_TAB || ev == MENU_TAB_PREV) { page = (page + (ev == MENU_TAB ? 1 : PAGES - 1)) % PAGES; m.touched = 1; refreshed = 0; continue; }
+            if (ev == MENU_BACK && page == P_CONTROLS && pad_menu_takes_back(&pm)) { m.touched = 1; pad_menu_event(&pm, MENU_BACK, 0); continue; }
+            if (ev == MENU_BACK) { menu_event(&m, MENU_BACK, seconds()); nm.s = nm.initial; pm.s = pm.initial; break; }
+            if (page == P_CONTROLS) {
+                m.touched = 1;
+                if (ev == MENU_CHAR || ev == MENU_ERASE) continue;
+                int r = ev == MENU_CLICK ? pad_click(&pm, prects, pvalue_x, (float)in.x, (float)in.y) : pad_menu_event(&pm, ev, in.x);
+                if (r == PAD_EV_PLAY) m.state = MENU_PLAY;
+                continue;
+            }
+            if (page == P_DISPLAY) {
                 if (ev == MENU_CLICK) menu_click(&m, rects, value_x, (float)in.x, (float)in.y, seconds());
                 else if (ev != MENU_CHAR && ev != MENU_ERASE) menu_event(&m, ev, seconds());
                 continue;
@@ -340,28 +391,60 @@ void menu_run(void) {
         /* Play from the Display page with Join and no address: the Network page first */
         if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN && !nm.s.host[0]) {
             m.state = MENU_OPEN;
-            page = 1;
+            page = P_NETWORK;
             nm.row = nm.nchoices ? NROW_LIST : NROW_HOST;
         }
         if (m.state != MENU_OPEN) break;
         /* (Join looks for rooms from the start, on either page: its address chosen before Play) */
-        int network = page || nm.s.mode == NET_MODE_JOIN;
+        int network = page == P_NETWORK || nm.s.mode == NET_MODE_JOIN;
         if (network && !searching) { net_discover_start(); searching = 1; }
         if (network && seconds() - refreshed >= 0.5) { refreshed = seconds(); net_refresh(&nm); }
-        menu_typing = page && net_menu_text_row(&nm);
+        menu_typing = page == P_NETWORK && net_menu_text_row(&nm);
+        pm.kind = pad_kind_of(menu_device == MENU_KEYS ? menu_pad_kind_seen : menu_device);   /* (the pad drawn: the one used, or seen, last) */
+        snprintf(pm.pad, sizeof pm.pad, "%s", menu_pad_name);
+        for (int a = 0; a < 4; a++) pm.axes[a] = menu_axes[a], pm.game_axes[a] = menu_axes_game[a];
+        menu_snapback[0] = pm.s.snapback_left, menu_snapback[1] = pm.s.snapback_right;
+        static int counted[2];   /* (a bounce ignored: said for a second) */
+        static double flashed[2];
+        for (int side = 0; side < 2; side++) {
+            if (menu_snap_count[side] != counted[side]) { counted[side] = menu_snap_count[side]; flashed[side] = seconds(); }
+            pm.snap_flash[side] = flashed[side] > 0 && seconds() - flashed[side] < 1.0;
+        }
+        menu_listening = page == P_CONTROLS && pm.listening;
+        menu_sticks_still = page == P_CONTROLS && pm.dead_zones;
         /* the footer, for overlay_build_menu: '\t' between hints, "key=what" a key's, '#' a countdown's fraction */
-        char footer[160], tabs[48];
+        char footer[160], tabs[80];
         const char *accept, *back, *pages;
         device_keys(&accept, &back, &pages);
         int keys = menu_device == MENU_KEYS;
         double left = m.deadline - seconds();
         if (!m.touched) snprintf(footer, sizeof footer, "#%.3f\tStarting in %.0f s - press %s to change settings", left / WAIT_S, left + 0.5,
                                  keys ? "any key" : "a button");
-        else if (page) snprintf(footer, sizeof footer, "%s%s=%s\t%s=play without changes", keys ? "Type=edit\t" : "", accept, keys ? "play" : "select", back);
+        else if (page == P_CONTROLS && pm.listening) snprintf(footer, sizeof footer, "!Press a button on the pad\t%s=cancel", keys ? "Esc" : back);
+        else if (page == P_CONTROLS && pm.testing)
+            snprintf(footer, sizeof footer, "%s=dead zone\t%s=stop the test", keys ? "< >" : "D-pad", back);
+        else if (page == P_CONTROLS && pm.dead_zones)
+            snprintf(footer, sizeof footer, "%s%s=select\t%s=back to Controls", keys ? "" : "D-pad=move\t", accept, back);
+        else if (page == P_CONTROLS && pad_menu_row_button(pm.row) >= 0)
+            snprintf(footer, sizeof footer, "%s=assign by pressing\t%s=play without changes", accept, back);
+        else if (page == P_CONTROLS) snprintf(footer, sizeof footer, "%s=select\t%s=play without changes", accept, back);
+        else if (page == P_NETWORK) snprintf(footer, sizeof footer, "%s%s=select\t%s=play without changes", keys ? "Type=edit\t" : "", accept, back);
         else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\t%s=play\t%s=no changes", accept, back);
         else snprintf(footer, sizeof footer, "%s=play\t%s=play without changes", accept, back);
-        snprintf(tabs, sizeof tabs, page ? "Display\t*Network\t%s" : "*Display\tNetwork\t%s", pages);
-        if (!page) {
+        snprintf(tabs, sizeof tabs, "%sDisplay\t%sNetwork\t%sControls\t@%s", page == P_DISPLAY ? "*" : "", page == P_NETWORK ? "*" : "",
+                 page == P_CONTROLS ? "*" : "", pages);
+        if (page == P_CONTROLS) {
+            const char *labels[CROWS], *vp[CROWS];
+            char values[CROWS][512];
+            int shown[CROWS];
+            for (int r = 0; r < CROWS; r++) {
+                labels[r] = pad_menu_label(r);
+                pad_menu_value(&pm, r, values[r], sizeof values[r]);
+                vp[r] = values[r];
+                shown[r] = pad_menu_visible(&pm, r);
+            }
+            if (!gfx_menu(tabs, CROWS, labels, vp, shown, pm.row, CROW_PLAY, footer, (float *)prects, &pvalue_x)) Sleep(30);
+        } else if (page == P_DISPLAY) {
             const char *labels[ROWS], *vp[ROWS];
             char values[ROWS][64];
             int shown[ROWS];
@@ -374,7 +457,7 @@ void menu_run(void) {
             if (!gfx_menu(tabs, ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
         } else {
             const char *labels[NROWS], *vp[NROWS];
-            char values[NROWS][160];
+            char values[NROWS][200];
             int shown[NROWS];
             for (int r = 0; r < NROWS; r++) {
                 labels[r] = net_menu_label(r);
@@ -387,8 +470,15 @@ void menu_run(void) {
         Sleep(16);
     }
     menu_typing = 0;
+    menu_listening = 0;
+    menu_sticks_still = 0;
     menu_active = 0;
     if (searching) net_discover_stop();
+    if (m.state == MENU_PLAY && memcmp(&pm.s, &pm.initial, sizeof pm.s)) {   /* (before the game reads controllers.ini) */
+        if (!pad_settings_save(&pm.s)) fprintf(stderr, "[menu] cannot write controllers.ini\n");
+        else fprintf(stderr, "[menu] controllers.ini: layout %s, dead zones %d%% / %d%%, rumble %d%%\n", pm.s.layout ? "labels" : "positional",
+                     pm.s.deadzone_left, pm.s.deadzone_right, pm.s.rumble);
+    }
     if (m.state == MENU_PLAY) {
         display_save(&m.s);
         display_apply(&m.s);

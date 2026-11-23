@@ -9,9 +9,11 @@ void menu_run(void);
 
 /* The window's thread: while menu_active, its input, here instead of to the game. */
 enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_ACCEPT, MENU_BACK, MENU_CLICK,
-       MENU_TAB,     /* the other page: Display <-> Network (Tab, a controller's shoulder buttons) */
+       MENU_TAB,     /* the next page: Display, Network, Controls (Tab, a controller's right shoulder button) */
        MENU_CHAR,    /* a typed character (x), for the Network page's text rows */
-       MENU_ERASE }; /* Backspace */
+       MENU_ERASE,   /* Backspace */
+       MENU_TAB_PREV,   /* the page before (Shift+Tab, the left shoulder button) */
+       MENU_PADKEY };   /* a pad's control pressed (x: pad_menu.h's PC_*) while the Controls page listens (menu_listening) */
 extern volatile int menu_active;
 extern volatile int menu_typing;            /* the selected row takes text: Space types, not plays */
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */
@@ -25,6 +27,18 @@ void menu_restart_network(void);
  * goes back, the shoulders change pages). */
 enum { MENU_KEYS, MENU_PAD_XBOX, MENU_PAD_PS, MENU_PAD_NINTENDO };
 extern volatile int menu_device;
+
+/* The Controls page's view of the pads (linux/window.c fills it while the menu is open): the pad used
+ * last, its sticks (lx, ly, rx, ry), and whether the page waits for a control pressed - the pads then
+ * press nothing in the menu, their next control going to it as MENU_PADKEY */
+extern char menu_pad_name[96];
+extern volatile int menu_axes[4];
+extern volatile int menu_listening;
+extern volatile int menu_sticks_still;
+/* The stick test's snapback fix (pad_snap.h), as the game will have it: on for the left, right stick (the
+ * page sets it), the sticks after it (linux/window.c), and how many bounces it has ignored on each */
+extern volatile int menu_snapback[2], menu_axes_game[4], menu_snap_count[2];   /* the sticks move nothing in the menu, the D-pad alone does (the dead zones' page: the sticks are tested there) */
+extern volatile int menu_pad_kind_seen;   /* the kind of the pad seen last (MENU_PAD_*), keyboard in use or not */
 
 /* In the game, F9: the Network page in a window over the picture, to change the room - or host one,
  * or go offline - without leaving the game (net_switch; started again only for LAN mode). While it

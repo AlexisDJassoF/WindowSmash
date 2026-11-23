@@ -55,6 +55,7 @@ int net_menu_visible(const NetMenu *m, int row) {
     case NROW_PORT: case NROW_ADDRS: case NROW_ROUTER: return mode == NET_MODE_HOST;
     case NROW_HOST: case NROW_LAN: case NROW_PAGER: return mode == NET_MODE_JOIN;
     case NROW_TIP: return m->tip[0] != 0;
+    case NROW_PLAY: return !m->no_play;
     default: return row >= 0 && row < NROWS;
     }
 }
@@ -193,7 +194,7 @@ int net_menu_event(NetMenu *m, int event, int c) {
         if (is_list(m->row)) {   /* Join: this room - and the game, when it can be joined now */
             m->host_auto = 0;
             pick(m, list_index(m, m->row));
-            if (!joinable(&m->choices[m->choice])) break;
+            if (!joinable(&m->choices[m->choice]) || m->no_play) break;   /* (no Play here: the room chosen, the game from Display) */
             m->row = NROW_PLAY;
         }
         if (m->row != NROW_PLAY) { move(m, 1); break; }

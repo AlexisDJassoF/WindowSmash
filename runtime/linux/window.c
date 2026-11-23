@@ -26,6 +26,7 @@
 #include "../display.h"
 #include "../gpu_menu.h"
 #include "../gpu_precompile.h"
+#include "../pad_snap.h"
 
 static SDL_Window *window;
 static volatile int focused;
@@ -206,28 +207,74 @@ static void menu_pads_poll(Uint64 now) {
                     open = 1;
                     const char *name = menu_pads[i] ? SDL_GameControllerName(menu_pads[i]) : NULL;
                     if (menu_pads[i] && !keys_used) menu_device = pad_kind(menu_pads[i]);   /* (a pad, and no key pressed yet) */
+                    if (menu_pads[i]) {   /* (the Controls page's pad: the one connected last, until another is used) */
+                        menu_pad_kind_seen = pad_kind(menu_pads[i]);
+                        snprintf(menu_pad_name, sizeof menu_pad_name, "%s", name ? name : "Gamepad");
+                    }
                     fprintf(stderr, "[menu] controller: %s\n", menu_pads[i] ? (name ? name : "gamepad") : SDL_GetError());
                 }
         }
     }
-    /* every pad's buttons together: a direction (D-pad or stick past half way), accept, back */
-    int dir = -1, accept = 0, back = 0, page = 0;
-    static int was_page;
+    /* every pad's buttons together: a direction (D-pad or stick past half way), accept, back, the
+     * shoulders (the page before, the next one); and every control as a bit (SDL's buttons, then the
+     * triggers at 26 and 27: pad_menu.h's PC_*) for the Controls page while it listens */
+    int dir = -1, accept = 0, back = 0, prev = 0, next = 0, any_pad = 0;
+    unsigned long long controls = 0;
+    static unsigned long long was_controls;
+    static int was_prev, was_next;
     for (int i = 0; i < 8; i++) {
         SDL_GameController *gp = menu_pads[i];
         if (!gp) continue;
+        any_pad = 1;
+        for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < 26; b++)
+            if (SDL_GameControllerGetButton(gp, (SDL_GameControllerButton)b)) controls |= 1ull << b;
+        if (SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) controls |= 1ull << 26;
+        if (SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) controls |= 1ull << 27;
         int x = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_LEFTX), y = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_LEFTY);
-        if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_UP) || y < -16000) dir = MENU_UP;
-        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || y > 16000) dir = MENU_DOWN;
-        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || x < -16000) dir = MENU_LEFT;
-        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || x > 16000) dir = MENU_RIGHT;
+        int sx = menu_sticks_still ? 0 : x, sy = menu_sticks_still ? 0 : y;   /* (the dead zones' page: the sticks are being tested, not steering) */
+        if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_UP) || sy < -16000) dir = MENU_UP;
+        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || sy > 16000) dir = MENU_DOWN;
+        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || sx < -16000) dir = MENU_LEFT;
+        else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || sx > 16000) dir = MENU_RIGHT;
         int any = 0;   /* (used now: the hints name this pad's buttons) */
         for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && !any; b++) any = SDL_GameControllerGetButton(gp, (SDL_GameControllerButton)b);
-        if (any || x < -16000 || x > 16000 || y < -16000 || y > 16000) menu_device = pad_kind(gp);
+        if (any || x < -16000 || x > 16000 || y < -16000 || y > 16000) {
+            menu_device = menu_pad_kind_seen = pad_kind(gp);
+            const char *name = SDL_GameControllerName(gp);
+            snprintf(menu_pad_name, sizeof menu_pad_name, "%s", name ? name : "Gamepad");
+        }
+        static SDL_GameController *shown_pad;   /* (the sticks drawn: the pad used last) */
+        if (any || !shown_pad) shown_pad = gp;
+        if (gp == shown_pad) {
+            menu_axes[0] = x, menu_axes[1] = y;
+            menu_axes[2] = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_RIGHTX);
+            menu_axes[3] = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_RIGHTY);
+            static PadSnap snap[2];   /* (the stick test: the snapback fix as hle_pad.c applies it in the game) */
+            static int was_held[2];
+            for (int side = 0; side < 2; side++) {
+                int32_t sx2 = menu_axes[side * 2], sy2 = menu_axes[side * 2 + 1];
+                int held = menu_snapback[side] && pad_snapback(&snap[side], &sx2, &sy2, now);
+                if (held && !was_held[side]) menu_snap_count[side]++;
+                was_held[side] = held;
+                menu_axes_game[side * 2] = sx2, menu_axes_game[side * 2 + 1] = sy2;
+            }
+        }
         accept |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_A);   /* (positional: the south button) */
         back |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_B);     /* (the east one) */
-        page |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) | SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+        prev |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+        next |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     }
+    if (!any_pad) { menu_pad_name[0] = 0; for (int a = 0; a < 4; a++) menu_axes[a] = 0; }
+    if (menu_listening) {   /* the Controls page waits: the first control newly pressed is its, and nothing else happens */
+        unsigned long long fresh = controls & ~was_controls;
+        for (int c = 0; c < 28 && fresh; c++)
+            if (fresh & 1ull << c) { menu_input(MENU_PADKEY, c, 0); break; }
+        was_controls = controls;
+        held = dir;
+        was_accept = accept, was_back = back, was_prev = prev, was_next = next;
+        return;
+    }
+    was_controls = controls;
     if (dir != held) {   /* a new press: now, then again after 400 ms held, every 120 ms */
         held = dir;
         held_since = repeated = now;
@@ -238,10 +285,12 @@ static void menu_pads_poll(Uint64 now) {
     }
     if (accept && !was_accept) menu_input(MENU_ACCEPT, 0, 0);
     if (back && !was_back) menu_input(MENU_BACK, 0, 0);
-    if (page && !was_page) menu_input(MENU_TAB, 0, 0);   /* (L or R: the other page) */
+    if (prev && !was_prev) menu_input(MENU_TAB_PREV, 0, 0);   /* (the left shoulder: the page before; the right: the next) */
+    if (next && !was_next) menu_input(MENU_TAB, 0, 0);
     was_accept = accept;
     was_back = back;
-    was_page = page;
+    was_prev = prev;
+    was_next = next;
 }
 
 /* 1 if the menu took the event */
@@ -255,7 +304,7 @@ static int menu_event_of(const SDL_Event *e) {
         case SDL_SCANCODE_DOWN: menu_input(MENU_DOWN, 0, 0); return 1;
         case SDL_SCANCODE_LEFT: menu_input(MENU_LEFT, 0, 0); return 1;
         case SDL_SCANCODE_RIGHT: menu_input(MENU_RIGHT, 0, 0); return 1;
-        case SDL_SCANCODE_TAB: if (!e->key.repeat) menu_input(MENU_TAB, 0, 0); return 1;
+        case SDL_SCANCODE_TAB: if (!e->key.repeat) menu_input(e->key.keysym.mod & KMOD_SHIFT ? MENU_TAB_PREV : MENU_TAB, 0, 0); return 1;
         case SDL_SCANCODE_BACKSPACE: menu_input(MENU_ERASE, 0, 0); return 1;
         case SDL_SCANCODE_SPACE: if (menu_typing) return 1;   /* (a space typed: SDL_TEXTINPUT brings it) */
             /* fall through */

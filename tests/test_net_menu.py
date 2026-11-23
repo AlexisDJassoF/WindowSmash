@@ -174,6 +174,12 @@ class NetMenuTests(unittest.TestCase):
         out = self.run_menu('drrgddddap0')   # (Join on the full one: chosen, no game)
         self.assertEqual((out['plays'], out['host'], out['row']), ('0', '192.168.1.7:39420', 'Room'))
 
+    def test_no_play_row(self):
+        out = self.run_menu('Ndrrgdddddap0')   # (Join on "dojo", no Play row: the room chosen, no game)
+        self.assertEqual((out['plays'], out['host'], out['room'], out['row']), ('0', '192.168.1.9:39420', 'dojo', 'Room'))
+        rows = [self.run_menu('Nudrr' + 'd' * i)['row'] for i in range(1, 6)]
+        self.assertEqual(rows, ['Your name', 'Room name', 'Host address', 'Refresh', 'Connection'])   # (around, no Play)
+
     def test_room_pages(self):
         out = self.run_menu('drrm')   # (6 rooms: two pages of 4)
         self.assertEqual((out['pages'], out['page']), ('2', '1'))
