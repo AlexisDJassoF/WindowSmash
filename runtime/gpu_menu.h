@@ -30,6 +30,10 @@ typedef struct Menu {
     double deadline;   /* seconds (now_s's clock) until it starts by itself, while untouched */
 } Menu;
 typedef struct MenuRect { float x, y, w, h; } MenuRect;   /* a row's place on screen, from the last frame */
+/* The Network page's list, as overlay_build_menu draws it: a room's Join button, from its row's right
+ * end; the heading's Refresh button, the same */
+#define MENU_JOIN_BUTTON 170
+#define MENU_ICON_BUTTON 64
 
 void menu_init(Menu *m, const DisplaySettings *now, unsigned locked, double now_s);
 int menu_visible(const Menu *m, int row);                     /* Sharpness only with FSR */

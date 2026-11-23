@@ -70,8 +70,8 @@ class NetMenuTests(unittest.TestCase):
         self.assertEqual(rows, ['Your name', 'Room name', 'UDP port', 'Play'])   # (information rows skipped)
 
     def test_join_rows_and_no_play_without_address(self):
-        rows = [self.run_menu('drr' + 'd' * i)['row'] for i in range(1, 5)]
-        self.assertEqual(rows, ['Your name', 'Room name', 'Host address', 'Play'])
+        rows = [self.run_menu('drr' + 'd' * i)['row'] for i in range(1, 6)]
+        self.assertEqual(rows, ['Your name', 'Room name', 'Host address', 'Refresh', 'Play'])   # (no rooms listed yet)
         out = self.run_menu('drrua')   # (up from Connection: Play) - nothing to join yet
         self.assertEqual((out['plays'], out['row']), ('0', 'Host address'))
 
@@ -91,7 +91,7 @@ class NetMenuTests(unittest.TestCase):
         self.assertEqual((out['host'], out['room']), ('192.168.1.9:39420', 'dojo'))
         out = self.run_menu('drrdddfrp0')
         self.assertEqual(out['tip'], 'Kim\'s room "dojo" on your network')
-        self.assertEqual(out['lan'], '1 room found - < > on Host address')
+        self.assertEqual(out['lan'], '1 room on your network: pick one and Join')
         self.assertEqual(self.run_menu('drrdddfrda')['plays'], '1')
 
     def test_saved_and_recent(self):
@@ -163,7 +163,33 @@ class NetMenuTests(unittest.TestCase):
         out = self.run_menu('drrgj0p0')   # (no last room: the first found with room for another, not the full one)
         self.assertEqual((out['host'], out['room'], out['auto'], out['kind']), ('192.168.1.9:39420', 'dojo', '3', '4'))
         self.assertIn('(2/8 players)', out['tip'])
-        self.assertEqual(self.run_menu('drrgj0dddda')['plays'], '1')
+        self.assertEqual(self.run_menu('drrgj0ua')['plays'], '1')   # (Play, from Connection: up)
+
+    def test_room_list(self):
+        rows = [self.run_menu('drrg' + 'd' * i)['row'] for i in range(4, 8)]
+        self.assertEqual(rows, ['Room', 'Room', 'Refresh', 'Play'])   # (the full room and "dojo", this PC's left out)
+        self.assertIn('\tfull\tFull\t', self.run_menu('drrg')['room0'])   # (the full one: first)
+        out = self.run_menu('drrgdddddap0')   # (Join on it: chosen, and the game starts)
+        self.assertEqual((out['plays'], out['host'], out['room'], out['row']), ('1', '192.168.1.9:39420', 'dojo', 'Play'))
+        out = self.run_menu('drrgddddap0')   # (Join on the full one: chosen, no game)
+        self.assertEqual((out['plays'], out['host'], out['row']), ('0', '192.168.1.7:39420', 'Room'))
+
+    def test_room_pages(self):
+        out = self.run_menu('drrm')   # (6 rooms: two pages of 4)
+        self.assertEqual((out['pages'], out['page']), ('2', '1'))
+        out = self.run_menu('drrmddddddddr')   # (Refresh's row, > : the second page)
+        self.assertEqual((out['row'], out['page']), ('Refresh', '2'))
+        self.assertIn('\troom4\t', out['room0'])
+        out = self.run_menu('drrmddddddddrud')   # (the second page: 2 rooms, then Refresh)
+        self.assertEqual(out['row'], 'Refresh')
+        self.assertEqual(self.run_menu('drrmdddddddl')['page'], '2')   # (< on a room: around to the last page)
+        out = self.run_menu('drrmdddddddr' + 'f')   # (on page 2, the rooms down to one: page 1, on that room)
+        self.assertEqual((out['page'], out['row'], out['host']), ('1', 'Room', ''))
+        self.assertIn('\tdojo\tOnline\tKim\'s room/192.168.1.9:39420\t2/8\tJoin', out['room0'])
+
+    def test_refresh(self):
+        self.assertEqual(self.run_menu('drrdddda')['refreshes'], '1')   # (Enter on Refresh)
+        self.assertEqual(self.run_menu('drrdddda')['plays'], '0')
 
     def test_join_chooses_the_last_room(self):
         self.ini.write_text('mode = join\nhost = 10.0.0.2\nroom = club\nrecent = 10.0.0.2 club\n')

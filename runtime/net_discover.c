@@ -30,7 +30,8 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static NetChoice found[FOUND_MAX];
 static u64 found_at[FOUND_MAX];
 static int nfound;
-static volatile int running, searching;
+static volatile int running, searching, ask_now;
+static u64 asked_at;              /* when the rooms were last asked: an answer's time since, its room's ms */
 static pthread_t searcher;
 static int upnp = NET_UPNP_UNKNOWN, upnp_busy;
 static char upnp_port[6], wan[NET_ADDR];
@@ -248,6 +249,8 @@ static void heard(const u8 *p, int n, const struct sockaddr_in *from) {
     for (char *t = c.who; *t; t++) if (*t < 32 || *t > 126) *t = '?';
     if (n >= NET_FIND_ANSWER_SIZE) { c.players = p[NET_FIND_SIZE]; c.most = p[NET_FIND_SIZE + 1]; }
     c.found = 1;
+    u64 t = now_ms();
+    c.ms = asked_at && t - asked_at < 1000 ? (int)(t - asked_at) : 999;
     u32 from_ip = ntohl(from->sin_addr.s_addr);
     pthread_mutex_lock(&lock);
     if (is_self(from_ip)) { pthread_mutex_unlock(&lock); return; }   /* (this PC's own room: not one to join) */
@@ -260,6 +263,7 @@ static void heard(const u8 *p, int n, const struct sockaddr_in *from) {
             found_at[i] = now_ms();
             found[i].players = c.players;
             found[i].most = c.most;
+            found[i].ms = c.ms;
             pthread_mutex_unlock(&lock);
             return;
         }
@@ -285,7 +289,12 @@ static void *search(void *unused) {
     u64 asked = 0;
     u8 buf[512];
     while (running) {
-        if (now_ms() - asked >= 1000) { asked = now_ms(); ask(s); ask_watched(s); }
+        if (ask_now || now_ms() - asked >= 1000) {
+            ask_now = 0;
+            asked = asked_at = now_ms();
+            ask(s);
+            ask_watched(s);
+        }
         struct sockaddr_in from;
         socklen_t flen = sizeof from;
         int n = (int)recvfrom(s, buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
@@ -306,6 +315,13 @@ void net_discover_stop(void) {
     running = 0;
     pthread_join(searcher, NULL);   /* (within 200 ms: its receive times out) */
     searching = 0;
+}
+
+void net_discover_refresh(void) {
+    pthread_mutex_lock(&lock);
+    nfound = 0;   /* (the rooms that answer again are listed again, within a moment) */
+    pthread_mutex_unlock(&lock);
+    ask_now = 1;
 }
 
 int net_discover_watch(const char *addr) {

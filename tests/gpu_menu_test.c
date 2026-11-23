@@ -19,6 +19,7 @@ int display_save(const DisplaySettings *s) { (void)s; return 1; }
 void net_stop(void) {}
 void net_discover_start(void) {}
 void net_discover_stop(void) {}
+void net_discover_refresh(void) {}
 int net_discover_found(NetChoice *out, int max) { (void)out; (void)max; return 0; }
 int net_discover_watch(const char *addr) { (void)addr; return NET_WATCH_NONE; }
 void net_discover_check_router(const char *port) { (void)port; }

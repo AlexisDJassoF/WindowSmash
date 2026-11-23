@@ -199,14 +199,18 @@ void menu_restart_network(void) {
 static double seconds(void) { return GetTickCount64() / 1000.0; }
 
 #ifndef _WIN32
-/* A click on the Network page: a row picked, its value's halves stepping it (as menu_click does) */
+/* A click on the Network page: a row picked, its value's halves stepping it (as menu_click does);
+ * Join's list: a room's button joins it, the heading's button and Refresh look again, the pages' halves turn them */
 static int net_click(NetMenu *nm, const MenuRect rects[NROWS], float value_x, float x, float y) {
     for (int row = 0; row < NROWS; row++) {
         const MenuRect *r = &rects[row];
         if (!net_menu_visible(nm, row) || r->w <= 0 || x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) continue;
+        if (row == NROW_LAN) return x >= r->x + r->w - MENU_ICON_BUTTON ? NET_EV_REFRESH : NET_EV_NONE;
         if (!net_menu_selectable(nm, row)) return NET_EV_NONE;
         nm->row = row;
         if (row == NROW_PLAY) return net_menu_event(nm, MENU_ACCEPT, 0);
+        if (row >= NROW_LIST && row <= NROW_LIST_END) return x >= r->x + r->w - MENU_JOIN_BUTTON ? net_menu_event(nm, MENU_ACCEPT, 0) : NET_EV_NONE;
+        if (row == NROW_PAGER && x < value_x) return NET_EV_REFRESH;
         if (x >= value_x) return net_menu_event(nm, x < value_x + (r->x + r->w - value_x) / 2 ? MENU_LEFT : MENU_RIGHT, 0);
         return NET_EV_NONE;
     }
@@ -294,11 +298,16 @@ void menu_run(void) {
             int mode = nm.s.mode;
             int r = ev == MENU_CLICK ? net_click(&nm, nrects, nvalue_x, (float)in.x, (float)in.y) : net_menu_event(&nm, ev, in.x);
             if (r == NET_EV_PLAY) m.state = MENU_PLAY;
+            if (r == NET_EV_REFRESH) { net_discover_refresh(); refreshed = 0; }
             if (nm.s.mode != mode) refreshed = 0;
         }
         menu_tick(&m, seconds());
         /* Play from the Display page with Join and no address: the Network page first */
-        if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN && !nm.s.host[0]) { m.state = MENU_OPEN; page = 1; nm.row = NROW_HOST; }
+        if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN && !nm.s.host[0]) {
+            m.state = MENU_OPEN;
+            page = 1;
+            nm.row = nm.nchoices ? NROW_LIST : NROW_HOST;
+        }
         if (m.state != MENU_OPEN) break;
         /* (Join looks for rooms from the start, on either page: its address chosen before Play) */
         int network = page || nm.s.mode == NET_MODE_JOIN;

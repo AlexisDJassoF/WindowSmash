@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include "gpu_overlay_quads.h"
+#include "gpu_menu.h"   /* (MENU_JOIN_BUTTON, MENU_ICON_BUTTON: where clicks on the Network page's list land) */
 
 #define CELL_W 12
 #define CELL_H 24
@@ -416,6 +417,159 @@ static void rbox_edge(float x, float y, float w, float h, float r, float t, unsi
     rbox(x + t, y + t, w - 2 * t, h - 2 * t, r - t > 0 ? r - t : 0, fill, fill);
 }
 
+/* ---- the Network page's list of rooms ---- */
+static void ring(float cx, float cy, float rx, float ry, float t, unsigned c) {   /* an ellipse's outline, t px thick */
+    for (int i = 0; i < 32; i++) {
+        float a = i * 2 * PI_F / 32, b = a + 2 * PI_F / 32;
+        line(cx + cosf(a) * rx, cy + sinf(a) * ry, cx + cosf(b) * rx, cy + sinf(b) * ry, t, c);
+    }
+}
+static void icon_globe(float cx, float cy, float r, unsigned c) {
+    ring(cx, cy, r, r, 2.2f, c);
+    ring(cx, cy, r * 0.42f, r, 2, c);
+    line(cx, cy - r, cx, cy + r, 2, c);
+    line(cx - r, cy, cx + r, cy, 2, c);
+    float y = r * 0.5f, x = sqrtf(r * r - y * y);
+    line(cx - x, cy - y, cx + x, cy - y, 1.6f, c);
+    line(cx - x, cy + y, cx + x, cy + y, 1.6f, c);
+}
+/* Two arcs chasing each other, an arrowhead on each */
+static void icon_refresh(float cx, float cy, float r, unsigned c) {
+    for (int half = 0; half < 2; half++) {
+        float a0 = half ? 0.15f * PI_F : 1.15f * PI_F, a1 = a0 + 0.72f * PI_F;
+        for (int i = 0; i < 10; i++) {
+            float a = a0 + (a1 - a0) * i / 10, b = a0 + (a1 - a0) * (i + 1) / 10;
+            line(cx + cosf(a) * r, cy + sinf(a) * r, cx + cosf(b) * r, cy + sinf(b) * r, 2.4f, c);
+        }
+        float ex = cx + cosf(a1) * r, ey = cy + sinf(a1) * r, tx = -sinf(a1), ty = cosf(a1), nx = cosf(a1), ny = sinf(a1), s = r * 0.5f;
+        tri(ex + tx * s, ey + ty * s, c, ex + nx * s * 0.75f, ey + ny * s * 0.75f, c, ex - nx * s * 0.75f, ey - ny * s * 0.75f, c);
+    }
+}
+static void person(float cx, float top, float s, unsigned c) {   /* a head and shoulders, s px tall */
+    disc(cx, top + s * 0.24f, s * 0.22f, c);
+    float by = top + s, r = s * 0.42f;
+    for (int i = 0; i < 12; i++) {
+        float a = PI_F + i * PI_F / 12, b = a + PI_F / 12;
+        tri(cx, by, c, cx + cosf(a) * r, by + sinf(a) * r * 1.05f, c, cx + cosf(b) * r, by + sinf(b) * r * 1.05f, c);
+    }
+}
+static void icon_people(float x, float y, float s, unsigned c) {
+    person(x + s * 0.72f, y, s * 0.85f, fade(c, 0.7f));
+    person(x + s * 0.38f, y + s * 0.12f, s * 0.88f, c);
+}
+static void signal_bars(float x, float bottom, float h, int bars, unsigned on, unsigned off) {
+    for (int i = 0; i < 4; i++) {
+        float bh = h * (0.4f + 0.2f * i);
+        rbox(x + i * 8, bottom - bh, 5, bh, 1.5f, i < bars ? on : off, i < bars ? on : off);
+    }
+}
+static unsigned signal_color(char s) { return s == 'g' ? M_GREEN : s == 'y' ? RGBA(244, 186, 44, 255) : RGBA(112, 116, 124, 255); }
+
+/* A square button with an icon (the heading's Refresh) */
+static void icon_button(float x, float y, float s) {
+    rbox_edge(x, y, s, s, 7, 1, RGBA(84, 88, 98, 255), RGBA(32, 34, 39, 255));
+    icon_refresh(x + s / 2, y + s / 2, s * 0.26f, M_TEXT);
+}
+
+/* The heading: a globe, what the list is (label) and what it holds (sub), the Refresh button */
+static void list_heading(float x, float y, float w, float h, const char *label, const char *sub) {
+    char cut[200];
+    rbox_edge(x, y, w, h, 5, 1, M_ROW_EDGE, RGBA(22, 23, 27, 255));
+    rbox(x + 1, y + 1, h - 2, h - 2, 4, RGBA(30, 32, 37, 255), RGBA(30, 32, 37, 255));
+    icon_globe(x + h / 2, y + h / 2, h * 0.28f, M_TEXT);
+    float tx = x + h + 18, small = h < 60 ? 0.75f : 0.8f;
+    char title[64];
+    snprintf(title, sizeof title, "%s", label);
+    int up = 1;
+    for (char *p = title; *p; p++) { if (up && *p >= 'a' && *p <= 'z') *p -= 32; up = *p == ' '; }   /* (Title Case) */
+    text_ex(tx, y + h / 2 - CELL_H - 1, 1, 0.5f, RGBA(240, 242, 246, 255), RGBA(240, 242, 246, 255), 0, title);
+    float room = w - (tx - x) - MENU_ICON_BUTTON - 8;
+    text_ex(tx, y + h / 2 + 3, small, 0, M_DIM, M_DIM, 0, fit(sub, room / small, cut, sizeof cut));
+    float s = h - 16 < 48 ? h - 16 : 48;
+    icon_button(x + w - 8 - s, y + (h - s) / 2, s);
+}
+
+/* A room (net_menu_value's '\7'): its signal, its name and the line under it, its players and Join */
+static void list_room(float x, float y, float w, float h, int sel, const char *v) {
+    char buf[200], cut[200];
+    snprintf(buf, sizeof buf, "%s", v);
+    char signal = buf[0], bars = buf[1], chosen = buf[2];
+    char *field[5] = {0};
+    char *p = strchr(buf, '\t');
+    for (int i = 0; i < 5 && p; i++) {
+        *p++ = 0;
+        field[i] = p;
+        p = strchr(p, '\t');
+    }
+    if (!field[4]) return;
+    const char *name = field[0], *state = field[1], *players = field[3], *action = field[4];
+    char *rest = field[2];
+    int can = signal != 'o' && strcmp(action, "Full");
+    unsigned sc = signal_color(signal);
+    float mid = y + h / 2;
+
+    if (sel) rbox_edge(x - 1, y - 1, w + 2, h + 2, 6, 3, M_GREEN, M_GREEN_DARK);
+    else rbox_edge(x, y, w, h, 5, 1, M_ROW_EDGE, M_ROW);
+    signal_bars(x + 22, mid + 13, 26, bars - '0', sc, signal == 'o' ? RGBA(64, 67, 74, 255) : fade(sc, 0.25f));
+
+    /* the button, then the players, from the right */
+    float bw = 140, bh = h - 18 < 44 ? h - 18 : 44, bx = x + w - 16 - bw, by = mid - bh / 2;
+    if (can && sel) {
+        rbox(bx, by, bw, bh, 6, RGBA(120, 236, 96, 255), RGBA(120, 236, 96, 255));
+        rbox(bx + 2, by + 2, bw - 4, bh - 4, 5, RGBA(64, 176, 48, 255), RGBA(40, 140, 34, 255));
+    } else if (can) rbox_edge(bx, by, bw, bh, 6, 2, RGBA(96, 100, 110, 255), RGBA(26, 27, 31, 255));
+    else rbox_edge(bx, by, bw, bh, 6, 2, RGBA(50, 53, 60, 255), RGBA(22, 23, 27, 255));
+    unsigned bc = can ? RGBA(244, 246, 250, 255) : RGBA(96, 100, 108, 255);
+    text_ex(bx + (bw - text_w(action, 1, 1)) / 2, mid - CELL_H / 2.0f, 1, 1, bc, bc, can && sel ? 120 : 0, action);
+    float px = bx - 24;
+    if (*players) {
+        px -= text_w(players, 1, 0);
+        text_ex(px, mid - CELL_H / 2.0f, 1, 0, M_TEXT, M_TEXT, 0, players);
+        px -= 8;
+    }
+    px -= 30;
+    icon_people(px, mid - 12, 24, RGBA(196, 200, 208, 255));
+
+    /* the name (a check when it is the address chosen), and under it: the state, then the rest */
+    float tx = x + 72, room = px - 16 - tx, small = h < 60 ? 0.75f : 0.8f;
+    unsigned nc = signal == 'o' ? RGBA(176, 180, 188, 255) : sel ? RGBA(255, 255, 255, 255) : RGBA(236, 238, 242, 255);
+    float end = text_ex(tx, mid - CELL_H - 1, 1, 0.5f, nc, nc, 0, fit(name, room - 30, cut, sizeof cut));
+    if (chosen == '*') icon_ok(end + 16, mid - CELL_H / 2.0f - 1, 18, M_GREEN);
+    float sy = mid + 3, cx = tx;
+    disc(cx + 5, sy + CELL_H * small / 2, 4.5f, sc);
+    cx = text_ex(cx + 16, sy, small, 0, signal == 'o' ? M_DIM : sc, signal == 'o' ? M_DIM : sc, 0, state);
+    for (char *part = rest, *next; part && *part; part = next) {
+        next = strchr(part, '|');
+        if (next) *next++ = 0;
+        float pw = text_w(part, small, 0);
+        if (cx + 20 + pw > tx + room) break;
+        disc(cx + 9, sy + CELL_H * small / 2, 2, M_DIM);
+        cx = text_ex(cx + 18, sy, small, 0, M_DIM, M_DIM, 0, part);
+    }
+}
+
+/* The pages ('\b': this one, '\t', how many): Refresh on the left, < page / pages > in the values' column */
+static void list_pages(float x, float y, float w, float h, float vx, float vw, int sel, const char *v) {
+    (void)w;
+    int page = atoi(v), pages = strchr(v, '\t') ? atoi(strchr(v, '\t') + 1) : 1;
+    float bw = vx - x - 24, mid = y + h / 2;
+    if (sel) rbox_edge(x - 1, y - 1, bw + 2, h + 2, 7, 3, M_GREEN, M_GREEN_DARK);
+    else rbox_edge(x, y, bw, h, 6, 2, RGBA(84, 88, 98, 255), RGBA(28, 30, 34, 255));
+    float lw = text_w("Refresh", 1, 0.5f), ix = x + (bw - lw - 34) / 2;
+    icon_refresh(ix + 11, mid, 10, M_TEXT);
+    text_ex(ix + 34, mid - CELL_H / 2.0f, 1, 0.5f, M_TEXT, M_TEXT, 0, "Refresh");
+    char label[24];
+    snprintf(label, sizeof label, "%d / %d", page, pages);
+    float cx = vx + vw / 2, s = h - 6 < 40 ? h - 6 : 40, tw = text_w(label, 1, 1);
+    unsigned ac = pages > 1 ? (sel ? RGBA(255, 255, 255, 255) : M_TEXT) : RGBA(84, 88, 96, 255);
+    for (int side = 0; side < 2; side++) {
+        float bx = side ? cx + tw / 2 + 24 : cx - tw / 2 - 24 - s;
+        rbox_edge(bx, mid - s / 2, s, s, 6, 1, pages > 1 ? RGBA(84, 88, 98, 255) : RGBA(50, 53, 60, 255), RGBA(28, 30, 34, 255));
+        text_ex(bx + (s - CELL_W) / 2, mid - CELL_H / 2.0f, 1, 0, ac, ac, 0, side ? ">" : "<");
+    }
+    text_ex(cx - tw / 2, mid - CELL_H / 2.0f, 1, 1, M_TEXT, M_TEXT, 0, label);
+}
+
 /* The start-up menu (gpu_menu.c), centred in the w x h back buffer: the pages' tabs (title: their
  * names, '\t' between them, '*' before the one shown - else a plain title), a row per shown item -
  * its label, and its value: between arrows, or as it is when it starts with a control character
@@ -431,13 +585,21 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     float W = (float)w, H = (float)h;
     backdrop(W, H);
 
-    int rows = 0;
-    for (int i = 0; i < n; i++) rows += shown[i] && i != button;
+    /* rows: the plain ones, and the taller ones of the Network page's list (its heading, rooms) */
+    int rows = 0, tall = 0, list = 0;
+    for (int i = 0; i < n; i++) {
+        if (!shown[i] || i == button) continue;
+        unsigned char k = (unsigned char)values[i][0];
+        rows++;
+        tall += k == 6 || k == 7;
+        list |= k >= 6 && k <= 8;
+    }
     /* widths: the label's column, values (the arrows' room too), callouts across the row */
     float label_w = 18.0f * CELL_W, value_w = 24.0f * CELL_W + 100, callout_w = 0;
     for (int i = 0; i < n; i++) {
         if (!shown[i] || i == button) continue;
         unsigned char k = (unsigned char)values[i][0];
+        if (k >= 6 && k <= 8) continue;
         float l = text_w(values[i] + (k < 32), 1, 0);
         if (k >= 3 && k <= 5) { if (l + 72 > callout_w) callout_w = l + 72; }
         else if (k == 1 || k == 2) { if (l + 32 > value_w) value_w = l + 32; }
@@ -447,14 +609,17 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     float pw = 16 + 16 + label_w + value_w + 16;
     if (callout_w + 48 > pw) pw = callout_w + 48;
     if (footer_w + 64 > pw) pw = footer_w + 64;
-    if (pw < 720) pw = 720;
+    if (pw < (list ? 880 : 720)) pw = list ? 880 : 720;
     if (pw > W - 32) pw = W - 32;
 
     /* heights: shrunk to fit a small window */
     int tabs = title && strchr(title, '\t');
-    float row_h = 46, gap = 4, tabs_h = 46, play_h = 52, footer_h = 58;
-    float ph = 8 + tabs_h + 10 + rows * (row_h + gap) + 14 + play_h + 16 + footer_h;
-    if (ph + 16 > H) { row_h = 36; play_h = 44; footer_h = 48; ph = 8 + tabs_h + 10 + rows * (row_h + gap) + 14 + play_h + 16 + footer_h; }
+    float row_h = 46, gap = 4, tabs_h = 46, play_h = 52, footer_h = 58, more = 18;   /* (more: a tall row's) */
+    float ph = 8 + tabs_h + 10 + rows * (row_h + gap) + tall * more + 14 + play_h + 16 + footer_h;
+    if (ph + 16 > H) {
+        row_h = 36; play_h = 44; footer_h = 48; more = 14;
+        ph = 8 + tabs_h + 10 + rows * (row_h + gap) + tall * more + 14 + play_h + 16 + footer_h;
+    }
     float px = floorf((W - pw) / 2), py = floorf((H - ph) / 2);
     if (py < 8) py = 8;
 
@@ -511,8 +676,15 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         size_t vl = strlen(val);
         int caret = sel && vl && val[vl - 1] == '_';   /* (the model's cursor: drawn as a caret) */
         if (caret) val[--vl] = 0;
-        float ry = y, rh = row_h, mid = ry + rh / 2, ty = mid - CELL_H / 2.0f;
+        float ry = y, rh = row_h + (kind == 6 || kind == 7 ? more : 0), mid = ry + rh / 2, ty = mid - CELL_H / 2.0f;
         r[0] = rx, r[1] = ry, r[2] = rw, r[3] = rh;
+        if (kind >= 6 && kind <= 8) {   /* the Network page's list */
+            if (kind == 6) list_heading(rx, ry, rw, rh, labels[i], val);
+            else if (kind == 7) list_room(rx, ry, rw, rh, sel, val);
+            else list_pages(rx, ry, rw, rh, vx, vw, sel, val);
+            y += rh + gap;
+            continue;
+        }
 
         if (kind >= 3 && kind <= 5) {   /* a callout across the row */
             unsigned edge = kind == 3 ? RGBA(255, 180, 60, 255) : kind == 4 ? M_GREEN : RGBA(120, 160, 255, 255);
@@ -523,7 +695,7 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
             else icon_info(rx + 28, mid, 20, edge);
             unsigned tc = kind == 3 ? RGBA(255, 226, 170, 255) : kind == 4 ? RGBA(200, 250, 190, 255) : RGBA(206, 216, 255, 255);
             text_ex(rx + 50, ty, 1, 0, tc, tc, 0, fit(val, rw - 66, cut, sizeof cut));
-            y += row_h + gap;
+            y += rh + gap;
             continue;
         }
         if (sel) rbox_edge(rx - 1, ry - 1, rw + 2, rh + 2, 5, 3, M_GREEN, M_GREEN_DARK);

@@ -19,11 +19,15 @@
 #define NET_CHOICES 16
 
 enum { NET_MODE_LAUNCHER, NET_MODE_HOST, NET_MODE_JOIN, NET_MODES };
-enum { NROW_MODE, NROW_NAME, NROW_ROOM, NROW_PORT, NROW_HOST, NROW_ADDRS, NROW_ROUTER, NROW_LAN, NROW_TIP, NROW_PLAY, NROWS };
-enum { NET_EV_NONE, NET_EV_PLAY };   /* what net_menu_event says happened */
+#define NET_PAGE 4            /* rooms listed at a time on Join's page */
+/* Join's list: NROW_LAN its heading, NROW_LIST.. a room each (choices[page * NET_PAGE + k]), NROW_PAGER Refresh and the pages */
+enum { NROW_MODE, NROW_NAME, NROW_ROOM, NROW_PORT, NROW_HOST, NROW_LAN, NROW_LIST, NROW_LIST_END = NROW_LIST + NET_PAGE - 1, NROW_PAGER,
+       NROW_ADDRS, NROW_ROUTER, NROW_TIP, NROW_PLAY, NROWS };
+enum { NET_EV_NONE, NET_EV_PLAY, NET_EV_REFRESH };   /* what net_menu_event says happened (REFRESH: look for rooms again) */
 
-/* found: answering now (on the LAN, or the address asked), else recent; players of most (most 0: not said) */
-typedef struct NetChoice { char addr[NET_ADDR], room[NET_TEXT], who[NET_TEXT]; int found, players, most; } NetChoice;
+/* found: answering now (on the LAN, or the address asked), else recent; players of most (most 0: not said);
+ * ms: how long it took to answer (found ones) */
+typedef struct NetChoice { char addr[NET_ADDR], room[NET_TEXT], who[NET_TEXT]; int found, players, most, ms; } NetChoice;
 #define NET_SELF 8
 
 /* The address asked whether a room is there (net_discover_watch): */
@@ -44,6 +48,7 @@ typedef struct NetMenu {
     int row;
     NetChoice choices[NET_CHOICES];   /* the Host row's < >: rooms found on the LAN, then recent ones */
     int nchoices, choice;             /* (choice: -1 while the address is typed) */
+    int page;                         /* Join's list: the page of NET_PAGE rooms shown */
     int host_auto;                    /* the address is Join's own choice still (not typed, not picked) */
     int auto_state, last_down;        /* NET_AUTO_*; the last room joined did not answer */
     int watch;                        /* NET_WATCH_*: whether a room answers at the address */
@@ -62,10 +67,14 @@ int net_menu_selectable(const NetMenu *m, int row);
 int net_menu_text_row(const NetMenu *m);   /* the selected row takes typed characters */
 const char *net_menu_label(int row);
 /* The value shown. A leading control character asks for it drawn as it is (no < >): '\1' information,
- * '\2' a text field, '\3' a warning, '\4' good news, '\5' a note (the last three across the row). */
+ * '\2' a text field, '\3' a warning, '\4' good news, '\5' a note (the last three across the row);
+ * Join's list: '\6' its heading (the label, then the value under it), '\7' a room and '\b' the pages
+ * (see net_menu_value). */
 void net_menu_value(const NetMenu *m, int row, char *out, unsigned n);
 /* MENU_UP/DOWN/LEFT/RIGHT/ACCEPT (gpu_menu.h), or MENU_CHAR with c, MENU_ERASE: NET_EV_PLAY when Play was chosen */
 int net_menu_event(NetMenu *m, int event, int c);
+int net_menu_pages(const NetMenu *m);   /* Join's list: how many pages of rooms (1 at least) */
+int net_menu_room_joinable(const NetMenu *m, int row);   /* a room row whose Join starts the game (found, not full) */
 /* The rooms found on the LAN now (the Host row's choices first, then the recent ones) */
 void net_menu_set_found(NetMenu *m, const NetChoice *found, int n);
 int net_menu_is_self(const NetMenu *m, const char *addr);   /* this PC (its addresses, the loopback) */

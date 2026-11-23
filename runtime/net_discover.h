@@ -8,6 +8,7 @@
 void net_discover_start(void);                    /* the LAN search, every second until stopped */
 void net_discover_stop(void);
 int net_discover_found(NetChoice *out, int max);  /* the rooms that answered in the last few seconds (never this PC's) */
+void net_discover_refresh(void);                  /* the rooms found forgotten, and asked for again now */
 /* addr ("" for none) asked directly every second, from anywhere (the last room joined may be outside the
  * LAN): NET_WATCH_* - checking, a room answers there, or none did (3 asks) */
 int net_discover_watch(const char *addr);

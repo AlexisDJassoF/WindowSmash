@@ -36,19 +36,32 @@ void net_menu_init(NetMenu *m, const NetSettings *s) {
     net_menu_set_found(m, NULL, 0);
 }
 
+static int list_index(const NetMenu *m, int row) { return m->page * NET_PAGE + row - NROW_LIST; }   /* (a room row's choice) */
+static int is_list(int row) { return row >= NROW_LIST && row <= NROW_LIST_END; }
+
+int net_menu_pages(const NetMenu *m) { return m->nchoices ? (m->nchoices + NET_PAGE - 1) / NET_PAGE : 1; }
+
+static int joinable(const NetChoice *c) { return c->found && (c->most <= 0 || c->players < c->most); }
+
+int net_menu_room_joinable(const NetMenu *m, int row) {
+    return is_list(row) && net_menu_visible(m, row) && joinable(&m->choices[list_index(m, row)]);
+}
+
 int net_menu_visible(const NetMenu *m, int row) {
     int mode = m->s.mode;
+    if (is_list(row)) return mode == NET_MODE_JOIN && list_index(m, row) < m->nchoices;
     switch (row) {
     case NROW_ROOM: return mode != NET_MODE_LAUNCHER;
     case NROW_PORT: case NROW_ADDRS: case NROW_ROUTER: return mode == NET_MODE_HOST;
-    case NROW_HOST: case NROW_LAN: return mode == NET_MODE_JOIN;
+    case NROW_HOST: case NROW_LAN: case NROW_PAGER: return mode == NET_MODE_JOIN;
     case NROW_TIP: return m->tip[0] != 0;
     default: return row >= 0 && row < NROWS;
     }
 }
 
 int net_menu_selectable(const NetMenu *m, int row) {
-    return net_menu_visible(m, row) && (row == NROW_MODE || row == NROW_NAME || row == NROW_ROOM || row == NROW_PORT || row == NROW_HOST || row == NROW_PLAY);
+    return net_menu_visible(m, row) && (row == NROW_MODE || row == NROW_NAME || row == NROW_ROOM || row == NROW_PORT || row == NROW_HOST ||
+                                        is_list(row) || row == NROW_PAGER || row == NROW_PLAY);
 }
 
 int net_menu_text_row(const NetMenu *m) {
@@ -57,8 +70,28 @@ int net_menu_text_row(const NetMenu *m) {
 }
 
 const char *net_menu_label(int row) {
-    static const char *const L[NROWS] = {"Connection", "Your name", "Room name", "UDP port", "Host address", "This PC", "Router", "On your LAN", "Tip", "Play"};
+    static const char *const L[NROWS] = {"Connection", "Your name", "Room name", "UDP port", "Host address", "Available rooms",
+                                         [NROW_PAGER] = "Refresh", "This PC", "Router", "Tip", "Play"};
+    if (is_list(row)) return "Room";
     return row >= 0 && row < NROWS ? L[row] : "";
+}
+
+/* A room of Join's list: '\7', then its signal (g good, y weak or full, o not answering), bars 0-4 and '*'
+ * when it is the address chosen, then '\t'-separated: its name, its state, the rest of the line under the
+ * name ('|' between the parts), its players and its button's text */
+static void room_value(const NetMenu *m, int i, char *out, unsigned n) {
+    const NetChoice *c = &m->choices[i];
+    int full = c->found && c->most > 0 && c->players >= c->most;
+    int bars = !c->found ? 0 : c->ms <= 15 ? 4 : c->ms <= 40 ? 3 : c->ms <= 100 ? 2 : 1;
+    char signal = !c->found ? 'o' : full || bars <= 2 ? 'y' : 'g';
+    int chosen = m->choice == i && m->s.host[0];
+    char players[24] = "", rest[160];
+    if (c->found && c->most > 0) snprintf(players, sizeof players, "%d/%d", c->players, c->most);
+    if (c->found && c->who[0]) snprintf(rest, sizeof rest, "%s's room|%s", c->who, c->addr);
+    else if (c->found) snprintf(rest, sizeof rest, "%s", c->addr);
+    else snprintf(rest, sizeof rest, "joined before|%s", c->addr);
+    snprintf(out, n, "\7%c%d%c\t%s\t%s\t%s\t%s\t%s", signal, bars, chosen ? '*' : '-', c->room[0] ? c->room : c->addr,
+             !c->found ? "Not answering" : full ? "Full" : "Online", rest, players, full ? "Full" : "Join");
 }
 
 void net_menu_value(const NetMenu *m, int row, char *out, unsigned n) {
@@ -76,9 +109,13 @@ void net_menu_value(const NetMenu *m, int row, char *out, unsigned n) {
         return;
     case NROW_ADDRS: snprintf(out, n, "\1%s", m->addrs); return;
     case NROW_ROUTER: snprintf(out, n, "\1%s", m->router); return;
-    case NROW_LAN: snprintf(out, n, "\1%s", m->lan); return;
+    case NROW_LAN: snprintf(out, n, "\6%s", m->lan); return;
+    case NROW_PAGER: snprintf(out, n, "\b%d\t%d", m->page + 1, net_menu_pages(m)); return;
     case NROW_TIP: snprintf(out, n, "%c%s", m->tip_kind ? m->tip_kind : '\5', m->tip); return;
-    default: if (n) out[0] = 0; return;
+    default:
+        if (is_list(row) && net_menu_visible(m, row)) { room_value(m, list_index(m, row), out, n); return; }
+        if (n) out[0] = 0;
+        return;
     }
 }
 
@@ -95,6 +132,13 @@ static void pick(NetMenu *m, int i) {   /* the Host row's choice i */
     if (m->choices[i].room[0]) copy(m->s.room, sizeof m->s.room, m->choices[i].room);
 }
 
+static void turn_page(NetMenu *m, int dir) {   /* Join's list: the next or the previous page, around */
+    int pages = net_menu_pages(m);
+    if (pages < 2) return;
+    m->page = ((m->page + dir) % pages + pages) % pages;
+    while (is_list(m->row) && !net_menu_visible(m, m->row)) m->row--;   /* (the last page shorter) */
+}
+
 static void step(NetMenu *m, int dir) {
     switch (m->row) {
     case NROW_MODE:
@@ -106,12 +150,14 @@ static void step(NetMenu *m, int dir) {
         snprintf(m->s.port, sizeof m->s.port, "%ld", p);
         break;
     }
+    case NROW_PAGER: turn_page(m, dir); break;
     case NROW_HOST:
         if (!m->nchoices) break;
         m->host_auto = 0;   /* (picked: Join chooses no more) */
         if (m->choice < 0) pick(m, dir > 0 ? 0 : m->nchoices - 1);
         else pick(m, ((m->choice + dir) % m->nchoices + m->nchoices) % m->nchoices);
         break;
+    default: if (is_list(m->row)) turn_page(m, dir);
     }
 }
 
@@ -143,6 +189,13 @@ int net_menu_event(NetMenu *m, int event, int c) {
     case MENU_CHAR: if (net_menu_text_row(m)) type(m, c); break;
     case MENU_ERASE: if (net_menu_text_row(m)) type(m, -1); break;
     case MENU_ACCEPT:
+        if (m->row == NROW_PAGER) return NET_EV_REFRESH;
+        if (is_list(m->row)) {   /* Join: this room - and the game, when it can be joined now */
+            m->host_auto = 0;
+            pick(m, list_index(m, m->row));
+            if (!joinable(&m->choices[m->choice])) break;
+            m->row = NROW_PLAY;
+        }
         if (m->row != NROW_PLAY) { move(m, 1); break; }
         if (m->s.mode == NET_MODE_JOIN && !m->s.host[0]) { m->row = NROW_HOST; break; }   /* (nothing to join yet) */
         if (!m->s.room[0]) copy(m->s.room, sizeof m->s.room, DEFAULT_ROOM);
@@ -209,6 +262,8 @@ void net_menu_set_found(NetMenu *m, const NetChoice *found, int n) {
     m->choice = -1;
     for (int j = 0; j < m->nchoices; j++)
         if (m->s.host[0] && same_address(m->choices[j].addr, m->s.host)) { m->choice = j; break; }
+    if (m->page >= net_menu_pages(m)) m->page = net_menu_pages(m) - 1;
+    while (is_list(m->row) && !net_menu_visible(m, m->row)) m->row = m->row > NROW_LIST ? m->row - 1 : NROW_PAGER;   /* (its room gone) */
 }
 
 const char *net_menu_last(const NetMenu *m) {
@@ -217,8 +272,6 @@ const char *net_menu_last(const NetMenu *m) {
         if (m->s.recent[i].addr[0] && !net_menu_is_self(m, m->s.recent[i].addr)) return m->s.recent[i].addr;
     return NULL;
 }
-
-static int joinable(const NetChoice *c) { return c->found && (c->most <= 0 || c->players < c->most); }
 
 static int found_at(const NetMenu *m, const char *addr) {   /* the choice answering at addr now, -1 if none */
     for (int i = 0; i < m->nchoices; i++)
@@ -302,8 +355,8 @@ void net_menu_describe(NetMenu *m, const NetProbe *p) {
     case NET_MODE_JOIN: {
         int found = 0;
         for (int i = 0; i < m->nchoices; i++) found += m->choices[i].found;
-        if (found) snprintf(m->lan, sizeof m->lan, "%d room%s found - < > on Host address", found, found == 1 ? "" : "s");
-        else snprintf(m->lan, sizeof m->lan, "%s", p->searching ? "searching..." : "no rooms found");
+        if (found) snprintf(m->lan, sizeof m->lan, "%d room%s on your network: pick one and Join", found, found == 1 ? "" : "s");
+        else snprintf(m->lan, sizeof m->lan, "%s", p->searching ? "Searching your network..." : "No rooms found: Refresh, or type the address above");
         const NetChoice *c = m->choice >= 0 ? &m->choices[m->choice] : NULL;
         const char *last = net_menu_last(m);
         char room[96] = "";
