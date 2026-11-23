@@ -50,7 +50,7 @@ The keyboard plays as player 1, together with player 1's pad if there is one:
 
 | Key | What it does |
 | :--- | :--- |
-| <kbd>F1</kbd> | Shows or hides the overlay: frame rate and, online, the connection. |
+| <kbd>F1</kbd> (or L3 + R3 on a controller: both sticks pressed in) | Shows or hides the overlay: frame rate and, online, the connection. Hidden at start. |
 | <kbd>F2</kbd> | Shows more details, including the connected pads. |
 | <kbd>F3</kbd> | Takes a screenshot. |
 | <kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> | Switches between a window and full screen. |

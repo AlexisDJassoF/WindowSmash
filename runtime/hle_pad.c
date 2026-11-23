@@ -59,6 +59,13 @@ enum { N_A, N_B, N_X, N_Y, N_LSTICK, N_RSTICK, N_L, N_R, N_ZL, N_ZR, N_PLUS, N_M
  * DOWN, triggers 0..32767). */
 typedef struct Raw { u32 buttons; i32 axis[RA_COUNT]; } Raw;
 
+/* Both sticks pressed in (L3 + R3) on any pad: the overlay on or off, as F1 (the game has no use for
+ * the two at once). Noted per pad as it is read, acted on once per press in the input thread. */
+#define OVERLAY_COMBO (1u << RB_LEFT_STICK | 1u << RB_RIGHT_STICK)
+void gfx_hotkey(int n);   /* (the renderer: F1 + n was pressed) */
+static int combo_held;
+static void note_combo(const Raw *raw) { if ((raw->buttons & OVERLAY_COMBO) == OVERLAY_COMBO) combo_held = 1; }
+
 enum { SRC_NONE, SRC_BUTTON, SRC_TRIGGER };
 typedef struct Source { u8 kind, index; } Source;
 enum { MAXSRC = 4 };
@@ -459,6 +466,7 @@ static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         }
         Raw raw;
         xinput_raw(&s.pad, &raw);
+        note_combo(&raw);
         dev_state(d, &raw, &fresh[i]);
         snprintf(names[i], sizeof names[i], "%s", d->name);
         u16 low, high;
@@ -576,6 +584,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         for (int b = 0; b < RB_COUNT; b++)
             if (p_SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = p_SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a);
+        note_combo(&raw);
         dev_state(d, &raw, &fresh[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
@@ -684,6 +693,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < RB_COUNT; b++)
             if (SDL_GameControllerGetButton(d->gp, (SDL_GameControllerButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = SDL_GameControllerGetAxis(d->gp, (SDL_GameControllerAxis)a);
+        note_combo(&raw);
         dev_state(d, &raw, &fresh[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
@@ -707,9 +717,13 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
         char names[PAD_SLOTS][48] = {{0}};
+        static int was_combo;
+        combo_held = 0;
         if (sdl) sdl_poll(fresh, names);
         else xinput_poll(fresh, names);
         publish(fresh, names);
+        if (combo_held && !was_combo) gfx_hotkey(0);   /* (L3 + R3: F1) */
+        was_combo = combo_held;
         LARGE_INTEGER due = {.QuadPart = -10000};   /* 1 ms */
         if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
         else Sleep(1);

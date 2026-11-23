@@ -337,8 +337,8 @@ static DWORD WINAPI window_thread(LPVOID done) {
 /* Linux: the window is SDL's, made and run by the main thread (linux/window.c), which passes
  * the debug keys on here; DXVK takes the SDL_Window as the swap chain's HWND. */
 void *rt_window(void);
-void gfx_hotkey(int n) { InterlockedOr(&hotkeys, 1 << n); }
 #endif
+void gfx_hotkey(int n) { InterlockedOr(&hotkeys, 1 << n); }   /* (also a pad's L3 + R3, hle_pad.c) */
 
 static ID3DBlob *compile_hlsl(const char *src, const char *entry, const char *target) {
     ID3DBlob *code = NULL, *errors = NULL;
@@ -3641,7 +3641,7 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     if (f4_at == -1) f4_at = getenv("SSBU_F4_AT") ? atof(getenv("SSBU_F4_AT")) : -2;
     if (f4_at >= 0 && rt_now_ns() > (u64)(f4_at * 1e9)) { f4_at = -2; keys |= 8; }
     static int overlay = -1, details;
-    if (overlay < 0) overlay = !getenv("SSBU_OVERLAY") || atoi(getenv("SSBU_OVERLAY")) != 0;
+    if (overlay < 0) overlay = getenv("SSBU_OVERLAY") && atoi(getenv("SSBU_OVERLAY")) != 0;   /* (off until F1, L3 + R3 or SSBU_OVERLAY=1) */
     if (keys & 1) overlay = !overlay;
     if (keys & 2) { details = !details; overlay = 1; }
     if (keys & 4) {   /* F3: the frame as the game drew it (without the overlay) */

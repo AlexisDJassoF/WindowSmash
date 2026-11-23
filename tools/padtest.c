@@ -7,6 +7,8 @@
  * Exit code 0 when every check passes. */
 #include "../runtime/hle_pad.c"
 
+void gfx_hotkey(int n) { (void)n; }   /* (the renderer's, which this test has not) */
+
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 

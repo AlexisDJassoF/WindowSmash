@@ -403,7 +403,7 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
 
     /* debug keys (F1 the overlay, F2 its details) and the overlay */
     static int overlay = -1, details;
-    if (overlay < 0) overlay = !getenv("SSBU_OVERLAY") || atoi(getenv("SSBU_OVERLAY")) != 0;
+    if (overlay < 0) overlay = getenv("SSBU_OVERLAY") && atoi(getenv("SSBU_OVERLAY")) != 0;   /* (off until F1, L3 + R3 or SSBU_OVERLAY=1) */
     if (keys & 1) overlay = !overlay;
     if (keys & 2) { details = !details; overlay = 1; }
     static double profile_at = -1;   /* SSBU_PROFILE_AT: the second to start a profile at (debug runs) */

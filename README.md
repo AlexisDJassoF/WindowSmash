@@ -213,7 +213,7 @@ Plug in a controller and press a button: each pad becomes the next free player, 
 
 | Key | What it does |
 | :--- | :--- |
-| <kbd>F1</kbd> | Show or hide the overlay (frame rate, online status). |
+| <kbd>F1</kbd> (or L3 + R3: both sticks pressed in) | Show or hide the overlay (frame rate, online status). Hidden at start. |
 | <kbd>F2</kbd> | Show more details, including the connected pads. |
 | <kbd>F3</kbd> | Take a screenshot (saved in the `screenshots` folder). |
 | <kbd>F11</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> | Switch between a window and full screen. |

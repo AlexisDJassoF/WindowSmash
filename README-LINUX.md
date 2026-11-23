@@ -149,7 +149,7 @@ SDL mappings for pads SDL doesn't know.
 
 | Key | What it does |
 | :--- | :--- |
-| F1 | Overlay |
+| F1 (or L3 + R3 on a controller: both sticks pressed in) | Overlay, hidden at start (`SSBU_OVERLAY=1` shows it from the start) |
 | F2 | Details |
 | F3 | Screenshot (into `screenshots/`) |
 | F4 | Log one frame's drawing |
