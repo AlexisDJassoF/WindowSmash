@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 #include "pad.h"
+#include "gpu_menu.h"   /* (F9's Network window: menu_modal, menu_input, menu_device) */
 #ifdef SSBU_HAVE_SDL3
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_gamepad.h>
@@ -64,7 +65,60 @@ typedef struct Raw { u32 buttons; i32 axis[RA_COUNT]; } Raw;
 #define OVERLAY_COMBO (1u << RB_LEFT_STICK | 1u << RB_RIGHT_STICK)
 void gfx_hotkey(int n);   /* (the renderer: F1 + n was pressed) */
 static int combo_held;
-static void note_combo(const Raw *raw) { if ((raw->buttons & OVERLAY_COMBO) == OVERLAY_COMBO) combo_held = 1; }
+/* Select + Start (Back + Start, Minus + Plus, Share + Options) on any pad: F9's Network window, open or closed */
+#define NETWORK_COMBO (1u << RB_BACK | 1u << RB_START)
+static int network_held;
+
+/* The menus' (gpu_menu.h): while F9's Network window is open in the game, the pads move it instead of
+ * playing - every pad's controls together, as the start-up menu reads them (linux/window.c) */
+static Raw menu_raw;    /* this round's pads, together */
+static int menu_kind;   /* the kind of the pad used last (MENU_PAD_*) */
+
+static int kind_of(const char *type) {
+    if (!strncmp(type, "ps", 2)) return MENU_PAD_PS;
+    if (!strncmp(type, "switch", 6) || !strncmp(type, "joycon", 6) || !strcmp(type, "gamecube")) return MENU_PAD_NINTENDO;
+    return MENU_PAD_XBOX;
+}
+
+static void note_combo(const Raw *raw, const char *type) {
+    if ((raw->buttons & OVERLAY_COMBO) == OVERLAY_COMBO) combo_held = 1;
+    if ((raw->buttons & NETWORK_COMBO) == NETWORK_COMBO) network_held = 1;
+    int moved = 0;
+    for (int a = RA_LEFTX; a <= RA_LEFTY; a++) {
+        if (abs(raw->axis[a]) > abs(menu_raw.axis[a])) menu_raw.axis[a] = raw->axis[a];
+        moved |= abs(raw->axis[a]) > 16000;
+    }
+    if (raw->buttons || moved) menu_kind = kind_of(type);
+    menu_raw.buttons |= raw->buttons;
+}
+
+/* The window's events from the pads (each round, while it is open): a direction now, then again after
+ * 400 ms held, every 120 ms; the south button applies, the east one closes */
+static void menu_events(void) {
+    static int held = -1, was_accept = 1, was_back = 1;   /* (a button held as it opened: not a press) */
+    static ULONGLONG held_since, repeated;
+    ULONGLONG now = GetTickCount64();
+    const Raw *r = &menu_raw;
+    int dir = r->buttons & 1u << RB_DPAD_UP || r->axis[RA_LEFTY] < -16000 ? MENU_UP
+            : r->buttons & 1u << RB_DPAD_DOWN || r->axis[RA_LEFTY] > 16000 ? MENU_DOWN
+            : r->buttons & 1u << RB_DPAD_LEFT || r->axis[RA_LEFTX] < -16000 ? MENU_LEFT
+            : r->buttons & 1u << RB_DPAD_RIGHT || r->axis[RA_LEFTX] > 16000 ? MENU_RIGHT : -1;
+    if (!menu_modal) { held = -1; was_accept = was_back = 1; return; }
+    if (menu_kind && (dir >= 0 || r->buttons)) menu_device = menu_kind;
+    if (dir != held) {
+        held = dir;
+        held_since = repeated = now;
+        if (dir >= 0) menu_input(dir, 0, 0);
+    } else if (dir >= 0 && now - held_since >= 400 && now - repeated >= 120) {
+        repeated = now;
+        menu_input(dir, 0, 0);
+    }
+    int accept = (r->buttons & 1u << RB_SOUTH) != 0, back = (r->buttons & 1u << RB_EAST) != 0;
+    if (accept && !was_accept) menu_input(MENU_ACCEPT, 0, 0);
+    if (back && !was_back) menu_input(MENU_BACK, 0, 0);
+    was_accept = accept;
+    was_back = back;
+}
 
 enum { SRC_NONE, SRC_BUTTON, SRC_TRIGGER };
 typedef struct Source { u8 kind, index; } Source;
@@ -466,7 +520,7 @@ static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         }
         Raw raw;
         xinput_raw(&s.pad, &raw);
-        note_combo(&raw);
+        note_combo(&raw, d->type);
         dev_state(d, &raw, &fresh[i]);
         snprintf(names[i], sizeof names[i], "%s", d->name);
         u16 low, high;
@@ -584,7 +638,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         for (int b = 0; b < RB_COUNT; b++)
             if (p_SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = p_SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a);
-        note_combo(&raw);
+        note_combo(&raw, d->type);
         dev_state(d, &raw, &fresh[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
@@ -693,7 +747,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48]) {
         for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < RB_COUNT; b++)
             if (SDL_GameControllerGetButton(d->gp, (SDL_GameControllerButton)b)) raw.buttons |= 1u << b;
         for (int a = 0; a < RA_COUNT; a++) raw.axis[a] = SDL_GameControllerGetAxis(d->gp, (SDL_GameControllerAxis)a);
-        note_combo(&raw);
+        note_combo(&raw, d->type);
         dev_state(d, &raw, &fresh[d->slot]);
         snprintf(names[d->slot], sizeof names[d->slot], "%s", d->name);
         u16 low, high;
@@ -717,10 +771,18 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
         char names[PAD_SLOTS][48] = {{0}};
-        static int was_combo;
-        combo_held = 0;
+        static int was_combo, was_network;
+        combo_held = network_held = 0;
+        memset(&menu_raw, 0, sizeof menu_raw);
         if (sdl) sdl_poll(fresh, names);
         else xinput_poll(fresh, names);
+        if (network_held && !was_network) {   /* (Select + Start: the Network window) */
+            if (menu_kind) menu_device = menu_kind;
+            menu_modal_toggle();
+        }
+        was_network = network_held;
+        menu_events();
+        if (menu_modal) memset(fresh, 0, sizeof fresh);   /* (the Network window's, not the game's: nothing pressed) */
         publish(fresh, names);
         if (combo_held && !was_combo) gfx_hotkey(0);   /* (L3 + R3: F1) */
         was_combo = combo_held;

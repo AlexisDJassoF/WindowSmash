@@ -34,7 +34,7 @@
 #include "host.h"
 #include <dxgi.h>
 
-enum { MODE_WINDOWED, MODE_BORDERLESS, MODE_FULLSCREEN };
+enum { MODE_WINDOWED, MODE_BORDERLESS, MODE_FULLSCREEN, MODE_MAXIMIZED };
 
 static struct {
     int mode, width, height, latency, hide_cursor;
@@ -58,13 +58,15 @@ static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts.\n"
     "; Delete this file to get it written again with the defaults. A line starting with ';' is a comment.\n"
     "\n"
-    "; window = windowed | borderless | fullscreen\n"
+    "; window = windowed | maximized | borderless | fullscreen\n"
 #ifdef _WIN32
     ";   windowed:   a normal window, kept 16:9 while you resize it.\n"
+    ";   maximized:  a normal window, maximized: the whole screen but the taskbar.\n"
     ";   borderless: no frame, covering the monitor the window is on.\n"
     ";   fullscreen: borderless and always on top (the monitor keeps its resolution).\n"
 #else
     ";   windowed:   a normal window; the picture stays 16:9 inside it, with black bars.\n"
+    ";   maximized:  a normal window, maximized: the whole screen but the desktop's panels.\n"
     ";   borderless, fullscreen: the desktop's full screen on the window's monitor (it keeps its resolution).\n"
 #endif
     "; F11 or Alt+Enter switches between the window and full screen while playing.\n"
@@ -128,7 +130,8 @@ static void parse_window(const char *v) {
     if (!_stricmp(v, "windowed")) cfg.mode = MODE_WINDOWED;
     else if (!_stricmp(v, "borderless")) cfg.mode = MODE_BORDERLESS;
     else if (!_stricmp(v, "fullscreen")) cfg.mode = MODE_FULLSCREEN;
-    else fprintf(stderr, "[display] window is windowed, borderless or fullscreen, not '%s'\n", v);
+    else if (!_stricmp(v, "maximized")) cfg.mode = MODE_MAXIMIZED;
+    else fprintf(stderr, "[display] window is windowed, maximized, borderless or fullscreen, not '%s'\n", v);
 }
 
 static void parse_pacing(const char *v) {
@@ -322,7 +325,7 @@ char *display_ini_rewrite(const char *text, const char *defaults, int n, const c
  * 1 if written (or nothing to write). */
 int display_save(const DisplaySettings *s) {
     load();
-    static const char *const WINDOW[] = {"windowed", "borderless", "fullscreen"}, *const PACE[] = {"clock", "vrr", "display", "vsync"};
+    static const char *const WINDOW[] = {"windowed", "borderless", "fullscreen", "maximized"}, *const PACE[] = {"clock", "vrr", "display", "vsync"};
     const char *keys[7], *values[7];
     char sharp[16], scale[8];
     int n = 0;
@@ -426,7 +429,11 @@ static void set_mode(HWND h, int mode) {
     if (mode == current_mode) return;
     if (current_mode == MODE_WINDOWED) have_place = GetWindowPlacement(h, &windowed_place);
     current_mode = mode;
-    if (mode == MODE_WINDOWED) {
+    if (mode == MODE_MAXIMIZED) {   /* (a window with its frame, filling the monitor's work area) */
+        SetWindowLongPtrW(h, GWL_STYLE, WINDOWED_STYLE);
+        SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        ShowWindow(h, SW_MAXIMIZE);
+    } else if (mode == MODE_WINDOWED) {
         SetWindowLongPtrW(h, GWL_STYLE, WINDOWED_STYLE);
         if (have_place) {
             SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
@@ -441,7 +448,13 @@ static void set_mode(HWND h, int mode) {
         SetWindowPos(h, mode == MODE_FULLSCREEN ? HWND_TOPMOST : HWND_NOTOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top,
                      SWP_FRAMECHANGED | SWP_NOACTIVATE);
     }
-    fprintf(stderr, "[display] %s\n", mode == MODE_WINDOWED ? "windowed" : mode == MODE_BORDERLESS ? "borderless" : "fullscreen");
+    fprintf(stderr, "[display] %s\n", mode == MODE_WINDOWED ? "windowed" : mode == MODE_MAXIMIZED ? "maximized" : mode == MODE_BORDERLESS ? "borderless" : "fullscreen");
+}
+
+/* F11, Alt+Enter: from a window to full screen (display.ini's kind), and back to its kind of window */
+static int other_mode(void) {
+    if (current_mode == MODE_WINDOWED || current_mode == MODE_MAXIMIZED) return cfg.mode == MODE_FULLSCREEN ? MODE_FULLSCREEN : MODE_BORDERLESS;
+    return cfg.mode == MODE_MAXIMIZED ? MODE_MAXIMIZED : MODE_WINDOWED;
 }
 
 HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *title) {
@@ -497,13 +510,12 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
     switch (msg) {
     case WM_KEYDOWN:
         if (w != VK_F11 || (l & (1 << 30))) return 0;
-        set_mode(h, current_mode == MODE_WINDOWED ? (cfg.mode == MODE_FULLSCREEN ? MODE_FULLSCREEN : MODE_BORDERLESS) : MODE_WINDOWED);
+        set_mode(h, other_mode());
         *result = 0;
         return 1;
     case WM_SYSKEYDOWN:   /* Alt+Enter */
         if (w != VK_RETURN || !(l & (1 << 29))) return 0;
-        if (!(l & (1 << 30)))
-            set_mode(h, current_mode == MODE_WINDOWED ? (cfg.mode == MODE_FULLSCREEN ? MODE_FULLSCREEN : MODE_BORDERLESS) : MODE_WINDOWED);
+        if (!(l & (1 << 30))) set_mode(h, other_mode());
         *result = 0;
         return 1;
     case WM_MENUCHAR:     /* (no "ding" for Alt+key) */

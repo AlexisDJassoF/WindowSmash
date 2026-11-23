@@ -68,7 +68,10 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(self.run_menu('uuur', TEST_PACING='2')['vsync'], 'VRR')
 
     def test_window_toggles(self):
-        self.assertEqual(self.run_menu('uur')['window'], 'Fullscreen')
+        self.assertEqual(self.run_menu('uur')['window'], 'Windowed (Maximized)')
+        self.assertEqual(self.run_menu('uurr')['window'], 'Fullscreen')
+        self.assertEqual(self.run_menu('uurrr')['window'], 'Windowed')   # (around)
+        self.assertEqual(self.run_menu('uul')['window'], 'Fullscreen')
 
     def test_renderer_toggles(self):
         self.assertEqual(self.run_menu('')['renderer'], 'DXVK')

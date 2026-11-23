@@ -367,7 +367,11 @@ static float keycap(float x, float y, const char *key) {
     return w;
 }
 
-/* The footer's hints: '\t' between them; "key=what" a key and what it does, '!' first a warning,
+#define PAD_BUTTON (CELL_H + 8.0f)   /* a pad's face button in the hints: its width and height */
+static void pad_button(float x, float mid, char kind, char where);
+
+/* The footer's hints: '\t' between them; "key=what" a key and what it does (a key "^" kind where: a
+ * pad's face button drawn, see pad_button), '!' first a warning,
  * '#' first a countdown's fraction left (a bar); else plain text. Its width (draw 0: only measured). */
 static float hints(float x, float y, const char *footer, int draw, float *countdown) {
     char buf[256];
@@ -389,7 +393,11 @@ static float hints(float x, float y, const char *footer, int draw, float *countd
             cx += text_w(tok + 1, 1, 0);
         } else if (eq && eq != tok) {
             *eq = 0;
-            if (draw) cx += keycap(cx, y, tok); else cx += text_w(tok, 1, 0) + 18;
+            if (tok[0] == '^' && tok[1] && tok[2]) {   /* (a pad's button) */
+                if (draw) pad_button(cx, y + CELL_H / 2.0f, tok[1], tok[2]);
+                cx += PAD_BUTTON;
+            } else if (draw) cx += keycap(cx, y, tok);
+            else cx += text_w(tok, 1, 0) + 18;
             cx += 6;
             if (draw) text_ex(cx, y, 1, 0, M_DIM, M_DIM, 0, ":");
             cx += CELL_W + 12;
@@ -403,8 +411,13 @@ static float hints(float x, float y, const char *footer, int draw, float *countd
     return cx - x;
 }
 
-/* The screen behind the menu: plain, near black, its edges a little darker */
+static int over_game;   /* overlay_menu_over: the menu drawn over the game's picture */
+void overlay_menu_over(int on) { over_game = on; }
+
+/* The screen behind the menu: plain, near black, its edges a little darker - or over the game, the
+ * game's picture dimmed */
 static void backdrop(float w, float h) {
+    if (over_game) { quad4(0, 0, w, h, RGBA(0, 0, 0, 175), RGBA(0, 0, 0, 175), RGBA(0, 0, 0, 205), RGBA(0, 0, 0, 205)); return; }
     vgrad(0, 0, w, h, M_BG_TOP, M_BG_BOTTOM);
     unsigned dark = RGBA(0, 0, 0, 90), none = RGBA(0, 0, 0, 0);
     hgrad(0, 0, w * 0.15f, h, dark, none);
@@ -424,6 +437,45 @@ static void ring(float cx, float cy, float rx, float ry, float t, unsigned c) { 
         line(cx + cosf(a) * rx, cy + sinf(a) * ry, cx + cosf(b) * rx, cy + sinf(b) * ry, t, c);
     }
 }
+/* A pad's face button, PAD_BUTTON across, its left end at x and its middle at mid: kind X (Xbox and
+ * most pads: A B X Y on coloured buttons), P (PlayStation: cross, circle, square, triangle) or N
+ * (Nintendo: B A Y X, by position); where S, E, W or N, the button's place in the diamond */
+static void pad_button(float x, float mid, char kind, char where) {
+    float r = PAD_BUTTON / 2, cx = x + r;
+    int at = where == 'S' ? 0 : where == 'E' ? 1 : where == 'W' ? 2 : 3;
+    soft(cx - r * 0.5f, mid - r * 0.4f, r, r, 6, RGBA(0, 0, 0, 70));
+    if (kind == 'P') {
+        static const unsigned SYMBOL[4] = {RGBA(128, 176, 240, 255), RGBA(240, 112, 112, 255), RGBA(228, 136, 208, 255), RGBA(96, 212, 176, 255)};
+        unsigned c = SYMBOL[at];
+        disc(cx, mid, r, RGBA(118, 122, 132, 255));
+        disc(cx, mid, r - 2, RGBA(36, 38, 44, 255));
+        float s = r * 0.42f;
+        if (at == 0) { line(cx - s, mid - s, cx + s, mid + s, 3, c); line(cx - s, mid + s, cx + s, mid - s, 3, c); }
+        else if (at == 1) { disc(cx, mid, s * 1.1f + 1.3f, c); disc(cx, mid, s * 1.1f - 1.3f, RGBA(36, 38, 44, 255)); }
+        else if (at == 2) {
+            line(cx - s, mid - s, cx + s, mid - s, 2.6f, c); line(cx + s, mid - s, cx + s, mid + s, 2.6f, c);
+            line(cx + s, mid + s, cx - s, mid + s, 2.6f, c); line(cx - s, mid + s, cx - s, mid - s, 2.6f, c);
+        } else {
+            float t = s * 1.15f;
+            line(cx, mid - t, cx + t, mid + t * 0.75f, 2.6f, c); line(cx + t, mid + t * 0.75f, cx - t, mid + t * 0.75f, 2.6f, c);
+            line(cx - t, mid + t * 0.75f, cx, mid - t, 2.6f, c);
+        }
+        return;
+    }
+    static const char XBOX[4] = {'A', 'B', 'X', 'Y'}, NINTENDO[4] = {'B', 'A', 'Y', 'X'};
+    char letter[2] = {kind == 'N' ? NINTENDO[at] : XBOX[at], 0};
+    if (kind == 'N') {   /* (dark buttons, white letters) */
+        disc(cx, mid, r, RGBA(150, 154, 164, 255));
+        disc(cx, mid, r - 2, RGBA(44, 46, 52, 255));
+        text_ex(cx - CELL_W / 2.0f, mid - CELL_H / 2.0f, 1, 0, RGBA(246, 247, 250, 255), RGBA(246, 247, 250, 255), 0, letter);
+        return;
+    }
+    static const unsigned FILL[4] = {RGBA(84, 178, 64, 255), RGBA(222, 64, 56, 255), RGBA(48, 120, 226, 255), RGBA(236, 182, 28, 255)};
+    disc(cx, mid, r, FILL[at]);
+    disc(cx, mid - 1, r - 3, mix(FILL[at], RGBA(255, 255, 255, 255), 0.12f));
+    text_ex(cx - CELL_W / 2.0f, mid - CELL_H / 2.0f, 1, 0, RGBA(255, 255, 255, 255), RGBA(240, 240, 240, 255), 110, letter);
+}
+
 static void icon_globe(float cx, float cy, float r, unsigned c) {
     ring(cx, cy, r, r, 2.2f, c);
     ring(cx, cy, r * 0.42f, r, 2, c);
@@ -570,8 +622,16 @@ static void list_pages(float x, float y, float w, float h, float vx, float vw, i
     text_ex(cx - tw / 2, mid - CELL_H / 2.0f, 1, 1, M_TEXT, M_TEXT, 0, label);
 }
 
+/* A pad's shoulder button by the tabs, as a cap: its left end at x, its middle at mid */
+static void shoulder_cap(float x, float mid, const char *label) {
+    float w = text_w(label, 1, 0.5f) + 26, h = CELL_H + 8;
+    rbox_edge(x, mid - h / 2, w, h, 8, 2, RGBA(150, 154, 164, 255), RGBA(34, 36, 41, 255));
+    text_ex(x + 13, mid - CELL_H / 2.0f, 1, 0.5f, RGBA(244, 246, 250, 255), RGBA(244, 246, 250, 255), 0, label);
+}
+
 /* The start-up menu (gpu_menu.c), centred in the w x h back buffer: the pages' tabs (title: their
- * names, '\t' between them, '*' before the one shown - else a plain title), a row per shown item -
+ * names, '\t' between them, '*' before the one shown, then optionally '\t' and the key that changes
+ * pages, "Tab" when none, or a pad's two shoulder buttons "L|R" - else a plain title), a row per shown item -
  * its label, and its value: between arrows, or as it is when it starts with a control character
  * ('\1' information, '\2' a text field, '\3' a warning, '\4' good news, '\5' a note) - the selected
  * one outlined, the button row (Play) as a button, and the footer's hints (see hints). Each row's
@@ -636,12 +696,19 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         snprintf(buf, sizeof buf, "%s", title);
         char *name[2] = {buf, strchr(buf, '\t') + 1};
         name[1][-1] = 0;
+        /* a third field: the key that changes pages - "Tab" after the other page's name, or a pad's
+         * shoulder buttons ("LB|RB"), each in a cap beside the tabs */
+        char *key = strchr(name[1], '\t'), *right = NULL;
+        if (key) *key++ = 0;
+        if (!key || !*key) key = "Tab";
+        if ((right = strchr(key, '|'))) *right++ = 0;
         char shown_name[2][48];
         float tw = 0;
         for (int t = 0; t < 2; t++) {
             int on = name[t][0] == '*';
             if (on) snprintf(shown_name[t], sizeof shown_name[t], "[ %s ]", name[t] + 1);
-            else snprintf(shown_name[t], sizeof shown_name[t], "%s (Tab)", name[t]);
+            else if (right) snprintf(shown_name[t], sizeof shown_name[t], "%s", name[t]);
+            else snprintf(shown_name[t], sizeof shown_name[t], "%s (%s)", name[t], key);
             float l = text_w(shown_name[t], 1, 1) + 56;
             if (l > tw) tw = l;
         }
@@ -656,6 +723,11 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
             }
             unsigned c = on ? M_GREEN : M_DIM;
             text_ex(tx + (tw - text_w(shown_name[t], 1, 1)) / 2, y + 2 + (th - CELL_H) / 2 - 1, 1, 1, c, c, 0, shown_name[t]);
+        }
+        if (right) {   /* the shoulder buttons' caps: the left one before the tabs, the right one after */
+            float mid = y + (th + 4) / 2;
+            shoulder_cap(tx0 - 4 - 16 - (text_w(key, 1, 0.5f) + 26), mid, key);
+            shoulder_cap(tx0 + 2 * tw + 4 + 16, mid, right);
         }
     } else text_c(W / 2, y + (tabs_h - CELL_H) / 2, 1, 0, M_TEXT, title ? title : "");
     y = iy + 10;

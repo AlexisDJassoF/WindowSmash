@@ -16,6 +16,8 @@
 #include "gpu_fsr.h"
 #include "gpu_scale.h"
 #include "gpu_overlay.h"
+#include "gpu_menu.h"
+#include "gpu_overlay_quads.h"
 #include "net.h"
 #include "pad.h"
 #include "gpu_shader.h"
@@ -3758,6 +3760,8 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
                     display_operation_mode() == OP_HANDHELD ? "Handheld (720p)" : "Docked (1080p)", button);
         display_note_bar_button(button[0], button[1], button[2], button[3]);
     }
+    if (menu_modal_build(back_desc.Width, back_desc.Height))   /* (F9's Network window, over everything) */
+        overlay_draw_built(dev, ctx, rtv, 0, 0, back_desc.Width, back_desc.Height);
 
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(back);

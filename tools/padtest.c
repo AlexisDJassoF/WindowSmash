@@ -7,7 +7,10 @@
  * Exit code 0 when every check passes. */
 #include "../runtime/hle_pad.c"
 
-void gfx_hotkey(int n) { (void)n; }   /* (the renderer's, which this test has not) */
+void gfx_hotkey(int n) { (void)n; }   /* (the renderer's and the menus', which this test has not) */
+volatile int menu_modal, menu_device;
+void menu_input(int event, int x, int y) { (void)event; (void)x; (void)y; }
+void menu_modal_toggle(void) {}
 
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)

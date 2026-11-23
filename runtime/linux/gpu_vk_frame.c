@@ -19,6 +19,7 @@
 
 #include "debug_profile.h"
 #include "display.h"
+#include "gpu_menu.h"
 #include "gpu_overlay_quads.h"
 
 void *rt_window(void);
@@ -425,6 +426,7 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
         vk_overlay_draw(&t, 0, 0, t.w, t.h);
         display_note_bar_button(button[0], button[1], button[2], button[3]);
     }
+    if (menu_modal_build(t.w, t.h)) vk_overlay_draw(&t, 0, 0, t.w, t.h);   /* (F9's Network window, over everything) */
     u64 ending_at = rt_now_ns();
     vk_frame_end(&t);
     u64 now = rt_now_ns();

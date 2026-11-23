@@ -48,6 +48,12 @@
 #define NET_FIND_ANSWER_SIZE (NET_FIND_SIZE + 2)
 
 void net_stop(void);                 /* leave the relay and close the router's port (before the program starts again) */
+/* The network as the SSBU_NET_* variables ask for it now (net_settings_apply), while the game runs:
+ * another room or relay joined, this PC's relay started or stopped, or offline. LAN mode, to or from,
+ * needs the program started again (the game's sockets are other ones); and not while the game is in
+ * a local wireless network (its players would be cut off): left as it is then. */
+enum { NET_SWITCH_DONE, NET_SWITCH_BUSY, NET_SWITCH_RESTART };
+int net_switch(void);
 
 int net_configured(void);            /* netplay asked for (host or join) */
 int net_log(void);                   /* SSBU_NET_LOG */

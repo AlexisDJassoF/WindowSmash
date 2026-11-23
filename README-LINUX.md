@@ -157,7 +157,10 @@ SDL mappings for pads SDL doesn't know.
 | F6 | 10-second profile (`build/profile_*.txt`) |
 | F7 | Switch between docked (1080p) and handheld (720p) while playing; the new mode shows on screen for 2 seconds |
 | F8, twice within 3 seconds | Start the game again on the settings menu's **Network** page, to host, join or go back to what the launcher chose (the match in progress ends) |
+| F9 (or Select + Start on a controller) | The **Network** window over the game: join a room from the list, host one or go offline without leaving the game (Enter / the south button applies, Esc / F9 / the east button closes; the pads and keyboard are the window's while it is open). The game starts again only for a change to or from LAN mode. Not while the game is in a Local Wireless room: leave it first |
 | F11 or Alt+Enter | Switch between a window and full screen |
+
+The settings menu's hints name the keys, or the buttons of the controller used last (Xbox, PlayStation or Nintendo names).
 
 In a window, a bar above the picture shows the mode: click it to switch, as F7 does. It isn't
 there in full screen.
@@ -175,7 +178,7 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 | Upscaling | **Linear** or **FSR** (AMD FidelityFX Super Resolution 1): how the picture is enlarged to a larger window. FSR keeps edges sharp; it is meant for Handheld in a 1080p (or larger) full screen. |
 | Sharpness | FSR's sharpening, 0.0 (the most) to 2.0. Only with FSR. |
 | VSync | **On**: every frame at the monitor's next refresh, no tearing. **Off**: shown the moment it's ready (less latency; may tear in full screen). **VRR**: for FreeSync / G-Sync monitors. |
-| Window | **Windowed** or **Fullscreen**. |
+| Window | **Windowed**, **Windowed (Maximized)** (a window filling the screen but the desktop's panels) or **Fullscreen**. |
 | Renderer | **DXVK** (Direct3D 11 through DXVK, as the game has always run) or **Vulkan (experimental)**: the port's own Vulkan renderer, with fewer steps from the game's shaders to the graphics card. Experimental: DXVK stays the default. Choosing the other one restarts the game on it, straight past this menu. |
 
 Arrows or a pad's D-pad / left stick move and change; **Enter** or the pad's bottom button
@@ -226,7 +229,7 @@ log names each pad as it connects, with its type and GUID.
 
 | Setting | On Linux |
 | :--- | :--- |
-| `window`, `width`, `height` | `borderless` and `fullscreen` are both the desktop's full screen on the window's monitor, which keeps its resolution. The picture stays 16:9, with black bars when the window has another shape. Unlike on Windows, the window isn't held to 16:9 while you resize it. |
+| `window`, `width`, `height` | `maximized` is a window, maximized (F11 goes to full screen and back to it). `borderless` and `fullscreen` are both the desktop's full screen on the window's monitor, which keeps its resolution. The picture stays 16:9, with black bars when the window has another shape. Unlike on Windows, the window isn't held to 16:9 while you resize it. |
 | `mode = docked` (default) or `handheld` | What the menu's Mode sets; F7 switches while playing (not saved). `SSBU_MODE` overrides it. |
 | `upscale = linear` (default) or `fsr`, `sharpness = 0.2` | What the menu's Upscaling and Sharpness set. FSR is used only when the window is larger than the game's picture; `SSBU_UPSCALE` overrides it. |
 | `menu = 1` (default) | The start-up menu; `0` starts straight away. |

@@ -28,6 +28,9 @@ void overlay_build_progress(unsigned w, unsigned h, const char *title, unsigned 
 void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],
                         const int shown[], int selected, int button, const char *footer, float *rects, float *value_x);
 
+/* The next menus built drawn over the game's picture (dimming it), not over a screen of their own. */
+void overlay_menu_over(int on);
+
 /* F7's notice at the top of a w x h picture. */
 void overlay_build_notice(unsigned w, unsigned h, const char *note);
 

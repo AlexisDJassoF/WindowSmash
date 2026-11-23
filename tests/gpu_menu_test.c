@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "gpu_menu.h"
+#include "net.h"
 #include "net_discover.h"
 
 /* (what gpu_menu.c's screen loop calls, not used by the model) */
@@ -20,6 +21,13 @@ void net_stop(void) {}
 void net_discover_start(void) {}
 void net_discover_stop(void) {}
 void net_discover_refresh(void) {}
+int net_switch(void) { return NET_SWITCH_DONE; }
+void display_show_notice(const char *text, unsigned ms) { (void)text; (void)ms; }
+void overlay_menu_over(int on) { (void)on; }
+void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],
+                        const int shown[], int selected, int button, const char *footer, float *rects, float *value_x) {
+    (void)w; (void)h; (void)title; (void)n; (void)labels; (void)values; (void)shown; (void)selected; (void)button; (void)footer; (void)rects; (void)value_x;
+}
 int net_discover_found(NetChoice *out, int max) { (void)out; (void)max; return 0; }
 int net_discover_watch(const char *addr) { (void)addr; return NET_WATCH_NONE; }
 void net_discover_check_router(const char *port) { (void)port; }

@@ -4,7 +4,8 @@
  * with GetAsyncKeyState. Here the main thread creates an SDL window at start-up (DXVK presents
  * into it: its HWND is the SDL_Window) and then runs the event loop for good, keeping what the
  * rest of the runtime asks for up to date: the keyboard (behind GetAsyncKeyState), focus, the
- * debug keys F1-F6, F8 twice (the start-up menu's Network page, the program started again) and the
+ * debug keys F1-F6, F8 twice (the start-up menu's Network page, the program started again), F9 (the
+ * Network window over the game, gpu_menu.c) and the
  * window's close button. Game controllers are hle_pad.c's: its input
  * thread reads them (SDL starts them here, with their events off).
  *
@@ -49,17 +50,24 @@ static void note_refresh(void) {   /* the refresh rate of the window's monitor *
     if (i >= 0 && !SDL_GetCurrentDisplayMode(i, &dm)) display_note_refresh(dm.refresh_rate);
 }
 
-static const char *mode_name(int m) { return m == DISPLAY_WINDOWED ? "windowed" : m == DISPLAY_BORDERLESS ? "borderless" : "fullscreen"; }
+static const char *mode_name(int m) {
+    return m == DISPLAY_WINDOWED ? "windowed" : m == DISPLAY_MAXIMIZED ? "maximized" : m == DISPLAY_BORDERLESS ? "borderless" : "fullscreen";
+}
+static int framed(int m) { return m == DISPLAY_WINDOWED || m == DISPLAY_MAXIMIZED; }   /* (a window with its frame, and the mode bar) */
 
 #define BAR_PX 32   /* the mode bar at the top of a window (gpu_d3d11.c draws it; its button is F7) */
 
 static void set_mode(int m) {
     if (m == mode) return;
     mode = m;
-    display_note_bar(m == DISPLAY_WINDOWED ? BAR_PX : 0);
-    if (SDL_SetWindowFullscreen(window, m == DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP))
+    display_note_bar(framed(m) ? BAR_PX : 0);
+    if (SDL_SetWindowFullscreen(window, framed(m) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP)) {
         fprintf(stderr, "[display] cannot switch to %s: %s\n", mode_name(m), SDL_GetError());
-    else fprintf(stderr, "[display] %s\n", mode_name(m));
+        return;
+    }
+    if (m == DISPLAY_MAXIMIZED) SDL_MaximizeWindow(window);
+    else if (m == DISPLAY_WINDOWED) SDL_RestoreWindow(window);
+    fprintf(stderr, "[display] %s\n", mode_name(m));
 }
 
 /* (every turn of the event loop) the pointer hides over the focused window after 2 s still */
@@ -94,7 +102,7 @@ static SDL_Scancode scancode_of(int vk) {
 }
 
 SHORT GetAsyncKeyState(int vk) {
-    if (!keys) return 0;
+    if (!keys || menu_modal) return 0;   /* (F9's Network window open: the keyboard is its) */
     SDL_Scancode s = scancode_of(vk);
     int down = s != SDL_SCANCODE_UNKNOWN && (int)s < nkeys && keys[s];
     if (vk == VK_SHIFT) down |= keys[SDL_SCANCODE_RSHIFT];
@@ -124,11 +132,11 @@ int rt_window_init(void) {
     int width, height;
     display_window_size(&width, &height);
     mode = display_window_mode();
-    if (mode == DISPLAY_WINDOWED) height += BAR_PX;   /* (the mode bar above the picture: the picture keeps its size) */
-    display_note_bar(mode == DISPLAY_WINDOWED ? BAR_PX : 0);
+    if (framed(mode)) height += BAR_PX;   /* (the mode bar above the picture: the picture keeps its size) */
+    display_note_bar(framed(mode) ? BAR_PX : 0);
     window = SDL_CreateWindow("Super Smash Bros. Ultimate (native)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height,
                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
-                              (mode == DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP));
+                              (mode == DISPLAY_MAXIMIZED ? SDL_WINDOW_MAXIMIZED : framed(mode) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP));
     if (!window) {
         fprintf(stderr, "[gfx] cannot create the window: %s\n", SDL_GetError());
         return 0;
@@ -159,6 +167,16 @@ static void menu_pads_stop(void) {
     menu_pads_open = 0;
 }
 
+static int keys_used;   /* the keyboard or the mouse used in a menu */
+
+static int pad_kind(SDL_GameController *gp) {   /* (the menu's hints name its buttons) */
+    switch (SDL_GameControllerGetType(gp)) {
+    case SDL_CONTROLLER_TYPE_PS3: case SDL_CONTROLLER_TYPE_PS4: case SDL_CONTROLLER_TYPE_PS5: return MENU_PAD_PS;
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return MENU_PAD_NINTENDO;
+    default: return MENU_PAD_XBOX;
+    }
+}
+
 static void menu_pads_poll(Uint64 now) {
     static Uint64 scanned, held_since, repeated;
     static int held = -1, was_accept, was_back;
@@ -187,6 +205,7 @@ static void menu_pads_poll(Uint64 now) {
                     menu_pads[i] = SDL_GameControllerOpen(k);
                     open = 1;
                     const char *name = menu_pads[i] ? SDL_GameControllerName(menu_pads[i]) : NULL;
+                    if (menu_pads[i] && !keys_used) menu_device = pad_kind(menu_pads[i]);   /* (a pad, and no key pressed yet) */
                     fprintf(stderr, "[menu] controller: %s\n", menu_pads[i] ? (name ? name : "gamepad") : SDL_GetError());
                 }
         }
@@ -202,6 +221,9 @@ static void menu_pads_poll(Uint64 now) {
         else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || y > 16000) dir = MENU_DOWN;
         else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || x < -16000) dir = MENU_LEFT;
         else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || x > 16000) dir = MENU_RIGHT;
+        int any = 0;   /* (used now: the hints name this pad's buttons) */
+        for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && !any; b++) any = SDL_GameControllerGetButton(gp, (SDL_GameControllerButton)b);
+        if (any || x < -16000 || x > 16000 || y < -16000 || y > 16000) menu_device = pad_kind(gp);
         accept |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_A);   /* (positional: the south button) */
         back |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_B);     /* (the east one) */
         page |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) | SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
@@ -224,7 +246,8 @@ static void menu_pads_poll(Uint64 now) {
 
 /* 1 if the menu took the event */
 static int menu_event_of(const SDL_Event *e) {
-    if (!menu_active) return 0;
+    if (!menu_active && !menu_modal) return 0;
+    if (e->type == SDL_KEYDOWN || e->type == SDL_TEXTINPUT || e->type == SDL_MOUSEBUTTONDOWN) { menu_device = MENU_KEYS; keys_used = 1; }
     switch (e->type) {
     case SDL_KEYDOWN:
         switch (e->key.keysym.scancode) {
@@ -267,8 +290,8 @@ void rt_window_loop(int every, void (*status)(void)) {
         if (menu_active) menu_pads_poll(SDL_GetTicks64());
         else if (menu_pads_open) menu_pads_stop();
         static int text_on = -1;   /* typed text for the menu only (no IME in the game's way) */
-        if (window && text_on != (menu_active != 0)) {
-            text_on = menu_active != 0;
+        if (window && text_on != (menu_active || menu_modal)) {
+            text_on = menu_active || menu_modal;
             if (text_on) SDL_StartTextInput(); else SDL_StopTextInput();
         }
         int request = display_take_window_request();   /* (the menu's Window setting) */
@@ -304,6 +327,7 @@ void rt_window_loop(int every, void (*status)(void)) {
                 if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F6)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
                 if (e.key.keysym.scancode == SDL_SCANCODE_F7 && !menu_active && !precompile_active) display_toggle_operation_mode();
+                if (e.key.keysym.scancode == SDL_SCANCODE_F9 && !menu_active && !precompile_active) menu_modal_toggle();   /* (the Network window) */
                 if (e.key.keysym.scancode == SDL_SCANCODE_F8 && !menu_active && !precompile_active) {   /* twice: the Network page */
                     static Uint64 f8_at;
                     Uint64 t = SDL_GetTicks64();
@@ -314,7 +338,7 @@ void rt_window_loop(int every, void (*status)(void)) {
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 ||
                     (e.key.keysym.scancode == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT))) {
                     int full = display_window_mode() == DISPLAY_FULLSCREEN ? DISPLAY_FULLSCREEN : DISPLAY_BORDERLESS;
-                    set_mode(mode == DISPLAY_WINDOWED ? full : DISPLAY_WINDOWED);
+                    set_mode(framed(mode) ? full : display_window_mode() == DISPLAY_MAXIMIZED ? DISPLAY_MAXIMIZED : DISPLAY_WINDOWED);
                 }
                 break;
             }

@@ -150,6 +150,12 @@ void overlay_menu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTarge
     flush(ctx, rtv, 0, 0, w, h);
 }
 
+void overlay_draw_built(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w,
+                        unsigned h) {
+    if (!ready(dev)) return;
+    flush(ctx, rtv, x0, y0, w, h);
+}
+
 void overlay_notice(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h,
                     const char *note) {
     if (!ready(dev)) return;

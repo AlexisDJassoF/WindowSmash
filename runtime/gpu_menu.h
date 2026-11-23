@@ -20,6 +20,19 @@ void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the wind
  * returns only if it cannot. */
 void menu_restart_network(void);
 
+/* What the menus were used with last (the window's thread, and hle_pad.c in the game): the keyboard
+ * or the mouse, or a pad of a kind - their hints name its buttons (the south one plays, the east one
+ * goes back, the shoulders change pages). */
+enum { MENU_KEYS, MENU_PAD_XBOX, MENU_PAD_PS, MENU_PAD_NINTENDO };
+extern volatile int menu_device;
+
+/* In the game, F9: the Network page in a window over the picture, to change the room - or host one,
+ * or go offline - without leaving the game (net_switch; started again only for LAN mode). While it
+ * is open the keyboard and the pads are its (menu_input), not the game's. Linux. */
+extern volatile int menu_modal;
+void menu_modal_toggle(void);                    /* F9 (the window's thread) */
+int menu_modal_build(unsigned w, unsigned h);    /* the renderer, every frame: 1 when its quads are built (overlay_quads), w x h at 0, 0 */
+
 /* ---- the model, without a window (tests/test_gpu_menu.py drives it) ---------------------- */
 enum { ROW_MODE, ROW_SCALE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_RENDERER, ROW_PLAY, ROWS };
 enum { MENU_OPEN, MENU_PLAY, MENU_KEEP };   /* MENU_KEEP: started as display.ini was (Esc, or no input in time) */

@@ -27,6 +27,7 @@
 
 #include "gpu_backend.h"
 #include "gpu_menu.h"
+#include "gpu_overlay_quads.h"
 #include "gpu_scale.h"
 #include "net.h"
 #include "net_discover.h"
@@ -75,7 +76,10 @@ void menu_value(const Menu *m, int row, char *out, unsigned n) {
     case ROW_VSYNC:
         v = m->s.pacing == PACING_VSYNC ? "On" : m->s.pacing == PACING_VRR ? "VRR" : m->s.pacing == PACING_DISPLAY ? "Display" : "Off";
         break;
-    case ROW_WINDOW: v = m->s.window == 0 ? "Windowed" : m->s.window == 1 ? "Borderless" : "Fullscreen"; break;
+    case ROW_WINDOW:
+        v = m->s.window == DISPLAY_WINDOWED ? "Windowed" : m->s.window == DISPLAY_MAXIMIZED ? "Windowed (Maximized)"
+          : m->s.window == DISPLAY_BORDERLESS ? "Borderless" : "Fullscreen";
+        break;
     case ROW_RENDERER: v = m->s.renderer == RENDERER_VULKAN ? "Vulkan (experimental)" : "DXVK"; break;
     }
     if (row != ROW_PLAY && (m->locked & ROW_LOCK[row])) snprintf(out, n, "%s (set by %s)", v, ROW_VAR[row]);
@@ -99,7 +103,12 @@ static void step(Menu *m, int dir) {
         m->s.pacing = VSYNC_ORDER[((i + dir) % n + n) % n];
         break;
     }
-    case ROW_WINDOW: m->s.window = m->s.window == 0 ? 2 : 0; break;
+    case ROW_WINDOW: {   /* Windowed, Windowed (Maximized), Fullscreen (display.ini's borderless: as Fullscreen) */
+        static const int ORDER[] = {DISPLAY_WINDOWED, DISPLAY_MAXIMIZED, DISPLAY_FULLSCREEN};
+        int at = m->s.window == DISPLAY_WINDOWED ? 0 : m->s.window == DISPLAY_MAXIMIZED ? 1 : 2;
+        m->s.window = ORDER[(at + dir + 3) % 3];
+        break;
+    }
     case ROW_RENDERER: m->s.renderer = m->s.renderer == RENDERER_VULKAN ? RENDERER_DXVK : RENDERER_VULKAN; break;
     case ROW_SCALE: {
         int i = 0, n = (int)(sizeof SCALES / sizeof SCALES[0]);
@@ -151,14 +160,40 @@ void menu_tick(Menu *m, double now_s) {
 /* ---- the window's input --------------------------------------------------------------------- */
 typedef struct Input { int event, x, y; } Input;
 static Input queue[64];
-static volatile LONG head, tail;   /* (one writer, the window's thread; one reader, this one) */
+static LONG head, tail;   /* (writers: the window's thread and, in the game, hle_pad.c's; one reader) */
+static SRWLOCK queue_lock = SRWLOCK_INIT;
+volatile int menu_device;
 
 void menu_input(int event, int x, int y) {
-    LONG h = head;
-    if (h - tail >= 64) return;
-    queue[h & 63] = (Input){event, x, y};
-    MemoryBarrier();
-    head = h + 1;
+    AcquireSRWLockExclusive(&queue_lock);
+    if (head - tail < 64) queue[head++ & 63] = (Input){event, x, y};
+    ReleaseSRWLockExclusive(&queue_lock);
+}
+
+static int next_input(Input *in) {   /* the oldest input not taken yet: 0 when there is none */
+    AcquireSRWLockExclusive(&queue_lock);
+    int got = tail != head;
+    if (got) *in = queue[tail++ & 63];
+    ReleaseSRWLockExclusive(&queue_lock);
+    return got;
+}
+
+static void drop_inputs(void) {
+    AcquireSRWLockExclusive(&queue_lock);
+    tail = head;
+    ReleaseSRWLockExclusive(&queue_lock);
+}
+
+/* The keys or buttons the hints name: what plays (or applies), what goes back, what changes pages */
+static void device_keys(const char **accept, const char **back, const char **pages) {
+    switch (menu_device) {
+    /* (a pad's buttons drawn: "^" its kind and the button's place, south or east - overlay_quads' pad_button;
+     * pages: the two shoulders, '|' between) */
+    case MENU_PAD_XBOX: *accept = "^XS"; *back = "^XE"; *pages = "LB|RB"; return;
+    case MENU_PAD_PS: *accept = "^PS"; *back = "^PE"; *pages = "L1|R1"; return;
+    case MENU_PAD_NINTENDO: *accept = "^NS"; *back = "^NE"; *pages = "L|R"; return;   /* (positional: the south button is B) */
+    default: *accept = "Enter"; *back = "Esc"; *pages = "Tab"; return;
+    }
 }
 
 /* ---- starting again ------------------------------------------------------------------------ */
@@ -167,6 +202,7 @@ void menu_input(int event, int x, int y) {
  * menu's; display.ini names the new one now) without the menu, or on the Network page with it (F8 in
  * the game). The environment goes along: the network the menu set up, the launcher's kept aside.
  * Returns only if it cannot. */
+enum { AGAIN_RENDERER, AGAIN_NETWORK_PAGE, AGAIN_NETWORK };
 static void start_again(int network) {
     static char args[65536];
     char *argv[256];
@@ -177,12 +213,13 @@ static void start_again(int network) {
     for (size_t at = 0; at < n && argc < 255; at += strlen(args + at) + 1) argv[argc++] = args + at;
     argv[argc] = NULL;
     if (!argc) return;
-    if (network) {
+    if (network == AGAIN_NETWORK_PAGE) {
         setenv("SSBU_MENU", "1", 1);
         setenv("SSBU_MENU_PAGE", "network", 1);
-        net_stop();   /* (the relay told, the router's port closed: exit's work, which execv skips) */
     } else setenv("SSBU_MENU", "0", 1);
-    fprintf(stderr, network ? "[menu] F8: starting again on the Network page\n" : "[menu] another renderer: starting again on it\n");
+    if (network) net_stop();   /* (the relay told, the router's port closed: exit's work, which execv skips) */
+    fprintf(stderr, network == AGAIN_NETWORK_PAGE ? "[menu] F8: starting again on the Network page\n"
+                    : network ? "[menu] the network changed to or from LAN mode: starting again\n" : "[menu] another renderer: starting again on it\n");
     fflush(NULL);
     execv("/proc/self/exe", argv);
     fprintf(stderr, "[menu] cannot start again: %s\n", network ? "change the network at the next start" : "the renderer changes at the next start");
@@ -191,7 +228,7 @@ static void start_again(int network) {
 
 void menu_restart_network(void) {
 #ifndef _WIN32
-    start_again(1);
+    start_again(AGAIN_NETWORK_PAGE);
 #endif
 }
 
@@ -275,13 +312,11 @@ void menu_run(void) {
     float value_x = 0, nvalue_x = 0;
     memset(rects, 0, sizeof rects);
     memset(nrects, 0, sizeof nrects);
-    tail = head;
+    drop_inputs();
     menu_active = 1;
     while (m.state == MENU_OPEN) {
-        while (tail != head) {
-            Input in = queue[tail & 63];
-            MemoryBarrier();
-            tail++;
+        Input in;
+        while (next_input(&in)) {
             int ev = in.event;
             if (ev == MENU_CLICK) {
                 int tab = title_click(page ? nrects : rects, page ? NROWS : ROWS, (float)in.x, (float)in.y);
@@ -315,12 +350,17 @@ void menu_run(void) {
         if (network && seconds() - refreshed >= 0.5) { refreshed = seconds(); net_refresh(&nm); }
         menu_typing = page && net_menu_text_row(&nm);
         /* the footer, for overlay_build_menu: '\t' between hints, "key=what" a key's, '#' a countdown's fraction */
-        char footer[160];
+        char footer[160], tabs[48];
+        const char *accept, *back, *pages;
+        device_keys(&accept, &back, &pages);
+        int keys = menu_device == MENU_KEYS;
         double left = m.deadline - seconds();
-        if (!m.touched) snprintf(footer, sizeof footer, "#%.3f\tStarting in %.0f s - press any key to change settings", left / WAIT_S, left + 0.5);
-        else if (page) snprintf(footer, sizeof footer, "Type=edit\tEnter=play\tEsc=play without changes");
-        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\tEnter=play\tEsc=no changes");
-        else snprintf(footer, sizeof footer, "Enter=play\tEsc=play without changes");
+        if (!m.touched) snprintf(footer, sizeof footer, "#%.3f\tStarting in %.0f s - press %s to change settings", left / WAIT_S, left + 0.5,
+                                 keys ? "any key" : "a button");
+        else if (page) snprintf(footer, sizeof footer, "%s%s=%s\t%s=play without changes", keys ? "Type=edit\t" : "", accept, keys ? "play" : "select", back);
+        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\t%s=play\t%s=no changes", accept, back);
+        else snprintf(footer, sizeof footer, "%s=play\t%s=play without changes", accept, back);
+        snprintf(tabs, sizeof tabs, page ? "Display\t*Network\t%s" : "*Display\tNetwork\t%s", pages);
         if (!page) {
             const char *labels[ROWS], *vp[ROWS];
             char values[ROWS][64];
@@ -331,7 +371,7 @@ void menu_run(void) {
                 vp[r] = values[r];
                 shown[r] = menu_visible(&m, r);
             }
-            if (!gfx_menu("*Display\tNetwork", ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
+            if (!gfx_menu(tabs, ROWS, labels, vp, shown, m.row, ROW_PLAY, footer, (float *)rects, &value_x)) Sleep(30);
         } else {
             const char *labels[NROWS], *vp[NROWS];
             char values[NROWS][160];
@@ -342,7 +382,7 @@ void menu_run(void) {
                 vp[r] = values[r];
                 shown[r] = net_menu_visible(&nm, r);
             }
-            if (!gfx_menu("Display\t*Network", NROWS, labels, vp, shown, nm.row, NROW_PLAY, footer, (float *)nrects, &nvalue_x)) Sleep(30);
+            if (!gfx_menu(tabs, NROWS, labels, vp, shown, nm.row, NROW_PLAY, footer, (float *)nrects, &nvalue_x)) Sleep(30);
         }
         Sleep(16);
     }
@@ -364,6 +404,128 @@ void menu_run(void) {
     char launched[96];
     net_launch_describe(launched, sizeof launched);
     fprintf(stderr, "[menu] network: %s\n", nm.s.mode == NET_MODE_HOST ? "hosting a room" : nm.s.mode == NET_MODE_JOIN ? "joining a room" : launched);
-    if (m.state == MENU_PLAY && m.s.renderer != m.initial.renderer) start_again(0);
+    if (m.state == MENU_PLAY && m.s.renderer != m.initial.renderer) start_again(AGAIN_RENDERER);
 #endif
 }
+
+/* ---- in the game: F9's Network window ------------------------------------------------------ *
+ * The Network page over the game's picture (the renderer draws it, menu_modal_build), with Apply for
+ * Play: the settings saved as the start-up menu saves them, then put to work at once (net_switch) -
+ * another room joined, this PC's room started or stopped. LAN mode, to or from, starts the program
+ * again (without the menu: the settings are made); a local wireless network the game is in now is
+ * not cut off - the window says to leave it first. Esc, the pad's east button or F9 closes it. */
+volatile int menu_modal;
+
+void menu_modal_toggle(void) {
+#ifndef _WIN32
+    if (!menu_modal) drop_inputs();   /* (nothing typed before it opened) */
+    menu_modal = !menu_modal;
+#endif
+}
+
+#ifndef _WIN32
+static struct {
+    int open;               /* (the render thread's: set up, the search for rooms going) */
+    NetMenu nm;
+    MenuRect rects[NROWS];
+    float value_x;
+    double refreshed;
+    char note[128];         /* why Apply did nothing, shown in the footer */
+} modal;
+
+static void modal_open(void) {
+    NetSettings ns;
+    net_settings_load(&ns);   /* (the mode in use: SSBU_NET_MENU_MODE, net_settings_apply's) */
+    net_menu_init(&modal.nm, &ns);
+    net_launch_describe(modal.nm.launched, sizeof modal.nm.launched);
+    modal.nm.row = NROW_MODE;
+    memset(modal.rects, 0, sizeof modal.rects);
+    modal.value_x = 0;
+    modal.refreshed = 0;
+    modal.note[0] = 0;
+    net_discover_start();
+    modal.open = 1;
+    fprintf(stderr, "[menu] F9: the Network window\n");
+}
+
+static void modal_close(void) {
+    net_discover_stop();
+    modal.open = 0;
+    menu_modal = 0;
+    menu_typing = 0;
+}
+
+/* Apply: the settings saved and put to work */
+static void modal_apply(void) {
+    NetMenu *nm = &modal.nm;
+    NetSettings s = nm->s;
+    net_settings_remember(&s);
+    net_settings_apply(&s);
+    int r = net_switch();
+    if (r == NET_SWITCH_BUSY) {
+        net_settings_apply(&nm->initial);   /* (as it was: nothing changed) */
+        snprintf(modal.note, sizeof modal.note, "Leave the Local Wireless room in the game first");
+        return;
+    }
+    NetSettings keep = s;   /* (as the start-up menu saves: an unchanged mode leaves netplay.ini's) */
+    if (keep.mode == nm->initial.mode) keep.mode = keep.file_mode;
+    if (!net_settings_save(&keep)) fprintf(stderr, "[menu] cannot write netplay.ini\n");
+    if (r == NET_SWITCH_RESTART) {
+        display_show_notice("LAN mode changes: starting again...", 3000);
+        start_again(AGAIN_NETWORK);
+        snprintf(modal.note, sizeof modal.note, "Cannot start again: the change comes at the next start");
+        return;
+    }
+    char note[160], launched[96];
+    if (s.mode == NET_MODE_HOST) snprintf(note, sizeof note, "Hosting room %s on port %s", s.room, s.port);
+    else if (s.mode == NET_MODE_JOIN) snprintf(note, sizeof note, "Joining room %s at %s", s.room, s.host);
+    else { net_launch_describe(launched, sizeof launched); snprintf(note, sizeof note, "Network: %s", launched); }
+    display_show_notice(note, 4000);
+    modal_close();
+}
+
+int menu_modal_build(unsigned w, unsigned h) {
+    if (!menu_modal) {
+        if (modal.open) modal_close();
+        return 0;
+    }
+    if (!modal.open) modal_open();
+    NetMenu *nm = &modal.nm;
+    Input in;
+    while (menu_modal && next_input(&in)) {
+        int ev = in.event, mode = nm->s.mode;
+        if (ev == MENU_BACK) { modal_close(); return 0; }
+        if (ev == MENU_TAB) continue;
+        int r = ev == MENU_CLICK ? net_click(nm, modal.rects, modal.value_x, (float)in.x, (float)in.y) : net_menu_event(nm, ev, in.x);
+        if (ev != MENU_CLICK || r != NET_EV_NONE) modal.note[0] = 0;
+        if (r == NET_EV_REFRESH) { net_discover_refresh(); modal.refreshed = 0; }
+        if (nm->s.mode != mode) modal.refreshed = 0;
+        if (r == NET_EV_PLAY) { modal_apply(); if (!modal.open) return 0; }
+    }
+    if (seconds() - modal.refreshed >= 0.5) { modal.refreshed = seconds(); net_refresh(nm); }
+    menu_typing = net_menu_text_row(nm);
+
+    const char *labels[NROWS], *vp[NROWS];
+    char values[NROWS][200];
+    int shown[NROWS];
+    for (int r = 0; r < NROWS; r++) {
+        labels[r] = r == NROW_PLAY ? "Apply" : net_menu_label(r);
+        net_menu_value(nm, r, values[r], sizeof values[r]);
+        vp[r] = values[r];
+        shown[r] = net_menu_visible(nm, r);
+    }
+    const char *accept, *back, *pages;
+    device_keys(&accept, &back, &pages);
+    char footer[200];
+    if (modal.note[0]) snprintf(footer, sizeof footer, "!%s\t%s=close", modal.note, menu_device == MENU_KEYS ? "F9 / Esc" : back);
+    else if (menu_device == MENU_KEYS) snprintf(footer, sizeof footer, "Type=edit\tEnter=apply\tF9 / Esc=close");
+    else snprintf(footer, sizeof footer, "%s=select\t%s=close", accept, back);
+    overlay_menu_over(1);
+    overlay_build_menu(w, h, "Network - change it without leaving the game", NROWS, labels, vp, shown, nm->row, NROW_PLAY, footer,
+                       (float *)modal.rects, &modal.value_x);
+    overlay_menu_over(0);
+    return 1;
+}
+#else
+int menu_modal_build(unsigned w, unsigned h) { (void)w; (void)h; return 0; }
+#endif

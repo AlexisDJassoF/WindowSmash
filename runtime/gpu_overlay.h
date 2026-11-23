@@ -20,6 +20,10 @@ void overlay_menu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTarge
                   const char *const labels[], const char *const values[], const int shown[], int selected, int button, const char *footer,
                   float *rects, float *value_x);
 
+/* What overlay_build_* (gpu_overlay_quads.h) built last, drawn at (x0, y0, w x h). Leaves the pipeline state changed. */
+void overlay_draw_built(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w,
+                        unsigned h);
+
 /* A short notice (F7's mode) at the top of the picture at (x0, y0, w x h). Leaves the pipeline state changed. */
 void overlay_notice(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h,
                     const char *note);

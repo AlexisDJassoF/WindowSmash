@@ -15,7 +15,7 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
 int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result);
 #else
 /* Linux: linux/window.c makes the window with SDL from display.ini's settings and reports to it. */
-enum { DISPLAY_WINDOWED, DISPLAY_BORDERLESS, DISPLAY_FULLSCREEN };
+enum { DISPLAY_WINDOWED, DISPLAY_BORDERLESS, DISPLAY_FULLSCREEN, DISPLAY_MAXIMIZED };   /* (maximized: a window, filling the screen but its taskbar) */
 int display_window_mode(void);
 void display_window_size(int *width, int *height);
 int display_hide_cursor(void);
@@ -38,7 +38,7 @@ int display_renderer(void);                               /* Linux: display.ini'
 enum { RENDERER_DXVK, RENDERER_VULKAN };
 
 /* The start-up menu's settings (gpu_menu.c): window is the window mode (0 windowed, 1 borderless,
- * 2 fullscreen). LOCK_*: set by an environment variable, not the menu's to change. */
+ * 2 fullscreen, 3 windowed and maximized). LOCK_*: set by an environment variable, not the menu's to change. */
 typedef struct DisplaySettings { int window; OperationMode operation; Upscale upscale; float sharpness; Pacing pacing; int scale; int renderer; } DisplaySettings;
 enum { LOCK_WINDOW = 1, LOCK_MODE = 2, LOCK_UPSCALE = 4, LOCK_PACING = 8, LOCK_SCALE = 16, LOCK_RENDERER = 32 };
 void display_get_settings(DisplaySettings *now, DisplaySettings *file, unsigned *fixed);

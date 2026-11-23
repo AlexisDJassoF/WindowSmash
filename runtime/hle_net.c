@@ -516,6 +516,12 @@ HLE(_ZN2nn3ldn10DisconnectEv) { LDN_TRACE;
 }
 
 static int has_network(void) { return L.state == LS_AP_CREATED || L.state == LS_CONNECTED; }
+int ldn_busy(void) {   /* (net_switch: not while the game is in a local wireless network) */
+    AcquireSRWLockShared(&L.lock);
+    int busy = has_network();
+    ReleaseSRWLockShared(&L.lock);
+    return busy;
+}
 int ldn_in_network(u32 ip) {
     AcquireSRWLockShared(&L.lock);
     int in = has_network() && node_of(ip) >= 0;

@@ -303,12 +303,14 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
     }
 }
 
+static volatile LONG relay_stopping, relay_running;   /* (net_switch: the relay asked to stop; it runs) */
+
 static DWORD WINAPI relay_thread(LPVOID unused) {
     (void)unused;
     SetThreadDescription(GetCurrentThread(), L"netplay relay");
     static u8 buf[65536];
     u64 last_sweep = now_ms();
-    for (;;) {
+    while (!relay_stopping) {
         struct sockaddr_in from;
         socklen_t flen = sizeof from;
         int n = recvfrom(relay_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
@@ -320,6 +322,8 @@ static DWORD WINAPI relay_thread(LPVOID unused) {
                     if (now_ms() - rooms[i].members[j].seen > TIMEOUT_MS) drop_member(&rooms[i], j); else j++;
         }
     }
+    InterlockedExchange(&relay_running, 0);
+    return 0;
 }
 
 /* ---- UPnP: open the relay's port on the router ---------------------------------------- */
@@ -860,19 +864,54 @@ static void read_members(const u8 *p, int n) {
     InterlockedExchange(&members, count);
 }
 
+static volatile LONG rejoin;   /* (net_switch: another relay, room or name - or none) */
+static SOCKET client_socket(void);
+
+/* Another relay to join (net_switch): a socket of its own (one bound to loopback for this PC's relay
+ * reaches no other), and everything of the last one forgotten */
+static void reconnect(void) {
+    SOCKET fresh = client_socket(), old = client_sock;
+    InterlockedExchange(&joined, 0);
+    InterlockedExchange(&lobby, 0);
+    InterlockedExchange(&members, 0);
+    InterlockedExchange(&ping_ms, -1);
+    my_ip = 0;
+    clear_peers();
+    bound_loopback = 0;
+    local_ip = 0;
+    local_port = 0;
+    reject_text[0] = 0;
+    unsigned int r1, r2;
+    rand_s(&r1); rand_s(&r2);
+    nonce = (u64)r1 << 32 | r2;
+    cookie = 0;
+    unjoined_since = now_ms();
+    client_sock = fresh;
+    if (old != INVALID_SOCKET) { Sleep(50); closesocket(old); }   /* (a send already on its way finishes first) */
+}
+
 static DWORD WINAPI client_thread(LPVOID unused) {
     (void)unused;
     SetThreadDescription(GetCurrentThread(), L"netplay client");
     static u8 buf[65536];
-    while (!resolve_relay()) {
-        snprintf(reject_text, sizeof reject_text, "cannot find the relay %s", relay_text);
-        Sleep(3000);
-    }
-    reject_text[0] = 0;
-    u64 last_join = 0, last_ping = 0, last_tick = 0;
+    int resolved = 0;
+    u64 last_join = 0, last_ping = 0, last_tick = 0, last_resolve = 0;
     if (!direct_ok) fprintf(stderr, "[net] direct connections off (SSBU_NET_DIRECT=0): all through the relay\n");
     for (;;) {
         u64 t = now_ms();
+        if (rejoin) {
+            InterlockedExchange(&rejoin, 0);
+            reconnect();
+            resolved = 0;
+            last_resolve = last_join = last_ping = 0;
+        }
+        if (!configured || client_sock == INVALID_SOCKET) { Sleep(100); continue; }   /* (offline now: net_switch) */
+        if (!resolved) {
+            if (last_resolve && t - last_resolve < 3000) { Sleep(100); continue; }
+            last_resolve = t;
+            if (!(resolved = resolve_relay())) { snprintf(reject_text, sizeof reject_text, "cannot find the relay %s", relay_text); continue; }
+            reject_text[0] = 0;
+        }
         if (!joined && t - last_join >= 500) { send_join(); last_join = t; }
         if (joined && t - last_ping >= 1000) {
             u8 p[PING_EXT_SIZE];
@@ -1120,6 +1159,77 @@ static void lan_start(void) {
     CloseHandle(CreateThread(NULL, 0, lan_thread, NULL, 0, NULL));
 }
 
+static void socket_timeout(SOCKET s) {
+#ifdef _WIN32
+    DWORD timeout = 100;
+#else
+    struct timeval timeout = {0, 100000};
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
+}
+
+/* This PC's relay (hosting): its port, its thread, the router asked to open the port */
+static void relay_start(void) {
+    relay_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    const char *only = getenv("SSBU_NET_BIND");   /* (an address to listen on alone, e.g. 127.0.0.1 for tests) */
+    if (only && *only) inet_pton(AF_INET, only, &a.sin_addr);
+    if (relay_sock == INVALID_SOCKET || bind(relay_sock, (struct sockaddr *)&a, sizeof a)) {
+        snprintf(reject_text, sizeof reject_text, "cannot use port %u for the relay (in use?)", port);
+        fprintf(stderr, "[net] %s\n", reject_text);
+        if (relay_sock != INVALID_SOCKET) closesocket(relay_sock);
+        relay_sock = INVALID_SOCKET;
+        return;
+    }
+    socket_timeout(relay_sock);
+    no_connreset(relay_sock);
+    relay_stopping = 0;
+    InterlockedExchange(&relay_running, 1);
+    CloseHandle(CreateThread(NULL, 0, relay_thread, NULL, 0, NULL));
+    InterlockedExchange(&upnp_state, 0);
+    const char *upnp = getenv("SSBU_NET_UPNP");   /* 0: leave the router alone */
+    if (upnp && !strcmp(upnp, "0")) { lan_address(); upnp_state = 3; }
+    else CloseHandle(CreateThread(NULL, 0, upnp_thread, NULL, 0, NULL));
+    fprintf(stderr, "[net] hosting the relay on UDP port %u, room %s\n", port, room);
+}
+
+/* (net_switch) This PC's relay stopped: its players gone, its port closed on the router */
+static void relay_stop(void) {
+    InterlockedExchange(&relay_stopping, 1);
+    for (int i = 0; i < 50 && relay_running; i++) Sleep(10);   /* (its receive times out every 100 ms) */
+    if (relay_sock != INVALID_SOCKET) closesocket(relay_sock);
+    relay_sock = INVALID_SOCKET;
+    memset(rooms, 0, sizeof rooms);
+    upnp_close();
+    fprintf(stderr, "[net] stopped hosting on UDP port %u\n", port);
+}
+
+static SOCKET client_socket(void) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return s;
+    socket_timeout(s);
+    no_connreset(s);
+    int big = 1 << 20;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof big);
+    return s;
+}
+
+static volatile LONG client_running;
+static void client_start(void) {
+    unsigned int r1, r2;
+    rand_s(&r1); rand_s(&r2);
+    nonce = (u64)r1 << 32 | r2;
+    unjoined_since = now_ms();
+    client_sock = client_socket();
+    if (client_sock == INVALID_SOCKET) return;
+    InterlockedExchange(&client_running, 1);
+    CloseHandle(CreateThread(NULL, 0, client_thread, NULL, 0, NULL));
+    static int at_exit;
+    if (!at_exit++) atexit(leave);
+}
+
 /* Started on first use (the overlay asks every frame), once Winsock is up. */
 static void start(void) {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -1127,50 +1237,56 @@ static void start(void) {
     InitOnceBeginInitialize(&once, 0, &pending, NULL);
     if (!pending) return;
     configure();
-    if (configured) {
 #ifdef _WIN32
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-        DWORD timeout = 100;
-#else
-        struct timeval timeout = {0, 100000};
+    WSADATA wsa;   /* (even offline: the in-game Network window may go online later, net_switch) */
+    WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
+    if (configured) {
         if (lan_mode) { lan_start(); InitOnceComplete(&once, 0, NULL); return; }
-        unsigned int r1, r2;
-        rand_s(&r1); rand_s(&r2);
-        nonce = (u64)r1 << 32 | r2;
-        unjoined_since = now_ms();
-        if (hosting) {
-            relay_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            struct sockaddr_in a = {0};
-            a.sin_family = AF_INET;
-            a.sin_port = htons(port);
-            const char *only = getenv("SSBU_NET_BIND");   /* (an address to listen on alone, e.g. 127.0.0.1 for tests) */
-            if (only && *only) inet_pton(AF_INET, only, &a.sin_addr);
-            if (relay_sock == INVALID_SOCKET || bind(relay_sock, (struct sockaddr *)&a, sizeof a)) {
-                snprintf(reject_text, sizeof reject_text, "cannot use port %u for the relay (in use?)", port);
-                fprintf(stderr, "[net] %s\n", reject_text);
-            } else {
-                setsockopt(relay_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
-                no_connreset(relay_sock);
-                CloseHandle(CreateThread(NULL, 0, relay_thread, NULL, 0, NULL));
-                const char *upnp = getenv("SSBU_NET_UPNP");   /* 0: leave the router alone */
-                if (upnp && !strcmp(upnp, "0")) { lan_address(); upnp_state = 3; }
-                else CloseHandle(CreateThread(NULL, 0, upnp_thread, NULL, 0, NULL));
-                fprintf(stderr, "[net] hosting the relay on UDP port %u, room %s\n", port, room);
-            }
-        }
-        client_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (client_sock != INVALID_SOCKET) {
-            setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
-            no_connreset(client_sock);
-            int big = 1 << 20;
-            setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof big);
-            CloseHandle(CreateThread(NULL, 0, client_thread, NULL, 0, NULL));
-            atexit(leave);
-        }
+        if (hosting) relay_start();
+        client_start();
     }
     InitOnceComplete(&once, 0, NULL);
+}
+
+/* ---- changing the network while the game runs (the in-game Network window, gpu_menu.c) ---------- */
+int ldn_busy(void);   /* (hle_net.c) in a local wireless network now */
+
+int net_switch(void) {
+    start();   /* (as the game found it, if it has not asked yet: the environment as set now) */
+    static SRWLOCK switching = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&switching);
+    const char *h = getenv("SSBU_NET_HOST"), *r = getenv("SSBU_NET_RELAY"), *v;
+    int want_host = h && *h && strcmp(h, "0"), want_lan = (v = getenv("SSBU_NET_LAN")) && *v && strcmp(v, "0");
+    u16 want_port = (v = getenv("SSBU_NET_PORT")) && atoi(v) > 0 && atoi(v) < 65536 ? (u16)atoi(v) : NET_DEFAULT_PORT;
+    char want_room[NAME_LEN + 1] = "smash", want_name[NAME_LEN + 1], want_relay[256] = "";
+    if ((v = getenv("SSBU_NET_ROOM")) && *v) snprintf(want_room, sizeof want_room, "%s", v);
+    snprintf(want_name, sizeof want_name, "%s", (v = getenv("SSBU_NET_NAME")) && *v ? v : name);
+    if (want_host) snprintf(want_relay, sizeof want_relay, "127.0.0.1:%u", want_port);
+    else if (r && *r) snprintf(want_relay, sizeof want_relay, "%s", r);
+    int result = NET_SWITCH_DONE;
+    if (want_lan || lan_mode) result = want_lan && lan_mode ? NET_SWITCH_DONE : NET_SWITCH_RESTART;   /* (the game's sockets differ) */
+    else if (want_host == hosting && want_port == port && !strcmp(want_relay, relay_text) && !strcmp(want_room, room) && !strcmp(want_name, name))
+        result = NET_SWITCH_DONE;   /* (as it is) */
+    else if (ldn_busy()) result = NET_SWITCH_BUSY;
+    else {
+        leave();
+        if (hosting && (!want_host || want_port != port)) relay_stop();
+        hosting = want_host;
+        port = want_port;
+        snprintf(room, sizeof room, "%s", want_room);
+        snprintf(name, sizeof name, "%s", want_name);
+        snprintf(relay_text, sizeof relay_text, "%s", want_relay);
+        configured = relay_text[0] != 0;
+        if (hosting && !relay_running) relay_start();
+        if (configured && client_sock == INVALID_SOCKET && !client_running) client_start();
+        else InterlockedExchange(&rejoin, 1);
+        if (!configured) fprintf(stderr, "[net] offline now\n");
+        else if (hosting) fprintf(stderr, "[net] now hosting room %s on UDP port %u\n", room, port);
+        else fprintf(stderr, "[net] now joining %s (room %s)\n", relay_text, room);
+    }
+    ReleaseSRWLockExclusive(&switching);
+    return result;
 }
 
 void net_status(char *out, size_t n) {
