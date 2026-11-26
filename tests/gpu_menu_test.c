@@ -25,6 +25,9 @@ int net_switch(void) { return NET_SWITCH_DONE; }
 void display_show_notice(const char *text, unsigned ms) { (void)text; (void)ms; }
 void overlay_menu_over(int on) { (void)on; }
 void overlay_menu_tabs(float *x0, float *w, int *count) { *x0 = *w = 0; *count = 0; }
+void overlay_menu_dialog(const char *text, int selected) { (void)text; (void)selected; }
+void overlay_menu_dialog_rects(float r[8]) { memset(r, 0, 8 * sizeof *r); }
+const char *rt_data_dir = ".";
 const char *pad_default_ini(void) { return "[device default]\n"; }
 void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],
                         const int shown[], int selected, int button, const char *footer, float *rects, float *value_x) {

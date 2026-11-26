@@ -15,6 +15,8 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "mod_arc.h"
+#include "mod_scan.h"
 
 #define R_PATH_NOT_FOUND RESULT(2, 1)
 #define R_PATH_EXISTS RESULT(2, 2)
@@ -170,11 +172,72 @@ typedef struct Handle {
     int used, kind, mode;
     HANDLE host;              /* host file */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
+    int arc;                  /* rom:/data.arc with the mods in it (mod_arc_read) */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
 } Handle;
 static Handle handles[512];
 static CRITICAL_SECTION lock;
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+
+/* ---- the mods (mod_arc.h, openspec mod-support) ----------------------------------------- */
+/* At the first OpenFile of rom:/data.arc (after the start-up menu: the game's thread is running),
+ * the enabled mods in mods/ are read once and the archive the game sees is set up: from
+ * cache/mods/table.bin when nothing changed, else built. Without mods (or SSBU_MODS=0) data.arc is
+ * served as it is. */
+static const char *data_root(char *out, size_t n, const char *leaf);
+static struct {
+    ModArc arc;
+    ModArcIO io;
+    ModArcFile *files;
+    HANDLE *handles;       /* each mod file's, opened when first read */
+    u64 rom_at;            /* where data.arc starts in the RomFS image */
+} mods;
+static INIT_ONCE mods_once = INIT_ONCE_STATIC_INIT;
+
+static int mods_io_arc(void *ctx, u64 at, void *buf, u64 size) { (void)ctx; return rom_read(mods.rom_at + at, buf, size); }
+static int mods_io_mod(void *ctx, int f, u64 at, void *buf, u64 size) {
+    (void)ctx;
+    HANDLE h = mods.handles[f];
+    if (!h) {
+        EnterCriticalSection(&lock);
+        if (!(h = mods.handles[f])) {
+            h = CreateFileA(mods.files[f].src, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+            if (h == INVALID_HANDLE_VALUE) {
+                h = NULL;
+                fprintf(stderr, "[mods] cannot open %s\n", mods.files[f].src);
+            } else mods.handles[f] = h;
+        }
+        LeaveCriticalSection(&lock);
+        if (!h) return 0;
+    }
+    return pread_all(h, at, buf, size);
+}
+
+static BOOL CALLBACK mods_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
+    (void)o; (void)ctx;
+    const Handle *arc = p;
+    mods.rom_at = arc->offset;
+    mods.io = (ModArcIO){NULL, mods_io_arc, mods_io_mod};
+    ModList *l = calloc(1, sizeof *l);
+    if (!l) return TRUE;
+    char root[1024], cache[1024];
+    mod_scan(l, mod_root(root, sizeof root));
+    int n = mod_load_list(l, &mods.files);
+    mod_list_free(l);
+    free(l);
+    if (n <= 0) return TRUE;
+    mods.handles = calloc((size_t)n, sizeof *mods.handles);
+    if (!mods.handles) return TRUE;
+    data_root(cache, sizeof cache, "cache");
+    CreateDirectoryA(cache, NULL);
+    snprintf(cache + strlen(cache), sizeof cache - strlen(cache), "/mods");
+    CreateDirectoryA(cache, NULL);
+    snprintf(cache + strlen(cache), sizeof cache - strlen(cache), "/table.bin");
+    u64 t0 = GetTickCount64();
+    if (mod_arc_setup(&mods.arc, arc->size, &mods.io, mods.files, n, cache))
+        fprintf(stderr, "[mods] data.arc with %d mod files ready in %llu ms\n", n, (unsigned long long)(GetTickCount64() - t0));
+    return TRUE;
+}
 
 static BOOL CALLBACK init_fs(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     (void)o; (void)p; (void)ctx;
@@ -318,6 +381,14 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
         h.offset = rom.data + rom_file(f)->offset;
         h.size = rom_file(f)->size;
+        while (*rest == '/') rest++;
+        if (!strcmp(rest, "data.arc")) {
+            InitOnceExecuteOnce(&mods_once, mods_init, &h, NULL);
+            if (mods.arc.on && h.size == mods.arc.n) {
+                h.arc = 1;
+                h.size = mods.arc.total;
+            }
+        }
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
@@ -344,7 +415,12 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (offset < 0 || (u64)offset > total) return ~0ull;
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
-    int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
+    static int trace = -1;   /* debug: SSBU_ARC_TRACE=1 logs every data.arc read */
+    if (trace < 0) trace = getenv("SSBU_ARC_TRACE") != NULL;
+    if (trace && !h->host && (h->arc || size >= 0x1000)) fprintf(stderr, "[arc] %#llx +%#llx\n", (unsigned long long)offset, (unsigned long long)size);
+    int ok = h->host ? pread_all(h->host, (u64)offset, buf, size)
+           : h->arc ? mod_arc_read(&mods.arc, (u64)offset, buf, size, &mods.io)
+                    : rom_read(h->offset + (u64)offset, buf, size);
     return ok ? size : ~0ull;
 }
 

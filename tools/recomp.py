@@ -553,7 +553,7 @@ def link(dirs, exe, rt_dir=None):
         with open(stamp, encoding="utf-8") as f:
             old = f.read()
     every = old != flags
-    sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*|pad_menu)\.c", n)]
+    sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*|pad_menu|mod_\w*)\.c", n)]
     jobs = []
     for n in sources:
         src, obj = os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj")

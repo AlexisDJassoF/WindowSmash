@@ -31,6 +31,11 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
 /* The last menu's tabs, for clicks: the first one's left end, each one's width, how many (0: none). */
 void overlay_menu_tabs(float *x0, float *w, int *count);
 
+/* A question over the next menus built (the Mods page's delete): its title, '\t', the text; Cancel and
+ * Delete, selected 0 or 1. NULL: none. Its buttons' places (x, y, w, h each) from the last frame. */
+void overlay_menu_dialog(const char *text, int selected);
+void overlay_menu_dialog_rects(float r[8]);
+
 /* The next menus built drawn over the game's picture (dimming it), not over a screen of their own. */
 void overlay_menu_over(int on);
 

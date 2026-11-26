@@ -1,0 +1,540 @@
+"""The mods' data.arc (runtime/mod_arc.c) on the player's own data.arc: tests/mod_arc_test.c, built
+here with the host's C compiler, builds the archive for a mods folder made for each test (reading
+data.arc through this test, over pipes), and tools/arc.py reads the result back the way the game
+would: a mod's path gives the mod's bytes, the paths that shared its bytes give the originals, and
+without mods nothing is served. Skipped without the game's data (dump/modules/romfs.cfg)."""
+from pathlib import Path
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'tools'))
+CC = shutil.which('clang') or shutil.which('cc') or shutil.which('gcc')
+ROMFS_CFG = Path(os.environ.get('SSBU_ROMFS_CFG') or ROOT / 'dump' / 'modules' / 'romfs.cfg')
+
+# A model file many colors share (decision 13), and its fighter's other colors
+SHARED = 'fighter/mario/model/body/c{:02d}/model.numshb'
+TEXTURE = 'fighter/mario/model/body/c{:02d}/def_mario_001_col.nutexb'
+
+
+@unittest.skipUnless(sys.platform.startswith('linux') and CC and ROMFS_CFG.is_file(), 'Linux, a C compiler and the game\'s data')
+class ModArcTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from arc import Arc
+        from nca import RomfsImage, romfs_entries
+        cls.temp = tempfile.TemporaryDirectory(prefix='mod-arc-test-')
+        cls.exe = Path(cls.temp.name) / 'mod_arc_test'
+        objs = []
+        for src, flags in (('runtime/mod_zstd.c', ['-O2', '-w']), ('runtime/mod_arc.c', ['-O1']), ('runtime/mod_scan.c', ['-O1'])):
+            obj = Path(cls.temp.name) / (Path(src).stem + '.o')
+            r = subprocess.run([CC, *flags, '-D_GNU_SOURCE', '-I', str(ROOT / 'runtime'), '-c', str(ROOT / src), '-o', str(obj)],
+                               capture_output=True, text=True)
+            if r.returncode:
+                raise AssertionError(f'compiling {src} failed:\n{r.stdout}{r.stderr}')
+            objs.append(str(obj))
+        r = subprocess.run([CC, '-O1', '-D_GNU_SOURCE', '-I', str(ROOT / 'runtime'), str(ROOT / 'tests/mod_arc_test.c'), *objs,
+                            '-o', str(cls.exe)], capture_output=True, text=True)
+        if r.returncode:
+            raise AssertionError(f'compiling the test failed:\n{r.stdout}{r.stderr}')
+        cls.image = RomfsImage(str(ROMFS_CFG))
+        (cls.arc_off, cls.arc_size), = [(o, s) for p, o, s in romfs_entries(cls.image) if p == 'data.arc']
+        cls.arc = Arc(lambda off, size: cls.image.read(cls.arc_off + off, size))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory(prefix='mod-arc-run-')
+        self.addCleanup(d.cleanup)
+        self.dir = Path(d.name)
+        self.mods = self.dir / 'mods'
+        self.mods.mkdir()
+
+    def put(self, mod, path, data):
+        p = self.mods / mod / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    def build(self, cache='-', **env):
+        """(the archive's reader or None, the log)"""
+        out = self.dir / 'out.bin'
+        base = {**{k: v for k, v in os.environ.items() if not k.startswith('SSBU_')}, **env}
+        p = subprocess.Popen([str(self.exe), str(self.mods), str(self.arc_size), str(cache), str(out)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=base)
+        status = None
+        while True:
+            kind = p.stdout.read(1)
+            if kind == b'R':
+                at, size = struct.unpack('<QQ', p.stdout.read(16))
+                p.stdin.write(self.image.read(self.arc_off + at, size))
+                p.stdin.flush()
+            elif kind == b'E':
+                status = struct.unpack('<i', p.stdout.read(4))[0]
+                break
+            else:
+                break
+        log = p.stderr.read().decode()
+        p.wait(timeout=60)
+        self.assertEqual(p.returncode, 0, log)
+        self.assertIsNotNone(status, log)
+        if not status:
+            return None, log
+        blob = out.read_bytes()
+        self.assertEqual(blob[:8], b'SSBUMODT')
+        n, total = struct.unpack_from('<QQ', blob, 8)
+        header, tail = blob[24:24 + 0x38], blob[24 + 0x38:]
+        self.assertEqual(n, self.arc_size)
+        self.assertEqual(len(tail), total - n)
+
+        def read(off, size):
+            got = bytearray()
+            while size:
+                if off < 0x38:
+                    k = min(size, 0x38 - off); got += header[off:off + k]
+                elif off < n:
+                    k = min(size, n - off); got += self.image.read(self.arc_off + off, k)
+                else:
+                    k = size; got += tail[off - n:off - n + k]
+                    if off - n + k > len(tail):
+                        raise AssertionError(f'read past the archive: {off:#x} +{size:#x}')
+                off += k; size -= k
+            return bytes(got)
+        from arc import Arc
+        return Arc(read), log
+
+    def existing(self, pattern, colors=range(8)):
+        return [pattern.format(c) for c in colors if self.arc.locate(pattern.format(c))]
+
+    def test_no_mods_serves_nothing(self):
+        self.assertIsNone(self.build()[0])
+        self.put('.Disabled', SHARED.format(0), b'x' * 100)
+        self.assertIsNone(self.build()[0])
+
+    def test_empty_file_is_not_loaded(self):
+        path = SHARED.format(0)
+        if not self.arc.locate(path):
+            self.skipTest('no Mario c00 model')
+        self.put('Half Downloaded', path, b'')
+        check, log = self.build()
+        self.assertIsNone(check, log)
+        self.assertIn(f'[mods] Half Downloaded: {path} is empty; not loaded', log)
+
+    def test_shared_model_replaced_for_its_color_only(self):
+        paths = self.existing(SHARED)
+        if len(paths) < 2:
+            self.skipTest('no shared Mario model in this data.arc')
+        mine = os.urandom(len(self.arc.get(paths[0])) * 3)   # (three times the original's size)
+        self.put('Big Mario', paths[0], mine)
+        check, log = self.build()
+        self.assertIsNotNone(check, log)
+        self.assertEqual(check.get(paths[0]), mine, log)
+        for other in paths[1:]:
+            self.assertEqual(check.get(other), self.arc.get(other), f'{other} changed\n{log}')
+
+    def test_several_files_and_a_missing_path(self):
+        paths = self.existing(TEXTURE, [0]) + self.existing(SHARED, [0])
+        if len(paths) < 2:
+            self.skipTest('no Mario c00 files in this data.arc')
+        data = {p: os.urandom(1000 + 7 * i) for i, p in enumerate(paths)}
+        for p, d in data.items():
+            self.put('Skin', p, d)
+        self.put('Skin', 'fighter/mario/model/body/c00/extra.nutexb', b'new')
+        self.put('Skin', 'info.toml', b'display_name = "Skin"\n')
+        check, log = self.build()
+        self.assertIsNotNone(check, log)
+        for p, d in data.items():
+            self.assertEqual(check.get(p), d, p)
+        self.assertIn('[mods] Skin: fighter/mario/model/body/c00/extra.nutexb is not in data.arc', log)
+        self.assertNotIn('info.toml', log)
+        for p in self.existing(TEXTURE, range(1, 8)):
+            self.assertEqual(check.get(p), self.arc.get(p), p)
+
+    def test_unchanged_file_is_left(self):
+        path = SHARED.format(0)
+        if not self.arc.locate(path):
+            self.skipTest('no Mario c00 model')
+        self.put('Same', path, self.arc.get(path))
+        check, log = self.build()
+        self.assertIsNone(check, log)
+
+    def test_first_mod_wins(self):
+        path = SHARED.format(0)
+        if not self.arc.locate(path):
+            self.skipTest('no Mario c00 model')
+        self.put('A_Mario', path, b'a' * 500)
+        self.put('B_Mario', path, b'b' * 700)
+        check, log = self.build()
+        self.assertEqual(check.get(path), b'a' * 500)
+        self.assertIn("[mods] B_Mario: " + path + " is A_Mario's", log)
+
+    def test_color_move_from_folder_name(self):
+        src, dst = SHARED.format(0), SHARED.format(2)
+        if not (self.arc.locate(src) and self.arc.locate(dst)):
+            self.skipTest('no Mario c00/c02 models')
+        self.put('mario-moved-c02', src, b'moved' * 100)
+        check, log = self.build()
+        self.assertEqual(check.get(dst), b'moved' * 100, log)
+        self.assertEqual(check.get(src), self.arc.get(src))
+
+    def test_color_move_takes_voice_sounds_and_camera(self):
+        # A Lucina c03 mod moved to c05 (as aMiku would be): every path that names the color goes to c05.
+        # The model and the portrait are loaded there; the voice, sounds and camera are logged at c05
+        # (moved), loaded or not (a sound with no slot of its own stays the game's). Kirby's copy of
+        # Lucina moves with her too (tests/test_mod_menu.py).
+        loaded = ['fighter/lucina/model/body/c{:02d}/model.numdlb', 'ui/replace/chara/chara_3/chara_3_lucina_{:02d}.bntx']
+        moved = ['sound/bank/fighter_voice/vc_lucina_c{:02d}.nus3audio', 'sound/bank/fighter/se_lucina_c{:02d}.nus3audio',
+                 'camera/fighter/lucina/c{:02d}/j02win1.nuanmb']
+        if not all(self.arc.locate(f.format(c)) for f in loaded + moved for c in (3, 5)):
+            self.skipTest('Lucina\'s per-color files are not in this data.arc')
+        for i, f in enumerate(loaded + moved):
+            self.put('lucina-miku-c05', f.format(3), bytes([65 + i]) * 400)
+        check, log = self.build()
+        self.assertIsNotNone(check, log)
+        for i, f in enumerate(loaded):
+            self.assertEqual(check.get(f.format(5)), bytes([65 + i]) * 400, f.format(5))
+            self.assertEqual(check.get(f.format(3)), self.arc.get(f.format(3)), f.format(3))
+        for f in moved:
+            self.assertIn(f.format(5), log)
+            self.assertNotIn(f.format(3), log)
+
+    def test_regional_file_replaced_in_every_region(self):
+        # (SSBU_MODS_VOICES=0, where a sound with a free slot keeps being regional) region r reads
+        # info-to-data i2d + r: a mod's file must reach every region, not region 0 only (the others kept an
+        # empty placeholder and "Rabbit Hole" Palutena's match never loaded)
+        from arc import hash40, zstd_decompress
+        path = 'sound/bank/fighter_voice/vc_palutena_c01.tonelabel'
+        if not self.arc.locate(path):
+            self.skipTest('no Palutena voice in this data.arc')
+        mine = os.urandom(500)
+        self.put('Rabbit', path, mine)
+        check, log = self.build(SSBU_MODS_VOICES='0')
+        self.assertIsNotNone(check, log)
+        got = []
+        for (h, region), (off, stored, size, flags) in check.files_by_path().items():
+            if h != hash40(path):
+                continue
+            raw = check.read(off, stored)
+            got.append((region, (zstd_decompress(raw) if flags & 3 else raw) == mine))
+        self.assertEqual(len(got), self.arc.regions, got)
+        self.assertTrue(all(ok for _, ok in got), sorted(got))
+
+    def test_sound_pair_goes_in_together_or_not_at_all(self):
+        # (SSBU_MODS_VOICES=0) Mario's color 1 voice: the bank has a slot, the samples do not; the bank must
+        # not go in alone (the game's samples with the mod's bank, or the other way: the match never loaded)
+        from arc import hash40
+        base = 'sound/bank/fighter_voice/vc_mario_c00'
+        if not (self.arc.locate(base + '.nus3audio') and self.arc.locate(base + '.nus3bank')):
+            self.skipTest('no Mario voice in this data.arc')
+        self.put('Voice', base + '.nus3audio', os.urandom(5000))
+        self.put('Voice', base + '.nus3bank', os.urandom(700))
+        self.put('Voice', SHARED.format(0), b'm' * 300)   # (something else that loads)
+        check, log = self.build(SSBU_MODS_VOICES='0')
+        self.assertIn(f'[mods] Voice: {base}.nus3audio and its .nus3bank go together and the samples cannot be loaded; neither is', log)
+        self.assertIsNotNone(check, log)
+        for ext in ('.nus3audio', '.nus3bank'):
+            mine = {r: v[1:] for (h, r), v in check.files_by_path().items() if h == hash40(base + ext)}
+            orig = {r: v[1:] for (h, r), v in self.arc.files_by_path().items() if h == hash40(base + ext)}
+            self.assertEqual(mine, orig, ext)
+
+    def test_model_needing_a_new_texture_keeps_the_games(self):
+        # (Splatsune Inku: its material names textures it brings as new files; the game waited for them)
+        mat, mesh = 'fighter/mario/model/body/c00/model.numatb', SHARED.format(0)
+        if not (self.arc.locate(mat) and self.arc.locate(mesh)):
+            self.skipTest('no Mario c00 model')
+        self.put('Needs', mat, b'\x00' * 16 + b'def_mario_new_emi\x00' + b'\x00' * 14)
+        self.put('Needs', mesh, b'm' * 300)
+        self.put('Needs', 'fighter/mario/model/body/c00/def_mario_new_emi.nutexb', b't' * 100)
+        self.put('Stray', 'fighter/mario/model/body/c01/model.numatb', b'\x00' * 16 + b'nothing_new\x00' + b'\x00' * 4)
+        self.put('Stray', 'fighter/mario/model/body/c01/leftover.nutexb', b'x' * 50)   # (named by nothing: no effect)
+        check, log = self.build()
+        self.assertIn('[mods] Needs: fighter/mario/model/body/c00: its material needs def_mario_new_emi.nutexb, a new file', log)
+        self.assertNotIn('[mods] Stray: fighter/mario/model/body/c01: its material', log)
+        self.assertEqual(check.get(mesh), self.arc.get(mesh))
+        self.assertEqual(check.get('fighter/mario/model/body/c01/model.numatb'), b'\x00' * 16 + b'nothing_new\x00' + b'\x00' * 4)
+
+    def test_new_filedata_for_a_child_with_no_slot(self):
+        # mod-support 1.4h: Kirby's copy of Lucina's mask in color 6 shares color 1's and its slot (start
+        # + k) is another folder's file; it gets a new FileData of its own in its directory's folder
+        # (load type 1), read in the directory's bulk read; the colors it shared with keep the original.
+        # SSBU_MODS_FRESH=0 turns it off.
+        from arc import hash40
+        path = 'fighter/kirby/model/copy_lucina_mask/c{:02d}/model.numdlb'
+        if not self.arc.locate(path.format(5)):
+            self.skipTest('no Kirby copy of Lucina in this data.arc')
+        self.put('Mask', path.format(5), b'k' * 700)
+        check, log = self.build(SSBU_MODS_FRESH='0')
+        self.assertIsNone(check, log)
+        check, log = self.build()
+        self.assertIsNotNone(check, log)
+        self.assertIn('new FileData for children with no slot of their own', log)
+        self.assertEqual(check.get(path.format(5)), b'k' * 700)
+        for c in (0, 3):
+            self.assertEqual(check.get(path.format(c)), self.arc.get(path.format(c)))
+        pi = next(i for i in range(check.tab['paths'][2] - 1, -1, -1) if check._entry('paths', i, '<Q')[0] & ((1 << 40) - 1) == hash40(path.format(5)))
+        info = check._entry('info_indices', check._entry('paths', pi, '<Q')[0] >> 40, '<2I')[1]
+        folder, data, lt = check._entry('info_to_datas', check._entry('infos', info, '<4I')[2], '<3I')
+        self.assertEqual(lt >> 24, 1)
+        self.assertGreaterEqual(data, self.arc.tab['datas'][2])   # (a new FileData)
+
+    def test_sounds_get_no_new_filedata_with_voices_off(self):
+        # SSBU_MODS_VOICES=0: Lucina's color 6 voice has no slot, so the pair stays the game's
+        base = 'sound/bank/fighter_voice/vc_lucina_c05'
+        if not self.arc.locate(base + '.nus3audio'):
+            self.skipTest('no Lucina voices in this data.arc')
+        self.put('Voice', base + '.nus3audio', os.urandom(6000))
+        self.put('Voice', base + '.nus3bank', os.urandom(900))
+        check, log = self.build(SSBU_MODS_VOICES='0')
+        self.assertIsNone(check, log)
+        self.assertIn('go together and the samples cannot be loaded; neither is', log)
+
+    def test_crowd_cheer_stays_the_games(self):
+        base = 'sound/bank/fighter_voice/vc_palutena_cheer_c01'
+        if not self.arc.locate(base + '.nus3audio'):
+            self.skipTest('no Palutena cheer in this data.arc')
+        self.put('Rabbit', base + '.nus3audio', os.urandom(5000))
+        self.put('Rabbit', base + '.nus3bank', os.urandom(700))
+        check, log = self.build()
+        self.assertIsNone(check, log)
+        self.assertIn(f'[mods] Rabbit: {base}.nus3audio: a crowd cheer, not loaded yet', log)
+
+    def test_voices_become_own_files_like_a_koopalings(self):
+        # (mod-support 1.4i) the voice pair of a color with no slot becomes the color's own
+        # files the way a Koopaling's voice is in data.arc: load type 1, one entry, not regional (flags 0x10)
+        from arc import hash40
+        base = 'sound/bank/fighter_voice/vc_lucina_c05'
+        if not self.arc.locate(base + '.nus3audio'):
+            self.skipTest('no Lucina voices in this data.arc')
+        audio, bank = os.urandom(6000), os.urandom(900)
+        self.put('Voice', base + '.nus3audio', audio)
+        self.put('Voice', base + '.nus3bank', bank)
+        check, log = self.build()
+        self.assertIsNotNone(check, log)
+        for path, mine in ((base + '.nus3audio', audio), (base + '.nus3bank', bank)):
+            self.assertEqual(check.get(path), mine, path)
+            pi = next(i for i in range(check.tab['paths'][2] - 1, -1, -1) if check._entry('paths', i, '<Q')[0] & ((1 << 40) - 1) == hash40(path))
+            info = check._entry('info_indices', check._entry('paths', pi, '<Q')[0] >> 40, '<2I')[1]
+            _p, _ii, i2d, flags = check._entry('infos', info, '<4I')
+            self.assertEqual(flags & 0x308000, 0, f'{path}: flags {flags:#x}')
+            self.assertEqual(check._entry('info_to_datas', i2d, '<3I')[2] >> 24, 1, path)
+        for c in (0, 3):
+            p = f'sound/bank/fighter_voice/vc_lucina_c{c:02d}.nus3audio'
+            self.assertEqual(check.files_by_path().get((hash40(p), 1)), self.arc.files_by_path().get((hash40(p), 1)), p)
+
+    def test_param_file_of_another_version_stays_the_games(self):
+        # Splatsune Inku's fighter/common/param/effect.prc came from an older game: one of the game's param
+        # names missing (and every index after it shifted); with it the match never loaded
+        path = 'fighter/common/param/effect.prc'
+        if not self.arc.locate(path):
+            self.skipTest('no effect.prc in this data.arc')
+        orig = self.arc.get(path)
+        n = struct.unpack_from('<I', orig, 8)[0]
+        older = orig[:8] + struct.pack('<I', n - 8) + orig[12:16 + n - 8] + orig[16 + n:]   # (its last name gone)
+        self.put('Old', path, older)
+        check, log = self.build()
+        self.assertIsNone(check, log)
+        self.assertIn(f'[mods] Old: {path} was made for another version of the game (1 of its names missing)', log)
+        tweaked = orig[:-1] + bytes([orig[-1] ^ 1])   # (every name there, a value changed)
+        self.put('Old', path, tweaked)
+        check, log = self.build()
+        self.assertEqual(check.get(path), tweaked, log)
+
+    def test_folders_last_file_stays_last(self):
+        # Splatsune Inku's copy_inkling_gun texture: its slot came right after the last file of Inkling c06's
+        # folder, so it was laid out past it; the game reads a folder to the end of its last file, never got
+        # the texture and the match never loaded. A file going there goes before the last file instead.
+        from arc import hash40
+        path = 'fighter/inkling/model/copy_inkling_gun/c06/def_inkling_girl_002_col.nutexb'
+        if not self.arc.locate(path):
+            self.skipTest('no Inkling copy gun in this data.arc')
+        mine = os.urandom(1000)
+        self.put('Ink', path, mine)
+        check, log = self.build()
+        self.assertEqual(check.get(path), mine, log)
+        pi = next(i for i in range(check.tab['paths'][2] - 1, -1, -1) if check._entry('paths', i, '<Q')[0] & ((1 << 40) - 1) == hash40(path))
+        info = check._entry('info_indices', check._entry('paths', pi, '<Q')[0] >> 40, '<2I')[1]
+        folder, data, _ = check._entry('info_to_datas', check._entry('infos', info, '<4I')[2], '<3I')
+        ends = {}
+        for i in range(check.tab['info_to_datas'][2]):
+            f, d, _ = check._entry('info_to_datas', i, '<3I')
+            if f == folder:
+                off4, stored, _, _ = check._entry('datas', d, '<4I')
+                if stored:
+                    ends[d] = off4 * 4 + stored
+        self.assertLess(ends[data], max(ends.values()), 'the mod file is the folder\'s last')
+
+    def test_new_files_from_config_json(self):
+        # mod-support 1.4c: Splatsune Inku's material needs two textures that are not in data.arc; its
+        # config.json adds them to Inkling c06's directory (new-dir-files). Each gets a path, FileInfoIndex,
+        # FileInfo, info-to-data and FileData; the directory's children move past the table's FileInfo,
+        # the new ones after them. The model loads with them (no "needs a new file" rule).
+        import json
+        from arc import hash40
+        new = 'fighter/inkling/model/body/c{:02d}/def_inkling_c{:02d}_001_emi.nutexb'
+        mat = 'fighter/inkling/model/body/c06/model.numatb'
+        if not self.arc.locate(mat) or self.arc.locate(new.format(6, 6)):
+            self.skipTest('no Inkling c06 model in this data.arc')
+        tex, material = os.urandom(3000), b'\x00' * 16 + b'def_inkling_c06_001_emi\x00' + b'\x00' * 8
+        self.put('Ink', new.format(6, 6), tex)
+        self.put('Ink', mat, material)
+        self.put('Ink', 'fighter/inkling/model/body/c06/not_listed.nutexb', b'n' * 40)
+        self.put('Ink', 'config.json', json.dumps({'new-dir-files': {'fighter/inkling/c06': [new.format(6, 6), new.format(6, 99)]}}).encode())
+        check, log = self.build()
+        self.assertIsNotNone(check, log)
+        self.assertNotIn('its material needs', log)
+        self.assertIn('[mods] Ink: 1 new files in fighter/inkling/c06', log)
+        self.assertIn('not_listed.nutexb is not in data.arc', log)
+        self.assertEqual(check.get(new.format(6, 6)), tex, log)
+        self.assertEqual(check.get(mat), material)
+        # the directory's children: its old ones (the same files) and the new one, each a FileInfoIndex of it
+        dirs = {check._entry('dir_hash_to_info', i, '<Q')[0] & ((1 << 40) - 1): check._entry('dir_hash_to_info', i, '<Q')[0] >> 40
+                for i in range(check.tab['dir_hash_to_info'][2])}
+        d = dirs[hash40('fighter/inkling/c06')]
+        old_start, old_count = self.arc._entry('dirs', d, '<QQQQII')[4:]
+        start, count = check._entry('dirs', d, '<QQQQII')[4:]
+        self.assertEqual(count, old_count + 1)
+        self.assertGreaterEqual(start, self.arc.tab['infos'][2])
+        names = [check._entry('infos', start + k, '<4I')[0] for k in range(count)]
+        self.assertEqual(names[:old_count], [self.arc._entry('infos', old_start + k, '<4I')[0] for k in range(old_count)])
+        pi, ii, i2d, flags = check._entry('infos', start + old_count, '<4I')
+        self.assertEqual(check._entry('paths', pi, '<Q')[0] & ((1 << 40) - 1), hash40(new.format(6, 6)))
+        self.assertEqual(check._entry('info_indices', ii, '<2I'), (d, start + old_count))
+        folder, data, lt = check._entry('info_to_datas', i2d, '<3I')
+        self.assertEqual(lt >> 24, 1)
+        self.assertEqual(flags, 0x1000)
+        # (its folder's FileData moved past the table's with it: the new one at start + k, in the range)
+        fstart, fcount = check._entry('folder_offsets', folder, '<QIIII')[3:]
+        self.assertEqual((data, fcount), (fstart + old_count, old_count + 1))
+        # (the game reads a folder forward, child by child: its files' offsets increase in child order, the
+        # new ones last, and none goes past the folder's end)
+        ends = []
+        for k in range(count):
+            f, dd, _ = check._entry('info_to_datas', check._entry('infos', start + k, '<4I')[2], '<3I')
+            off4, stored, _, _ = check._entry('datas', dd, '<4I')
+            if f == folder and stored:
+                ends.append((off4 * 4, off4 * 4 + stored))
+        self.assertEqual(ends, sorted(ends))
+        self.assertLessEqual(ends[-1][1], check._entry('folder_offsets', folder, '<QIII')[2])
+        self.assertEqual(ends[-1][1], max(e for _, e in ends))   # (a texture: as every .nutexb of data.arc)
+        for k in (0, old_count // 2, old_count - 1):   # (the moved children's FileInfoIndex follow them)
+            own_ii = check._entry('infos', start + k, '<4I')[1]
+            dd, info = check._entry('info_indices', own_ii, '<2I')
+            if dd == d:
+                self.assertEqual(info, start + k)
+        for p in ('fighter/inkling/model/body/c06/model.numdlb', 'fighter/inkling/model/body/c05/model.numatb'):
+            if self.arc.locate(p):
+                self.assertEqual(check.get(p), self.arc.get(p), p)
+        check, log = self.build(SSBU_MODS_NEW='0')
+        self.assertIn('a new file (SSBU_MODS_NEW=0: not loaded)', log)
+        self.assertIn('its material needs def_inkling_c06_001_emi.nutexb, a new file config.json does not add', log)
+        self.assertIsNone(check, log)   # (then the material stays the game's too: nothing left to serve)
+
+    def test_new_files_move_with_the_color(self):
+        import json
+        new = 'fighter/inkling/model/body/c{:02d}/def_inkling_c06_001_emi.nutexb'
+        if not self.arc.locate('fighter/inkling/model/body/c07/model.numatb') or self.arc.locate(new.format(7)):
+            self.skipTest('no Inkling c07 model in this data.arc')
+        tex = os.urandom(2000)
+        self.put('Ink-c07', new.format(6), tex)
+        self.put('Ink-c07', 'fighter/inkling/model/body/c06/model.numatb', b'\x00' * 16 + b'def_inkling_c06_001_emi\x00')
+        self.put('Ink-c07', 'config.json', json.dumps({'new-dir-files': {'fighter/inkling/c06': [new.format(6)]}}).encode())
+        check, log = self.build()
+        self.assertIn('1 new files in fighter/inkling/c07', log)
+        self.assertEqual(check.get(new.format(7)), tex, log)
+        self.assertIsNone(check.locate(new.format(6)))
+
+    def test_own_file_not_at_its_slot_is_replaced_where_it_is(self):
+        # Wii Fit c01 keeps 407 of its own files (load type 1) at a FileData that is not start + k, its
+        # voice among them; they were skipped ("load type 1; skipped"), now replaced in place
+        base = 'sound/bank/fighter_voice/vc_wiifit_c01'
+        if not self.arc.locate(base + '.nus3audio'):
+            self.skipTest('no Wii Fit voices in this data.arc')
+        audio, bank = os.urandom(7000), os.urandom(800)
+        self.put('Miku', base + '.nus3audio', audio)
+        self.put('Miku', base + '.nus3bank', bank)
+        check, log = self.build()
+        self.assertNotIn('skipped', log)
+        self.assertEqual(check.get(base + '.nus3audio'), audio, log)
+        self.assertEqual(check.get(base + '.nus3bank'), bank, log)
+        from arc import hash40
+        for path in (base + '.nus3audio', base + '.nus3bank'):   # (not regional any more: as a Koopaling's voice)
+            pi = next(i for i in range(check.tab['paths'][2] - 1, -1, -1) if check._entry('paths', i, '<Q')[0] & ((1 << 40) - 1) == hash40(path))
+            info = check._entry('info_indices', check._entry('paths', pi, '<Q')[0] >> 40, '<2I')[1]
+            self.assertEqual(check._entry('infos', info, '<4I')[3] & 0x8000, 0, path)
+        other = hash40('sound/bank/fighter_voice/vc_wiifit_c00.nus3audio')
+        self.assertEqual(check.files_by_path().get((other, 1)), self.arc.files_by_path().get((other, 1)))
+
+    def test_voice_bank_gets_the_games_id(self):
+        # Miku Fitness Boxing's banks for Wii Fit's male colors are copies of the female's: ID 4048 where
+        # the game looks for 4049 (vc_wiifit_c01), and the voice never played. As ARCropolis does, the
+        # mod's bank is served with the game's ID, the rest of it as it is.
+        from arc import hash40, zstd_decompress
+        base = 'sound/bank/fighter_voice/vc_wiifit_c{:02d}'
+        fb = self.arc.files_by_path()
+
+        def game(path):
+            loc = fb.get((hash40(path), 1)) or fb.get((hash40(path), 0))
+            if not loc or not loc[1]:
+                return None
+            raw = self.arc.read(loc[0], loc[1])
+            return zstd_decompress(raw) if loc[3] & 3 else raw
+        female, male = game(base.format(0) + '.nus3bank'), game(base.format(1) + '.nus3bank')
+        if not female or not male:
+            self.skipTest('no Wii Fit voices in this data.arc')
+        i, j = female.find(b'vc_wiifit\x00'), male.find(b'vc_wiifit_c01\x00')
+        self.assertGreater(i, 0)
+        self.assertGreater(j, 0)
+        self.put('Miku', base.format(1) + '.nus3audio', os.urandom(5000))
+        self.put('Miku', base.format(1) + '.nus3bank', female)
+        check, log = self.build()
+        self.assertIn(f'[mods] Miku: {base.format(1)}.nus3bank: served with the game\'s bank name and ID ("vc_wiifit_c01"', log)
+        got = check.get(base.format(1) + '.nus3bank')
+
+        def sections(b):   # (NUS3, size, BANKTOC, TOC size, count, (magic, size)..., then each section)
+            tsize, n = struct.unpack_from('<II', b, 16)
+            out, p = {}, 20 + tsize
+            for k in range(n):
+                magic, size = struct.unpack_from('<4sI', b, 24 + 8 * k)
+                self.assertEqual(b[p:p + 4], magic)
+                out[magic] = b[p + 8:p + 8 + size]
+                p += 8 + size
+            self.assertEqual(p, len(b))
+            self.assertEqual(struct.unpack_from('<I', b, 4)[0], len(b) - 8)
+            return out
+        g, m, f = sections(got), sections(male), sections(female)
+        self.assertEqual(g[b'BINF'], m[b'BINF'])   # (the game's name and ID)
+        self.assertEqual(list(g), list(f))
+        for k in f:
+            if k not in (b'BINF', b'JUNK'):
+                self.assertEqual(g[k], f[k], k)   # (the rest the mod's)
+        self.build(cache=self.dir / 'cache.bin')
+        check3, log3 = self.build(cache=self.dir / 'cache.bin')   # (from the cache: the same)
+        self.assertIn('the table from', log3)
+        self.assertEqual(check3.get(base.format(1) + '.nus3bank'), got)
+
+    def test_cache(self):
+        path = SHARED.format(0)
+        if not self.arc.locate(path):
+            self.skipTest('no Mario c00 model')
+        cache = self.dir / 'table.bin'
+        self.put('Skin', path, b'1' * 300)
+        first, log = self.build(cache)
+        self.assertIn('cache=0', log)
+        self.assertTrue(cache.is_file())
+        again, log = self.build(cache)
+        self.assertIn('cache=1', log)
+        self.assertEqual(again.get(path), b'1' * 300)
+        self.put('Skin', path, b'2' * 301)   # (a new size: built again)
+        changed, log = self.build(cache)
+        self.assertIn('cache=0', log)
+        self.assertEqual(changed.get(path), b'2' * 301)
+
+
+if __name__ == '__main__':
+    unittest.main()

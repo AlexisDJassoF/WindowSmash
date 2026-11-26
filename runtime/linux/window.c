@@ -221,7 +221,7 @@ static void menu_pads_poll(Uint64 now) {
     int dir = -1, accept = 0, back = 0, prev = 0, next = 0, any_pad = 0;
     unsigned long long controls = 0;
     static unsigned long long was_controls;
-    static int was_prev, was_next;
+    static int was_prev, was_next, was_west, was_north, was_rtrigger;
     for (int i = 0; i < 8; i++) {
         SDL_GameController *gp = menu_pads[i];
         if (!gp) continue;
@@ -264,6 +264,14 @@ static void menu_pads_poll(Uint64 now) {
         prev |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
         next |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     }
+    /* the Mods page's actions: the west button deletes, the north one opens the folder, the right trigger moves */
+    int west = 0, north = 0, rtrigger = 0;
+    for (int i = 0; i < 8; i++)
+        if (menu_pads[i]) {
+            west |= SDL_GameControllerGetButton(menu_pads[i], SDL_CONTROLLER_BUTTON_X);
+            north |= SDL_GameControllerGetButton(menu_pads[i], SDL_CONTROLLER_BUTTON_Y);
+            rtrigger |= SDL_GameControllerGetAxis(menu_pads[i], SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000;
+        }
     if (!any_pad) { menu_pad_name[0] = 0; for (int a = 0; a < 4; a++) menu_axes[a] = 0; }
     if (menu_listening) {   /* the Controls page waits: the first control newly pressed is its, and nothing else happens */
         unsigned long long fresh = controls & ~was_controls;
@@ -287,6 +295,10 @@ static void menu_pads_poll(Uint64 now) {
     if (back && !was_back) menu_input(MENU_BACK, 0, 0);
     if (prev && !was_prev) menu_input(MENU_TAB_PREV, 0, 0);   /* (the left shoulder: the page before; the right: the next) */
     if (next && !was_next) menu_input(MENU_TAB, 0, 0);
+    if (west && !was_west) menu_input(MENU_DELETE, 0, 0);
+    if (north && !was_north) menu_input(MENU_FOLDER, 0, 0);
+    if (rtrigger && !was_rtrigger) menu_input(MENU_MOVE, 0, 0);
+    was_west = west, was_north = north, was_rtrigger = rtrigger;
     was_accept = accept;
     was_back = back;
     was_prev = prev;
@@ -306,6 +318,7 @@ static int menu_event_of(const SDL_Event *e) {
         case SDL_SCANCODE_RIGHT: menu_input(MENU_RIGHT, 0, 0); return 1;
         case SDL_SCANCODE_TAB: if (!e->key.repeat) menu_input(e->key.keysym.mod & KMOD_SHIFT ? MENU_TAB_PREV : MENU_TAB, 0, 0); return 1;
         case SDL_SCANCODE_BACKSPACE: menu_input(MENU_ERASE, 0, 0); return 1;
+        case SDL_SCANCODE_DELETE: if (!e->key.repeat) menu_input(MENU_DELETE, 0, 0); return 1;
         case SDL_SCANCODE_SPACE: if (menu_typing) return 1;   /* (a space typed: SDL_TEXTINPUT brings it) */
             /* fall through */
         case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER:

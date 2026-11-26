@@ -150,7 +150,7 @@ def runtime_jobs():
               [os.path.join(RUNTIME, "linux", n) for n in os.listdir(os.path.join(RUNTIME, "linux")) if n.endswith(".h")] + \
               [os.path.join(RUNTIME, "linux", "include", "windows.h")]
     sources = [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME))
-               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|pad_menu|debug_watchdog)\.c", n)]
+               if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|pad_menu|mod_\w*|debug_watchdog)\.c", n)]
     sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
                 if n.endswith((".c", ".cpp"))]
     # The SPIR-V translator's version, for the Vulkan renderer's disk cache (gpu_vk_draw.c): a hash of

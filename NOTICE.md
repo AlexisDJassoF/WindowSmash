@@ -19,6 +19,10 @@ The VP9 decoder of the WebM Project's libvpx, release v1.15.2, is included as so
 
 libopus 1.5.2 (Xiph.Org Foundation and contributors) is included as source in [`third_party/opus/`](third_party/opus/) and compiled into the game when it is built (the game's music is Opus), under its [BSD license](third_party/opus/COPYING). [`third_party/README.md`](third_party/README.md) says which files; none is modified.
 
+## Zstandard
+
+The decompressor of Zstandard 1.5.7 (Meta Platforms, Inc. and affiliates) is included as source in [`third_party/zstd/`](third_party/zstd/) and compiled into the game when it is built (mods: `data.arc`'s file system table is zstd-compressed), under its [BSD license](third_party/zstd/LICENSE) (zstd is dual-licensed BSD or GPLv2; the BSD license is the one taken). [`third_party/README.md`](third_party/README.md) says which files; none is modified.
+
 ## SDL3
 
 Controller input can use [SDL3](https://www.libsdl.org/) (Simple DirectMedia Layer), copyright Sam Lantinga, under the [zlib license](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt).

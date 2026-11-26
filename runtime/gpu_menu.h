@@ -13,7 +13,10 @@ enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_ACCEPT, MENU_BACK, MENU_C
        MENU_CHAR,    /* a typed character (x), for the Network page's text rows */
        MENU_ERASE,   /* Backspace */
        MENU_TAB_PREV,   /* the page before (Shift+Tab, the left shoulder button) */
-       MENU_PADKEY };   /* a pad's control pressed (x: pad_menu.h's PC_*) while the Controls page listens (menu_listening) */
+       MENU_PADKEY,     /* a pad's control pressed (x: pad_menu.h's PC_*) while the Controls page listens (menu_listening) */
+       MENU_DELETE,     /* the Mods page's actions: Delete / the pad's west button, */
+       MENU_FOLDER,     /* the north button (open the mods folder), */
+       MENU_MOVE };     /* the right trigger (move a mod to another color); F and M typed come as MENU_CHAR */
 extern volatile int menu_active;
 extern volatile int menu_typing;            /* the selected row takes text: Space types, not plays */
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */

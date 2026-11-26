@@ -10,6 +10,7 @@ release named below, and the selection can be checked against that release's arc
 | :--- | :--- | :--- | :--- |
 | libopus | 1.5.2 | https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz | `65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1` |
 | libvpx | 1.15.2 | https://github.com/webmproject/libvpx/archive/refs/tags/v1.15.2.tar.gz | `26fcd3db88045dee380e581862a6ef106f49b74b6396ee95c2993a260b4636aa` |
+| zstd | 1.5.7 | https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz | `eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3` |
 
 ## opus/
 
@@ -55,6 +56,16 @@ configure run is needed:
   run it (`vpx_dsp/vpx_dsp_rtcd_defs.pl`, `vp9/common/vp9_rtcd_defs.pl`,
   `vpx_scale/vpx_scale_rtcd.pl`).
 - `vpx_version.h`: `build/make/version.sh <source dir> vpx_version.h`.
+
+## zstd/
+
+The decompressor only, for the mods' `data.arc` (`runtime/mod_arc.c`): `lib/zstd.h`,
+`lib/zstd_errors.h`, `lib/common/*.[ch]` without `pool.c`, `threading.c` and `xxhash.c` (the
+decoder does not compile them), `lib/decompress/*.[ch]` (not `huf_decompress_amd64.S`), `LICENSE`,
+and `build/single_file_libs/zstddeclib-in.c`, the list of sources and settings zstd's own
+single-file decoder is generated from (no legacy formats, no assembly, no error strings).
+`runtime/mod_zstd.c` includes that file, so the build compiles the decoder as one unit, the way the
+generated `zstddeclib.c` would be, with no change to the build scripts.
 
 ## Updating a library
 
