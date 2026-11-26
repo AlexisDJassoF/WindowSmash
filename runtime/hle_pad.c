@@ -66,9 +66,12 @@ typedef struct Raw { u32 buttons; i32 axis[RA_COUNT]; } Raw;
 #define OVERLAY_COMBO (1u << RB_LEFT_STICK | 1u << RB_RIGHT_STICK)
 void gfx_hotkey(int n);   /* (the renderer: F1 + n was pressed) */
 static int combo_held;
-/* Select + Start (Back + Start, Minus + Plus, Share + Options) on any pad: F9's Network window, open or closed */
+/* Select + Start (Back + Start, Minus + Plus, Share + Options) on any pad: F9's Network window, open or
+ * closed - when let go, unless L + R were held with them: L + R + Select + Start held for
+ * MENU_BACK_HOLD_MS ends the game and starts the program again on its start-up menu (menu_restart_menu) */
 #define NETWORK_COMBO (1u << RB_BACK | 1u << RB_START)
-static int network_held;
+#define MENU_COMBO (NETWORK_COMBO | 1u << RB_LEFT_SHOULDER | 1u << RB_RIGHT_SHOULDER)
+static int network_held, menu_held;
 
 /* The menus' (gpu_menu.h): while F9's Network window is open in the game, the pads move it instead of
  * playing - every pad's controls together, as the start-up menu reads them (linux/window.c) */
@@ -84,6 +87,7 @@ static int kind_of(const char *type) {
 static void note_combo(const Raw *raw, const char *type) {
     if ((raw->buttons & OVERLAY_COMBO) == OVERLAY_COMBO) combo_held = 1;
     if ((raw->buttons & NETWORK_COMBO) == NETWORK_COMBO) network_held = 1;
+    if ((raw->buttons & MENU_COMBO) == MENU_COMBO) menu_held = 1;
     int moved = 0;
     for (int a = RA_LEFTX; a <= RA_LEFTY; a++) {
         if (abs(raw->axis[a]) > abs(menu_raw.axis[a])) menu_raw.axis[a] = raw->axis[a];
@@ -808,16 +812,31 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
         char names[PAD_SLOTS][48] = {{0}};
-        static int was_combo, was_network;
-        combo_held = network_held = 0;
+        static int was_combo, was_network, with_lr;
+        static ULONGLONG menu_since;
+        combo_held = network_held = menu_held = 0;
         memset(&menu_raw, 0, sizeof menu_raw);
         if (sdl) sdl_poll(fresh, names);
         else xinput_poll(fresh, names);
-        if (network_held && !was_network) {   /* (Select + Start: the Network window) */
+        if (menu_held) with_lr = 1;
+        if (!network_held && was_network && !with_lr) {   /* (Select + Start let go: the Network window) */
             if (menu_kind) menu_device = menu_kind;
             menu_modal_toggle();
         }
+        if (!network_held) with_lr = 0;
         was_network = network_held;
+#ifndef _WIN32
+        if (menu_held) {   /* (L + R + Select + Start held: the start-up menu, the game ended) */
+            ULONGLONG t = GetTickCount64();
+            if (!menu_since) { menu_since = t; display_show_notice("Keep holding L + R + Select + Start: back to the menu (the game ends)", MENU_BACK_HOLD_MS + 500); }
+            else if (t - menu_since >= MENU_BACK_HOLD_MS) {
+                fprintf(stderr, "[input] L + R + Select + Start held: back to the start-up menu\n");
+                display_show_notice("Back to the menu...", 3000);
+                menu_restart_menu();   /* (returns only if it cannot) */
+                menu_since = ~0ull >> 1;   /* (not again until let go) */
+            }
+        } else menu_since = 0;
+#endif
         menu_events();
         if (menu_modal) memset(fresh, 0, sizeof fresh);   /* (the Network window's, not the game's: nothing pressed) */
         publish(fresh, names);

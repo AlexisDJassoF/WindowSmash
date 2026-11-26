@@ -1,5 +1,5 @@
 /* runtime/gpu_menu.c's model without a window: tests/test_gpu_menu.py builds this with it.
- *   gpu_menu_test <script>   events, one letter each: u d l r a b (up down left right accept back),
+ *   gpu_menu_test <script>   events, one letter each: u d l r a b s (up down left right accept back start),
  *                            t<seconds> (time passes), c<x>,<y> (a click; the rows are 40 px tall
  *                            from y = 100 - Mode, Resolution scale, Upscaling... Play at 380 - values from x = 300). Prints the state, row and settings, '|' between them. */
 #include <stdio.h>
@@ -61,6 +61,7 @@ int main(int argc, char **argv) {
         case 'r': menu_event(&m, MENU_RIGHT, t); break;
         case 'a': menu_event(&m, MENU_ACCEPT, t); break;
         case 'b': menu_event(&m, MENU_BACK, t); break;
+        case 's': menu_event(&m, MENU_START, t); break;
         case 't': t += strtod(p + 1, (char **)&p); p--; menu_tick(&m, t); break;
         case 'c': {
             char *e;
@@ -73,8 +74,11 @@ int main(int argc, char **argv) {
     }
     char v[ROWS][80];
     for (int r = 0; r < ROWS; r++) menu_value(&m, r, v[r], sizeof v[r]);
-    printf("state=%d|row=%s|mode=%s|scale=%s|upscale=%s|sharpness=%s|vsync=%s|window=%s|renderer=%s|sharp_shown=%d|fsr_hint=%d\n", m.state,
+    char play[48];
+    menu_play_label(getenv("TEST_DEVICE") ? atoi(getenv("TEST_DEVICE")) : MENU_KEYS, menu_changed(&m), play, sizeof play);
+    for (char *c = play; *c; c++) if (*c == '\t') *c = '/';
+    printf("state=%d|row=%s|mode=%s|scale=%s|upscale=%s|sharpness=%s|vsync=%s|window=%s|renderer=%s|sharp_shown=%d|fsr_hint=%d|play=%s|hint=%d\n", m.state,
            menu_label(m.row), v[ROW_MODE], v[ROW_SCALE], v[ROW_UPSCALE], v[ROW_SHARPNESS], v[ROW_VSYNC], v[ROW_WINDOW], v[ROW_RENDERER],
-           menu_visible(&m, ROW_SHARPNESS), menu_recommends_fsr(&m));
+           menu_visible(&m, ROW_SHARPNESS), menu_recommends_fsr(&m), play, m.hint_until > t);
     return 0;
 }

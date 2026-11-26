@@ -11,6 +11,7 @@
 #include "gpu_precompile.h"
 
 const char *rt_data_dir;
+volatile int menu_back_hold;   /* (gpu_menu.c's: never held here) */
 int shader_dispatch_forced(void) { return getenv("SSBU_SHADER_DISPATCH") && atoi(getenv("SSBU_SHADER_DISPATCH")); }
 int gfx_progress(const char *title, unsigned done, unsigned total, const char *status) {
     static unsigned frames;

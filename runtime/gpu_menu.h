@@ -3,7 +3,7 @@
 #pragma once
 #include "display.h"
 
-/* On the start-up thread, first: returns when Play, Esc or the 10 s without input started the game.
+/* On the start-up thread, first: returns when Start (F5), a click on Play or the 10 s without input started the game.
  * display.ini's menu = 0 or SSBU_MENU=0: returns at once. Linux only (Windows has no start-up phase). */
 void menu_run(void);
 
@@ -16,7 +16,8 @@ enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_ACCEPT, MENU_BACK, MENU_C
        MENU_PADKEY,     /* a pad's control pressed (x: pad_menu.h's PC_*) while the Controls page listens (menu_listening) */
        MENU_DELETE,     /* the Mods page's actions: Delete / the pad's west button, */
        MENU_FOLDER,     /* the north button (open the mods folder), */
-       MENU_MOVE };     /* the right trigger (move a mod to another color); F and M typed come as MENU_CHAR */
+       MENU_MOVE,       /* the right trigger (move a mod to another color); F and M typed come as MENU_CHAR */
+       MENU_START };    /* play (Start / OPTIONS / +, F5): the only key that starts the game, besides a click on Play */
 extern volatile int menu_active;
 extern volatile int menu_typing;            /* the selected row takes text: Space types, not plays */
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */
@@ -25,6 +26,13 @@ void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the wind
  * returns only if it cannot. */
 void menu_restart_network(void);
 
+/* After Play and before the game's thread starts (the shaders' screen): menu_prestart is set, and
+ * Select+Start (or Esc) held for a second asks for the menu again - menu_back is set, the shaders
+ * stop, and menu_restart_menu starts the program again on the menu, without its countdown. Linux. */
+extern volatile int menu_prestart, menu_back;
+extern volatile int menu_back_hold;   /* how long it is held so far, in ms (0: not), for the shaders' screen to say so */
+void menu_restart_menu(void);   /* (also in the game: L + R + Select + Start held, hle_pad.c - the room left as F8 leaves it) */
+#define MENU_BACK_HOLD_MS 1000
 /* What the menus were used with last (the window's thread, and hle_pad.c in the game): the keyboard
  * or the mouse, or a pad of a kind - their hints name its buttons (the south one plays, the east one
  * goes back, the shoulders change pages). */
@@ -52,12 +60,13 @@ int menu_modal_build(unsigned w, unsigned h);    /* the renderer, every frame: 1
 
 /* ---- the model, without a window (tests/test_gpu_menu.py drives it) ---------------------- */
 enum { ROW_MODE, ROW_SCALE, ROW_UPSCALE, ROW_SHARPNESS, ROW_VSYNC, ROW_WINDOW, ROW_RENDERER, ROW_PLAY, ROWS };
-enum { MENU_OPEN, MENU_PLAY, MENU_KEEP };   /* MENU_KEEP: started as display.ini was (Esc, or no input in time) */
+enum { MENU_OPEN, MENU_PLAY, MENU_KEEP };   /* MENU_KEEP: started as display.ini was (no input in time) */
 typedef struct Menu {
     DisplaySettings s, initial;
     unsigned locked;
     int row, state, touched;
     double deadline;   /* seconds (now_s's clock) until it starts by itself, while untouched */
+    double hint_until; /* accept on Play: "Press Start to play" shown until then */
 } Menu;
 typedef struct MenuRect { float x, y, w, h; } MenuRect;   /* a row's place on screen, from the last frame */
 /* The Network page's list, as overlay_build_menu draws it: a room's Join button, from its row's right
@@ -70,6 +79,10 @@ int menu_visible(const Menu *m, int row);                     /* Sharpness only 
 const char *menu_label(int row);
 void menu_value(const Menu *m, int row, char *out, unsigned n);   /* "Handheld (720p)", "75% (960 x 540)", "(set by SSBU_MODE)" ... */
 int menu_recommends_fsr(const Menu *m);                      /* below 100% with linear upscaling */
+int menu_changed(const Menu *m);                             /* a setting differs from the one it opened with */
+/* The Play button's label: the key that plays ("^XM" a pad's Start, or "F5"), '\t', then "Play", or
+ * "Apply and Play" when changed (any page's settings differ from what they were) */
+void menu_play_label(int device, int changed, char *out, unsigned n);
 void menu_event(Menu *m, int event, double now_s);
 /* A click at (x, y) against the rows drawn (rects[row], value_x: where values start): the events it is */
 void menu_click(Menu *m, const MenuRect rects[ROWS], float value_x, float x, float y, double now_s);

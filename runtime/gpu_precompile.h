@@ -8,7 +8,8 @@
  * pressed, or there is nothing to do. SSBU_PRECOMPILE=0 turns it off; Linux only. */
 void precompile_run(void);
 
-/* The window's thread: while the screen is up (precompile_active), Esc sets precompile_skip. */
+/* The window's thread: while the screen is up (precompile_active), Esc let go before a second sets
+ * precompile_skip; held, or Select+Start held, the menu again (gpu_menu.h's menu_back) sets it too. */
 extern volatile int precompile_active, precompile_skip;
 
 /* (the parts the tests drive) The keys of keys_path ("vs <hash>" / "ps <hash> <vs outputs>", as

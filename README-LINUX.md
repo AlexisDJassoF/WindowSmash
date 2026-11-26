@@ -157,10 +157,11 @@ SDL mappings for pads SDL doesn't know.
 | F6 | 10-second profile (`build/profile_*.txt`) |
 | F7 | Switch between docked (1080p) and handheld (720p) while playing; the new mode shows on screen for 2 seconds |
 | F8, twice within 3 seconds | Start the game again on the settings menu's **Network** page, to host, join or go back to what the launcher chose (the match in progress ends) |
-| F9 (or Select + Start on a controller) | The **Network** window over the game: join a room from the list, host one or go offline without leaving the game (Enter / the south button applies, Esc / F9 / the east button closes; the pads and keyboard are the window's while it is open). The game starts again only for a change to or from LAN mode. Not while the game is in a Local Wireless room: leave it first |
+| L + R + Select + Start on a controller, held a second | Back to the settings menu: the game ends (a room you are in is told you left) and the program starts again on the menu, without its countdown |
+| F9 (or Select + Start on a controller, when let go) | The **Network** window over the game: join a room from the list, host one or go offline without leaving the game (Enter / the south button applies, Esc / F9 / the east button closes; the pads and keyboard are the window's while it is open). The game starts again only for a change to or from LAN mode. Not while the game is in a Local Wireless room: leave it first |
 | F11 or Alt+Enter | Switch between a window and full screen |
 
-The settings menu's **Controls** page (Tab / the shoulder buttons go through Display, Network and Controls) sets up the controllers, in `controllers.ini`'s `[device default]` (comments and other sections kept): the face buttons' layout (by position, as on a Switch, or by the printed letters), each stick's dead zone (**Stick dead zones** opens a page of its own, `deadzone_left` / `deadzone_right` in the file, with each stick's **snapback** fix - off by default: on, a stick let go fast from far out doesn't register its bounce past the centre (`snapback_left` / `snapback_right`) - and **Test the sticks**: each stick's travel, its dead zone, and what the game gets of it, live, a bounce ignored said so), rumble, and which control presses each of the console's buttons - pick it with the arrows, or press Enter / the south button and then the control on the pad. A picture of the pad in use (Xbox, PlayStation or Nintendo) shows which console button each control presses, the selected one lit, and the sticks live inside their dead zone. It applies to the game that starts.
+The settings menu's **Controls** page (Q / E, Tab / Shift+Tab or the shoulder buttons go through Display, Network, Controls and Mods) sets up the controllers, in `controllers.ini`'s `[device default]` (comments and other sections kept): the face buttons' layout (by position, as on a Switch, or by the printed letters), each stick's dead zone (**Stick dead zones** opens a page of its own, `deadzone_left` / `deadzone_right` in the file, with each stick's **snapback** fix - off by default: on, a stick let go fast from far out doesn't register its bounce past the centre (`snapback_left` / `snapback_right`) - and **Test the sticks**: each stick's travel, its dead zone, and what the game gets of it, live, a bounce ignored said so), rumble, and which control presses each of the console's buttons - pick it with the arrows, or press Enter / the south button and then the control on the pad. A picture of the pad in use (Xbox, PlayStation or Nintendo) shows which console button each control presses, the selected one lit, and the sticks live inside their dead zone. It applies to the game that starts.
 
 The settings menu's hints name the keys, or the buttons of the controller used last (Xbox, PlayStation or Nintendo names).
 
@@ -184,8 +185,13 @@ When the game asks for text (a name, a Smash Tag), a `zenity` text box opens.
 | Renderer | **DXVK** (Direct3D 11 through DXVK, as the game has always run) or **Vulkan (experimental)**: the port's own Vulkan renderer, with fewer steps from the game's shaders to the graphics card. Experimental: DXVK stays the default. Choosing the other one restarts the game on it, straight past this menu. |
 
 Arrows or a pad's D-pad / left stick move and change; **Enter** or the pad's bottom button
-plays; **Esc** or the right one starts without changes; the mouse works too (a value's left or
-right half steps it). Untouched for 10 seconds, the game starts with what was saved. Play writes
+selects; only the pad's **Start** (Menu on Xbox, OPTIONS on PlayStation, + on Nintendo) or **F5**
+plays - the Play button shows which, and says **Apply and Play** when a page's settings changed.
+**Esc** or the pad's right button goes back (out of a question, a move, a sub-page) and never
+plays; the mouse works too (a value's left or right half steps it, a click on Play plays).
+Untouched for 10 seconds, the game starts with what was saved. After Play and before the game
+starts (the shaders' screen), holding **Select + Start** or **Esc** for a second comes back to the
+menu. Play writes
 what changed into `display.ini`, keeping your own comments and other settings (the first time,
 the file as it was is kept as `display.ini.bak`). `menu = 0` in `display.ini`, or
 `SSBU_MENU=0 ./run.sh`, starts straight away. A setting an environment variable fixes
@@ -215,7 +221,7 @@ the host already lets through, so nothing else needs opening. `SSBU_NET_ANNOUNCE
 keeps its room from answering.
 
 On a text row, typing edits it, Backspace erases, and Space types a space. Play with Join and no
-address goes to Host address first. Esc starts with `netplay.ini` as it was. In the game, F8
+address goes to Host address first. In the game, F8
 twice starts the program again on this page (the game in progress ends; the room you left is told).
 
 Two files in this folder, each written with its defaults and explanations the first time the game
@@ -249,7 +255,8 @@ game compares the two: if shaders are missing from the cache, a **Preparing shad
 compiles them before the game starts, with a bar and the time left. The first time that is the
 whole game: about 40,000 shaders, half an hour on a 14-core desktop processor (longer with fewer cores); after that only what is new (a game update, or a new
 translator: the screen then shows again). **Esc** starts the game at once: what is compiled is
-kept, and the next start carries on with the rest. The full cache takes about 2 GB of disk.
+kept, and the next start carries on with the rest (Esc or Select + Start held for a second goes
+back to the settings menu instead). The full cache takes about 2 GB of disk.
 `SSBU_PRECOMPILE=0 ./run.sh` starts without the screen. Shaders it can't compile ahead (those
 with jump tables, and compute ones) are still compiled the first time they're needed, as is
 any shader without the index; DXVK also makes each shader's Vulkan pipeline the first time it

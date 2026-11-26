@@ -3,8 +3,10 @@
  * Every start (unless display.ini's menu = 0 or SSBU_MENU=0), before the shaders' screen
  * (gpu_precompile.c) and the game: Mode, Resolution scale, Upscaling (and Sharpness with FSR), VSync, Window
  * and Renderer, as display.ini has them, then Play. Up/down picks a row, left/right changes it, Enter / the
- * controller's south button plays, Esc / east starts with display.ini as it was; a click picks a
- * row, its value's left or right half steps it, Play plays. Untouched for 10 s, it starts as
+ * controller's south button selects; only Start (OPTIONS, +) or F5 plays - "Apply and Play" when a page's
+ * settings changed -, and Esc / east goes back from a question or a sub-page, nothing at a page's top;
+ * a click picks a row, its value's left or right half steps it, a click on Play plays. Select+Start (or
+ * Esc) held for a second before the game starts comes back to the menu (menu_restart_menu). Untouched for 10 s, it starts as
  * display.ini was. Play writes what changed into display.ini (display_save: the user's comments
  * and other keys kept) and applies it to this start (display_apply). A setting an environment
  * variable fixes is shown, not changeable, and not written. The renderer is already drawing the
@@ -141,9 +143,22 @@ void menu_event(Menu *m, int event, double now_s) {
     case MENU_DOWN: move(m, 1); break;
     case MENU_LEFT: step(m, -1); break;
     case MENU_RIGHT: step(m, 1); break;
-    case MENU_ACCEPT: if (m->row == ROW_PLAY) m->state = MENU_PLAY; else move(m, 1); break;
-    case MENU_BACK: m->state = MENU_KEEP; m->s = m->initial; break;
+    case MENU_ACCEPT: if (m->row == ROW_PLAY) m->hint_until = now_s + 2; else move(m, 1); break;   /* (Start plays, not accept) */
+    case MENU_START: m->state = MENU_PLAY; break;
+    case MENU_BACK: break;   /* (back goes back from something; here, at the top, there is nothing to go back from) */
     }
+}
+
+int menu_changed(const Menu *m) {
+    const DisplaySettings *a = &m->s, *b = &m->initial;
+    float d = a->sharpness - b->sharpness;
+    return a->window != b->window || a->operation != b->operation || a->upscale != b->upscale || a->pacing != b->pacing ||
+           a->scale != b->scale || a->renderer != b->renderer || d > 0.05f || d < -0.05f;
+}
+
+void menu_play_label(int device, int changed, char *out, unsigned n) {
+    const char *key = device == MENU_PAD_XBOX ? "^XM" : device == MENU_PAD_PS ? "^PM" : device == MENU_PAD_NINTENDO ? "^NM" : "F5";
+    snprintf(out, n, "%s\t%s", key, changed ? "Apply and Play" : "Play");
 }
 
 void menu_click(Menu *m, const MenuRect rects[ROWS], float value_x, float x, float y, double now_s) {
@@ -152,7 +167,7 @@ void menu_click(Menu *m, const MenuRect rects[ROWS], float value_x, float x, flo
         if (!menu_visible(m, row) || r->w <= 0 || x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) continue;
         m->touched = 1;
         m->row = row;
-        if (row == ROW_PLAY) menu_event(m, MENU_ACCEPT, now_s);
+        if (row == ROW_PLAY) menu_event(m, MENU_START, now_s);   /* (the mouse has no Start: a click on Play plays) */
         else if (x >= value_x) menu_event(m, x < value_x + (r->x + r->w - value_x) / 2 ? MENU_LEFT : MENU_RIGHT, now_s);
         return;
     }
@@ -192,7 +207,21 @@ static void drop_inputs(void) {
     ReleaseSRWLockExclusive(&queue_lock);
 }
 
-/* The keys or buttons the hints name: what plays (or applies), what goes back, what changes pages */
+/* The key or button that plays: a pad's Start ("^" kind 'M', overlay_quads' pad_button), or F5 */
+static const char *start_key(void) {
+    switch (menu_device) {
+    case MENU_PAD_XBOX: return "^XM";
+    case MENU_PAD_PS: return "^PM";
+    case MENU_PAD_NINTENDO: return "^NM";
+    default: return "F5";
+    }
+}
+
+static const char *start_name(void) {   /* (what the pad calls its Start) */
+    return menu_device == MENU_PAD_PS ? "OPTIONS" : menu_device == MENU_PAD_NINTENDO ? "+" : "Menu";
+}
+
+/* The keys or buttons the hints name: what selects (or applies), what goes back, what changes pages */
 static void device_keys(const char **accept, const char **back, const char **pages) {
     switch (menu_device) {
     /* (a pad's buttons drawn: "^" its kind and the button's place, south or east - overlay_quads' pad_button;
@@ -200,7 +229,7 @@ static void device_keys(const char **accept, const char **back, const char **pag
     case MENU_PAD_XBOX: *accept = "^XS"; *back = "^XE"; *pages = "LB|RB"; return;
     case MENU_PAD_PS: *accept = "^PS"; *back = "^PE"; *pages = "L1|R1"; return;
     case MENU_PAD_NINTENDO: *accept = "^NS"; *back = "^NE"; *pages = "L|R"; return;   /* (positional: the south button is B) */
-    default: *accept = "Enter"; *back = "Esc"; *pages = "Tab"; return;
+    default: *accept = "Enter"; *back = "Esc"; *pages = "Q|E"; return;   /* (Q and E, or Tab and Shift+Tab) */
     }
 }
 
@@ -215,12 +244,14 @@ static void mod_keys(const char **del, const char **mv, const char **folder) {
 }
 
 /* ---- starting again ------------------------------------------------------------------------ */
+volatile int menu_prestart, menu_back, menu_back_hold;
+
 #ifndef _WIN32
 /* The program again, with the same arguments: for another renderer (chosen at its first frame, the
  * menu's; display.ini names the new one now) without the menu, or on the Network page with it (F8 in
  * the game). The environment goes along: the network the menu set up, the launcher's kept aside.
  * Returns only if it cannot. */
-enum { AGAIN_RENDERER, AGAIN_NETWORK_PAGE, AGAIN_NETWORK };
+enum { AGAIN_RENDERER, AGAIN_NETWORK_PAGE, AGAIN_NETWORK, AGAIN_MENU };
 static void start_again(int network) {
     static char args[65536];
     char *argv[256];
@@ -234,13 +265,20 @@ static void start_again(int network) {
     if (network == AGAIN_NETWORK_PAGE) {
         setenv("SSBU_MENU", "1", 1);
         setenv("SSBU_MENU_PAGE", "network", 1);
+    } else if (network == AGAIN_MENU) {   /* (before the game: back to the menu, no countdown) */
+        setenv("SSBU_MENU", "1", 1);
+        setenv("SSBU_MENU_WAIT", "0", 1);
     } else setenv("SSBU_MENU", "0", 1);
-    if (network) net_stop();   /* (the relay told, the router's port closed: exit's work, which execv skips) */
+    int in_game = network == AGAIN_MENU && !menu_prestart;   /* (L + R + Select + Start in the game, hle_pad.c) */
+    if (network == AGAIN_NETWORK_PAGE || network == AGAIN_NETWORK || in_game) net_stop();   /* (the relay told, the router's port closed: exit's work, which execv skips) */
     fprintf(stderr, network == AGAIN_NETWORK_PAGE ? "[menu] F8: starting again on the Network page\n"
+                    : in_game ? "[menu] back to the menu from the game: starting again\n"
+                    : network == AGAIN_MENU ? "[menu] back to the menu before the game: starting again\n"
                     : network ? "[menu] the network changed to or from LAN mode: starting again\n" : "[menu] another renderer: starting again on it\n");
     fflush(NULL);
     execv("/proc/self/exe", argv);
-    fprintf(stderr, "[menu] cannot start again: %s\n", network ? "change the network at the next start" : "the renderer changes at the next start");
+    fprintf(stderr, "[menu] cannot start again: %s\n", network == AGAIN_MENU ? "starting the game"
+                    : network ? "change the network at the next start" : "the renderer changes at the next start");
 }
 #endif
 
@@ -250,8 +288,14 @@ void menu_restart_network(void) {
 #endif
 }
 
+void menu_restart_menu(void) {
+#ifndef _WIN32
+    start_again(AGAIN_MENU);
+#endif
+}
+
 /* SSBU_MENU_INPUT="<seconds>:<key>,...": the menu's keys pressed at those times since it opened, for
- * tests without hands - up down left right accept back tab tabprev delete folder move, or a letter
+ * tests without hands - up down left right accept back start tab tabprev delete folder move, or a letter
  * typed ("char:f"). Returns the next one due (its event and character), 0 when none is. */
 static int scripted_input(double since, int *event, int *ch) {
     static const char *at;
@@ -267,7 +311,7 @@ static int scripted_input(double since, int *event, int *ch) {
     snprintf(key, sizeof key, "%.*s", (int)(len < sizeof key ? len : sizeof key - 1), colon + 1);
     at = end ? end + 1 : "";
     static const struct { const char *name; int event; } K[] = {
-        {"up", MENU_UP}, {"down", MENU_DOWN}, {"left", MENU_LEFT}, {"right", MENU_RIGHT}, {"accept", MENU_ACCEPT}, {"back", MENU_BACK},
+        {"up", MENU_UP}, {"down", MENU_DOWN}, {"left", MENU_LEFT}, {"right", MENU_RIGHT}, {"accept", MENU_ACCEPT}, {"back", MENU_BACK}, {"start", MENU_START},
         {"tab", MENU_TAB}, {"tabprev", MENU_TAB_PREV}, {"delete", MENU_DELETE}, {"folder", MENU_FOLDER}, {"move", MENU_MOVE}};
     *ch = 0;
     if (!strncmp(key, "char", 4) && key[4]) { *event = MENU_CHAR; *ch = key[5]; return 1; }
@@ -330,6 +374,28 @@ static int pad_click(PadMenu *pm, const MenuRect rects[CROWS], float value_x, fl
     return PAD_EV_NONE;
 }
 
+/* What "Apply and Play" looks at besides the Display page: the Network page's settings, and the mods
+ * (which are enabled, where they are moved to, which are there) - a fingerprint to compare */
+static int net_changed(const NetMenu *nm) {
+    const NetSettings *a = &nm->s, *b = &nm->initial;
+    return a->mode != b->mode || strcmp(a->name, b->name) || strcmp(a->room, b->room) || strcmp(a->port, b->port) ||
+           (a->mode == NET_MODE_JOIN && strcmp(a->host, b->host));
+}
+
+static unsigned long long mods_print(const ModList *l) {
+    unsigned long long h = 1469598103934665603ull;   /* (FNV-1a) */
+#define MIX(byte) (h = (h ^ (unsigned char)(byte)) * 1099511628211ull)
+    for (int i = 0; i < l->n; i++) {
+        const ModInfo *x = &l->mods[i];
+        for (const char *p = x->key; *p; p++) MIX(*p);
+        MIX(0);
+        MIX(x->enabled);
+        for (int c = 0; c < MOD_COLORS; c++) MIX(x->to[c]);
+    }
+#undef MIX
+    return h;
+}
+
 static int pad_kind_of(int device) { return device == MENU_PAD_PS ? PK_PS : device == MENU_PAD_NINTENDO ? PK_NINTENDO : PK_XBOX; }
 
 static void net_refresh(NetMenu *nm) {
@@ -376,6 +442,11 @@ void menu_run(void) {
     nm.row = NROW_MODE;
     net_launch_describe(nm.launched, sizeof nm.launched);
     if (page) { m.touched = 1; nm.row = NROW_MODE; }   /* (F8: here to change the network - no countdown) */
+    {
+        const char *wait = getenv("SSBU_MENU_WAIT");   /* (back to the menu from before the game: no countdown) */
+        if (wait && !strcmp(wait, "0")) m.touched = 1;
+        unsetenv("SSBU_MENU_WAIT");
+    }
     PadSettings ps;
     pad_settings_load(&ps);
     PadMenu pm;
@@ -386,6 +457,7 @@ void menu_run(void) {
     char mods_root[512];
     mod_scan(&ml, mod_root(mods_root, sizeof mods_root));
     mod_menu_init(&mm, &ml);
+    unsigned long long mods_opened = mods_print(&ml);
     static MenuRect mrects[MOD_MAX + 2];
     float mvalue_x = 0;
     time_t mods_seen = 0;   /* the folder's time when it was read */
@@ -436,9 +508,10 @@ void menu_run(void) {
                         : page == P_MODS ? title_click(mrects, mod_menu_rows(&mm), (float)in.x, (float)in.y) : title_click(prects, CROWS, (float)in.x, (float)in.y);
                 if (tab) { m.touched = 1; refreshed = 0; page = (tab - 1) % PAGES; continue; }
             }
+            if (ev == MENU_START) { menu_event(&m, MENU_START, seconds()); break; }   /* (on any page; not in a question or a move: those took it above) */
             if (ev == MENU_TAB || ev == MENU_TAB_PREV) { page = (page + (ev == MENU_TAB ? 1 : PAGES - 1)) % PAGES; m.touched = 1; refreshed = 0; continue; }
             if (ev == MENU_BACK && page == P_CONTROLS && pad_menu_takes_back(&pm)) { m.touched = 1; pad_menu_event(&pm, MENU_BACK, 0); continue; }
-            if (ev == MENU_BACK) { menu_event(&m, MENU_BACK, seconds()); nm.s = nm.initial; pm.s = pm.initial; break; }
+            if (ev == MENU_BACK) { m.touched = 1; continue; }   /* (at a page's top: nothing to go back from - it never plays) */
             if (page == P_CONTROLS) {
                 m.touched = 1;
                 if (ev == MENU_CHAR || ev == MENU_ERASE) continue;
@@ -457,9 +530,7 @@ void menu_run(void) {
                         r = mod_menu_click_row(&mm, row, in.x >= rr->x + rr->w - 150);
                         break;
                     }
-                } else if (ev == MENU_BACK) r = MOD_EV_BACK;
-                else if (ev != MENU_ERASE) r = mod_menu_event(&mm, ev, in.x);
-                if (r == MOD_EV_BACK) { menu_event(&m, MENU_BACK, seconds()); nm.s = nm.initial; pm.s = pm.initial; break; }
+                } else if (ev != MENU_ERASE) r = mod_menu_event(&mm, ev, in.x);   /* (MOD_EV_BACK at the top: nothing) */
                 if (r == MOD_EV_OPEN_FOLDER) {
                     snprintf(mm.note, sizeof mm.note, mod_open_folder(mods_root) ? "Opening the mods folder..." : "!Cannot open the mods folder");
                     fprintf(stderr, "[mods] open folder %s\n", mods_root);
@@ -507,7 +578,11 @@ void menu_run(void) {
         char footer[320], tabs[80];
         const char *accept, *back, *pages;
         device_keys(&accept, &back, &pages);
+        const char *start = start_key();
         int keys = menu_device == MENU_KEYS;
+        int changed = menu_changed(&m) || net_changed(&nm) || memcmp(&pm.s, &pm.initial, sizeof pm.s) || mods_print(&ml) != mods_opened;
+        char play[48];
+        menu_play_label(menu_device, changed, play, sizeof play);
         double left = m.deadline - seconds();
         if (!m.touched) snprintf(footer, sizeof footer, "#%.3f\tStarting in %.0f s - press %s to change settings", left / WAIT_S, left + 0.5,
                                  keys ? "any key" : "a button");
@@ -517,11 +592,13 @@ void menu_run(void) {
         else if (page == P_CONTROLS && pm.dead_zones)
             snprintf(footer, sizeof footer, "%s%s=select\t%s=back to Controls", keys ? "" : "D-pad=move\t", accept, back);
         else if (page == P_CONTROLS && pad_menu_row_button(pm.row) >= 0)
-            snprintf(footer, sizeof footer, "%s=assign by pressing\t%s=play without changes", accept, back);
-        else if (page == P_CONTROLS) snprintf(footer, sizeof footer, "%s=select\t%s=play without changes", accept, back);
-        else if (page == P_NETWORK) snprintf(footer, sizeof footer, "%s%s=select\t%s=play without changes", keys ? "Type=edit\t" : "", accept, back);
-        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\t%s=play\t%s=no changes", accept, back);
-        else snprintf(footer, sizeof footer, "%s=play\t%s=play without changes", accept, back);
+            snprintf(footer, sizeof footer, "%s=assign by pressing\t%s=play", accept, start);
+        else if (page == P_CONTROLS) snprintf(footer, sizeof footer, "%s=select\t%s=play", accept, start);
+        else if (page == P_NETWORK) snprintf(footer, sizeof footer, "%s%s=select\t%s=play", keys ? "Type=edit\t" : "", accept, start);
+        else if (seconds() < m.hint_until)   /* (accept on Play: it does not play) */
+            snprintf(footer, sizeof footer, "!Press %s to play\t%s=play", keys ? "F5" : start_name(), start);
+        else if (menu_recommends_fsr(&m)) snprintf(footer, sizeof footer, "!FSR recommended below 100%%\t%s=play", start);
+        else snprintf(footer, sizeof footer, "%s=select\t%s=play", accept, start);
         snprintf(tabs, sizeof tabs, "%sDisplay\t%sNetwork\t%sControls\t%sMods\t@%s", page == P_DISPLAY ? "*" : "", page == P_NETWORK ? "*" : "",
                  page == P_CONTROLS ? "*" : "", page == P_MODS ? "*" : "", pages);
         if (page == P_MODS) {
@@ -548,8 +625,8 @@ void menu_run(void) {
             }
             if (mm.dialog) snprintf(footer, sizeof footer, "%s=choose\t%s=cancel", accept, back);
             else if (mm.moving) snprintf(footer, sizeof footer, "%s=choose the color\t%s=place it\t%s=cancel", menu_device == MENU_KEYS ? "< >" : "D-pad", accept, back);
-            else if (mm.note[0]) snprintf(footer, sizeof footer, "%s\t%s=open the folder\t%s=play without changes", mm.note, folder, back);
-            else if (m.touched) snprintf(footer, sizeof footer, "Changes apply when you play\t%s=open the folder\t%s=play without changes", folder, back);
+            else if (mm.note[0]) snprintf(footer, sizeof footer, "%s\t%s=open the folder\t%s=play", mm.note, folder, start);
+            else if (m.touched) snprintf(footer, sizeof footer, "Changes apply when you play\t%s=open the folder\t%s=play", folder, start);
             if (mm.dialog) {
                 char q[400];
                 mod_menu_dialog_text(&mm, q, sizeof q);
@@ -574,7 +651,7 @@ void menu_run(void) {
             char values[ROWS][64];
             int shown[ROWS];
             for (int r = 0; r < ROWS; r++) {
-                labels[r] = menu_label(r);
+                labels[r] = r == ROW_PLAY ? play : menu_label(r);   /* (the key that plays, then Play or Apply and Play) */
                 menu_value(&m, r, values[r], sizeof values[r]);
                 vp[r] = values[r];
                 shown[r] = menu_visible(&m, r);

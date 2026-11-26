@@ -439,8 +439,12 @@ static void ring(float cx, float cy, float rx, float ry, float t, unsigned c) { 
 }
 /* A pad's face button, PAD_BUTTON across, its left end at x and its middle at mid: kind X (Xbox and
  * most pads: A B X Y on coloured buttons), P (PlayStation: cross, circle, square, triangle) or N
- * (Nintendo: B A Y X, by position); where S, E, W or N, the button's place in the diamond */
+ * (Nintendo: B A Y X, by position); where S, E, W or N, the button's place in the diamond - or M (the
+ * pad's Start: Xbox Menu, PlayStation OPTIONS, Nintendo +) or V (its Select: View, Create, -), drawn by
+ * pad_middle */
+static void pad_middle(float cx, float mid, float r, char kind, char where, int shadow);
 static void pad_face(float cx, float mid, float r, char kind, char where, int shadow) {
+    if (where == 'M' || where == 'V') { pad_middle(cx, mid, r, kind, where, shadow); return; }
     int at = where == 'S' ? 0 : where == 'E' ? 1 : where == 'W' ? 2 : 3;
     float ts = r / (PAD_BUTTON / 2);   /* (the letters' size) */
     if (shadow) soft(cx - r * 0.5f, mid - r * 0.4f, r, r, 6, RGBA(0, 0, 0, 70));
@@ -476,6 +480,41 @@ static void pad_face(float cx, float mid, float r, char kind, char where, int sh
     disc(cx, mid, r, FILL[at]);
     disc(cx, mid - 1, r - 3 * ts, mix(FILL[at], RGBA(255, 255, 255, 255), 0.12f));
     text_ex(lx, ly, ts, 0, RGBA(255, 255, 255, 255), RGBA(240, 240, 240, 255), 110, letter);
+}
+
+/* A pad's middle buttons, in a coloured ring so they stand out (Start: the one that plays): Xbox's
+ * Menu (three lines) and View (two boxes), PlayStation's OPTIONS and Create (a pill, lines or a dot
+ * in it), Nintendo's + and - */
+static void pad_middle(float cx, float mid, float r, char kind, char where, int shadow) {
+    int start = where == 'M';
+    unsigned ring_c = kind == 'P' ? RGBA(70, 140, 236, 255) : kind == 'N' ? RGBA(232, 52, 52, 255) : RGBA(84, 178, 64, 255);
+    if (!start) ring_c = mix(ring_c, RGBA(120, 124, 134, 255), 0.6f);
+    unsigned body = RGBA(36, 38, 44, 255), mark = RGBA(246, 247, 250, 255);
+    float lw = r * 0.16f < 2 ? 2 : r * 0.16f;
+    if (shadow) soft(cx - r * 0.5f, mid - r * 0.4f, r, r, 6, RGBA(0, 0, 0, 70));
+    if (kind == 'P') {   /* (a pill) */
+        float w = r * 1.9f, h = r * 1.25f;
+        rbox(cx - w / 2, mid - h / 2, w, h, h / 2, ring_c, ring_c);
+        rbox(cx - w / 2 + 2.5f, mid - h / 2 + 2.5f, w - 5, h - 5, h / 2 - 2.5f, body, body);
+        if (start) for (int i = -1; i <= 1; i++) line(cx - r * 0.42f, mid + i * r * 0.24f, cx + r * 0.42f, mid + i * r * 0.24f, lw * 0.8f, mark);
+        else disc(cx, mid, r * 0.16f, mark);
+        return;
+    }
+    disc(cx, mid, r, ring_c);
+    disc(cx, mid, r - 3, body);
+    float s = r * 0.42f;
+    if (kind == 'N') {   /* (+ or -) */
+        line(cx - s, mid, cx + s, mid, lw * 1.2f, mark);
+        if (start) line(cx, mid - s, cx, mid + s, lw * 1.2f, mark);
+        return;
+    }
+    if (start) for (int i = -1; i <= 1; i++) line(cx - s, mid + i * s * 0.6f, cx + s, mid + i * s * 0.6f, lw, mark);
+    else {   /* (View: two boxes, one over the other) */
+        float b = s * 0.95f;
+        line(cx - s, mid - s * 0.6f, cx - s + b, mid - s * 0.6f, lw * 0.7f, mark);
+        line(cx - s, mid - s * 0.6f, cx - s, mid - s * 0.6f + b, lw * 0.7f, mark);
+        rbox(cx - s * 0.35f, mid - s * 0.2f, b, b, 1, mark, mark);
+    }
 }
 
 static void pad_button(float x, float mid, char kind, char where) { pad_face(x + PAD_BUTTON / 2, mid, PAD_BUTTON / 2, kind, where, 1); }
@@ -1123,6 +1162,14 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     pw += side_w;
     if (footer_w + 64 > pw) pw = footer_w + 64;
     if (pw > W - 32) pw = W - 32;
+    /* The start-up menu: the whole window but a margin, the same on every page (its rows in a column
+     * of one width, the button at the bottom) - over the game (F9's window): as big as it needs */
+    int full = !over_game;
+    float margin = floorf((W < H ? W : H) * 0.035f);
+    if (margin < 16) margin = 16;
+    if (margin > 48) margin = 48;
+    if (full) pw = W - 2 * margin;
+    float avail_h = full ? H - 2 * margin + 16 : H;   /* (what the fitting below measures against: its 16 the margin) */
 
     /* heights: shrunk to fit a small window; rows that still do not fit scroll, the selected one shown */
     int tabs = title && strchr(title, '\t');
@@ -1131,16 +1178,16 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     int first = 0, last = n - 1;        /* the rows drawn */
     float rows_h = 0, fixed = 0;
     int has_button = button >= 0 && button < n && shown[button];
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = full && H < 800; pass < 2; pass++) {   /* (the start-up menu: sizes by the window alone, the same on every page) */
         if (pass) { row_h = 36; play_h = 44; footer_h = 48; more = 14; pic_h = pic >= 0 ? 340 : 0; }
         rows_h = 0;
         for (int i = 0; i < n; i++)
             if (shown[i] && i != button && i != pic)
                 rows_h += row_h + gap + ((unsigned char)values[i][0] == 6 || (unsigned char)values[i][0] == 7 || (unsigned char)values[i][0] == 15 ? more : 0);
         fixed = 8 + tabs_h + 10 + (has_button ? 14 + play_h : 0) + 16 + footer_h;   /* (a page without the button: no room for it) */
-        if (fixed + (rows_h > pic_h ? rows_h : pic_h) + 16 <= H) break;
+        if (full || fixed + (rows_h > pic_h ? rows_h : pic_h) + 16 <= avail_h) break;
     }
-    float room_h = H - 16 - fixed;
+    float room_h = avail_h - 16 - fixed;
     if (rows_h > room_h && room_h > 0) {   /* scrolling: the window of rows around the selected one */
         float tall_of[256];
         int count = n < 256 ? n : 256;
@@ -1164,6 +1211,8 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         rows_h = used;
     }
     float ph = fixed + (rows_h > pic_h ? rows_h : pic_h);
+    if (full && pic >= 0 && room_h > pic_h) pic_h = room_h;   /* (the picture: as tall as the room) */
+    if (full) ph = H - 2 * margin;
     float px = floorf((W - pw) / 2), py = floorf((H - ph) / 2);
     if (py < 8) py = 8;
 
@@ -1181,17 +1230,18 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     if (tabs) {
         char buf[160];
         snprintf(buf, sizeof buf, "%s", title);
-        char *name[4], *key = "Tab", *right = NULL;
+        char *name[6], *key = "Tab", *right = NULL;
         int nt = 0, on_at = 0;
-        for (char *t = buf, *next; t && nt < 4; t = next) {
+        for (char *t = buf, *next; t; t = next) {   /* (every field: the key's comes after the names) */
             next = strchr(t, '\t');
             if (next) *next++ = 0;
             if (*t == '@') { if (t[1]) key = t + 1; continue; }
+            if (nt == 6) continue;
             if (*t == '*') on_at = nt;
             name[nt++] = t;
         }
         if ((right = strchr(key, '|'))) *right++ = 0;
-        char shown_name[4][48];
+        char shown_name[6][48];
         float tw = 0;
         for (int t = 0; t < nt; t++) {
             int on = name[t][0] == '*';
@@ -1200,6 +1250,9 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
             else snprintf(shown_name[t], sizeof shown_name[t], "%s", name[t]);
             float l = text_w(shown_name[t], 1, 1) + 48;
             if (l > tw) tw = l;
+            char longest[64];   /* (every tab as wide as the widest it can be: the tabs stay put from page to page) */
+            snprintf(longest, sizeof longest, "%s (%s)", name[t] + (name[t][0] == '*'), key);
+            if (!right && (l = text_w(longest, 1, 1) + 48) > tw) tw = l;
         }
         float tx0 = floorf(W / 2 - tw * nt / 2), th = tabs_h - 6;
         tab_x0 = tx0, tab_w = tw, tab_count = nt;
@@ -1221,20 +1274,23 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         }
     } else text_c(W / 2, y + (tabs_h - CELL_H) / 2, 1, 0, M_TEXT, title ? title : "");
     y = iy + 10;
+    /* the rows' column: across the box - in the start-up menu, one width in its middle */
+    float cw = iw - 20, cx = ix + 10;
+    if (full && cw > 1400) { cx += floorf((cw - 1400) / 2); cw = 1400; }
     if (first > 0 || last < n - 1) {   /* (scrolling: a bar at the right edge of the rows) */
         int all = 0, before = 0, seen = 0;
         for (int i = 0; i < n; i++)
             if (shown[i] && i != button && i != pic) { all++; before += i < first; seen += i >= first && i <= last; }
-        float bx = ix + iw - side_w - 7, top = iy + 10, len = rows_h - gap;
+        float bx = cx + cw - side_w + 3, top = iy + 10, len = rows_h - gap;
         rbox(bx, top, 3, len, 1.5f, RGBA(255, 255, 255, 18), RGBA(255, 255, 255, 18));
         if (all) rbox(bx, top + len * before / all, 3, len * seen / all, 1.5f, M_DIM, M_DIM);
     }
     /* the rows */
-    float rx = ix + 10, rw = iw - 20 - (side_w ? side_w + 4 : 0) - (first > 0 || last < n - 1 ? 8 : 0);
+    float rx = cx, rw = cw - (side_w ? side_w + 4 : 0) - (first > 0 || last < n - 1 ? 8 : 0);
     float vx = rx + 16 + label_w, vw = rx + rw - 12 - vx;
     if (vw < 160) { vx = rx + rw - 172; vw = 160; }
     if (pic >= 0) {   /* the picture: the column right of the rows, as tall as they are */
-        float *r = rects + 4 * pic, sx = ix + iw - side_w - 4, sh = (rows_h > pic_h ? rows_h : pic_h) - gap;
+        float *r = rects + 4 * pic, sx = cx + cw - side_w + 6, sh = (rows_h > pic_h ? rows_h : pic_h) - gap;
         if ((unsigned char)values[pic][0] == 18) mod_detail(sx, iy + 10, side_w - 6, sh, values[pic] + 1);
         else pad_picture(sx, iy + 10, side_w - 6, sh, values[pic] + 1);
         r[0] = sx, r[1] = iy + 10, r[2] = side_w - 6, r[3] = sh;
@@ -1311,7 +1367,15 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     if (button >= 0 && button < n && shown[button]) {
         int sel = selected == button;
         y += 10;
-        float bw = text_w(labels[button], 1.25f, 1) + 64, bh = play_h;
+        if (full) y = iy + ih - 12 - play_h;   /* (always in the same place: the box's bottom) */
+        /* "key\tlabel": the key that presses it first (a pad's "^" button or a key's cap), then the label */
+        const char *label = labels[button], *tab = strchr(label, '\t');
+        char key[16] = "";
+        if (tab) { snprintf(key, sizeof key, "%.*s", (int)(tab - label < 15 ? tab - label : 15), label); label = tab + 1; }
+        int pad = key[0] == '^' && key[1] && key[2];
+        float ls = 1.25f, lw = text_w(label, ls, 1);
+        float kw = !key[0] ? 0 : (pad ? PAD_BUTTON : text_w(key, 1, 0) + 18) + 14;   /* (the key and its gap) */
+        float bw = lw + kw + 64, bh = play_h;
         if (bw < 250) bw = 250;
         float bx = floorf(side_w ? rx + (rw - bw) / 2 : (W - bw) / 2);   /* (under the rows, beside a picture) */
         if (sel) {
@@ -1320,10 +1384,11 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
             rbox(bx + 2, y + 2, bw - 4, bh - 4, 5, RGBA(64, 176, 48, 255), RGBA(40, 140, 34, 255));
             rbox(bx + 2, y + bh - 5, bw - 4, 3, 1.5f, RGBA(24, 90, 22, 255), RGBA(24, 90, 22, 255));
         } else rbox_edge(bx, y, bw, bh, 6, 2, RGBA(54, 120, 46, 255), RGBA(22, 48, 22, 255));
-        const char *label = labels[button];
-        float ls = 1.25f, lw = text_w(label, ls, 1);
         unsigned c = sel ? RGBA(244, 255, 240, 255) : RGBA(150, 220, 140, 255);
-        text_ex(bx + (bw - lw) / 2, y + (bh - CELL_H * ls) / 2 - 1, ls, 1, c, c, sel ? 140 : 0, label);
+        float lx = bx + (bw - lw - kw) / 2;
+        if (pad) pad_button(lx, y + bh / 2.0f, key[1], key[2]);
+        else if (key[0]) keycap(lx, y + (bh - CELL_H) / 2.0f, key);
+        text_ex(lx + kw, y + (bh - CELL_H * ls) / 2 - 1, ls, 1, c, c, sel ? 140 : 0, label);
         float *r = rects + 4 * button;
         r[0] = bx, r[1] = y, r[2] = bw, r[3] = bh;
         y += bh;

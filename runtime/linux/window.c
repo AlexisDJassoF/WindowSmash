@@ -158,8 +158,9 @@ int rt_window_init(void) {
  * While it is up, the arrows, Enter, Esc and left clicks go to it, not to the game; and the
  * controllers are read as hle_pad.c reads them while playing - their state, not their events
  * (this loop has those off), with gamecontrollerdb.txt's mappings, looked for every 100 ms -
- * the D-pad and left stick as presses that repeat while held, the south button to play, the east
- * one to start without changes. Once the menu closes they are closed again, for hle_pad.c. */
+ * the D-pad and left stick as presses that repeat while held, the south button to select, the east
+ * one to go back, Start to play. Once the menu closes they stay open until the game's thread starts
+ * (Select+Start held: back to the menu, prestart_poll), then are closed again, for hle_pad.c. */
 static SDL_GameController *menu_pads[8];
 static int menu_pads_open;
 
@@ -178,9 +179,9 @@ static int pad_kind(SDL_GameController *gp) {   /* (the menu's hints name its bu
     }
 }
 
-static void menu_pads_poll(Uint64 now) {
-    static Uint64 scanned, held_since, repeated;
-    static int held = -1, was_accept, was_back;
+/* The pads open (the ones that came, closed the ones that went - every 100 ms), their state read */
+static void menu_pads_scan(Uint64 now) {
+    static Uint64 scanned;
     if (!menu_pads_open) {
         SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");   /* (as hle_pad.c: some pads need it) */
         menu_pads_open = 1;
@@ -215,13 +216,20 @@ static void menu_pads_poll(Uint64 now) {
                 }
         }
     }
+}
+
+static void menu_pads_poll(Uint64 now) {
+    static Uint64 held_since, repeated;
+    static int held = -1, was_accept, was_back;
+    menu_pads_scan(now);
     /* every pad's buttons together: a direction (D-pad or stick past half way), accept, back, the
      * shoulders (the page before, the next one); and every control as a bit (SDL's buttons, then the
      * triggers at 26 and 27: pad_menu.h's PC_*) for the Controls page while it listens */
     int dir = -1, accept = 0, back = 0, prev = 0, next = 0, any_pad = 0;
     unsigned long long controls = 0;
     static unsigned long long was_controls;
-    static int was_prev, was_next, was_west, was_north, was_rtrigger;
+    static int was_prev, was_next, was_west, was_north, was_rtrigger, was_start;
+    int start = 0;
     for (int i = 0; i < 8; i++) {
         SDL_GameController *gp = menu_pads[i];
         if (!gp) continue;
@@ -263,6 +271,7 @@ static void menu_pads_poll(Uint64 now) {
         back |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_B);     /* (the east one) */
         prev |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
         next |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+        start |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_START);   /* (Menu, OPTIONS, +: the one that plays) */
     }
     /* the Mods page's actions: the west button deletes, the north one opens the folder, the right trigger moves */
     int west = 0, north = 0, rtrigger = 0;
@@ -279,7 +288,7 @@ static void menu_pads_poll(Uint64 now) {
             if (fresh & 1ull << c) { menu_input(MENU_PADKEY, c, 0); break; }
         was_controls = controls;
         held = dir;
-        was_accept = accept, was_back = back, was_prev = prev, was_next = next;
+        was_accept = accept, was_back = back, was_prev = prev, was_next = next, was_start = start;
         return;
     }
     was_controls = controls;
@@ -298,12 +307,38 @@ static void menu_pads_poll(Uint64 now) {
     if (west && !was_west) menu_input(MENU_DELETE, 0, 0);
     if (north && !was_north) menu_input(MENU_FOLDER, 0, 0);
     if (rtrigger && !was_rtrigger) menu_input(MENU_MOVE, 0, 0);
-    was_west = west, was_north = north, was_rtrigger = rtrigger;
+    if (start && !was_start) menu_input(MENU_START, 0, 0);
+    was_west = west, was_north = north, was_rtrigger = rtrigger, was_start = start;
     was_accept = accept;
     was_back = back;
     was_prev = prev;
     was_next = next;
 }
+
+/* ---- back to the menu before the game (menu_prestart: the shaders' screen) ----------------
+ * Select+Start on a pad, or Esc, held for MENU_BACK_HOLD_MS: menu_back set and the shaders stopped
+ * (host.c then starts the program again on the menu). Esc let go sooner skips the shaders, as before. */
+static Uint64 esc_down_at;   /* Esc pressed, not let go yet (0: up) */
+
+static void prestart_poll(Uint64 now) {
+    static Uint64 since;
+    menu_pads_scan(now);
+    int combo = esc_down_at != 0;
+    for (int i = 0; i < 8 && !combo; i++)
+        combo = menu_pads[i] && SDL_GameControllerGetButton(menu_pads[i], SDL_CONTROLLER_BUTTON_START) &&
+                SDL_GameControllerGetButton(menu_pads[i], SDL_CONTROLLER_BUTTON_BACK);
+    if (!combo || menu_back) { since = 0; menu_back_hold = 0; return; }
+    if (!since) since = esc_down_at ? esc_down_at : now;
+    menu_back_hold = (int)(now - since) + 1;
+    if (now - since >= MENU_BACK_HOLD_MS) {
+        fprintf(stderr, "[menu] %s held: back to the menu\n", esc_down_at ? "Esc" : "Select+Start");
+        menu_back = 1;
+        precompile_skip = 1;   /* (the shaders' screen ends; host.c starts again on the menu) */
+        esc_down_at = 0;
+    }
+}
+
+static int page_key_text;   /* Q or E changed the page: its letter's text event dropped */
 
 /* 1 if the menu took the event */
 static int menu_event_of(const SDL_Event *e) {
@@ -317,6 +352,11 @@ static int menu_event_of(const SDL_Event *e) {
         case SDL_SCANCODE_LEFT: menu_input(MENU_LEFT, 0, 0); return 1;
         case SDL_SCANCODE_RIGHT: menu_input(MENU_RIGHT, 0, 0); return 1;
         case SDL_SCANCODE_TAB: if (!e->key.repeat) menu_input(e->key.keysym.mod & KMOD_SHIFT ? MENU_TAB_PREV : MENU_TAB, 0, 0); return 1;
+        case SDL_SCANCODE_Q: case SDL_SCANCODE_E:   /* the page before, the next one - as a pad's shoulders (typing a name: letters) */
+            if (menu_typing || !menu_active) return 0;
+            if (!e->key.repeat) menu_input(e->key.keysym.scancode == SDL_SCANCODE_Q ? MENU_TAB_PREV : MENU_TAB, 0, 0);
+            page_key_text = 1;   /* (its letter, which SDL_TEXTINPUT brings next, is not typed on the page it lands on) */
+            return 1;
         case SDL_SCANCODE_BACKSPACE: menu_input(MENU_ERASE, 0, 0); return 1;
         case SDL_SCANCODE_DELETE: if (!e->key.repeat) menu_input(MENU_DELETE, 0, 0); return 1;
         case SDL_SCANCODE_SPACE: if (menu_typing) return 1;   /* (a space typed: SDL_TEXTINPUT brings it) */
@@ -326,9 +366,11 @@ static int menu_event_of(const SDL_Event *e) {
             if (!e->key.repeat) menu_input(MENU_ACCEPT, 0, 0);
             return 1;
         case SDL_SCANCODE_ESCAPE: if (!e->key.repeat) menu_input(MENU_BACK, 0, 0); return 1;
+        case SDL_SCANCODE_F5: if (!e->key.repeat && menu_active) menu_input(MENU_START, 0, 0); return menu_active;   /* (plays; in F9's window: the game's F5) */
         default: return 0;
         }
     case SDL_TEXTINPUT:   /* the Network page's names and addresses (printable ASCII: the overlay's font) */
+        if (page_key_text) { page_key_text = 0; if (e->text.text[0] && !e->text.text[1]) return 1; }
         for (const char *t = e->text.text; *t; t++)
             if (*t >= 32 && *t <= 126) menu_input(MENU_CHAR, *t, 0);
         return 1;
@@ -350,6 +392,7 @@ void rt_window_loop(int every, void (*status)(void)) {
     for (;;) {
         SDL_Event e;
         if (menu_active) menu_pads_poll(SDL_GetTicks64());
+        else if (menu_prestart) prestart_poll(SDL_GetTicks64());
         else if (menu_pads_open) menu_pads_stop();
         static int text_on = -1;   /* typed text for the menu only (no IME in the game's way) */
         if (window && text_on != (menu_active || menu_modal)) {
@@ -379,13 +422,19 @@ void rt_window_loop(int every, void (*status)(void)) {
                     if (display_bar_hit(e.button.x * dw / (ww ? ww : 1), e.button.y * dh / (wh ? wh : 1))) display_toggle_operation_mode();
                 }
                 break;
+            case SDL_KEYUP:   /* (the start-up's shader screen: Esc let go before a second skips it) */
+                if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE && esc_down_at) {
+                    if (precompile_active && !menu_back && SDL_GetTicks64() - esc_down_at < MENU_BACK_HOLD_MS) precompile_skip = 1;
+                    esc_down_at = 0;
+                }
+                break;
             case SDL_MOUSEMOTION:
                 mouse_moved_at = SDL_GetTicks64();
                 if (cursor_hidden) { SDL_ShowCursor(SDL_ENABLE); cursor_hidden = 0; }
                 break;
             case SDL_KEYDOWN:
                 if (e.key.repeat) break;
-                if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE && precompile_active) precompile_skip = 1;   /* (the start-up's shader screen) */
+                if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE && menu_prestart) esc_down_at = SDL_GetTicks64();   /* (held: the menu; let go soon: prestart_poll, below) */
                 if (e.key.keysym.scancode >= SDL_SCANCODE_F1 && e.key.keysym.scancode <= SDL_SCANCODE_F6)
                     gfx_hotkey(e.key.keysym.scancode - SDL_SCANCODE_F1);
                 if (e.key.keysym.scancode == SDL_SCANCODE_F7 && !menu_active && !precompile_active) display_toggle_operation_mode();

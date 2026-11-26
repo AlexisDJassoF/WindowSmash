@@ -39,16 +39,34 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return dict(kv.split('=', 1) for kv in r.stdout.strip().split('|'))
 
-    def test_starts_on_play_and_enter_plays(self):
-        out = self.run_menu('a')
-        self.assertEqual((int(out['state']), out['row']), (PLAY, 'Play'))
+    def test_accept_on_play_does_not_play(self):
+        out = self.run_menu('a')   # (it opens on Play)
+        self.assertEqual((int(out['state']), out['row'], out['hint']), (OPEN, 'Play', '1'))   # "Press Start to play"
+        self.assertEqual(self.run_menu('at3')['hint'], '0')   # (for 2 s)
+
+    def test_start_plays(self):
+        self.assertEqual(int(self.run_menu('s')['state']), PLAY)
+        out = self.run_menu('drs')   # down from Play wraps to Mode; right; Start plays from any row
+        self.assertEqual((int(out['state']), out['row'], out['mode']), (PLAY, 'Mode', 'Handheld (720p)'))
 
     def test_change_mode_and_play(self):
-        out = self.run_menu('dra')   # down from Play wraps to Mode; right; Mode is not Play, so a moves down
+        out = self.run_menu('dra')   # Mode is not Play, so a moves down
         self.assertEqual(out['mode'], 'Handheld (720p)')
         self.assertEqual(int(out['state']), OPEN)
-        out = self.run_menu('dr' + 'd' * 6 + 'a')   # on down to Play (Sharpness hidden: 6 rows)
+        out = self.run_menu('dr' + 'd' * 6 + 'a')   # on down to Play (Sharpness hidden: 6 rows): accept still does not play
+        self.assertEqual((int(out['state']), out['mode']), (OPEN, 'Handheld (720p)'))
+        out = self.run_menu('dr' + 'd' * 6 + 's')
         self.assertEqual((int(out['state']), out['mode']), (PLAY, 'Handheld (720p)'))
+
+    def test_play_label(self):
+        self.assertEqual(self.run_menu('')['play'], 'F5/Play')
+        self.assertEqual(self.run_menu('uuul')['play'], 'F5/Apply and Play')   # VSync Off -> On
+        self.assertEqual(self.run_menu('uuulr')['play'], 'F5/Play')            # and back: nothing to apply
+        self.assertEqual(self.run_menu('', TEST_DEVICE='1')['play'], '^XM/Play')   # (Xbox: its Menu button)
+        self.assertEqual(self.run_menu('', TEST_DEVICE='2')['play'], '^PM/Play')   # (PlayStation: OPTIONS)
+        self.assertEqual(self.run_menu('', TEST_DEVICE='3')['play'], '^NM/Play')   # (Nintendo: +)
+        self.assertEqual(self.run_menu('dddrdrl')['play'], 'F5/Apply and Play')    # (FSR on; Sharpness up and down: FSR still)
+        self.assertEqual(self.run_menu('dddrdrll' + 'r')['play'], 'F5/Apply and Play')
 
     def test_sharpness_only_with_fsr(self):
         out = self.run_menu('ddd')   # Mode, Resolution scale, then Upscaling
@@ -87,9 +105,10 @@ class MenuTests(unittest.TestCase):
     def test_touched_waits(self):
         self.assertEqual(int(self.run_menu('ut60')['state']), OPEN)
 
-    def test_back_keeps_display_ini(self):
+    def test_back_at_the_top_does_nothing(self):
         out = self.run_menu('drb')
-        self.assertEqual((int(out['state']), out['mode']), (KEEP, 'Docked (1080p)'))
+        self.assertEqual((int(out['state']), out['mode']), (OPEN, 'Handheld (720p)'))
+        self.assertEqual(int(self.run_menu('bt60')['state']), OPEN)   # (touched: no countdown either)
 
     def test_locked_row_does_not_change(self):
         out = self.run_menu('dr', TEST_LOCKED='2')   # LOCK_MODE

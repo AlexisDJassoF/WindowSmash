@@ -7,7 +7,8 @@
  * tools/shaderaot.c processes - one a logical processor but one, at low priority - while the
  * window shows how far they are. Processes, not the renderer's compiler threads: the translator
  * gives up on some programs with rt_fatal, which would end the game, and shaderaot counts those
- * and carries on. Esc starts the game at once; what is compiled stays, and the next start
+ * and carries on. Esc starts the game at once (Esc or Select+Start held: the menu again, gpu_menu.h's
+ * menu_back); what is compiled stays, and the next start
  * compiles the rest. The processes die with the game (shaderaot --die-with-parent), and write
  * each file whole (a .tmp renamed), so closing the window leaves nothing half written.
  *
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gpu_menu.h"
 #include "gpu_precompile.h"
 #include "gpu_shader_cache.h"
 
@@ -215,7 +217,7 @@ void precompile_run(void) {
         fprintf(stderr, "[shaders] indexing the game's shaders for cache version %u\n", SHADER_CACHE_VERSION);
         while (pid && waitpid(pid, &status, WNOHANG) == 0) {
             if (precompile_skip) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); status = -1; break; }
-            if (!gfx_progress("Indexing shaders", 0, 0, "reading the game's shaders")) usleep(50000);
+            if (!gfx_progress("Indexing shaders", 0, 0, menu_back_hold ? "Keep holding: back to the menu" : "reading the game's shaders")) usleep(50000);
         }
         if (pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) rename(tmp, keys);
         else { unlink(tmp); fprintf(stderr, "[shaders] indexing failed or skipped: starting without precompiling\n"); precompile_active = 0; return; }
@@ -261,7 +263,8 @@ void precompile_run(void) {
         if (done && !first_at) first_at = now_s();
         if (precompile_skip) break;
         char status[96];
-        eta_text(status, sizeof status, done > total ? total : done, total, first_at);
+        if (menu_back_hold) snprintf(status, sizeof status, "Keep holding: back to the menu");
+        else eta_text(status, sizeof status, done > total ? total : done, total, first_at);
         gfx_progress("Preparing shaders", (unsigned)(done > total ? total : done), (unsigned)total, status);
     }
     int skipped = precompile_skip;

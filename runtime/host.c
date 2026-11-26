@@ -897,7 +897,10 @@ static DWORD WINAPI crash_test(void *seconds) {
 static DWORD WINAPI start_game(LPVOID unused) {
     (void)unused;
     menu_run();         /* the settings, every start (gpu_menu.c) */
+    menu_prestart = 1;  /* (from here to the game's thread: Select+Start or Esc held comes back to the menu) */
     precompile_run();   /* then the shaders the cache lacks */
+    if (menu_back) menu_restart_menu();   /* (returns only if it cannot: then the game starts) */
+    menu_prestart = 0;
     /* Guest call depth becomes host call depth, so the guest runs on a thread with a large stack. */
     CloseHandle(CreateThread(NULL, 512ull << 20, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL));
     return 0;
