@@ -24,6 +24,9 @@
  *                      players not listed: the ones this player reaches directly)
  *  14 PUNCH    player: secret u64, from u32, to u32, ack u8, nonce u64   (straight to another player)
  *  15 DIRECT   player: secret u64, then as DATA                         (the same)
+ *  16 MODGET   player: secret u64, sha u64, first block u32, count u16  (a room's mod file, from its host:
+ *  17 MODPART  host:   secret u64, sha u64, block u32, bytes             straight there, or through a private
+ *                      room's relay - its cookie the secret; never through the lobby. mod_sync.h)
  * A game that can connect directly adds to its PINGs: peers version u32 (of the last PEERS it got),
  * LAN address u32, port u16, flags u8 (1: direct connections allowed), direct peers u8; a lobby
  * that introduces players says so with WELCOME flag 2. Older games and lobbies ignore both.
@@ -31,7 +34,10 @@
  * destination (the room's broadcast address: every other member), checking the source; a
  * lobby gives every player an address of its own and carries a Local Wireless network's
  * traffic between that network's players only. A member that is silent for 10 s is gone; a
- * JOIN with its nonce from a new place takes it back. Up to 8 members a relay's room.
+ * JOIN with its nonce from a new place takes it back. Up to 8 members a relay's room. A private room's
+ * relay gives each member a cookie of its own in WELCOME (older ones give 0), which its MODGETs carry.
+ * A room's mods' manifest travels in DATA between port 65512s (mod_sync.h): a relay carries it as any
+ * other traffic, and older games ignore it.
  *
  * Direct connections: the lobby introduces the players of a room to each other, and their games
  * then send the room's traffic straight to each other where their routers let them (UDP hole
@@ -65,12 +71,16 @@ typedef int SOCKET;
 #include <string.h>
 
 #include "host.h"
+#include "mod_room.h"
+#include "mod_scan.h"
+#include "mod_sync.h"
 #include "net.h"
+#include "net_menu.h"
 
 #define MAGIC0 'S'
 #define MAGIC1 'N'
 enum { T_JOIN = 1, T_WELCOME, T_REJECT, T_PING, T_PONG, T_DATA, T_MEMBERS, T_LEAVE, T_LIST, T_LISTING, T_LIST_END,
-       T_PEERS, T_BCAST, T_PUNCH, T_DIRECT };
+       T_PEERS, T_BCAST, T_PUNCH, T_DIRECT, T_MODGET, T_MODPART };
 #define NAME_LEN 32
 #define BUILD_LEN 40
 #define JOIN_SIZE (4 + 8 + 2 * NAME_LEN + BUILD_LEN)
@@ -142,11 +152,12 @@ int net_log(void) { configure(); return logging; }
 const char *net_player_name(void) { configure(); return name; }
 
 /* ---- the relay (host mode) ------------------------------------------------------------ */
-typedef struct Member { struct sockaddr_in at; u64 nonce, seen; u32 ip; char name[NAME_LEN + 1]; } Member;
+typedef struct Member { struct sockaddr_in at; u64 nonce, seen, cookie; u32 ip; char name[NAME_LEN + 1]; } Member;
 typedef struct Room { char name[NAME_LEN + 1]; u8 build[BUILD_LEN]; Member members[ROOM_MEMBERS]; int count; } Room;
 #define ROOMS 64
 static Room rooms[ROOMS];
 static SOCKET relay_sock = INVALID_SOCKET;
+static u64 random64(void);
 
 static int same_addr(const struct sockaddr_in *a, const struct sockaddr_in *b) {
     return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
@@ -262,6 +273,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             r->members[m].at = *from;
             r->members[m].nonce = nonce;
             r->members[m].ip = ip;
+            r->members[m].cookie = random64() | 1;   /* (a room's mod files ask with it: mod_sync.h) */
             snprintf(r->members[m].name, sizeof r->members[m].name, "%s", who);
             if (logging) fprintf(stderr, "[net] relay: %s joined room %s as 10.13.%u.%u\n", who, r->name, ip >> 8 & 255, ip & 255);
             tell_members(r);
@@ -270,7 +282,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
         header(out, T_WELCOME);
         put64(out + 4, nonce);
         put32(out + 12, r->members[m].ip);
-        put64(out + 16, 0);   /* (cookie: a private room's relay checks none) */
+        put64(out + 16, r->members[m].cookie);   /* (cookie: a private room's relay checks it in MODGETs alone) */
         out[24] = 0;          /* (flags: not a lobby) */
         int len = 25 + member_list(r, out + 25);
         sendto(relay_sock, (const char *)out, len, 0, (const struct sockaddr *)from, sizeof *from);
@@ -289,6 +301,13 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
     case T_LEAVE:
         if (m >= 0) drop_member(r, m);
         return;
+    case T_MODGET: {   /* a room's mod file: this PC's game hosts the room and gives them (mod_sync.c) */
+        if (m < 0 || n < 4 + 8 + 14 || get64(p + 4) != r->members[m].cookie) return;
+        r->members[m].seen = now_ms();
+        ModRoute to = {1, ntohl(from->sin_addr.s_addr), ntohs(from->sin_port), r->members[m].cookie};
+        mod_sync_get(&to, p + 12, (size_t)(n - 12));
+        return;
+    }
     case T_DATA: {
         if (m < 0 || n < 16) return;
         Member *src = &r->members[m];
@@ -675,6 +694,19 @@ static void direct_packet(const u8 *p, int n, const struct sockaddr_in *from) {
     int c = 0;
     if (t >= test_block_at || !lobby || n < DIRECT_HEAD) return;
     u64 secret = get64(p + 4);
+    if ((p[3] == T_MODGET || p[3] == T_MODPART) && n >= DIRECT_HEAD + 12) {   /* a room's mod files, straight (mod_sync.h) */
+        AcquireSRWLockShared(&peers_lock);
+        Peer *q = peer_from(secret, from, &c);
+        int ok = q && nat_lets_in(q, c, t);
+        u32 ip = ok ? q->ip : 0;
+        ReleaseSRWLockShared(&peers_lock);
+        if (!ok) return;
+        if (p[3] == T_MODGET) {
+            ModRoute to = {2, ntohl(from->sin_addr.s_addr), ntohs(from->sin_port), secret};
+            mod_sync_get(&to, p + DIRECT_HEAD, (size_t)(n - DIRECT_HEAD));
+        } else mod_sync_part(ip, p + DIRECT_HEAD, (size_t)(n - DIRECT_HEAD));
+        return;
+    }
     if (p[3] == T_DIRECT && n >= DIRECT_HEAD + 12) {
         const u8 *b = p + DIRECT_HEAD;
         u32 src = get32(b), dst = get32(b + 4);
@@ -688,7 +720,8 @@ static void direct_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             InterlockedIncrement(ok ? &q->in_direct : &q->dropped);
         }
         ReleaseSRWLockShared(&peers_lock);
-        if (ok && ldn_in_network(src)) vsock_deliver(src, sport, dst, dport, b + 12, (u32)(n - DIRECT_HEAD - 12));
+        if (ok && sport == MODS_PORT && dport == MODS_PORT) mod_sync_data(src, b + 12, (size_t)(n - DIRECT_HEAD - 12));   /* (a room's mods' list) */
+        else if (ok && ldn_in_network(src)) vsock_deliver(src, sport, dst, dport, b + 12, (u32)(n - DIRECT_HEAD - 12));
         else if (ok) InterlockedIncrement(&direct_not_in_room);
         return;
     }
@@ -743,8 +776,11 @@ static void local_address(void) {   /* this player's own address and port, for p
 
 /* To one player (straight there while a direct path works, else through the lobby), or to the
  * room: straight to each player reached directly, through the lobby to the rest. */
+static volatile LONG game_sent;   /* the game's own datagrams sent (not local wireless's, not the mods'): a fight's go fast */
+
 void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
     if (!joined || client_sock == INVALID_SOCKET || len > 65000) return;
+    if (src_port != NET_LDN_PORT && dst_port != NET_LDN_PORT && src_port != MODS_PORT) InterlockedIncrement(&game_sent);
     enum { ROOM = 4 + 1 + 4 * PEERS_MAX };   /* (before the DATA body: room for the longest header, BCAST's) */
     u8 stack[1600], *buf = ROOM + 12 + len <= sizeof stack ? stack : malloc(ROOM + 12 + len);
     if (!buf) return;
@@ -793,6 +829,124 @@ void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *da
         sendto(client_sock, (const char *)h, (int)(body - h) + n, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
     }
     if (buf != stack) free(buf);
+}
+
+/* ---- a room's mods (mod_sync.h): the transport, and who gives them ---------------------------
+ * In a private room the host's game gives them, through its relay (its cookie the secret); in a room
+ * of the online lobby the game that hosts the local wireless network does, straight to each player
+ * it reaches directly (never through the lobby). It gives nothing while a fight goes on: its game
+ * sends more than SSBU_MODS_FIGHT_PPS (30) datagrams a second then. */
+static u32 mods_target;            /* the host whose files are asked for (a private room's come from the relay) */
+static volatile LONG game_pps;     /* the game's datagrams in the last second */
+
+static void mods_data(u32 dst, const void *p, size_t n) { net_send(my_ip, MODS_PORT, dst, MODS_PORT, p, (u32)n); }
+
+static int mods_get(u32 host, const void *body, size_t n) {
+    if (!joined || client_sock == INVALID_SOCKET || n != 14) return 0;
+    u8 p[4 + 8 + 14];
+    header(p, T_MODGET);
+    memcpy(p + 12, body, 14);
+    mods_target = host;
+    if (!lobby) {   /* (a private room: its relay is the host's game) */
+        if (!cookie) return 0;   /* (an older relay: it gives no files) */
+        put64(p + 4, cookie);
+        sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&relay_at, sizeof relay_at);
+        return 1;
+    }
+    struct sockaddr_in at;
+    u64 secret = 0;
+    int found = 0;
+    AcquireSRWLockShared(&peers_lock);
+    for (int i = 0; i < npeers && !found; i++)
+        if (peers[i].ip == host && peers[i].introduced && peers[i].state != P_PUNCHING) {   /* (direct, or was: it may come back) */
+            at = peers[i].cand[peers[i].via].at;
+            secret = peers[i].secret;
+            found = peers[i].state == P_DIRECT || now_ms() - peers[i].last_ack < 30000;
+        }
+    ReleaseSRWLockShared(&peers_lock);
+    if (!found) return 0;
+    put64(p + 4, secret);
+    sendto(client_sock, (const char *)p, sizeof p, 0, (const struct sockaddr *)&at, sizeof at);
+    return 1;
+}
+
+static void mods_part(const ModRoute *to, const void *body, size_t n) {
+    u8 p[4 + 8 + 12 + MOD_BLOCK];
+    if (n > sizeof p - 12) return;
+    header(p, T_MODPART);
+    put64(p + 4, to->secret);
+    memcpy(p + 12, body, n);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(to->ip);
+    a.sin_port = htons(to->port);
+    SOCKET s = to->via == 1 ? relay_sock : client_sock;
+    if (s != INVALID_SOCKET) sendto(s, (const char *)p, (int)(12 + n), 0, (const struct sockaddr *)&a, sizeof a);
+}
+
+static int mods_fight(void) {
+    static long limit = -1;
+    if (limit < 0) { const char *v = getenv("SSBU_MODS_FIGHT_PPS"); limit = v && atol(v) > 0 ? atol(v) : 30; }
+    return game_pps > limit;
+}
+
+static int mods_may_ask(u32 src) { return ldn_in_network(src); }
+
+static int mods_reachable(u32 host) {   /* a private room's relay gives them; in the lobby, a direct path to the host */
+    if (!lobby) return joined && cookie != 0;
+    int ok = 0;
+    AcquireSRWLockShared(&peers_lock);
+    for (int i = 0; i < npeers; i++) ok |= peers[i].ip == host && peers[i].introduced && (peers[i].state == P_DIRECT || peers[i].state == P_PUNCHING);
+    ReleaseSRWLockShared(&peers_lock);
+    return ok;
+}
+
+static const char *mods_cache_file(char *out, size_t n) {   /* cache/mods/hashes.txt (made), as hle_fs.c's cache/mods */
+    const char *root = getenv("SSBU_DATA_ROOT");
+    char dir[600];
+    if (root) snprintf(dir, sizeof dir, "%s/cache", root);
+    else snprintf(dir, sizeof dir, "%s/../../cache", rt_data_dir);
+    CreateDirectoryA(dir, NULL);
+    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/mods");
+    CreateDirectoryA(dir, NULL);
+    snprintf(out, n, "%s/hashes.txt", dir);
+    return out;
+}
+
+/* (the client's thread, every second) who gives the room's mods here, and a lobby's room just joined */
+static void mods_tick(void) {
+    static int ready, share = 1, said, was;
+    static long rate;
+    static u32 station_of;
+    if (!ready) {
+        ready = 1;
+        NetSettings s;
+        net_settings_load(&s);
+        share = s.share_mods, rate = s.room_mods_rate;
+    }
+    u32 ldn_host = 0;
+    int role = ldn_role(&ldn_host), now = hosting ? 1 : lobby && role == 1 ? 2 : 0;
+    const char *borrowed = getenv("SSBU_ROOM_MODS");   /* (playing with another host's mods: its own are not what it plays with) */
+    if (now && borrowed && *borrowed) {
+        if (!said++) fprintf(stderr, "[mods] playing with another room's mods: the rooms hosted here announce none\n");
+        now = 0;
+    }
+    if (now) {
+        ModHost h;
+        memset(&h, 0, sizeof h);
+        h.lobby = now == 2;
+        h.host_id = net_host_id();
+        snprintf(h.name, sizeof h.name, "%s", name);
+        h.share = share;
+        h.rate = rate;
+        mod_root(h.mods, sizeof h.mods);
+        mods_cache_file(h.hash_cache, sizeof h.hash_cache);
+        h.may_ask = h.lobby ? mods_may_ask : NULL;
+        mod_host_set(&h);
+    } else if (was) mod_host_set(NULL);
+    was = now;
+    if (lobby && role == 2 && ldn_host != station_of) mod_room_joined(ldn_host, 1);   /* (a lobby's room: its host asked, mod_room.c) */
+    station_of = lobby && role == 2 ? ldn_host : 0;
 }
 
 /* (ICMP "port unreachable" would otherwise make a UDP socket's next receive fail; Linux reports
@@ -941,6 +1095,15 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             fprintf(stderr, "[net] lost the relay %s; reconnecting\n", relay_text);
         }
         if (joined && t - last_tick >= 50) { peers_tick(t); last_tick = t; }
+        static u64 last_mods;
+        if (joined && t - last_mods >= 1000) {   /* (the game's rate of datagrams, for the mods' host: a fight's) */
+            static LONG counted;
+            LONG sent = game_sent;
+            InterlockedExchange(&game_pps, (LONG)((sent - counted) * 1000 / (LONG)(t - last_mods > 0 && last_mods ? t - last_mods : 1000)));
+            counted = sent;
+            last_mods = t;
+            mods_tick();
+        }
         struct sockaddr_in from;
         socklen_t flen = sizeof from;
         int n = recvfrom(client_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
@@ -952,6 +1115,10 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         if (buf[2] != NET_PROTOCOL && buf[3] != T_REJECT) continue;   /* (a REJECT comes in our own version) */
         switch (buf[3]) {
         case T_DATA:
+            if (n >= 16 && joined && get16(buf + 12) == MODS_PORT && get16(buf + 14) == MODS_PORT) {   /* (a room's mods' list: mod_sync.h) */
+                mod_sync_data(get32(buf + 4), buf + 16, (size_t)(n - 16));
+                break;
+            }
             if (n >= 16 && joined) {
                 if (get16(buf + 12) != NET_LDN_PORT) count_relayed_in(get32(buf + 4));
                 vsock_deliver(get32(buf + 4), get16(buf + 12), get32(buf + 8), get16(buf + 14), buf + 16, (u32)(n - 16));
@@ -987,6 +1154,9 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             break;
         case T_MEMBERS:
             read_members(buf + 4, n - 4);
+            break;
+        case T_MODPART:   /* a room's mod file, from a private room's relay (its host) */
+            if (n >= 4 + 8 + 12 && joined && !lobby && cookie && get64(buf + 4) == cookie) mod_sync_part(mods_target, buf + 12, (size_t)(n - 12));
             break;
         case T_LISTING:
             if (n >= 12 + NETWORK_INFO && lobby) ldn_listing(get32(buf + 4), get32(buf + 8), buf + 12);
@@ -1241,6 +1411,8 @@ static void start(void) {
     WSADATA wsa;   /* (even offline: the in-game Network window may go online later, net_switch) */
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
+    ModNet mods = {mods_data, mods_get, mods_part, mods_fight, mods_reachable};
+    mod_sync_init(&mods);
     if (configured) {
         if (lan_mode) { lan_start(); InitOnceComplete(&once, 0, NULL); return; }
         if (hosting) relay_start();

@@ -12,7 +12,7 @@ This document describes the checked-in implementation. Implemented paths and dev
 | :--- | :--- |
 | [1. From extracted modules to a Windows executable](#1-from-extracted-modules-to-a-windows-executable) | Inputs, function discovery, translation, module placement. |
 | [2. Loading, symbols, and guest execution](#2-loading-symbols-and-guest-execution) | Mapping, binding, native replacements, exceptions. |
-| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts. |
+| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts, and mods. |
 | [4. The graphics path](#4-the-graphics-path) | GPU commands, the D3D11 back end, shader compilation, audio and video. |
 | [5. Multiplayer transport](#5-multiplayer-transport) | The relay, the lobby and direct connections. |
 | [6. DLC and fighter unlocks](#6-dlc-and-fighter-unlocks) | Installed-content reporting and save editing. |
@@ -106,6 +106,24 @@ These are targeted service implementations, not a complete implementation of the
 Save data and cache files are host directories. `SSBU_DATA_ROOT` can redirect those per-run files for testing. A network identity is separate from save contents: copying `netplay_id.txt` to another PC can make two installs appear as the same player.
 
 The font service loads six firmware font files, decodes their container format, and maps shared font memory. Fonts are user-supplied runtime inputs, not repository assets.
+
+### Mods: the data.arc the game sees
+
+Mods (Linux only for now) replace files of `data.arc` without patching the game's memory: when the game opens `rom:/data.arc`, [`hle_fs.c`](../runtime/hle_fs.c) serves a larger archive built by [`mod_arc.c`](../runtime/mod_arc.c), and every other RomFS path is unchanged. With `N` the real archive's size, the archive the game sees is:
+
+| Range | Contents |
+| :--- | :--- |
+| `[0, 0x38)` | The header, its file system table offset pointing past `N` |
+| `[0x38, N)` | `data.arc`'s own bytes, read in place (the original table among them, unread) |
+| past `N` | The new table, then every folder a mod touches, rebuilt |
+
+The new table is the original one decompressed, edited and wrapped in a zstd frame of raw blocks, so no compressor is needed; the vendored decompressor ([`third_party/zstd`](../third_party/README.md#zstd)) reads the original. Entries are only added at the ends of their tables, never reordered, and the header's counts grow. A directory loads its children as FileData `start + k` of one folder read in one pass, so a mod's file goes in place of the child's own FileData, inside a copy of that folder rebuilt past `N` with its files in the same order. Children that share another color's bytes (a load-type-0 or shared-group FileData) are unshared first, so only the mod's color changes, and colors that read a replaced FileData get the original bytes back. A child with no slot of its own gets a new FileData; regional files (voices) point every region at the mod's file and stop being regional, as a Koopaling's own voice is; a mod's `.nus3bank` is served with the game's ID and name sections. New files a mod's `config.json` lists (`new-dir-files`) get a new path, FileInfo and FileData in their directory. Every file, the mods' included, is a zstd frame of raw blocks made from the mod's file as it is read; nothing is copied to disk.
+
+[`mod_scan.c`](../runtime/mod_scan.c) reads `mods/`: one folder per mod, a leading `.` disabled, files at `data.arc` paths in lower case. It classifies each file (model, portraits, voice, effects, or anything else, which can change how the game plays), finds the fighter and color its path names, applies a color move (`mods/windowsmash.toml`, or a `-c0X` folder name) to every path naming the color (model, `copy_<f>` for Kirby, camera, effects, voices, sounds, portraits), and lists what loads: the first mod in alphabetical order wins a path. The table is cached in `cache/mods/table.bin`, keyed by the archive's header and table and every mod file's path, size and date; building it takes a few hundred milliseconds.
+
+The start-up menu's Mods page ([`mod_menu.c`](../runtime/mod_menu.c), drawn in [`gpu_overlay_quads.c`](../runtime/gpu_overlay_quads.c)) groups mods by fighter in the character select's order ([`mod_roster.c`](../runtime/mod_roster.c)). Its pictures are the game's own: [`gpu_menu_pics.c`](../runtime/gpu_menu_pics.c) reads them from `data.arc` by path (`mod_arc_read_path`, the table read once and freed before the game) or from a mod, on a thread of its own, decodes BNTX ([`gpu_bntx.c`](../runtime/gpu_bntx.c), block linear as in [`gpu_texture.c`](../runtime/gpu_texture.c)) or PNG ([`stb_image`](../third_party/README.md#stb)), and registers them as overlay textures, uploaded still BC-compressed. The overlay draws them in batches, the shader sampling coverage for text and RGBA, or greys, for pictures.
+
+[`mod_recovery.c`](../runtime/mod_recovery.c) keeps `cache/mods/session.txt` while a session with mods runs: `starting` before the archive opens, `running` after 20 s of frames (and `last_good.txt` then lists the mods), `crashed` or `frozen` from the fault handlers, `rt_fatal` and the watchdog, written with plain `open`/`write` and the last eight mod files the game read. A normal exit deletes it. A file left behind makes the next start open the Mods page with the suspect: the mod of the last file read, else the mods new since `last_good.txt`.
 
 ## 4. The graphics path
 
@@ -212,6 +230,7 @@ Paths below are relative to the repository root. Diagnostic tools may require `r
 | [`eh.py`](../tools/eh.py) | Inspect exception-frame information and C++ landing-pad tables. |
 | [`find_crc.py`](../tools/find_crc.py) | Find the CRC-32 table and code references to it. |
 | [`strrefs.py`](../tools/strrefs.py) | Report strings referenced by instructions in a range. |
+| [`mod_arc_proto.py`](../tools/mod_arc_proto.py) | The prototype of the mods' `data.arc` (an overlay file built in Python), kept as the reference for [`mod_arc.c`](../runtime/mod_arc.c)'s steps; `--slot` moves a skin to another color. |
 | [`sym.py`](../tools/sym.py) | Resolve module-relative offsets to nearby exported function symbols. |
 | [`hostsym.py`](../tools/hostsym.py) | Resolve host executable offsets using a locally generated linker map. |
 | [`sass.py`](../tools/sass.py) | List or count Maxwell shader instructions in dumped shader binaries. |

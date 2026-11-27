@@ -11,6 +11,7 @@ release named below, and the selection can be checked against that release's arc
 | libopus | 1.5.2 | https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz | `65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1` |
 | libvpx | 1.15.2 | https://github.com/webmproject/libvpx/archive/refs/tags/v1.15.2.tar.gz | `26fcd3db88045dee380e581862a6ef106f49b74b6396ee95c2993a260b4636aa` |
 | zstd | 1.5.7 | https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz | `eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3` |
+| stb_image | 2.31 | https://raw.githubusercontent.com/nothings/stb/562641d1e825ed40414ffa099ce56a24e672a166/stb_image.h (the file itself) | `0e266e9f94592d9b87e97fa801a6d7e1bf8ebfe5809e5d7838f78257cba46e0c` |
 
 ## opus/
 
@@ -66,6 +67,12 @@ and `build/single_file_libs/zstddeclib-in.c`, the list of sources and settings z
 single-file decoder is generated from (no legacy formats, no assembly, no error strings).
 `runtime/mod_zstd.c` includes that file, so the build compiles the decoder as one unit, the way the
 generated `zstddeclib.c` would be, with no change to the build scripts.
+
+## stb/
+
+`stb_image.h` alone, for the start-up menu's pictures: a mod's `preview.png` (`runtime/gpu_menu_pics.c`,
+which compiles it with `STBI_ONLY_PNG`). One header, public domain or MIT (the license is at its
+end); the commit is the one in the table above, not a release archive (stb has none).
 
 ## Updating a library
 

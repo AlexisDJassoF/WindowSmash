@@ -27,6 +27,7 @@
 #include "../gpu_menu.h"
 #include "../gpu_precompile.h"
 #include "../pad_snap.h"
+#include "mod_recovery.h"
 
 static SDL_Window *window;
 static volatile int focused;
@@ -228,7 +229,7 @@ static void menu_pads_poll(Uint64 now) {
     int dir = -1, accept = 0, back = 0, prev = 0, next = 0, any_pad = 0;
     unsigned long long controls = 0;
     static unsigned long long was_controls;
-    static int was_prev, was_next, was_west, was_north, was_rtrigger, was_start;
+    static int was_prev, was_next, was_west, was_north, was_rtrigger, was_ltrigger, was_start;
     int start = 0;
     for (int i = 0; i < 8; i++) {
         SDL_GameController *gp = menu_pads[i];
@@ -239,7 +240,8 @@ static void menu_pads_poll(Uint64 now) {
         if (SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) controls |= 1ull << 26;
         if (SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) controls |= 1ull << 27;
         int x = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_LEFTX), y = SDL_GameControllerGetAxis(gp, SDL_CONTROLLER_AXIS_LEFTY);
-        int sx = menu_sticks_still ? 0 : x, sy = menu_sticks_still ? 0 : y;   /* (the dead zones' page: the sticks are being tested, not steering) */
+        int still = menu_sticks_still || menu_stick_free;   /* (the dead zones' page: the sticks are being tested, not steering; the Mods grid: its cursor) */
+        int sx = still ? 0 : x, sy = still ? 0 : y;
         if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_UP) || sy < -16000) dir = MENU_UP;
         else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || sy > 16000) dir = MENU_DOWN;
         else if (SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || sx < -16000) dir = MENU_LEFT;
@@ -274,14 +276,15 @@ static void menu_pads_poll(Uint64 now) {
         start |= SDL_GameControllerGetButton(gp, SDL_CONTROLLER_BUTTON_START);   /* (Menu, OPTIONS, +: the one that plays) */
     }
     /* the Mods page's actions: the west button deletes, the north one opens the folder, the right trigger moves */
-    int west = 0, north = 0, rtrigger = 0;
+    int west = 0, north = 0, rtrigger = 0, ltrigger = 0;
     for (int i = 0; i < 8; i++)
         if (menu_pads[i]) {
             west |= SDL_GameControllerGetButton(menu_pads[i], SDL_CONTROLLER_BUTTON_X);
             north |= SDL_GameControllerGetButton(menu_pads[i], SDL_CONTROLLER_BUTTON_Y);
             rtrigger |= SDL_GameControllerGetAxis(menu_pads[i], SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000;
+            ltrigger |= SDL_GameControllerGetAxis(menu_pads[i], SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000;
         }
-    if (!any_pad) { menu_pad_name[0] = 0; for (int a = 0; a < 4; a++) menu_axes[a] = 0; }
+    if (!any_pad) { menu_pad_name[0] = 0; for (int a = 0; a < 4; a++) menu_axes[a] = menu_axes_game[a] = 0; }   /* (gone while tilted: nothing moves on) */
     if (menu_listening) {   /* the Controls page waits: the first control newly pressed is its, and nothing else happens */
         unsigned long long fresh = controls & ~was_controls;
         for (int c = 0; c < 28 && fresh; c++)
@@ -302,13 +305,15 @@ static void menu_pads_poll(Uint64 now) {
     }
     if (accept && !was_accept) menu_input(MENU_ACCEPT, 0, 0);
     if (back && !was_back) menu_input(MENU_BACK, 0, 0);
+    if (prev && next) menu_safe_held = 1;   /* (L+R: the safe mode, if the menu is just opening - gpu_menu.c) */
     if (prev && !was_prev) menu_input(MENU_TAB_PREV, 0, 0);   /* (the left shoulder: the page before; the right: the next) */
     if (next && !was_next) menu_input(MENU_TAB, 0, 0);
     if (west && !was_west) menu_input(MENU_DELETE, 0, 0);
     if (north && !was_north) menu_input(MENU_FOLDER, 0, 0);
     if (rtrigger && !was_rtrigger) menu_input(MENU_MOVE, 0, 0);
+    if (ltrigger && !was_ltrigger) menu_input(MENU_SHARE, 0, 0);
     if (start && !was_start) menu_input(MENU_START, 0, 0);
-    was_west = west, was_north = north, was_rtrigger = rtrigger, was_start = start;
+    was_west = west, was_north = north, was_rtrigger = rtrigger, was_ltrigger = ltrigger, was_start = start;
     was_accept = accept;
     was_back = back;
     was_prev = prev;
@@ -374,7 +379,19 @@ static int menu_event_of(const SDL_Event *e) {
         for (const char *t = e->text.text; *t; t++)
             if (*t >= 32 && *t <= 126) menu_input(MENU_CHAR, *t, 0);
         return 1;
+    case SDL_MOUSEMOTION: {   /* (the start-up menu: the Mods grid's tile under it; the pointer still shown, below) */
+        if (!menu_active) return 0;
+        int ww = 1, wh = 1, dw = 1, dh = 1;
+        SDL_GetWindowSize(window, &ww, &wh);
+        SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+        menu_input(MENU_HOVER, e->motion.x * dw / (ww ? ww : 1), e->motion.y * dh / (wh ? wh : 1));
+        return 0;
+    }
     case SDL_MOUSEBUTTONDOWN: {
+        if (e->button.button == SDL_BUTTON_RIGHT || e->button.button == SDL_BUTTON_X1) {   /* (right click, the mouse's back button: back) */
+            menu_input(MENU_BACK, 0, 0);
+            return 1;
+        }
         if (e->button.button != SDL_BUTTON_LEFT) return 0;
         int ww = 1, wh = 1, dw = 1, dh = 1;   /* (window units to the drawable's pixels: they differ on a scaled desktop) */
         SDL_GetWindowSize(window, &ww, &wh);
@@ -391,8 +408,11 @@ void rt_window_loop(int every, void (*status)(void)) {
     Uint64 last = SDL_GetTicks64();
     for (;;) {
         SDL_Event e;
-        if (menu_active) menu_pads_poll(SDL_GetTicks64());
-        else if (menu_prestart) prestart_poll(SDL_GetTicks64());
+        if (menu_active) {
+            if (window && SDL_GetModState() & KMOD_SHIFT) menu_safe_held = 1;   /* (Shift: the safe mode, if the menu is just opening) */
+            menu_pads_poll(SDL_GetTicks64());
+            if (menu_prestart) prestart_poll(SDL_GetTicks64());   /* (a room's mods downloading before the game: Select+Start held, the menu) */
+        } else if (menu_prestart) prestart_poll(SDL_GetTicks64());
         else if (menu_pads_open) menu_pads_stop();
         static int text_on = -1;   /* typed text for the menu only (no IME in the game's way) */
         if (window && text_on != (menu_active || menu_modal)) {
@@ -403,10 +423,14 @@ void rt_window_loop(int every, void (*status)(void)) {
         if (request >= 0 && window) set_mode(request);
         int got = window ? SDL_WaitEventTimeout(&e, 8) : (SDL_Delay(50), 0);
         while (got) {
+            if (menu_active && menu_prestart && e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE)
+                esc_down_at = SDL_GetTicks64();   /* (the menu takes Esc - it cancels -, and held it goes back to the menu) */
+            if (menu_active && menu_prestart && e.type == SDL_KEYUP && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) esc_down_at = 0;
             if (menu_event_of(&e)) { got = SDL_PollEvent(&e); continue; }
             switch (e.type) {
             case SDL_QUIT:
                 fprintf(stderr, "[gfx] window closed\n");
+                mod_recovery_close();   /* (a normal close: no recovery at the next start) */
                 ExitProcess(0);
             case SDL_WINDOWEVENT:
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) focused = 1;

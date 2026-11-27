@@ -22,7 +22,7 @@ enum { NET_MODE_LAUNCHER, NET_MODE_HOST, NET_MODE_JOIN, NET_MODES };
 #define NET_PAGE 4            /* rooms listed at a time on Join's page */
 /* Join's list: NROW_LAN its heading, NROW_LIST.. a room each (choices[page * NET_PAGE + k]), NROW_PAGER Refresh and the pages */
 enum { NROW_MODE, NROW_NAME, NROW_ROOM, NROW_PORT, NROW_HOST, NROW_LAN, NROW_LIST, NROW_LIST_END = NROW_LIST + NET_PAGE - 1, NROW_PAGER,
-       NROW_ADDRS, NROW_ROUTER, NROW_TIP, NROW_PLAY, NROWS };
+       NROW_ADDRS, NROW_ROUTER, NROW_TIP, NROW_MODS, NROW_PLAY, NROWS };   /* (NROW_MODS: the mods that can desync, when there are) */
 enum { NET_EV_NONE, NET_EV_PLAY, NET_EV_REFRESH };   /* what net_menu_event says happened (REFRESH: look for rooms again) */
 
 /* found: answering now (on the LAN, or the address asked), else recent; players of most (most 0: not said);
@@ -35,12 +35,22 @@ enum { NET_WATCH_NONE, NET_WATCH_CHECKING, NET_WATCH_UP, NET_WATCH_DOWN };
 /* What Join chose by itself (NetMenu.auto_state): */
 enum { NET_AUTO_NONE, NET_AUTO_CHECKING, NET_AUTO_LAST, NET_AUTO_FIRST, NET_AUTO_LAST_DOWN };
 
+/* The room's mods (openspec change netplay-mod-sync, mod_sync.h): what this player does with a host's,
+ * and what it shares when it hosts */
+enum { ROOM_MODS_ASK, ROOM_MODS_ALWAYS, ROOM_MODS_NEVER };   /* room_mods: the dialog, download without asking, never ask the host */
+enum { ROOM_MODE_MIRROR, ROOM_MODE_OVERLAY };                /* room_mods_mode: the host's mods alone, or this player's skins over them */
+#define ROOM_RATE_DEFAULT (4L << 20)                         /* room_mods_rate: bytes a second the host serves at most */
+
 typedef struct NetSettings {
     int mode;
     char name[NET_TEXT], room[NET_TEXT], port[6], host[NET_ADDR];
     NetChoice recent[NET_RECENT];   /* (addr, room) of the last rooms joined, newest first */
     int nrecent;
     int file_mode;                  /* netplay.ini's mode (mode may differ: a launcher's own choice, below) */
+    char host_id[17];               /* this game's identity as a host: 16 hex digits, random ("" not made yet: net_host_id) */
+    int share_mods;                 /* share_mods = on | off (1, the default: the host serves its mods' files) */
+    int room_mods, room_mods_mode;  /* ROOM_MODS_*, ROOM_MODE_* */
+    long room_mods_rate;            /* bytes a second */
 } NetSettings;
 
 typedef struct NetMenu {
@@ -49,7 +59,7 @@ typedef struct NetMenu {
     NetChoice choices[NET_CHOICES];   /* the Host row's < >: rooms found on the LAN, then recent ones */
     int nchoices, choice;             /* (choice: -1 while the address is typed) */
     int page;                         /* Join's list: the page of NET_PAGE rooms shown */
-    int no_play;                      /* no Play row (the start-up menu plays from its Display page): Join picks the room only */
+    int no_play;                      /* no Play row (the start-up menu plays from its Display page): a room's Join plays at once */
     int host_auto;                    /* the address is Join's own choice still (not typed, not picked) */
     int auto_state, last_down;        /* NET_AUTO_*; the last room joined did not answer */
     int watch;                        /* NET_WATCH_*: whether a room answers at the address */
@@ -59,6 +69,7 @@ typedef struct NetMenu {
     char launched[96];                /* what "As launched" means now: "Online lobby smash.recomps.wtf:39420"... */
     char addrs[96], router[96], lan[96], tip[128];
     char tip_kind;                    /* how the Tip is drawn: '\5' a note, '\3' a warning, '\4' good news */
+    char mods_warn[200];              /* the enabled mods that change more than looks (mod_gameplay_warning), "" none */
 } NetMenu;
 
 /* ---- the model ---- */
@@ -103,6 +114,9 @@ void net_menu_describe(NetMenu *m, const NetProbe *p);   /* This PC, Router, On 
  * join-netplay.sh, run-lan.sh, run-offline.sh: SSBU_NET_MODE=launcher); else netplay.ini's. */
 void net_settings_load(NetSettings *s);
 int net_settings_save(const NetSettings *s);   /* 1 written */
+/* This game's host_id (netplay.ini's), made the first time it is asked for - 64 random bits, from
+ * neither the PC nor the name - and saved there. Never 0. */
+unsigned long long net_host_id(void);
 void net_settings_remember(NetSettings *s);   /* Join: the address and room to the front of the recent ones */
 /* The launcher's own SSBU_NET_* kept aside (once per process tree), so that "As launched" still means
  * them after another mode set the variables, and after F8 started the program again. */

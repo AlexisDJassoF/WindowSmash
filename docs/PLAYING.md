@@ -12,6 +12,7 @@ Everything about playing once the game is built: how to start it, the controls, 
 - [Window and display](#window-and-display)
 - [Shaders and first-time stutter](#shaders-and-first-time-stutter)
 - [Low frame rate](#low-frame-rate)
+- [Mods](#mods)
 - [Where your files are](#where-your-files-are)
 - [Problem reports](#problem-reports)
 
@@ -145,6 +146,20 @@ If matches run slowly on a PC that should manage them (press <kbd>F1</kbd> for t
 - **NVIDIA's shader cache is off.** In NVIDIA Control Panel → *Manage 3D settings*, set **Shader Cache Size** to *Driver default* (not *Disabled*). Without it, the graphics driver redoes its part of every shader each time the game starts.
 - **Windows uses a slow system timer.** Some "gaming tweaks" set Windows to time everything with an old, slow timer (the HPET). WindowSmash notices and works around it, and says so near the top of `build\play.log`: a `[clock]` line ending in *slow*. Other programs stay slower, though; to undo the tweak, run `bcdedit /deletevalue useplatformclock` in a Command Prompt opened as administrator, then restart the PC.
 
+## Mods
+
+WindowSmash loads skins and other visual mods made for ARCropolis (the Switch's mod loader) from a
+`mods` folder in the WindowSmash folder, one folder per mod, with a page of the start-up menu to
+enable, disable, move and delete them.
+
+> [!NOTE]
+> **Linux only for now.** The Windows build doesn't read the `mods` folder yet (it has no start-up
+> menu to manage them), so on Windows the game plays as it ships. The Linux guide explains
+> everything: [Mods on Linux](../README-LINUX.md#mods).
+
+A mod that changes how the game plays, not only how it looks, can make an online match desync with
+players who don't have it; rooms can share their mods ([Mods in a room](../NETPLAY.md#mods-in-a-room)).
+
 ## Where your files are
 
 All of these are in the WindowSmash folder:
@@ -157,6 +172,7 @@ All of these are in the WindowSmash folder:
 | Crash and freeze reports | `reports\` |
 | Controller and window settings | `controllers.ini`, `display.ini` |
 | Your online name | `online_name.txt` |
+| Mods (Linux) | `mods\`, and what the game builds from them in `cache\mods\` |
 | Your multiplayer identity | `netplay_id.txt`. Don't copy it to another PC: two PCs with the same one look like one player. |
 
 > [!TIP]

@@ -2,6 +2,7 @@
  * (see net_menu.h). No window and no sockets here: gpu_menu.c draws it and feeds it input, and
  * net_discover.c finds what it shows of this PC's network. */
 #define _CRT_SECURE_NO_WARNINGS
+#define _CRT_RAND_S
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,7 @@ int net_menu_visible(const NetMenu *m, int row) {
     case NROW_PORT: case NROW_ADDRS: case NROW_ROUTER: return mode == NET_MODE_HOST;
     case NROW_HOST: case NROW_LAN: case NROW_PAGER: return mode == NET_MODE_JOIN;
     case NROW_TIP: return m->tip[0] != 0;
+    case NROW_MODS: return m->mods_warn[0] != 0;
     case NROW_PLAY: return !m->no_play;
     default: return row >= 0 && row < NROWS;
     }
@@ -72,7 +74,7 @@ int net_menu_text_row(const NetMenu *m) {
 
 const char *net_menu_label(int row) {
     static const char *const L[NROWS] = {"Connection", "Your name", "Room name", "UDP port", "Host address", "Available rooms",
-                                         [NROW_PAGER] = "Refresh", "This PC", "Router", "Tip", "Play"};
+                                         [NROW_PAGER] = "Refresh", "This PC", "Router", "Tip", "Mods", "Play"};
     if (is_list(row)) return "Room";
     return row >= 0 && row < NROWS ? L[row] : "";
 }
@@ -113,6 +115,7 @@ void net_menu_value(const NetMenu *m, int row, char *out, unsigned n) {
     case NROW_LAN: snprintf(out, n, "\6%s", m->lan); return;
     case NROW_PAGER: snprintf(out, n, "\b%d\t%d", m->page + 1, net_menu_pages(m)); return;
     case NROW_TIP: snprintf(out, n, "%c%s", m->tip_kind ? m->tip_kind : '\5', m->tip); return;
+    case NROW_MODS: snprintf(out, n, "\3%s", m->mods_warn); return;
     default:
         if (is_list(row) && net_menu_visible(m, row)) { room_value(m, list_index(m, row), out, n); return; }
         if (n) out[0] = 0;
@@ -194,10 +197,10 @@ int net_menu_event(NetMenu *m, int event, int c) {
         if (is_list(m->row)) {   /* Join: this room - and the game, when it can be joined now */
             m->host_auto = 0;
             pick(m, list_index(m, m->row));
-            if (!joinable(&m->choices[m->choice]) || m->no_play) break;   /* (no Play here: the room chosen, the game from Display) */
-            m->row = NROW_PLAY;
+            if (!joinable(&m->choices[m->choice])) break;
+            if (!m->no_play) m->row = NROW_PLAY;
         }
-        if (m->row != NROW_PLAY) { move(m, 1); break; }
+        if (m->row != NROW_PLAY && !(is_list(m->row) && m->no_play)) { move(m, 1); break; }   /* (the start-up menu, no Play row: a room's Join plays) */
         if (m->s.mode == NET_MODE_JOIN && !m->s.host[0]) { m->row = NROW_HOST; break; }   /* (nothing to join yet) */
         if (!m->s.room[0]) copy(m->s.room, sizeof m->s.room, DEFAULT_ROOM);
         if (!m->s.port[0]) copy(m->s.port, sizeof m->s.port, DEFAULT_PORT);
@@ -477,6 +480,25 @@ static void printable(char *s) {   /* (the overlay's font: printable ASCII) */
     for (; *s; s++) if ((unsigned char)*s < 32 || (unsigned char)*s > 126) *s = '?';
 }
 
+/* room_mods_rate: "4M", "512K", "4" (megabytes), "1.5M": bytes a second, from 64 KB to 1 GB; 0 when not one */
+static long room_rate_of(const char *v) {
+    char *end = NULL;
+    double x = strtod(v, &end);
+    if (!end || end == v) return 0;
+    while (*end == ' ') end++;
+    double unit = 1 << 20;
+    if (*end == 'k' || *end == 'K') unit = 1 << 10, end++;
+    else if (*end == 'm' || *end == 'M') end++;
+    if (*end == 'b' || *end == 'B') end++;
+    if (*end || x * unit < 65536 || x * unit > 1073741824.0) return 0;
+    return (long)(x * unit);
+}
+
+static void rate_text(long r, char *out, size_t n) {
+    if (r % (1 << 20) == 0) snprintf(out, n, "%ldM", r >> 20);
+    else snprintf(out, n, "%ldK", r >> 10);
+}
+
 void net_settings_load(NetSettings *s) {
     memset(s, 0, sizeof *s);
     s->mode = NET_MODE_LAUNCHER;
@@ -493,6 +515,10 @@ void net_settings_load(NetSettings *s) {
     copy(s->room, sizeof s->room, DEFAULT_ROOM);
     v = launched("PORT");
     copy(s->port, sizeof s->port, v && atoi(v) > 0 && atoi(v) < 65536 ? v : DEFAULT_PORT);
+    s->share_mods = 1;
+    s->room_mods = ROOM_MODS_ASK;
+    s->room_mods_mode = ROOM_MODE_MIRROR;
+    s->room_mods_rate = ROOM_RATE_DEFAULT;
     FILE *f = fopen(ini_path(), "r");
     if (f) {
         char line[512];
@@ -507,6 +533,28 @@ void net_settings_load(NetSettings *s) {
             else if (!strcmp(key, "room") && *val) copy(s->room, sizeof s->room, val);
             else if (!strcmp(key, "port") && atoi(val) > 0 && atoi(val) < 65536) snprintf(s->port, sizeof s->port, "%d", atoi(val));
             else if (!strcmp(key, "host")) copy(s->host, sizeof s->host, val);
+            else if (!strcmp(key, "host_id")) {
+                char *end = NULL;
+                unsigned long long id = strtoull(val, &end, 16);
+                if (id && end && !*end && strlen(val) <= 16) snprintf(s->host_id, sizeof s->host_id, "%016llx", id);
+                else if (*val) fprintf(stderr, "[netplay] netplay.ini: host_id = %s is not 16 hex digits; a new one is made\n", val);
+            } else if (!strcmp(key, "share_mods")) {
+                if (!strcmp(val, "on") || !strcmp(val, "off")) s->share_mods = !strcmp(val, "on");
+                else fprintf(stderr, "[netplay] netplay.ini: share_mods = %s not understood (on | off); on\n", val);
+            } else if (!strcmp(key, "room_mods")) {
+                if (!strcmp(val, "ask")) s->room_mods = ROOM_MODS_ASK;
+                else if (!strcmp(val, "always")) s->room_mods = ROOM_MODS_ALWAYS;
+                else if (!strcmp(val, "never")) s->room_mods = ROOM_MODS_NEVER;
+                else fprintf(stderr, "[netplay] netplay.ini: room_mods = %s not understood (ask | always | never); ask\n", val);
+            } else if (!strcmp(key, "room_mods_mode")) {
+                if (!strcmp(val, "mirror")) s->room_mods_mode = ROOM_MODE_MIRROR;
+                else if (!strcmp(val, "overlay")) s->room_mods_mode = ROOM_MODE_OVERLAY;
+                else fprintf(stderr, "[netplay] netplay.ini: room_mods_mode = %s not understood (mirror | overlay); mirror\n", val);
+            } else if (!strcmp(key, "room_mods_rate")) {
+                long rate = room_rate_of(val);
+                if (rate > 0) s->room_mods_rate = rate;
+                else fprintf(stderr, "[netplay] netplay.ini: room_mods_rate = %s not understood (as 4M, 512K); 4M\n", val);
+            }
             else if (!strcmp(key, "recent") && *val && s->nrecent < NET_RECENT) {
                 NetChoice *c = &s->recent[s->nrecent++];
                 memset(c, 0, sizeof *c);
@@ -540,7 +588,54 @@ int net_settings_save(const NetSettings *s) {
                "; recent = address room: the last rooms joined, newest first (the Network page offers them).\n",
             mode_name(s->mode), s->name, s->room, s->port, s->host);
     for (int i = 0; i < s->nrecent; i++) fprintf(f, "recent = %s %s\n", s->recent[i].addr, s->recent[i].room);
+    char rate[24];
+    rate_text(s->room_mods_rate > 0 ? s->room_mods_rate : ROOM_RATE_DEFAULT, rate, sizeof rate);
+    fprintf(f, "\n; The room's mods (NETPLAY.md, \"Mods in a room\").\n"
+               "; room_mods = ask | always | never: what joining a room whose host has mods does - ask with a dialog,\n"
+               ";   download and use them without asking, or never even ask the host for its list.\n"
+               "room_mods = %s\n"
+               "; room_mods_mode = mirror | overlay: mirror uses the host's mods alone; overlay keeps your own skins\n"
+               ";   where they clash with the host's. Your own mods that change how the game plays are off in both.\n"
+               "room_mods_mode = %s\n"
+               "; share_mods = on | off: when you host, whether your mods' files are given to those who join\n"
+               ";   (off: only the names of the mods that change how the game plays are told, so they know).\n"
+               "share_mods = %s\n"
+               "; room_mods_rate: how fast you give them, at most (4M: 4 megabytes a second; 512K...).\n"
+               "room_mods_rate = %s\n"
+               "; host_id: who you are as a host, to those who keep your mods - random, made once. Delete the line\n"
+               ";   for a new one (and do, if you copied this file from another PC).\n",
+            s->room_mods == ROOM_MODS_ALWAYS ? "always" : s->room_mods == ROOM_MODS_NEVER ? "never" : "ask",
+            s->room_mods_mode == ROOM_MODE_OVERLAY ? "overlay" : "mirror", s->share_mods ? "on" : "off", rate);
+    if (s->host_id[0]) fprintf(f, "host_id = %s\n", s->host_id);
     return fclose(f) == 0;
+}
+
+static unsigned long long random_id(void) {
+    unsigned long long id = 0;
+#ifdef _WIN32
+    unsigned int a = 0, b = 0;
+    rand_s(&a);
+    rand_s(&b);
+    id = (unsigned long long)a << 32 | b;
+#else
+    FILE *r = fopen("/dev/urandom", "rb");
+    if (r) { if (fread(&id, sizeof id, 1, r) != 1) id = 0; fclose(r); }
+#endif
+    return id;
+}
+
+unsigned long long net_host_id(void) {
+    static unsigned long long id;
+    if (id) return id;
+    NetSettings s;
+    net_settings_load(&s);
+    if (s.host_id[0]) return id = strtoull(s.host_id, NULL, 16);
+    while (!id) id = random_id();
+    snprintf(s.host_id, sizeof s.host_id, "%016llx", id);
+    s.mode = s.file_mode;   /* (netplay.ini as it was, the id added) */
+    if (!net_settings_save(&s)) fprintf(stderr, "[netplay] cannot write netplay.ini: the host_id is this run's only\n");
+    else fprintf(stderr, "[netplay] netplay.ini: a new host_id\n");
+    return id;
 }
 
 void net_settings_remember(NetSettings *s) {

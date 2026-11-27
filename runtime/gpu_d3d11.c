@@ -23,6 +23,7 @@
 #include "gpu_shader.h"
 #include "gpu_shader_cache.h"
 #include "gpu_texture.h"
+#include "mod_recovery.h"
 #include <math.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -319,7 +320,7 @@ static volatile LONG hotkeys;
 static LRESULT CALLBACK window_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     LRESULT result;
     if (display_message(h, msg, w, l, &result)) return result;   /* size, full screen, pointer (gpu_display.c) */
-    if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); ExitProcess(0); }
+    if (msg == WM_CLOSE) { fprintf(stderr, "[gfx] window closed\n"); mod_recovery_close(); ExitProcess(0); }
     if (msg == WM_KEYDOWN && w >= VK_F1 && w <= VK_F6 && !(l & (1 << 30))) InterlockedOr(&hotkeys, 1 << (w - VK_F1));
     return DefWindowProcW(h, msg, w, l);
 }
@@ -3727,6 +3728,9 @@ void gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
         snprintf(hint, sizeof hint, "F2 details%s%s%s%s", depth_sampling == 0 ? "  depth sampling OFF" : "",
                  profile_running() ? "  profiling..." : "", net[0] ? "\n" : "", net);
         if (net[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", net); }
+        char note[160];
+        mod_recovery_note(note, sizeof note);   /* (started without mods by the recovery: said in F2) */
+        if (note[0]) { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\n%s", note); }
         char pads[256];
         pad_describe(pads, sizeof pads);
         { size_t l = strlen(detail); snprintf(detail + l, sizeof detail - l, "\npads: %s", pads[0] ? pads : "none (keyboard only)"); }

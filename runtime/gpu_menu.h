@@ -17,7 +17,9 @@ enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_ACCEPT, MENU_BACK, MENU_C
        MENU_DELETE,     /* the Mods page's actions: Delete / the pad's west button, */
        MENU_FOLDER,     /* the north button (open the mods folder), */
        MENU_MOVE,       /* the right trigger (move a mod to another color); F and M typed come as MENU_CHAR */
-       MENU_START };    /* play (Start / OPTIONS / +, F5): the only key that starts the game, besides a click on Play */
+       MENU_START,      /* play (Start / OPTIONS / +, F5): the only key that starts the game, besides a click on Play */
+       MENU_SHARE,      /* the Mods page: shared in rooms hosted here or not (the left trigger; S typed comes as MENU_CHAR) */
+       MENU_HOVER };    /* the mouse moved (x, y: its pixel in the window's drawable): the Mods page's grid selects the tile under it */
 extern volatile int menu_active;
 extern volatile int menu_typing;            /* the selected row takes text: Space types, not plays */
 void menu_input(int event, int x, int y);   /* x, y: a click's pixel in the window's drawable */
@@ -46,6 +48,8 @@ extern char menu_pad_name[96];
 extern volatile int menu_axes[4];
 extern volatile int menu_listening;
 extern volatile int menu_sticks_still;
+extern volatile int menu_stick_free;
+extern volatile int menu_safe_held;     /* Shift or a pad's L+R held while the menu is up (linux/window.c): its first moments ask for the safe mode */    /* the Mods page's grid: the left stick moves its cursor (gpu_menu.c reads it), no direction pressed by it - the D-pad's still are */
 /* The stick test's snapback fix (pad_snap.h), as the game will have it: on for the left, right stick (the
  * page sets it), the sticks after it (linux/window.c), and how many bounces it has ignored on each */
 extern volatile int menu_snapback[2], menu_axes_game[4], menu_snap_count[2];   /* the sticks move nothing in the menu, the D-pad alone does (the dead zones' page: the sticks are tested there) */

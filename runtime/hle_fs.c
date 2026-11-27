@@ -13,9 +13,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "host.h"
 #include "mod_arc.h"
+#include "mod_recovery.h"
+#include "mod_cache.h"
+#include "mod_room.h"
 #include "mod_scan.h"
 
 #define R_PATH_NOT_FOUND RESULT(2, 1)
@@ -221,11 +225,39 @@ static BOOL CALLBACK mods_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     ModList *l = calloc(1, sizeof *l);
     if (!l) return TRUE;
     char root[1024], cache[1024];
+    mod_body_hook = mod_arc_game_body;          /* (a move to a color of another body: undone for this load) */
+    mod_game_file_hook = mod_arc_game_file;     /* (a moved mod's param entries of its colors: taken along) */
     mod_scan(l, mod_root(root, sizeof root));
-    int n = mod_load_list(l, &mods.files);
+    mod_room_tidy();   /* (mods/.netplay: old hosts forgotten, unfinished downloads gone) */
+    uint64_t room_host;
+    int room_mode, n;
+    HostIndex *room = NULL;
+    if (mod_room_chosen(&room_host, &room_mode) && (room = malloc(sizeof *room))) {   /* a room's mods agreed to (mod_room.h) */
+        char netplay[1100], blobs[1200];
+        mod_cache_dir(root, netplay, sizeof netplay);
+        mod_cache_blobs(netplay, blobs, sizeof blobs);
+        if (host_index_read(netplay, room_host, room)) {
+            n = mod_room_load_list(l, room, netplay, room_mode, &mods.files);
+            fprintf(stderr, "[mods] %s's room mods (%s): %d files\n", room->name, room_mode == ROOM_OVERLAY ? "overlay" : "mirror", n);
+        } else {
+            fprintf(stderr, "[mods] the room mods asked for (%016llx) are not kept here: your own mods instead\n", (unsigned long long)room_host);
+            n = mod_load_list(l, &mods.files);
+        }
+        host_index_free(room);
+        free(room);
+    } else n = mod_load_list(l, &mods.files);
+    mod_body_hook = NULL, mod_game_file_hook = NULL;
+    mod_arc_game_done();   /* (data.arc's table those read: mod_arc_setup reads its own) */
+    if (n > 0) mod_gameplay_warning(l, mod_gameplay_note, sizeof mod_gameplay_note);   /* (F2: mods that can desync online play) */
     mod_list_free(l);
     free(l);
     if (n <= 0) return TRUE;
+    if (!mod_recovery_session(mods.files, n)) {   /* (the recovery's: twice failed with these mods, nothing chosen) */
+        mod_load_free(mods.files, n);
+        mods.files = NULL;
+        return TRUE;
+    }
+    mod_arc_on_read = mod_recovery_read_file;
     mods.handles = calloc((size_t)n, sizeof *mods.handles);
     if (!mods.handles) return TRUE;
     data_root(cache, sizeof cache, "cache");
@@ -237,6 +269,62 @@ static BOOL CALLBACK mods_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     if (mod_arc_setup(&mods.arc, arc->size, &mods.io, mods.files, n, cache))
         fprintf(stderr, "[mods] data.arc with %d mod files ready in %llu ms\n", n, (unsigned long long)(GetTickCount64() - t0));
     return TRUE;
+}
+
+/* The game's own data.arc, one file by its path (mod_arc.h): the start-up menu's pictures, before the
+ * game's thread - the RomFS opened here if it is not yet */
+static void ready(void);
+static u64 game_arc_at;
+static int game_io_arc(void *ctx, u64 at, void *buf, u64 size) { (void)ctx; return rom_read(game_arc_at + at, buf, size); }
+static SRWLOCK game_arc_lock = SRWLOCK_INIT;   /* (the pictures' thread and the menu's: one reads at a time) */
+void *mod_arc_game_file(const char *path, uint64_t *size) {
+    *size = 0;
+    ready();
+    AcquireSRWLockExclusive(&game_arc_lock);
+    if (!game_arc_at) {
+        u32 dir, file;
+        if (!rom_lookup("data.arc", &dir, &file) || file == NONE) return NULL;
+        game_arc_at = rom.data + rom_file(file)->offset;
+    }
+    ModArcIO io = {NULL, game_io_arc, NULL};
+    void *out = mod_arc_read_path(&io, path, size);
+    ReleaseSRWLockExclusive(&game_arc_lock);
+    return out;
+}
+void mod_arc_game_done(void) {
+    AcquireSRWLockExclusive(&game_arc_lock);
+    mod_arc_read_done();
+    ReleaseSRWLockExclusive(&game_arc_lock);
+}
+
+uint64_t mod_arc_game_body(const char *fighter, int color) {
+    static struct { char f[32]; uint64_t h[8]; } known[24];   /* (the fighters asked, their eight colors) */
+    static int nknown;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    if (color < 0 || color >= 8 || strlen(fighter) >= sizeof known[0].f) return 0;
+    AcquireSRWLockExclusive(&lock);
+    int k = 0;
+    while (k < nknown && strcmp(known[k].f, fighter)) k++;
+    if (k == nknown) {
+        if (nknown == (int)(sizeof known / sizeof known[0])) memmove(known, known + 1, sizeof known - sizeof known[0]), k = --nknown;
+        snprintf(known[k].f, sizeof known[k].f, "%s", fighter);
+        for (int c = 0; c < 8; c++) {
+            char path[96];
+            uint64_t size, h = 0;
+            snprintf(path, sizeof path, "fighter/%s/model/body/c%02d/model.nusktb", fighter, c);
+            unsigned char *d = mod_arc_game_file(path, &size);
+            if (d) {
+                h = 1469598103934665603ull;   /* (FNV-1a) */
+                for (uint64_t i = 0; i < size; i++) h = (h ^ d[i]) * 1099511628211ull;
+                free(d);
+            }
+            known[k].h[c] = h;
+        }
+        nknown++;
+    }
+    uint64_t h = known[k].h[color];
+    ReleaseSRWLockExclusive(&lock);
+    return h;
 }
 
 static BOOL CALLBACK init_fs(PINIT_ONCE o, PVOID p, PVOID *ctx) {

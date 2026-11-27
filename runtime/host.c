@@ -17,6 +17,7 @@
 #include "display.h"
 #include "gpu_menu.h"
 #include "gpu_precompile.h"
+#include "mod_recovery.h"
 #ifdef _WIN32
 #include <dbghelp.h>
 #else
@@ -322,6 +323,7 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
         TerminateProcess(GetCurrentProcess(), 6);
     }
     char name[96], report[MAX_PATH];
+    mod_recovery_failed(REC_CRASH);   /* (before the report: the next start's recovery) */
     fflush(stdout);
     report_open("crash", report, sizeof report);
     out("\n*** host exception %#lx during %s", code, phase);
@@ -372,6 +374,7 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
 #include <setjmp.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
 
@@ -455,6 +458,7 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     if (reporter == me) _exit(6);   /* (a fault while reporting one) */
     if (!__atomic_compare_exchange_n(&reporter, &none, me, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) for (;;) pause();   /* (one report at a time) */
     char name[96], report[MAX_PATH];
+    mod_recovery_failed(REC_CRASH);   /* (before the report: the next start's recovery) */
     fflush(stdout);
     report_open("crash", report, sizeof report);
     out("\n*** host exception (signal %d: %s) during %s", sig, sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error" :
@@ -506,6 +510,7 @@ _Noreturn void rt_fatal(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(text, sizeof text, fmt, ap);
     va_end(ap);
+    mod_recovery_failed(REC_FATAL);
     report_open("stopped", report, sizeof report);
     out("\n*** stopped during %s: %s\n", phase, text);
     rt_backtrace();
@@ -912,6 +917,18 @@ int main(int argc, char **argv) {
     if (argc >= 6 && !strcmp(argv[1], "--write-dump")) return write_dump_main(argv);
 #endif
     if (argc < 2) { fprintf(stderr, "usage: ssbu <directory with *.reloc.bin images> [--trace]\n"); return 2; }
+#ifndef _WIN32
+    {   /* open files: a desktop session's 1024 is too few once mods are in (each mod file stays open after its
+         * first read, besides the window's, Vulkan's and the network's) - the soft limit raised to the hard one */
+        struct rlimit lim;
+        if (!getrlimit(RLIMIT_NOFILE, &lim) && lim.rlim_cur < lim.rlim_max) {
+            rlim_t was = lim.rlim_cur;
+            lim.rlim_cur = lim.rlim_max;
+            if (!setrlimit(RLIMIT_NOFILE, &lim)) fprintf(stderr, "[boot] open files: %llu at most (was %llu)\n",
+                                                         (unsigned long long)lim.rlim_cur, (unsigned long long)was);
+        }
+    }
+#endif
     display_dpi_aware();
 #ifdef _WIN32
     {   /* which build this is, for reports */

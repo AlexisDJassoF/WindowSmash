@@ -19,7 +19,7 @@
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkCreateImageView) \
     X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
-    X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdPipelineBarrier2) X(vkCmdBeginRendering) \
+    X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets) X(vkFreeDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdPipelineBarrier2) X(vkCmdBeginRendering) \
     X(vkCmdEndRendering) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
     X(vkCmdBindVertexBuffers) X(vkCmdPushConstants) X(vkCmdDraw) X(vkCmdCopyBufferToImage) X(vkCmdClearColorImage) X(vkCmdClearAttachments) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdBlitImage) X(vkCmdClearDepthStencilImage) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) \

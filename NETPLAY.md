@@ -15,6 +15,7 @@ WindowSmash plays the game's **Local Wireless** mode over the internet. To the g
 - [Direct connections and your internet address](#direct-connections-and-your-internet-address)
 - [Private room](#private-room)
 - [With a Switch on your network (LAN mode)](#with-a-switch-on-your-network-lan-mode)
+- [Mods in a room](#mods-in-a-room)
 - [If a room doesn't appear](#if-a-room-doesnt-appear)
 - [Run your own lobby](#run-your-own-lobby)
 - [Logs and privacy](#logs-and-privacy)
@@ -169,6 +170,63 @@ If the room doesn't show up:
 - On a PC with more than one network (VPN, virtual machines, Docker), set `SSBU_NET_LAN_IP` to the PC's address on the Switch's network. The overlay (<kbd>F2</kbd>) shows the address the game uses.
 - `SSBU_NET_LOG=2` logs every datagram the PC receives (`[net] lan: ...`).
 
+## Mods in a room
+
+Only the color each player picks travels over the network; every game draws it with its own files. So if the host plays Mario with a skin in color 4 and you don't have that skin, you see the normal Mario. And if the host has a mod that changes how the game plays (fighter parameters, `.prc` files, animations) and you don't, the match can desync. When you join a room, the game can fetch the host's mods and use them for that room, without touching your own `mods` folder.
+
+> [!NOTE]
+> Linux only for now: the Windows build doesn't read the `mods` folder yet. A Windows player joins and plays as before, without the dialog.
+
+### What is shared
+
+| | Private room | Online lobby |
+| :--- | :--- | :--- |
+| Visual mods (skins, portraits, voices, effects) | Their files | Their files, only over a direct connection with the host |
+| Mods that change how the game plays | Their files | Their names only, to warn you |
+
+Only files at `data.arc` paths, and each mod's `config.json` (which says where its new files go), are ever shared. Code (`.nro` plugins, `.lua` scripts) and files outside `data.arc` never are. The mods you downloaded from a room are never shared again when you host.
+
+### When you join
+
+- **Private room:** after you press Start with *Join a room* (or Join on a room in the list, which starts at once), the game asks the host for its list. If there's something to download or to warn about, a dialog lists each mod (new, changed, moved, you have it, the host no longer uses it), the size, where it comes from and the mode. **Play without them** is selected when it opens; **Download and apply** fetches them and starts the game with them; **Menu** goes back to the Network page. During the download, Back cancels (what has arrived is kept) and Select+Start or Esc held for a second goes back to the menu.
+- **Online lobby:** the game is already running, so the dialog appears over it when you enter a room. The download continues while you play; afterwards **Restart and rejoin** starts the game again on the Network page with the mods, and **Later** keeps them for the next time you join that host. **Menu** leaves the room and restarts on the menu.
+
+If you already have everything from last time, there is no dialog: the mods are used (a mod the host moved to another color just moves) and a short note says so. A host running an older version doesn't answer; after 3 seconds you play as before.
+
+### Mirror and overlay
+
+| Mode | Your own mods | The host's mods |
+| :--- | :--- | :--- |
+| **Mirror** (default) | All off | All on: you see and play exactly what the host has |
+| **Overlay** | Your skins on, and they win where they clash; your gameplay mods off | All on where your skins don't cover them |
+
+In both modes the mods that change how the game plays are exactly the host's, which is what keeps the match in sync. The mode applies to that start only: offline, or in another host's room, your own mods load as always.
+
+### Settings (`netplay.ini`)
+
+| Key | Values | Meaning |
+| :--- | :--- | :--- |
+| `room_mods` | `ask` (default), `always`, `never` | Show the dialog, download without asking, or never even ask the host for its list. |
+| `room_mods_mode` | `mirror` (default), `overlay` | The mode the dialog opens with (and `always` uses). |
+| `share_mods` | `on` (default), `off` | When you host: give your mods' files. With `off`, only the names of your gameplay mods are told, so others know. |
+| `room_mods_rate` | `4M` (default), `512K`... | When you host: how fast you give them, at most. Nothing is given while you are in a fight, so the download never lags a match. |
+| `host_id` | 16 hex digits, made once | Who you are as a host to those who keep your mods. It's random and says nothing about your PC. If you copy `netplay.ini` to another PC, delete this line there to get a new one. |
+
+On the **Mods** page, the left trigger (or **S**) marks a mod **Don't share**. A visual mod marked that way isn't announced at all, so others see the normal fighter. A gameplay mod marked that way is announced without its files, so others are warned.
+
+### Where they are kept
+
+Downloaded mods go to `mods_join/`, beside `mods/`. It has a folder for each host, and in it each of its mods as a normal mod folder (its files, its `config.json`, an `info.toml`), plus `windowsmash.toml` with the colors the host plays them in: the room's configuration. In that host's room the game reads that folder just as it reads `mods/`. Anything you already have isn't downloaded again: a file of your own mods with the same content is linked instead, and each file is stored once in `.blobs/` (the mod folders are hard links to it), even when several hosts use it. `.hosts/<host_id>/host.toml` says what each host has; editing the folders changes nothing, they're made again from it each time. Rejoining a host downloads only what changed. A mod the host drops stays there unused, so if the host brings it back it isn't downloaded again. A host you haven't joined for 30 days is forgotten with its files (files another host still uses are kept). The **Mods** page lists each host; X deletes one.
+
+### Where they come from, and limits
+
+- From the host: through the private room's relay, or straight to you in the lobby. Never through the public lobby, which drops mod files.
+- From where the mod is published: if a visual mod's `info.toml` has `url = "https://.../mod.zip"` and `url_sha256 = "<the .zip's SHA-256>"`, the game downloads the `.zip` from there first (Linux, with the system's libcurl) and takes from it the files whose hashes match. The dialog warns you that the site sees your IP address. If that fails, the files come from the host.
+- Every file is checked against its SHA-256 and kept only when it matches. If one fails, its whole mod isn't used and the dialog says so.
+- A room announces at most 128 mods, 20,000 files and 4 GB, and 128 MB per file. A mod beyond that isn't announced, and the host's log says why (`[mods]`).
+
+Mods are shared between the players of one room when one of them asks. Respect their authors: mark mods you may not pass on as **Don't share**, and prefer mods that declare where they come from.
+
 ## If a room doesn't appear
 
 | What you see | What to check |
@@ -231,5 +289,7 @@ The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG
 | `SSBU_NET_LOG=1` / `2` | Network logging: a summary, or more detail. |
 | `SSBU_NET_ANNOUNCE=0` | A hosted room does not answer the Network page's search for rooms on the same network (Linux and Windows hosts answer it by default, only from private addresses). |
 | `SSBU_NETPLAY_INI` | Linux: the Network page's settings file instead of `netplay.ini`. |
+| `SSBU_MODS_FIGHT_PPS` | When hosting room mods: the game's packets per second above which a fight is assumed and nothing is given. Default `30`. |
+| `SSBU_ROOM_MODS` | Set by the game itself (`<host_id>:mirror\|overlay`): the room mods this start loads. |
 
 Without a host or relay setting, the game stays offline. `Play SSBU Offline.bat` clears both; `Play SSBU.bat` takes the relay from `online_server.txt`; the host and join launchers set their own.

@@ -718,6 +718,31 @@ class Peers(LobbyTest):
         self.assertEqual(host.datas(0.3) + b.datas(0.1), [])
 
 
+class RoomMods(LobbyTest):
+    """A room's mods (netplay-mod-sync): the list is carried in the room as game traffic; the files never."""
+    def test_manifest_carried_in_the_room(self):
+        host, session, (guest,) = self.room(1)
+        stranger = self.player()
+        modq = b"MQ\x01" + struct.pack(">QH", 42, 0)
+        guest.data(BCAST, modq, R.MODS_PORT, R.MODS_PORT)
+        self.assertEqual([(s, p) for s, d, sp, p in host.datas()], [(guest.ip, modq)])
+        chunk = b"ML\x01" + struct.pack(">QQQHH", 42, 0x1122, 0x3344, 0, 1) + b"SNMF" + bytes(1000)
+        host.data(guest.ip, chunk, R.MODS_PORT, R.MODS_PORT)
+        self.assertEqual([p for *_, p in guest.datas()], [chunk])
+        self.assertEqual(stranger.datas(0.1), [])   # (only in the room)
+
+    def test_mod_files_dropped(self):
+        host, session, (guest,) = self.room(1)
+        get = R.header(R.MODGET) + struct.pack(">QQIH", guest.cookie, 0xABCD, 0, 64)
+        part = R.header(R.MODPART) + struct.pack(">QQI", host.cookie, 0xABCD, 0) + bytes(1024)
+        guest.send(get)
+        host.send(part)
+        self.assertEqual(host.recv(0.2) + guest.recv(0.2), [])
+        self.assertEqual(self.server.lobby.drops["mod files"], 2)
+        guest.data(host.ip, b"still here")   # (and the room goes on)
+        self.assertEqual([p for *_, p in host.datas()], [b"still here"])
+
+
 class Timeouts(LobbyTest):
     server_options = {"client_timeout": 1.0, "listing_timeout": 2.0, "listed_for": 0.5}
 

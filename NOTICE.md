@@ -23,6 +23,8 @@ libopus 1.5.2 (Xiph.Org Foundation and contributors) is included as source in [`
 
 The decompressor of Zstandard 1.5.7 (Meta Platforms, Inc. and affiliates) is included as source in [`third_party/zstd/`](third_party/zstd/) and compiled into the game when it is built (mods: `data.arc`'s file system table is zstd-compressed), under its [BSD license](third_party/zstd/LICENSE) (zstd is dual-licensed BSD or GPLv2; the BSD license is the one taken). [`third_party/README.md`](third_party/README.md) says which files; none is modified.
 
+The PNG decoder of [stb_image](https://github.com/nothings/stb) 2.31 (Sean Barrett) is included as [`third_party/stb/stb_image.h`](third_party/stb/stb_image.h) and compiled into the game (the start-up menu's mod previews), in the public domain or under the MIT license, the licensee's choice (the text is at the end of the file). It is not modified.
+
 ## SDL3
 
 Controller input can use [SDL3](https://www.libsdl.org/) (Simple DirectMedia Layer), copyright Sam Lantinga, under the [zlib license](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt).

@@ -5,7 +5,8 @@
  *                            N (no Play row, as the start-up menu's page), m (rooms found: six, room0..room5 at 10.0.0.1..6 - two pages of the list),
  *                            j<0-3> (Join chooses, the address answering NET_WATCH_*),
  *                            p<0-4> (what the network looks like: NET_UPNP_*, LAN 192.168.1.5, VPN from TEST_VPN),
- *                            S (the launcher's variables kept aside), W (remembered and saved), A (applied).
+ *                            S (the launcher's variables kept aside), W (remembered and saved), A (applied),
+ *                            I (net_host_id: made and saved if netplay.ini has none).
  * netplay.ini: SSBU_NETPLAY_INI. Prints the page and the SSBU_NET_* variables, '|' between them. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@ int main(int argc, char **argv) {
     NetMenu m;
     net_menu_init(&m, &s);
     net_launch_describe(m.launched, sizeof m.launched);
+    if (getenv("TEST_MODS_WARN")) snprintf(m.mods_warn, sizeof m.mods_warn, "%s", getenv("TEST_MODS_WARN"));   /* (the mods that can desync: gpu_menu.c's) */
     int plays = 0, refreshes = 0;
     NetChoice many[6];
     for (int i = 0; i < 6; i++) {
@@ -69,6 +71,7 @@ int main(int argc, char **argv) {
             break;
         }
         case 'A': net_settings_apply(&m.s); break;
+        case 'I': printf("id=%016llx|", net_host_id()); break;
         }
     }
     char v[NROWS][200];
@@ -80,10 +83,13 @@ int main(int argc, char **argv) {
     if (net_menu_visible(&m, NROW_LIST)) snprintf(room0, sizeof room0, "%s", v[NROW_LIST] + 3);
     for (char *c = room0; *c; c++) if (*c == '|') *c = '/';   /* (the parts of its line: '/' here, '|' being the output's) */
     printf("page=%d|pages=%d|refreshes=%d|room0=%s|", m.page + 1, net_menu_pages(&m), refreshes, room0);
+    printf("mods=%s|", net_menu_visible(&m, NROW_MODS) ? v[NROW_MODS] + (v[NROW_MODS][0] == 3) : "(hidden)");
     printf("kind=%d|auto=%d|choices=%d|plays=%d|row=%s|mode=%s|name=%s|room=%s|port=%s|host=%s|addrs=%s|router=%s|lan=%s|tip=%s|launched=%s|text=%d|recent=%d|"
-           "HOST=%s|RELAY=%s|ROOM=%s|PORT=%s|NAME=%s|LAN=%s|MENU_MODE=%s\n",
+           "HOST=%s|RELAY=%s|ROOM=%s|PORT=%s|NAME=%s|LAN=%s|MENU_MODE=%s|"
+           "share_mods=%d|room_mods=%d|room_mods_mode=%d|room_mods_rate=%ld|host_id=%s\n",
            net_menu_visible(&m, NROW_TIP) ? m.tip_kind : 0, m.auto_state, m.nchoices, plays, net_menu_label(m.row), v[NROW_MODE], m.s.name, m.s.room, m.s.port, m.s.host, v[NROW_ADDRS], v[NROW_ROUTER], v[NROW_LAN],
            v[NROW_TIP], m.launched, net_menu_text_row(&m), m.s.nrecent, env("SSBU_NET_HOST"), env("SSBU_NET_RELAY"), env("SSBU_NET_ROOM"),
-           env("SSBU_NET_PORT"), env("SSBU_NET_NAME"), env("SSBU_NET_LAN"), env("SSBU_NET_MENU_MODE"));
+           env("SSBU_NET_PORT"), env("SSBU_NET_NAME"), env("SSBU_NET_LAN"), env("SSBU_NET_MENU_MODE"),
+           m.s.share_mods, m.s.room_mods, m.s.room_mods_mode, m.s.room_mods_rate, m.s.host_id);
     return 0;
 }

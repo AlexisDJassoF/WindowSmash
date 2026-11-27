@@ -54,9 +54,25 @@ typedef struct ModArc {
  * no cache). 1 when there is something to serve (a->on); 0 nothing (no file found in data.arc, or
  * data.arc unreadable: then the game sees it as it is). `files` must outlive `a`. */
 int mod_arc_setup(ModArc *a, uint64_t arc_size, const ModArcIO *io, const ModArcFile *files, int n, const char *cache_file);
+/* Called with each mod file the game is given (its mod and data.arc path, strings that last): NULL none */
+extern void (*mod_arc_on_read)(const char *mod, const char *dest);
 /* The archive's bytes [at, at + size): 1 read */
 int mod_arc_read(const ModArc *a, uint64_t at, void *buf, uint64_t size, const ModArcIO *io);
 void mod_arc_free(ModArc *a);
 
 /* Whether the last setup took the table from the cache (1) or built it (0): for the log and the tests */
 extern int mod_arc_from_cache;
+
+/* One file of data.arc by its path ("ui/replace/chara/chara_7/chara_7_mario_00.bntx"), decompressed:
+ * malloc'd, its size into *size; NULL when it is not there or cannot be read. The first call reads the
+ * file system table, kept until mod_arc_read_done (before the game: mod_arc_setup reads its own). For
+ * one thread at a time (the menu's pictures' loader). */
+void *mod_arc_read_path(const ModArcIO *io, const char *path, uint64_t *size);
+void mod_arc_read_done(void);
+
+/* The same on the game's own data.arc, in its RomFS (hle_fs.c): for the start-up menu's pictures */
+void *mod_arc_game_file(const char *path, uint64_t *size);
+void mod_arc_game_done(void);
+/* The game's body of fighter f's color c: a hash of fighter/<f>/model/body/c0<c>/model.nusktb, 0 none
+ * (mod_scan.h's mod_body_hook; kept per fighter) */
+uint64_t mod_arc_game_body(const char *fighter, int color);

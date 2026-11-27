@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -34,11 +35,17 @@
 #include "gpu_menu.h"
 #include "gpu_overlay_quads.h"
 #include "gpu_scale.h"
+#include "gpu_menu_pics.h"
+#include "mod_arc.h"
+#include "mod_cache.h"
+#include "mod_fetch.h"
 #include "mod_menu.h"
+#include "mod_room.h"
 #include "net.h"
 #include "net_discover.h"
 #include "net_menu.h"
 #include "pad_menu.h"
+#include "mod_recovery.h"
 
 #define WAIT_S 10.0
 
@@ -184,7 +191,7 @@ static LONG head, tail;   /* (writers: the window's thread and, in the game, hle
 static SRWLOCK queue_lock = SRWLOCK_INIT;
 volatile int menu_device;
 char menu_pad_name[96];
-volatile int menu_axes[4], menu_listening, menu_sticks_still, menu_pad_kind_seen = MENU_PAD_XBOX;
+volatile int menu_axes[4], menu_listening, menu_sticks_still, menu_stick_free, menu_pad_kind_seen = MENU_PAD_XBOX;
 volatile int menu_snapback[2], menu_axes_game[4], menu_snap_count[2];
 
 void menu_input(int event, int x, int y) {
@@ -233,13 +240,13 @@ static void device_keys(const char **accept, const char **back, const char **pag
     }
 }
 
-/* The Mods page's other keys: delete, move, open the folder */
-static void mod_keys(const char **del, const char **mv, const char **folder) {
+/* The Mods page's other keys: delete, move, open the folder, share in rooms */
+static void mod_keys(const char **del, const char **mv, const char **folder, const char **share) {
     switch (menu_device) {
-    case MENU_PAD_XBOX: *del = "^XW"; *mv = "RT"; *folder = "^XN"; return;
-    case MENU_PAD_PS: *del = "^PW"; *mv = "R2"; *folder = "^PN"; return;
-    case MENU_PAD_NINTENDO: *del = "^NW"; *mv = "ZR"; *folder = "^NN"; return;
-    default: *del = "Del"; *mv = "M"; *folder = "F"; return;
+    case MENU_PAD_XBOX: *del = "^XW"; *mv = "RT"; *folder = "^XN"; *share = "LT"; return;
+    case MENU_PAD_PS: *del = "^PW"; *mv = "R2"; *folder = "^PN"; *share = "L2"; return;
+    case MENU_PAD_NINTENDO: *del = "^NW"; *mv = "ZR"; *folder = "^NN"; *share = "ZL"; return;
+    default: *del = "Del"; *mv = "M"; *folder = "F"; *share = "S"; return;
     }
 }
 
@@ -275,6 +282,7 @@ static void start_again(int network) {
                     : in_game ? "[menu] back to the menu from the game: starting again\n"
                     : network == AGAIN_MENU ? "[menu] back to the menu before the game: starting again\n"
                     : network ? "[menu] the network changed to or from LAN mode: starting again\n" : "[menu] another renderer: starting again on it\n");
+    mod_recovery_close();   /* (starting again is not a failure) */
     fflush(NULL);
     execv("/proc/self/exe", argv);
     fprintf(stderr, "[menu] cannot start again: %s\n", network == AGAIN_MENU ? "starting the game"
@@ -312,7 +320,7 @@ static int scripted_input(double since, int *event, int *ch) {
     at = end ? end + 1 : "";
     static const struct { const char *name; int event; } K[] = {
         {"up", MENU_UP}, {"down", MENU_DOWN}, {"left", MENU_LEFT}, {"right", MENU_RIGHT}, {"accept", MENU_ACCEPT}, {"back", MENU_BACK}, {"start", MENU_START},
-        {"tab", MENU_TAB}, {"tabprev", MENU_TAB_PREV}, {"delete", MENU_DELETE}, {"folder", MENU_FOLDER}, {"move", MENU_MOVE}};
+        {"tab", MENU_TAB}, {"tabprev", MENU_TAB_PREV}, {"delete", MENU_DELETE}, {"folder", MENU_FOLDER}, {"move", MENU_MOVE}, {"share", MENU_SHARE}};
     *ch = 0;
     if (!strncmp(key, "char", 4) && key[4]) { *event = MENU_CHAR; *ch = key[5]; return 1; }
     for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
@@ -416,6 +424,105 @@ static void net_refresh(NetMenu *nm) {
 }
 #endif
 
+#ifndef _WIN32
+/* ---- a private room's mods (mod_room.h), after Start with Join: the room's relay joined, its host
+ * asked, the dialog when there is something to agree to, the download with its bar - before the game,
+ * in this same start. Back cancels the download; Select+Start (or Esc) held, the menu; Menu in the
+ * dialog, the Network page (both start the program again: the room left). */
+static void room_phase(void) {
+    if (!net_configured()) return;
+    menu_active = 1;
+    menu_prestart = 1;   /* (Select+Start held: window.c's) */
+    menu_back = 0;
+    drop_inputs();
+    double t0 = seconds();
+    int begun = 0, again = -1;
+    MenuRect rects[1];
+    float value_x;
+    memset(rects, 0, sizeof rects);
+    for (;;) {
+        if (!begun && net_local_ip()) { mod_room_begin(0, 0); begun = 1; }   /* (joined: the room's broadcast reaches its host) */
+        if (!begun && seconds() - t0 > 6) { fprintf(stderr, "[mods] the room did not answer in time: its mods not asked for\n"); break; }
+        if (begun) mod_room_tick();
+        int r = RM_EV_NONE;
+        Input in;
+        while (r == RM_EV_NONE && next_input(&in)) {
+            if (in.event == MENU_CLICK) {
+                float rr[16];
+                overlay_menu_room_rects(rr);
+                for (int b = 0; b < 4; b++)
+                    if (rr[b * 4 + 2] > 0 && in.x >= rr[b * 4] && in.x < rr[b * 4] + rr[b * 4 + 2] && in.y >= rr[b * 4 + 1] && in.y < rr[b * 4 + 1] + rr[b * 4 + 3])
+                        r = mod_room_click(b == 3 ? -1 : b);
+            } else if (begun) r = mod_room_event(in.event);
+            else if (in.event == MENU_BACK) r = RM_EV_MENU;
+        }
+        if (menu_back) { again = AGAIN_MENU; break; }
+        if (r == RM_EV_MENU) { again = AGAIN_NETWORK_PAGE; break; }
+        if (r == RM_EV_PLAY || (begun && mod_room_stage() == RM_READY)) break;
+        RoomView v;
+        mod_room_view(&v);
+        if (!begun || !v.show) {
+            memset(&v, 0, sizeof v);
+            v.show = 1;
+            v.progress = -1;
+            snprintf(v.title, sizeof v.title, "Joining the room...");
+            snprintf(v.lines[0], sizeof v.lines[0], "iAsking the host which mods it plays with");
+            v.nlines = 1;
+        }
+        overlay_menu_room(&v);
+        const char *accept, *back, *pages;
+        device_keys(&accept, &back, &pages);
+        char footer[200];
+        if (mod_room_stage() == RM_FETCHING) snprintf(footer, sizeof footer, "%s=cancel\t%s=back to the menu", back, menu_device == MENU_KEYS ? "Esc held" : "Select+Start held");
+        else if (mod_room_stage() == RM_DIALOG) snprintf(footer, sizeof footer, "%s=choose\t%s=play without them", accept, back);
+        else snprintf(footer, sizeof footer, "%s=back to the menu", menu_device == MENU_KEYS ? "Esc held" : "Select+Start held");
+        static const char *const label[1] = {""}, *const value[1] = {""};
+        static const int shown[1] = {0};
+        if (!gfx_menu("Network", 1, label, value, shown, -1, -1, footer, (float *)rects, &value_x)) Sleep(30);
+        overlay_menu_room(NULL);
+        Sleep(16);
+    }
+    if (again >= 0) mod_fetch_cancel();
+    menu_prestart = 0;   /* (start_again: the room left, as from the game) */
+    menu_active = 0;
+    menu_back = 0;
+    if (again >= 0) start_again(again);
+    const char *note = mod_room_note();
+    if (*note) fprintf(stderr, "[mods] %s\n", note + (note[0] == '!'));
+}
+#endif
+
+volatile int menu_safe_held;
+
+#ifndef _WIN32
+/* The recovery's "start without mods": this start alone (the environment does not outlive it, but for
+ * the menu's own restarts of the same start) */
+static void start_without_mods(void) {
+    setenv("SSBU_MODS", "0", 1);
+    mod_recovery_mods_off = 1;
+    fprintf(stderr, "[mods] this start goes without mods (the recovery's choice); they stay enabled\n");
+}
+
+/* A mod enabled in mods/ (a folder not starting with '.'): the safe mode's keys looked for */
+static int mods_enabled_any(void) {
+    char root[512];
+    DIR *d = opendir(mod_root(root, sizeof root));
+    int any = 0;
+    for (struct dirent *e; d && !any && (e = readdir(d));) any = e->d_name[0] != '.';
+    if (d) closedir(d);
+    return any;
+}
+
+/* The Mods grid's tile at (x, y), as the last frame drew it: -1 none */
+static int grid_tile(float x, float y) {
+    float r[ROSTER_TILES * 4];
+    int cols, n = overlay_menu_grid(r, ROSTER_TILES, &cols);
+    for (int t = 0; t < n; t++)
+        if (r[t * 4 + 2] > 0 && x >= r[t * 4] && x < r[t * 4] + r[t * 4 + 2] && y >= r[t * 4 + 1] && y < r[t * 4 + 1] + r[t * 4 + 3]) return t;
+    return -1;
+}
+#endif
+
 void menu_run(void) {
 #ifdef _WIN32
     return;   /* (no start-up phase on Windows: display.ini is edited there) */
@@ -427,9 +534,32 @@ void menu_run(void) {
     enum { P_DISPLAY, P_NETWORK, P_CONTROLS, P_MODS, PAGES };
     int page = page_env && !strcmp(page_env, "network") ? P_NETWORK : page_env && !strcmp(page_env, "mods") ? P_MODS : P_DISPLAY;
     unsetenv("SSBU_MENU_PAGE");
-    if (!display_menu_enabled()) {
+    /* the recovery (mod_recovery.h): after a failed session with mods, or with Shift / L+R held (the safe
+     * mode), the menu opens on the Mods page with its question - display.ini's menu = 0 or not */
+    Recovery *rec = mod_recovery_state();
+    int safe = 0;
+    if (!display_menu_enabled() && !rec->failed && mods_enabled_any()) {   /* (a moment to see the keys held) */
+        menu_active = 1;
+        for (int t = 0; t < 40 && !menu_safe_held; t++) Sleep(10);
+        menu_active = 0;
+        safe = menu_safe_held;
+    }
+    if (!display_menu_enabled() && !rec->failed && !safe) {
         net_settings_apply(&ns);
         return;
+    }
+    if (rec->failed || safe) page = P_MODS;
+    {   /* a room's mods (mod_room.h): chosen again each start - but the lobby's Restart and rejoin keeps its own */
+        const char *keep = getenv("SSBU_ROOM_MODS_KEEP");
+        if (!keep || strcmp(keep, "1")) unsetenv("SSBU_ROOM_MODS");
+        unsetenv("SSBU_ROOM_MODS_KEEP");
+        RoomPrefs rp;
+        memset(&rp, 0, sizeof rp);
+        rp.room_mods = ns.room_mods;
+        rp.mode = ns.room_mods_mode == ROOM_MODE_OVERLAY ? ROOM_OVERLAY : ROOM_MIRROR;
+        mod_root(rp.mods_root, sizeof rp.mods_root);
+        mod_room_setup(&rp);
+        mod_room_tidy();
     }
     DisplaySettings now;
     unsigned locked;
@@ -455,10 +585,19 @@ void menu_run(void) {
     static ModList ml;   /* (big: not on the stack) */
     static ModMenu mm;
     char mods_root[512];
+    mod_body_hook = mod_arc_game_body;   /* (a move only to colors of the same body: the game's data.arc says) */
     mod_scan(&ml, mod_root(mods_root, sizeof mods_root));
     mod_menu_init(&mm, &ml);
+    char rec_dir[1100];
+    mod_recovery_dir(rec_dir, sizeof rec_dir);
+    int rec_shown = rec->failed || safe;
+    if (rec_shown) {
+        m.touched = 1;   /* (no countdown) */
+        rec->safe = safe;
+        mod_menu_recovery(&mm, rec, rec_dir);
+    }
     unsigned long long mods_opened = mods_print(&ml);
-    static MenuRect mrects[MOD_MAX + 2];
+    static MenuRect mrects[MOD_MAX + MENU_HOSTS + 3];
     float mvalue_x = 0;
     time_t mods_seen = 0;   /* the folder's time when it was read */
     double mods_checked = 0;
@@ -474,6 +613,7 @@ void menu_run(void) {
     memset(nrects, 0, sizeof nrects);
     memset(prects, 0, sizeof prects);
     drop_inputs();
+    overlay_menu_pictures(menu_pic);   /* (the Mods page's portraits and icons, loaded aside) */
     menu_active = 1;
     double opened = seconds();
     while (m.state == MENU_OPEN) {
@@ -481,6 +621,13 @@ void menu_run(void) {
         Input in;
         while (next_input(&in)) {
             int ev = in.event;
+            if (ev == MENU_HOVER) {   /* (the mouse moved: the Mods grid's tile under it - it touches nothing else) */
+                if (page == P_MODS && mod_menu_grid(&mm) && !mm.dialog) {
+                    int t = grid_tile((float)in.x, (float)in.y);
+                    if (t >= 0) mod_menu_hover(&mm, t);
+                }
+                continue;
+            }
             if (page == P_CONTROLS && pm.listening) {   /* (waiting for a control: that, or going back, only) */
                 m.touched = 1;
                 if (ev == MENU_PADKEY || ev == MENU_BACK || ev == MENU_ACCEPT || ev == MENU_CLICK) pad_menu_event(&pm, ev == MENU_CLICK ? MENU_BACK : ev, in.x);
@@ -489,19 +636,21 @@ void menu_run(void) {
             if (ev == MENU_PADKEY) continue;
             if (page == P_MODS && (mm.dialog || mm.moving) && ev != MENU_CLICK) {   /* (the question, or a move: theirs, Esc too) */
                 m.touched = 1;
-                if (ev != MENU_TAB && ev != MENU_TAB_PREV) mod_menu_event(&mm, ev, in.x);
+                if (ev != MENU_TAB && ev != MENU_TAB_PREV && mod_menu_event(&mm, ev, in.x) == MOD_EV_NO_MODS) start_without_mods();
                 continue;
             }
             if (page == P_MODS && mm.dialog && ev == MENU_CLICK) {
                 m.touched = 1;
-                float r[8];
+                float r[16];
                 overlay_menu_dialog_rects(r);
-                for (int b = 0; b < 2; b++)
-                    if (r[b * 4 + 2] > 0 && in.x >= r[b * 4] && in.x < r[b * 4] + r[b * 4 + 2] && in.y >= r[b * 4 + 1] && in.y < r[b * 4 + 1] + r[b * 4 + 3])
-                        mod_menu_click_dialog(&mm, b);
+                for (int b = 0; b < 4; b++)
+                    if (r[b * 4 + 2] > 0 && in.x >= r[b * 4] && in.x < r[b * 4] + r[b * 4 + 2] && in.y >= r[b * 4 + 1] && in.y < r[b * 4 + 1] + r[b * 4 + 3]) {
+                        if (mod_menu_click_dialog(&mm, b) == MOD_EV_NO_MODS) start_without_mods();
+                        break;
+                    }
                 continue;
             }
-            if ((ev == MENU_DELETE || ev == MENU_FOLDER || ev == MENU_MOVE) && page != P_MODS) continue;
+            if ((ev == MENU_DELETE || ev == MENU_FOLDER || ev == MENU_MOVE || ev == MENU_SHARE) && page != P_MODS) continue;
             if (ev == MENU_CLICK) {
                 int tab = page == P_DISPLAY ? title_click(rects, ROWS, (float)in.x, (float)in.y)
                         : page == P_NETWORK ? title_click(nrects, NROWS, (float)in.x, (float)in.y)
@@ -511,7 +660,8 @@ void menu_run(void) {
             if (ev == MENU_START) { menu_event(&m, MENU_START, seconds()); break; }   /* (on any page; not in a question or a move: those took it above) */
             if (ev == MENU_TAB || ev == MENU_TAB_PREV) { page = (page + (ev == MENU_TAB ? 1 : PAGES - 1)) % PAGES; m.touched = 1; refreshed = 0; continue; }
             if (ev == MENU_BACK && page == P_CONTROLS && pad_menu_takes_back(&pm)) { m.touched = 1; pad_menu_event(&pm, MENU_BACK, 0); continue; }
-            if (ev == MENU_BACK) { m.touched = 1; continue; }   /* (at a page's top: nothing to go back from - it never plays) */
+            /* (at a page's top: nothing to go back from - it never plays; a Mods tile's page goes back to the grid) */
+            if (ev == MENU_BACK && !(page == P_MODS && !mm.list && mm.level == 1)) { m.touched = 1; continue; }
             if (page == P_CONTROLS) {
                 m.touched = 1;
                 if (ev == MENU_CHAR || ev == MENU_ERASE) continue;
@@ -522,7 +672,20 @@ void menu_run(void) {
             if (page == P_MODS) {
                 m.touched = 1;
                 int r = MOD_EV_NONE;
-                if (ev == MENU_CLICK) {
+                int t = ev == MENU_CLICK && mod_menu_grid(&mm) ? grid_tile((float)in.x, (float)in.y) : -1;
+                int act = -1, color = -1;
+                if (ev == MENU_CLICK && !mod_menu_grid(&mm)) {   /* (the detail's actions, a page's colors) */
+                    float ar[32], cr[32];
+                    int na = overlay_menu_actions(ar), nc = overlay_menu_colors(cr);
+                    for (int k = 0; k < na && act < 0; k++)
+                        if (in.x >= ar[k * 4] && in.x < ar[k * 4] + ar[k * 4 + 2] && in.y >= ar[k * 4 + 1] && in.y < ar[k * 4 + 1] + ar[k * 4 + 3]) act = k;
+                    for (int k = 0; k < nc && color < 0; k++)
+                        if (in.x >= cr[k * 4] && in.x < cr[k * 4] + cr[k * 4 + 2] && in.y >= cr[k * 4 + 1] && in.y < cr[k * 4 + 1] + cr[k * 4 + 3]) color = k;
+                }
+                if (t >= 0) r = mod_menu_click_tile(&mm, t);
+                else if (act >= 0) r = mod_menu_click_action(&mm, act);
+                else if (color >= 0) r = mod_menu_click_color(&mm, color);
+                else if (ev == MENU_CLICK) {
                     int rows = mod_menu_rows(&mm);
                     for (int row = 0; row < rows; row++) {
                         const MenuRect *rr = &mrects[row];
@@ -549,6 +712,14 @@ void menu_run(void) {
             if (r == NET_EV_REFRESH) { net_discover_refresh(); refreshed = 0; }
             if (nm.s.mode != mode) refreshed = 0;
         }
+        if (!rec_shown && menu_safe_held && seconds() - opened < 1.5) {   /* (Shift / L+R held as it opened: the safe mode) */
+            rec_shown = 1;
+            rec->safe = 1;
+            page = P_MODS;
+            m.touched = 1;
+            mod_menu_recovery(&mm, rec, rec_dir);
+            fprintf(stderr, "[mods] safe mode asked (Shift or L+R held)\n");
+        }
         menu_tick(&m, seconds());
         /* Play from the Display page with Join and no address: the Network page first */
         if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN && !nm.s.host[0]) {
@@ -562,6 +733,7 @@ void menu_run(void) {
         if (network && !searching) { net_discover_start(); searching = 1; }
         if (network && seconds() - refreshed >= 0.5) { refreshed = seconds(); net_refresh(&nm); }
         menu_typing = page == P_NETWORK && net_menu_text_row(&nm);
+        mod_gameplay_warning(&ml, nm.mods_warn, sizeof nm.mods_warn);   /* (the Network page: mods that can desync online play) */
         pm.kind = pad_kind_of(menu_device == MENU_KEYS ? menu_pad_kind_seen : menu_device);   /* (the pad drawn: the one used, or seen, last) */
         snprintf(pm.pad, sizeof pm.pad, "%s", menu_pad_name);
         for (int a = 0; a < 4; a++) pm.axes[a] = menu_axes[a], pm.game_axes[a] = menu_axes_game[a];
@@ -574,6 +746,16 @@ void menu_run(void) {
         }
         menu_listening = page == P_CONTROLS && pm.listening;
         menu_sticks_still = page == P_CONTROLS && pm.dead_zones;
+        {   /* the Mods grid: the left stick moves its cursor (after the snapback fix, through the left dead zone) */
+            static double stepped;
+            double now = seconds(), dt = stepped > 0 ? now - stepped : 0;
+            stepped = now;
+            if (dt > 0.1) dt = 0.1;   /* (a slow frame: no jump) */
+            menu_stick_free = page == P_MODS && mod_menu_grid(&mm) && !mm.dialog;
+            float ax, ay;
+            mod_menu_stick(menu_axes_game[0], menu_axes_game[1], pm.s.deadzone_left, &ax, &ay);
+            if (menu_stick_free && (ax || ay)) { m.touched = 1; mod_menu_cursor(&mm, ax, ay, (float)dt); }
+        }
         /* the footer, for overlay_build_menu: '\t' between hints, "key=what" a key's, '#' a countdown's fraction */
         char footer[320], tabs[80];
         const char *accept, *back, *pages;
@@ -609,24 +791,30 @@ void menu_run(void) {
                 time_t t = !stat(mods_root, &st) ? st.st_mtime : 0;
                 if (t != mods_seen) { mods_seen = t; mod_menu_reload(&mm); }
             }
-            const char *del, *mv, *folder;
-            mod_keys(&del, &mv, &folder);
-            const char *keys[5] = {accept, del, mv, folder, back};
+            const char *del, *mv, *folder, *share;
+            mod_keys(&del, &mv, &folder, &share);
+            const char *keys[6] = {accept, del, mv, folder, back, share};
             int rows = mod_menu_rows(&mm);
-            static char mlabels[MOD_MAX + 2][40], mvalues[MOD_MAX + 1][640], mdetail[2400];
-            const char *labels[MOD_MAX + 2], *vp[MOD_MAX + 2];
-            int shown[MOD_MAX + 2];
+            static char mlabels[MOD_MAX + MENU_HOSTS + 3][40], mvalues[MOD_MAX + MENU_HOSTS + 2][2048], mdetail[4096];
+            const char *labels[MOD_MAX + MENU_HOSTS + 3], *vp[MOD_MAX + MENU_HOSTS + 3];
+            int shown[MOD_MAX + MENU_HOSTS + 3];
             for (int r = 0; r < rows; r++) {
-                int big = r == rows - 2;   /* (the detail) */
+                int big = r == rows - 2;   /* (the detail, or the grid) */
                 mod_menu_row(&mm, r, keys, mlabels[r], sizeof mlabels[r], big ? mdetail : mvalues[r], big ? sizeof mdetail : sizeof mvalues[r]);
                 labels[r] = mlabels[r];
                 vp[r] = big ? mdetail : mvalues[r];
                 shown[r] = 1;
             }
-            if (mm.dialog) snprintf(footer, sizeof footer, "%s=choose\t%s=cancel", accept, back);
+            int grid = mod_menu_grid(&mm);
+            char to_grid[40] = "";   /* (a tile's page: back to the grid) */
+            if (!grid && !mm.list) snprintf(to_grid, sizeof to_grid, "\t%s=grid", back);
+            if (mm.dialog == 2) snprintf(footer, sizeof footer, "%s=choose\t%s=ignore", accept, back);
+            else if (mm.dialog) snprintf(footer, sizeof footer, "%s=choose\t%s=cancel", accept, back);
             else if (mm.moving) snprintf(footer, sizeof footer, "%s=choose the color\t%s=place it\t%s=cancel", menu_device == MENU_KEYS ? "< >" : "D-pad", accept, back);
-            else if (mm.note[0]) snprintf(footer, sizeof footer, "%s\t%s=open the folder\t%s=play", mm.note, folder, start);
-            else if (m.touched) snprintf(footer, sizeof footer, "Changes apply when you play\t%s=open the folder\t%s=play", folder, start);
+            else if (mm.note[0]) snprintf(footer, sizeof footer, "%s\t%s=open the folder%s\t%s=play", mm.note, folder, to_grid, start);
+            else if (grid && m.touched)
+                snprintf(footer, sizeof footer, "%s%s=open\t%s=open the folder\t%s=play", menu_device == MENU_KEYS ? "" : "Stick=move\t", accept, folder, start);
+            else if (m.touched) snprintf(footer, sizeof footer, "Changes apply when you play\t%s=open the folder%s\t%s=play", folder, to_grid, start);
             if (mm.dialog) {
                 char q[400];
                 mod_menu_dialog_text(&mm, q, sizeof q);
@@ -634,6 +822,12 @@ void menu_run(void) {
             }
             int drew = gfx_menu(tabs, rows, labels, vp, shown, mod_menu_selected_row(&mm), mod_menu_button_row(&mm), footer, (float *)mrects, &mvalue_x);
             overlay_menu_dialog(NULL, 0);
+            if (grid) {   /* (the columns the window's width gave: the D-pad's up and down, the cursor's rows) */
+                float r[4];
+                int cols;
+                overlay_menu_grid(r, 1, &cols);
+                if (cols > 0) mod_menu_set_cols(&mm, cols);
+            }
             if (!drew) Sleep(30);
         } else if (page == P_CONTROLS) {
             const char *labels[CROWS], *vp[CROWS];
@@ -674,7 +868,12 @@ void menu_run(void) {
     menu_typing = 0;
     menu_listening = 0;
     menu_sticks_still = 0;
+    menu_stick_free = 0;
     menu_active = 0;
+    overlay_menu_pictures(NULL);
+    menu_pics_stop();   /* (their textures, their thread and data.arc's table let go: the game's turn) */
+    mod_body_hook = NULL;
+    mod_arc_game_done();   /* (the bodies' reads may have come after the pictures' thread let it go) */
     if (searching) net_discover_stop();
     if (m.state == MENU_PLAY && memcmp(&pm.s, &pm.initial, sizeof pm.s)) {   /* (before the game reads controllers.ini) */
         if (!pad_settings_save(&pm.s)) fprintf(stderr, "[menu] cannot write controllers.ini\n");
@@ -696,6 +895,8 @@ void menu_run(void) {
         if (!net_settings_save(&keep)) fprintf(stderr, "[menu] cannot write netplay.ini\n");
     }
     net_settings_apply(&nm.s);   /* (Esc: as netplay.ini was; untouched: as it is) */
+    if (m.state == MENU_PLAY && nm.s.mode == NET_MODE_JOIN) room_phase();   /* (its host's mods, before the game) */
+    else if (nm.s.mode != NET_MODE_LAUNCHER) unsetenv("SSBU_ROOM_MODS");   /* (another room, or none: the player's own) */
     fprintf(stderr, "[menu] %s: %s at %d%%, upscale %s, pacing %d, window %d, renderer %s\n", m.state == MENU_PLAY ? "play" : "as display.ini was",
             m.s.operation == OP_HANDHELD ? "handheld" : "docked", m.s.scale, m.s.upscale == UPSCALE_FSR ? "fsr" : "linear", (int)m.s.pacing,
             m.s.window, m.s.renderer == RENDERER_VULKAN ? "vulkan" : "dxvk");
@@ -714,8 +915,11 @@ void menu_run(void) {
  * not cut off - the window says to leave it first. Esc, the pad's east button or F9 closes it. */
 volatile int menu_modal;
 
+static int room_modal;   /* a room's mods' dialog over the game (the online lobby): the keys and pads are its */
+
 void menu_modal_toggle(void) {
 #ifndef _WIN32
+    if (room_modal) return;   /* (the room's dialog first) */
     if (!menu_modal) drop_inputs();   /* (nothing typed before it opened) */
     menu_modal = !menu_modal;
 #endif
@@ -735,6 +939,7 @@ static void modal_open(void) {
     NetSettings ns;
     net_settings_load(&ns);   /* (the mode in use: SSBU_NET_MENU_MODE, net_settings_apply's) */
     net_menu_init(&modal.nm, &ns);
+    snprintf(modal.nm.mods_warn, sizeof modal.nm.mods_warn, "%s", mod_gameplay_note);   /* (the mods loaded that can desync) */
     net_launch_describe(modal.nm.launched, sizeof modal.nm.launched);
     modal.nm.row = NROW_MODE;
     memset(modal.rects, 0, sizeof modal.rects);
@@ -782,9 +987,52 @@ static void modal_apply(void) {
     modal_close();
 }
 
+/* A lobby's room's mods over the game (mod_room.h): its dialog takes the input while it shows; the
+ * download behind the game, a line at the top; then Restart and rejoin, or Later. */
+static int room_modal_build(unsigned w, unsigned h) {
+    if (!room_modal) {
+        if (modal.open) modal_close();   /* (F9's window gives way) */
+        room_modal = 1;
+        menu_modal = 1;   /* (window.c, hle_pad.c: the input is the menu's) */
+        drop_inputs();
+    }
+    Input in;
+    int r = RM_EV_NONE;
+    while (r == RM_EV_NONE && next_input(&in)) {
+        if (in.event == MENU_CLICK) {
+            float rr[16];
+            overlay_menu_room_rects(rr);
+            for (int b = 0; b < 4; b++)
+                if (rr[b * 4 + 2] > 0 && in.x >= rr[b * 4] && in.x < rr[b * 4] + rr[b * 4 + 2] && in.y >= rr[b * 4 + 1] && in.y < rr[b * 4 + 1] + rr[b * 4 + 3])
+                    r = mod_room_click(b == 3 ? -1 : b);
+        } else r = mod_room_event(in.event);
+    }
+    if (r == RM_EV_MENU) { display_show_notice("Leaving the room: back to the menu...", 3000); menu_restart_menu(); }   /* (the room left, as L+R+Select+Start) */
+    if (r == RM_EV_RESTART) { display_show_notice("Starting again with the room's mods...", 3000); start_again(AGAIN_NETWORK_PAGE); }
+    if (!mod_room_busy()) {
+        room_modal = 0;
+        menu_modal = 0;
+        drop_inputs();
+        return 0;
+    }
+    RoomView v;
+    mod_room_view(&v);
+    overlay_menu_over(1);
+    overlay_build_room(w, h, &v);
+    overlay_menu_over(0);
+    return 1;
+}
+
 int menu_modal_build(unsigned w, unsigned h) {
+    mod_room_tick();   /* (a lobby's room just entered: its host asked; the download behind the game) */
+    const char *note = mod_room_note();
+    if (*note) display_show_notice(note + (note[0] == '!'), 4000);
+    if (room_modal || mod_room_busy()) return room_modal_build(w, h);
     if (!menu_modal) {
         if (modal.open) modal_close();
+        RoomView v;
+        mod_room_view(&v);
+        if (v.show == 2) { overlay_build_room(w, h, &v); return 1; }   /* (the download's line) */
         return 0;
     }
     if (!modal.open) modal_open();

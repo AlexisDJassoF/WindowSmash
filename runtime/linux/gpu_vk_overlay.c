@@ -1,30 +1,45 @@
 /* The overlay (frame rate, statistics, the start-up's screens, F7's notice, the mode bar) with
  * Vulkan: the quads gpu_overlay_quads.c builds, from a vertex ring in host-visible memory (a part
- * of it for each frame in flight), the glyph atlas a one-channel image. */
+ * of it for each frame in flight), the glyph atlas a one-channel image; and the menu's pictures
+ * (overlay_texture_add), each an image of its own made the first time it is drawn, batch by batch. */
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gpu_vk.h"
 #include "gpu_overlay_quads.h"
 
-#define MAX_VERTS (8192 * 6)          /* (gpu_overlay_quads.c's most for one drawing) */
+#define MAX_VERTS (16384 * 6)         /* (gpu_overlay_quads.c's most for one drawing) */
 #define DRAWS_PER_FRAME 4             /* the overlay, the notice, the bar, a screen */
 #define RING_PART ((VkDeviceSize)MAX_VERTS * DRAWS_PER_FRAME * sizeof(OverlayVertex))
 
 /* (the same drawing as gpu_overlay.c's: position in pixels to clip space, colour times coverage) */
 static const char HLSL[] =
-    "cbuffer C : register(b0) { float2 inv_size; };\n"
+    "cbuffer C : register(b0) { float2 inv_size; float mode; };\n"
     "struct I { float2 p : POSITION; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
     "struct O { float4 p : SV_Position; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
     "O vs(I i) { O o; o.p = float4(i.p * inv_size * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = i.uv; o.c = i.c; return o; }\n"
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
-    "float4 ps(O i) : SV_Target { return float4(i.c.rgb, i.c.a * t.Sample(s, i.uv).r); }\n";
+    "float4 ps(O i) : SV_Target {\n"
+    "  float4 x = t.Sample(s, i.uv);\n"
+    "  if (mode < 0.5) return float4(i.c.rgb, i.c.a * x.r);\n"   /* the glyphs: coverage */
+    "  if (mode > 1.5) x.rgb = dot(x.rgb, float3(0.299, 0.587, 0.114));\n"   /* a picture in greys */
+    "  return x * i.c;\n"
+    "}\n";
 
 static int state;   /* 0 not yet, 1 ready, -1 failed */
 static VkPipeline pipeline;
 static VkPipelineLayout layout;
 static VkDescriptorSet set;
+static VkDescriptorSetLayout set_layout;
+static VkDescriptorPool pool;
+static VkSampler sampler;
+
+/* The pictures on the GPU: id, image, its memory and view, its set; freed ones kept until the
+ * frames that drew them are done */
+#define MAX_PICTURES 256
+static struct Picture { int id; VkImage image; VkDeviceMemory memory; VkImageView view; VkDescriptorSet set; u64 dead_at; } pics[MAX_PICTURES];
 static VkBuffer ring;
 static OverlayVertex *ring_mem;
 static VkDeviceSize ring_used;       /* in this frame's part */
@@ -71,21 +86,19 @@ static int init(void) {
     VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR,
                               VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                               VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
-    VkSampler sampler;
     vk_check(vkCreateSampler(vk.dev, &si, NULL, &sampler), "the overlay's sampler");
     VkDescriptorSetLayoutBinding b[2] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
     };
     VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b};
-    VkDescriptorSetLayout set_layout;
     vk_check(vkCreateDescriptorSetLayout(vk.dev, &li, NULL, &set_layout), "the overlay's descriptor layout");
     VkPushConstantRange push = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
     VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &set_layout, 1, &push};
     vk_check(vkCreatePipelineLayout(vk.dev, &pli, NULL, &layout), "the overlay's pipeline layout");
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1}};
-    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 2, sizes};
-    VkDescriptorPool pool;
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1 + MAX_PICTURES}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1 + MAX_PICTURES}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+                                      1 + MAX_PICTURES, 2, sizes};
     vk_check(vkCreateDescriptorPool(vk.dev, &dpi, NULL, &pool), "the overlay's descriptor pool");
     VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, pool, 1, &set_layout};
     vk_check(vkAllocateDescriptorSets(vk.dev, &dai, &set), "the overlay's descriptor set");
@@ -137,6 +150,78 @@ static int init(void) {
     return 1;
 }
 
+static void picture_destroy(struct Picture *p) {
+    vkFreeDescriptorSets(vk.dev, pool, 1, &p->set);
+    vkDestroyImageView(vk.dev, p->view, NULL);
+    vkDestroyImage(vk.dev, p->image, NULL);
+    vkFreeMemory(vk.dev, p->memory, NULL);
+    memset(p, 0, sizeof *p);
+}
+
+/* The picture id on the GPU: made from its data the first time; NULL when it is gone (or no room) */
+static struct Picture *picture(int id) {
+    struct Picture *free_slot = NULL;
+    for (int i = 0; i < MAX_PICTURES; i++) {
+        if (pics[i].id == id && !pics[i].dead_at) return &pics[i];
+        if (!pics[i].id && !free_slot) free_slot = &pics[i];
+    }
+    int format;
+    unsigned w, h;
+    void *data;
+    size_t size;
+    if (!free_slot || !overlay_texture_take(id, &format, &w, &h, &data, &size) || !data) return NULL;
+    static const VkFormat F[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC7_UNORM_BLOCK};
+    VkFormat vf = F[format >= 0 && format < 4 ? format : 0];
+    struct Picture *p = free_slot;
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, vf, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                            VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(vk.dev, &ii, NULL, &p->image) != VK_SUCCESS) { free(data); return NULL; }
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(vk.dev, p->image, &req);
+    p->memory = vk_alloc(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vk_check(vkBindImageMemory(vk.dev, p->image, p->memory, 0), "a picture's memory");
+    VkDeviceMemory staging_mem;
+    void *staging_ptr;
+    VkBuffer staging = vk_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 &staging_mem, &staging_ptr);
+    memcpy(staging_ptr, data, size);
+    free(data);
+    VkCommandBuffer cb = vk_once_begin();
+    vk_image_barrier(cb, p->image, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyBufferToImage(cb, staging, p->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    vk_image_barrier(cb, p->image, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    vk_once_end(cb);
+    vkDestroyBuffer(vk.dev, staging, NULL);
+    vkFreeMemory(vk.dev, staging_mem, NULL);
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, p->image, VK_IMAGE_VIEW_TYPE_2D, vf, {0},
+                                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vk_check(vkCreateImageView(vk.dev, &vi, NULL, &p->view), "a picture's view");
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, pool, 1, &set_layout};
+    vk_check(vkAllocateDescriptorSets(vk.dev, &dai, &p->set), "a picture's descriptor set");
+    VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, p->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo sampler_info = {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkWriteDescriptorSet wr[2] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, p->set, 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &image_info, NULL, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, p->set, 1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &sampler_info, NULL, NULL},
+    };
+    vkUpdateDescriptorSets(vk.dev, 2, wr, 0, NULL);
+    p->id = id;
+    return p;
+}
+
+/* The pictures freed (overlay_texture_free): let go once no frame in flight draws them */
+static void pictures_tidy(u64 serial) {
+    for (int id; (id = overlay_texture_dead());)
+        for (int i = 0; i < MAX_PICTURES; i++)
+            if (pics[i].id == id && !pics[i].dead_at) pics[i].dead_at = serial + VK_FRAMES;
+    for (int i = 0; i < MAX_PICTURES; i++)
+        if (pics[i].id && pics[i].dead_at && serial >= pics[i].dead_at) picture_destroy(&pics[i]);
+}
+
 void vk_overlay_draw(VkFrameTarget *t, unsigned x, unsigned y, unsigned w, unsigned h) {
     if (!state) state = init() ? 1 : -1;
     if (state < 0 || !w || !h) return;
@@ -152,11 +237,24 @@ void vk_overlay_draw(VkFrameTarget *t, unsigned x, unsigned y, unsigned w, unsig
     VkViewport vp = vk_viewport(x, y, w, h);
     VkRect2D scissor = {{0, 0}, {t->w, t->h}};
     float inv[4] = {1.0f / (float)w, 1.0f / (float)h, 0, 0};
+    pictures_tidy(t->serial);
     vkCmdBindPipeline(t->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdSetViewport(t->cb, 0, 1, &vp);
     vkCmdSetScissor(t->cb, 0, 1, &scissor);
-    vkCmdBindDescriptorSets(t->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
-    vkCmdPushConstants(t->cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof inv, inv);
     vkCmdBindVertexBuffers(t->cb, 0, 1, &ring, &offset);
-    vkCmdDraw(t->cb, n, 1, 0, 0);
+    unsigned nb;
+    const OverlayBatch *b = overlay_batches(&nb);
+    for (unsigned k = 0; k < nb; k++) {   /* (the glyphs with the atlas, each picture with its own) */
+        if (!b[k].count) continue;
+        VkDescriptorSet use = set;
+        if (b[k].texture) {
+            struct Picture *p = picture(b[k].texture);
+            if (!p) continue;
+            use = p->set;
+        }
+        inv[2] = (float)b[k].mode;
+        vkCmdBindDescriptorSets(t->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &use, 0, NULL);
+        vkCmdPushConstants(t->cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof inv, inv);
+        vkCmdDraw(t->cb, b[k].count, 1, b[k].first, 0);
+    }
 }

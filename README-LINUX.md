@@ -21,6 +21,7 @@ folder made by `tools/update.py` (for example 13.0.5). `dump/port.txt` says whic
 - [In a VMware virtual machine](#in-a-vmware-virtual-machine)
 - [Controls](#controls)
 - [Settings](#settings)
+- [Mods](#mods)
 - [Other launchers](#other-launchers)
 - [Saves](#saves)
 - [If something goes wrong](#if-something-goes-wrong)
@@ -264,6 +265,103 @@ draws, so a new effect can still show a moment late once, if less often.
 The Windows build's start-up shader prewarm is off here: under DXVK it made a Vulkan pipeline for
 every cached shader at once and held up the first frame (`SSBU_SHADER_PREWARM=1` turns it on).
 
+## Mods
+
+The game loads **skins and other visual mods** made for ARCropolis, the mod loader of the Switch, from
+the `mods/` folder (next to `save/`; it is made at the first start). Only files that replace the
+game's own files are used: no plugins (`.nro`), no scripts. A mod changes nothing on disk; take it out
+of the folder and the game is as before.
+
+### Adding a mod
+
+Unpack each mod into a folder of its own inside `mods/`, so that its files sit at the game's paths:
+
+```
+mods/
+  Frieren over Palutena/
+    info.toml                (optional: display_name, authors, version, description)
+    preview.png              (optional: shown when the mod has no portrait of its own)
+    fighter/palutena/model/body/c03/...
+    ui/replace/chara/chara_3/chara_3_palutena_03.bntx
+```
+
+If the mod's archive has one more folder level around `fighter/` and `ui/`, move that inner folder
+up. The Mods page notices a mod added, renamed or removed while it is open.
+
+### The Mods page
+
+The start-up menu's **Mods** page shows every fighter as on the game's character select, each with
+its own portrait: in colour with a green frame and a count when it has enabled mods, dimmed when
+its mods are all disabled, grey without mods. A red sign marks two enabled skins in the same color
+(or a mod with colors 9 and up); a yellow one, a warning (it changes more than looks, music, a
+`config.json`, files another mod replaces too). The label above the grid says which.
+
+Move with the left stick (a cursor, as in the game), the D-pad, the arrow keys or the mouse; **A**
+(**Enter**, a click) opens a fighter. Mods that touch several fighters, or none (menus, stages),
+are under **Other** at the end, with the mods kept from rooms you joined.
+
+A fighter's page shows its eight colors with their icons, its mods, and the selected one's detail:
+a preview split corner to corner (the game's portrait and the mod's), what it changes and its notes.
+
+| Key | Pad | What it does |
+| :--- | :--- | :--- |
+| Enter | A | Enable or disable the mod (its folder gets or loses a `.` in front) |
+| Del | X | Delete the mod's folder, after asking (Cancel is chosen first) |
+| M | RT / R2 / ZR | Move it to another of the fighter's colors: left/right, then A to place it |
+| S | LT / L2 / ZL | Share it, or not, in the rooms you host ([Mods in a room](NETPLAY.md#mods-in-a-room)) |
+| F | Y | Open the `mods/` folder |
+| Left / Right | D-pad | The preview's other colors, when the mod has several |
+| Esc, right click | B | Back to the grid |
+
+Everything applies at the next **Play**. `SSBU_MENU_MODS=list ./run.sh` shows the plain list of
+mods of earlier builds instead of the grid.
+
+### Colors
+
+A skin goes in the color its files name (`c00` is color 1 ... `c07` color 8). Moving it (**M** on the
+page) moves its model, portraits, voice, effects and victory camera together, and saves where it goes
+in `mods/windowsmash.toml`; a folder name ending in `-c05` does the same. Another skin already in that
+color swaps places with it. Two enabled skins in the same color: the first in alphabetical order wins,
+and the page marks both. Some fighters' colors are different characters (Steve and Alex, the
+Koopalings, Hero...): a skin moved between them may keep the other one's voice.
+
+### What doesn't work yet
+
+- New colors (`c08` and up): those files are left out.
+- Music (`stream:` files) and crowd cheers (`vc_<fighter>_cheer`).
+- Parameter patches (`.prcx`), and a `.prc` made for another game version (it is skipped, with a
+  note in the log).
+- A `config.json` is read for the new files it adds; anything else in it is not.
+- Windows: the Windows build doesn't read `mods/` yet.
+
+### Online
+
+A mod that changes how the game plays (parameters, animations: anything but models, portraits,
+voices and effects) can make an online match desync with players who don't have it. The Network
+page and the details of <kbd>F2</kbd> say when one is enabled. How rooms share mods:
+[Mods in a room](NETPLAY.md#mods-in-a-room).
+
+### When a mod breaks the game
+
+If the game crashes, freezes or doesn't finish starting with mods enabled, the next start opens the
+menu on the Mods page (even with `menu = 0`), says what happened and which mod it was loading at the
+time, and offers:
+
+| Choice | What it does |
+| :--- | :--- |
+| **Disable** *the mod* | Disables that mod; the others load. |
+| **Back to the mods that last worked** | Disables the mods enabled since the last start that worked. |
+| **Start without mods this time** | This start only; nothing is changed. |
+| **Ignore** (Esc / B) | Starts as before. |
+
+Nothing is ever deleted. If it fails twice in a row with the same mods and nobody chose anything,
+the game starts without them (they stay enabled) and says so. To start without mods on purpose,
+hold **Shift** (or **L + R** on a pad) while the game starts, or run `SSBU_MODS=0 ./run.sh`.
+
+The game keeps what it needs in `cache/mods/`: `table.bin` (the archive's table, rebuilt when a mod
+changes), and `session.txt` and `last_good.txt` for the above. The log's `[mods]` lines say what was
+loaded, and which mod file the game was reading last.
+
 ## Other launchers
 
 | Launcher | What it does |
@@ -289,6 +387,7 @@ back.
 | *Some libraries the game needs are not installed* | Run `bash install-deps.sh`. |
 | A black window, or `cannot create the window` / DXVK errors in the log | Run `vulkaninfo --summary`. If it lists no device, install `mesa-vulkan-drivers`. |
 | No sound | SDL uses PulseAudio or PipeWire. Check the log for `[audio]` lines. |
+| A crash or a freeze with mods enabled | The next start offers to disable the mod it was loading ([When a mod breaks the game](#when-a-mod-breaks-the-game)). |
 | A crash | It writes `reports/crash_<date>_<time>.txt`: the guest function and host frames (`*** host exception`), also at the end of the log. Send it with `build/play.log`. When the port stops the game itself (something it can't do yet), it writes `reports/stopped_*.txt`. |
 | A freeze (no new picture for 5 seconds) | It writes `reports/freeze_*.txt`, again at 30 and 120 seconds: every thread's stack and who holds the renderer's locks. `SSBU_WATCHDOG=0` turns that off. Windows also writes minidumps; Linux doesn't, so a core dump, if your system keeps them, is the closest thing. |
 | A low frame rate on an integrated graphics card (the GPU at 100%: `DXVK_HUD=fps,gpuload ./run.sh` shows it) | In the start-up menu, Mode **Handheld (720p)** and Upscaling **FSR**, and play in full screen (F11): the game draws under half the pixels, and FSR enlarges them to the screen. Still too slow: Resolution scale **75%** (or 50%). |

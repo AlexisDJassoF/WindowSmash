@@ -42,6 +42,10 @@ class ModArcTests(unittest.TestCase):
                             '-o', str(cls.exe)], capture_output=True, text=True)
         if r.returncode:
             raise AssertionError(f'compiling the test failed:\n{r.stdout}{r.stderr}')
+        r = subprocess.run([CC, '-O1', '-I', str(ROOT / 'runtime'), str(ROOT / 'tests/bntx_test.c'), str(ROOT / 'runtime/gpu_bntx.c'),
+                            '-o', str(Path(cls.temp.name) / 'bntx_test')], capture_output=True, text=True)
+        if r.returncode:
+            raise AssertionError(f'compiling the BNTX test failed:\n{r.stdout}{r.stderr}')
         cls.image = RomfsImage(str(ROMFS_CFG))
         (cls.arc_off, cls.arc_size), = [(o, s) for p, o, s in romfs_entries(cls.image) if p == 'data.arc']
         cls.arc = Arc(lambda off, size: cls.image.read(cls.arc_off + off, size))
@@ -449,6 +453,130 @@ class ModArcTests(unittest.TestCase):
         self.assertEqual(check.get(new.format(7)), tex, log)
         self.assertIsNone(check.locate(new.format(6)))
 
+    def test_moved_files_named_by_their_color_are_new_there(self):
+        # Splatsune Inku moved from c06: Inkling's textures are named by the color (def_inkling_c06_...),
+        # and c07 has none of those names - they are new files of c07's directory, no config.json needed
+        tex = 'fighter/inkling/model/body/c{:02d}/def_inkling_c06_001_col.nutexb'
+        if not self.arc.locate(tex.format(6)) or self.arc.locate(tex.format(7)):
+            self.skipTest('no Inkling c06 textures in this data.arc')
+        data = os.urandom(2500)
+        self.put('Ink-c07', tex.format(6), data)
+        self.put('Ink-c07', 'fighter/inkling/model/body/c06/model.numatb', b'\x00' * 16 + b'def_inkling_c06_001_col\x00')
+        check, log = self.build()
+        self.assertNotIn('is not in data.arc', log)
+        self.assertNotIn('its material needs', log)
+        self.assertIn('1 new files in fighter/inkling/c07', log)
+        self.assertEqual(check.get(tex.format(7)), data, log)
+        self.assertEqual(check.get(tex.format(6)), self.arc.get(tex.format(6)))   # (c06 the game's)
+
+    def test_a_move_takes_its_ink_along_and_keeps_the_body(self):
+        # Splatsune Inku (Inkling c06) moved to c00: Inkling's ink is fighter/common/param/effect.prc's, a
+        # list with an entry a color; the mod's c06 entry goes to c00, c06 gets the game's back. A move to
+        # c05 (the boy's body: the fight's loading hung) is undone at the start.
+        import sys
+        sys.path.insert(0, str(ROOT / 'tests'))
+        path = 'fighter/common/param/effect.prc'
+        if not self.arc.locate(path) or not self.arc.locate('fighter/inkling/model/body/c05/model.nusktb'):
+            self.skipTest('no effect.prc or Inkling in this data.arc')
+        game = self.arc.get(path)
+        def entries(b):   # the 8-entry lists of 3 floats: their values, by list
+            out, n = {}, struct.unpack_from('<I', b, 8)[0]
+            refs = 16 + n
+            root = refs + struct.unpack_from('<I', b, 12)[0]
+            hashes = [struct.unpack_from('<Q', b, 16 + 8 * i)[0] & ((1 << 40) - 1) for i in range(n // 8)]
+            count, r = struct.unpack_from('<II', b, root + 1)
+            for i in range(count):
+                hi, off = struct.unpack_from('<II', b, refs + r + 8 * i)
+                o = root + off
+                if b[o] == 11 and struct.unpack_from('<I', b, o + 1)[0] == 8:
+                    row = []
+                    for k in range(8):
+                        e = o + struct.unpack_from('<I', b, o + 5 + 4 * k)[0]
+                        row.append(b[e:e + 24])
+                    out[hashes[hi]] = row
+            return out
+        lists = entries(game)
+        key = next(k for k, row in lists.items() if len(set(row)) > 1)
+        mine = bytearray(game)
+        e = game.index(lists[key][6])
+        mine[e + 10:e + 14] = struct.pack('<f', 0.123)   # (the mod's ink at c06: its first value changed)
+        self.put('Ink-c00', path, bytes(mine))
+        self.put('Ink-c00', 'fighter/inkling/model/body/c06/model.numdlb', self.arc.get('fighter/inkling/model/body/c06/model.numdlb'))
+        (self.mods / 'windowsmash.toml').write_text('[mod."Ink-c00"]\ninkling.c06 = "c00"\n')
+        check, log = self.build(TEST_GAME_HOOKS='1')
+        self.assertRegex(log, r"effect.prc: \d+ of its colors' entries moved with them")
+        got = entries(check.get(path))
+        self.assertEqual(got[key][0], bytes(mine[e:e + 24]))   # (the mod's c06 entry, now c00's)
+        self.assertEqual(got[key][6], lists[key][6])           # (c06: the game's again)
+        (self.mods / 'windowsmash.toml').write_text('[mod."Ink-c00"]\ninkling.c06 = "c05"\n')
+        check, log = self.build(TEST_GAME_HOOKS='1')
+        self.assertIn('Ink-c00: moved to color 6, where Inkling has another body (skeleton); loaded at its own colors', log)
+        self.assertNotIn('entries moved', log)
+
+    def test_a_move_copies_the_games_textures_its_material_names(self):
+        # Splatsune Inku's material names textures of c06 it does not bring - the game's (its hair's,
+        # alp_inkling_c06_002_col, its eyes'); moved to c00, which has none of those names, the hair was
+        # black. They are copied from the game's c06, new files of c00.
+        tex = 'fighter/inkling/model/body/c{:02d}/alp_inkling_c06_002_col.nutexb'
+        if not self.arc.locate(tex.format(6)) or self.arc.locate(tex.format(0)):
+            self.skipTest('no Inkling c06 hair texture in this data.arc')
+        self.put('Ink', 'fighter/inkling/model/body/c06/model.numatb',
+                 b'\x00' * 16 + b'alp_inkling_c06_002_col\x00' + b'\x01' + b'default_Normal\x00' + b'\x00' * 8)
+        (self.mods / 'windowsmash.toml').write_text('[mod."Ink"]\ninkling.c06 = "c00"\n')
+        check, log = self.build(TEST_GAME_HOOKS='1')
+        self.assertIn('Ink: fighter/inkling/model/body/c00/model.numatb: 1 of the game\'s textures it names copied with it', log)
+        self.assertIn('new files in fighter/inkling/c00', log)
+        self.assertEqual(check.get(tex.format(0)), self.arc.get(tex.format(6)), log)
+        self.assertNotIn('its material needs', log)
+
+    def test_a_move_takes_the_huds_ink_along(self):
+        # Splatsune Inku's layout.arc (the fight's HUD): the ink behind the portrait is an animation whose
+        # frames are the colors, the mod's c06 changed. Moved to c00, those keys go to c00's frames and
+        # c06's get the game's back.
+        path = 'ui/layout/info/info_melee/info_melee/layout.arc'
+        anim = 'anim/info_melee_lct_ink_ink_bg.bflan'
+        if not self.arc.locate(path):
+            self.skipTest('no HUD layout in this data.arc')
+        game = self.arc.get(path)
+        def bflan(b):   # where the animation is in the SARC
+            data, count = struct.unpack_from('<I', b, 0xC)[0], struct.unpack_from('<H', b, 0x1A)[0]
+            sfnt = 0x20 + 16 * count
+            for i in range(count):
+                _, attr, st, en = struct.unpack_from('<4I', b, 0x20 + 16 * i)
+                no = sfnt + 8 + 4 * (attr & 0xFFFF)
+                if b[no:b.index(0, no)].decode() == anim:
+                    return data + st
+        def keys(b):   # the first curve of 15 keys: where its keys are
+            f = bflan(b)
+            p = f + struct.unpack_from('<H', b, f + 6)[0]
+            while b[p:p + 4] != b'pai1':
+                p += struct.unpack_from('<I', b, p + 4)[0]
+            n, table = struct.unpack_from('<H', b, p + 0xE)[0], p + struct.unpack_from('<I', b, p + 0x10)[0]
+            for e in range(n):
+                eo = p + struct.unpack_from('<I', b, table + 4 * e)[0]
+                for t in range(b[eo + 28]):
+                    to = eo + struct.unpack_from('<I', b, eo + 32 + 4 * t)[0]
+                    for c in range(b[to + 4]):
+                        co = to + struct.unpack_from('<I', b, to + 8 + 4 * c)[0]
+                        if struct.unpack_from('<H', b, co + 4)[0] == 15:
+                            return co + struct.unpack_from('<I', b, co + 8)[0]
+        k = keys(game)
+        value = lambda b, i: struct.unpack_from('<f', b, k + 12 * i + 4)[0]
+        mine = bytearray(game)
+        for i in (12, 13):   # (color 6: the keys at frames 6 and 7)
+            struct.pack_into('<f', mine, k + 12 * i + 4, 42.0)
+        self.put('Ink', path, bytes(mine))
+        self.put('Ink', 'fighter/inkling/model/body/c06/model.numdlb', self.arc.get('fighter/inkling/model/body/c06/model.numdlb'))
+        (self.mods / 'windowsmash.toml').write_text('[mod."Ink"]\ninkling.c06 = "c00"\n')
+        check, log = self.build(TEST_GAME_HOOKS='1')
+        self.assertRegex(log, r"layout.arc: \d+ of its colors' entries moved with them")
+        # (every curve of the colors moves c06 whole - those the mod left as the game's c06 had too: the
+        # gauge's blue, green at c00 when ink was spent)
+        out = check.get(path)
+        self.assertEqual(value(out, 14), value(game, 14))   # (c07 untouched)
+        self.assertEqual([value(out, i) for i in (0, 1)], [42.0, 42.0])
+        self.assertEqual([value(out, i) for i in (12, 13)], [value(game, 12), value(game, 13)])
+
     def test_own_file_not_at_its_slot_is_replaced_where_it_is(self):
         # Wii Fit c01 keeps 407 of its own files (load type 1) at a FileData that is not start + k, its
         # voice among them; they were skipped ("load type 1; skipped"), now replaced in place
@@ -535,6 +663,95 @@ class ModArcTests(unittest.TestCase):
         self.assertIn('cache=0', log)
         self.assertEqual(changed.get(path), b'2' * 301)
 
+
+    # ---- one file by its path (mod_arc_read_path), and the BNTX reader (runtime/gpu_bntx.c) ----
+
+    def read_paths(self, *paths):
+        """{path: bytes or None} as mod_arc_read_path gives them"""
+        out = self.dir / 'paths.bin'
+        p = subprocess.Popen([str(self.exe), '--path', str(out), *paths], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+        while True:
+            kind = p.stdout.read(1)
+            if kind == b'R':
+                at, size = struct.unpack('<QQ', p.stdout.read(16))
+                p.stdin.write(self.image.read(self.arc_off + at, size))
+                p.stdin.flush()
+            else:
+                self.assertEqual(kind, b'E', p.stderr.read().decode())
+                self.assertEqual(struct.unpack('<i', p.stdout.read(4))[0], 1)
+                break
+        p.wait(timeout=60)
+        blob, got, at = out.read_bytes(), {}, 0
+        for path in paths:
+            n, = struct.unpack_from('<Q', blob, at)
+            at += 8
+            if n == (1 << 64) - 1:
+                got[path] = None
+            else:
+                got[path] = blob[at:at + n]
+                at += n
+        return got
+
+    def test_read_a_file_by_its_path(self):
+        mario = 'ui/replace/chara/chara_7/chara_7_mario_00.bntx'
+        sora = 'ui/replace_patch/chara/chara_7/chara_7_trail_00.bntx'   # (a DLC's: in replace_patch alone)
+        model = SHARED.format(3)
+        got = self.read_paths(mario, sora, model, 'ui/replace/chara/chara_7/chara_7_trail_00.bntx', 'no/such/file.bntx')
+        for path in (mario, sora, model):
+            self.assertEqual(got[path], self.arc.get(path), path)
+        self.assertIsNone(got['ui/replace/chara/chara_7/chara_7_trail_00.bntx'])
+        self.assertIsNone(got['no/such/file.bntx'])
+
+    @staticmethod
+    def unswizzle(bntx):
+        """The BNTX's level 0 as linear 4x4 BC blocks, read here on its own (tools/arc.py's way of
+        reading the format, the block-linear GOBs written out again)"""
+        nx = bntx.find(b'NX  ')
+        brti, = struct.unpack_from('<Q', bntx, struct.unpack_from('<Q', bntx, nx + 8)[0])
+        w, h = struct.unpack_from('<II', bntx, brti + 0x24)
+        bh = struct.unpack_from('<I', bntx, brti + 0x34)[0] & 7
+        mip0, = struct.unpack_from('<Q', bntx, struct.unpack_from('<Q', bntx, brti + 0x70)[0])
+        row, rows = (w + 3) // 4 * 16, (h + 3) // 4
+        out = bytearray(row * rows)
+        for y in range(rows):
+            by, yin = divmod(y, 8 << bh)
+            line = by * ((row + 63) // 64) * (512 << bh) + (yin // 8) * 512
+            for x in range(0, row, 16):
+                g = ((x % 64) // 32) * 256 + ((yin % 8) // 2) * 64 + ((x % 32) // 16) * 32 + (yin % 2) * 16
+                off = mip0 + line + (x // 64) * (512 << bh) + g
+                out[y * row + x:y * row + x + 16] = bntx[off:off + 16]
+        return bytes(out)
+
+    def test_bntx_portrait_reads_as_a_picture(self):
+        for path, size in (('ui/replace/chara/chara_7/chara_7_mario_00.bntx', (454, 300)),
+                           ('ui/replace/chara/chara_2/chara_2_mario_00.bntx', (64, 64)),
+                           ('ui/replace/chara/chara_3/chara_3_mario_00.bntx', (1132, 1212))):
+            bntx, raw = self.dir / 'p.bntx', self.dir / 'p.raw'
+            data = self.arc.get(path)
+            bntx.write_bytes(data)
+            r = subprocess.run([str(Path(self.temp.name) / 'bntx_test'), str(bntx), str(raw)], capture_output=True, text=True, timeout=30)
+            info = dict(kv.split('=') for kv in r.stdout.split())
+            self.assertEqual((info['format'], int(info['width']), int(info['height'])), ('3', *size), r.stdout)   # (OVERLAY_TEX_BC7)
+            blocks = raw.read_bytes()
+            self.assertEqual(blocks, self.unswizzle(data), path)
+            try:   # (and, with PIL, a real picture: opaque in the middle, many colours)
+                from PIL import Image
+            except ImportError:
+                continue
+            w, h = size
+            dds = (b'DDS ' + struct.pack('<7I', 124, 0x81007, h, w, len(blocks), 0, 1) + bytes(44) + struct.pack('<2I', 32, 4) + b'DX10'
+                   + bytes(20) + struct.pack('<4I', 0x1000, 0, 0, 0) + bytes(4) + struct.pack('<5I', 98, 3, 0, 1, 0))
+            (self.dir / 'p.dds').write_bytes(dds + blocks)
+            pic = Image.open(self.dir / 'p.dds').convert('RGBA')
+            self.assertEqual(pic.size, size)
+            self.assertGreater(pic.getpixel((w // 2, h // 2))[3], 200, path)
+            self.assertGreater(len(set(pic.getdata())), 500, path)
+        r = subprocess.run([str(Path(self.temp.name) / 'bntx_test'), str(self.dir / 'p.raw'), str(self.dir / 'x')], capture_output=True, text=True)
+        self.assertIn('error=not a BNTX file', r.stdout)
+        (self.dir / 'cut.bntx').write_bytes(data[:0x2000])
+        r = subprocess.run([str(Path(self.temp.name) / 'bntx_test'), str(self.dir / 'cut.bntx'), str(self.dir / 'x')], capture_output=True, text=True)
+        self.assertIn('error=cut short', r.stdout)
 
 if __name__ == '__main__':
     unittest.main()

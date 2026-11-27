@@ -29,6 +29,11 @@ import time
 PROTOCOL = 2
 JOIN, WELCOME, REJECT, PING, PONG, DATA, MEMBERS, LEAVE, LIST, LISTING, LIST_END = range(1, 12)
 PEERS, BCAST, PUNCH, DIRECT = range(12, 16)   # (direct connections; PUNCH and DIRECT go between players)
+# A room's mods (openspec change netplay-mod-sync): their list travels inside DATA between port 65512s,
+# so the lobby carries it in the room like any game traffic; their files, MODGET and MODPART, go only
+# straight between players or through a private room's relay - never through the lobby, which drops them.
+MODGET, MODPART = 16, 17
+MODS_PORT = 65512
 NAME_LEN = 32
 BUILD_LEN = 40
 JOIN_SIZE = 4 + 8 + 2 * NAME_LEN + BUILD_LEN
@@ -364,6 +369,9 @@ class Lobby(asyncio.DatagramProtocol):
         if p[2] != PROTOCOL:   # another version of the game's netplay: say so
             if kind == JOIN and len(p) >= V1_JOIN_SIZE and self.gate(at, now):
                 self.reject(at, p[4:12], 2, f"different netplay version (lobby {PROTOCOL}, you {p[2]})", p[2])
+            return
+        if kind in (MODGET, MODPART):   # (a room's mod files: never carried here)
+            self.drops["mod files"] += 1
             return
         c = self.by_addr.get(at)
         if kind == JOIN:

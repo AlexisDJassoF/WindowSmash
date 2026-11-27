@@ -16,6 +16,7 @@
 #include <windows.h>
 
 #include "debug_profile.h"
+#include "mod_recovery.h"
 
 typedef unsigned long long U64;
 
@@ -72,16 +73,22 @@ static DWORD WINAPI watchdog(void *unused) {
         U64 now = GetTickCount64(), since = now - last_present;
         if (paused || IsDebuggerPresent()) continue;
         if (since < 5000) {
-            if (reports) { fprintf(stderr, "[watchdog] frames are presented again\n"); reports = 0; }
+            if (reports) { fprintf(stderr, "[watchdog] frames are presented again\n"); reports = 0; mod_recovery_thawed(); }
             continue;
         }
-        if (reports < 3 && since >= AT[reports]) write_report(since, reports++ == 0);
+        if (reports < 3 && since >= AT[reports]) {
+            if (AT[reports] == 30000) mod_recovery_frozen();   /* (30 s: a freeze, for the next start's recovery) */
+            write_report(since, reports++ == 0);
+        }
     }
 }
 
 void watchdog_present(void) {
     last_present = GetTickCount64();
     presented++;
+    static U64 first;   /* (20 s of frames: the mods work - mod_recovery.h) */
+    if (!first) first = last_present;
+    if (presented % 60 == 0) mod_recovery_frames((int)((last_present - first) / 1000));
     if (started < 0) {   /* the first frame: start (once) */
         const char *v = getenv("SSBU_WATCHDOG");
         started = !v || atoi(v) != 0;

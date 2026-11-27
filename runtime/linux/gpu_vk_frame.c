@@ -21,6 +21,7 @@
 #include "display.h"
 #include "gpu_menu.h"
 #include "gpu_overlay_quads.h"
+#include "mod_recovery.h"
 
 void *rt_window(void);
 void watchdog_present(void);                 /* debug_watchdog.c */
@@ -411,8 +412,14 @@ void vk_gfx_present(u64 guest, u32 crop_x, u32 crop_y, u32 crop_w, u32 crop_h) {
     if (profile_at == -1) profile_at = getenv("SSBU_PROFILE_AT") ? atof(getenv("SSBU_PROFILE_AT")) : -2;
     if (profile_at >= 0 && rt_now_ns() > (u64)(profile_at * 1e9)) { profile_at = -2; keys |= 32; }
     if (keys & 32) profile_start(getenv("SSBU_PROFILE_SECONDS") ? atof(getenv("SSBU_PROFILE_SECONDS")) : 10.0);   /* F6: a sampling profile, 10 s (SSBU_PROFILE_SECONDS) */
-    char detail[512];
+    char detail[768];
     vk_draw_describe(detail, sizeof detail);
+    {
+        char note[160];
+        mod_recovery_note(note, sizeof note);   /* (started without mods by the recovery: said in F2) */
+        size_t l = strlen(detail);
+        if (note[0]) snprintf(detail + l, sizeof detail - l, "\n%s", note);
+    }
     if (overlay_build_present(overlay, details ? detail : "F2 details")) vk_overlay_draw(&t, fit_x, fit_y, fit_w, fit_h);
     char note[96];
     if (display_notice(note, sizeof note)) {   /* (F7's mode) */

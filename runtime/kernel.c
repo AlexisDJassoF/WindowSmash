@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "mod_recovery.h"
 
 enum { R_OK = 0, R_TIMEOUT = 0xEA01, R_CANCELLED = 0xEC01, R_INVALID_HANDLE = 0xE401, R_INVALID_STATE = 0xFA01,
        R_INVALID_ADDRESS = 0xCC01, R_INVALID_ENUM = 0xF001, R_OUT_OF_MEMORY = 0xD001 };
@@ -394,7 +395,7 @@ void rt_svc(Cpu *c, u32 n) {
         if (x[2] == 4 && x[1])   /* the info is a failed result */
             rt_fatal("the guest aborted on result %#x (module %u, description %u)", ld32(x[1]), ld32(x[1]) & 0x1FF, (ld32(x[1]) >> 9) & 0x1FFF);
         rt_fatal("the guest called svcBreak (reason %#llx, info %#llx, size %#llx)", x[0], x[1], x[2]);
-    case 0x07: fprintf(stderr, "guest process exited\n"); exit(0);
+    case 0x07: fprintf(stderr, "guest process exited\n"); mod_recovery_close(); exit(0);
     case 0x0A: exit_thread(me);
     case 0x1F: {   /* ConnectToNamedPort(name) -> session handle */
         void *s = ipc_connect((const char *)x[1]);

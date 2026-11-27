@@ -25,7 +25,9 @@ class MenuTests(unittest.TestCase):
         flags = ['-O1', '-w', '-D_GNU_SOURCE', '-I', str(ROOT / 'runtime'), '-I', str(ROOT / 'runtime/linux/include'),
                  '-I', str(DXVK_INCLUDE / 'windows'), '-I', str(DXVK_INCLUDE / 'directx')]
         r = subprocess.run([CC, *flags, str(ROOT / 'tests/gpu_menu_test.c'), str(ROOT / 'runtime/gpu_menu.c'),
-                            str(ROOT / 'runtime/gpu_scale.c'), str(ROOT / 'runtime/net_menu.c'), str(ROOT / 'runtime/pad_menu.c'), str(ROOT / 'runtime/mod_menu.c'), str(ROOT / 'runtime/mod_scan.c'), '-lm', '-o', str(cls.exe)],
+                            str(ROOT / 'runtime/gpu_scale.c'), str(ROOT / 'runtime/net_menu.c'), str(ROOT / 'runtime/pad_menu.c'), str(ROOT / 'runtime/mod_menu.c'), str(ROOT / 'runtime/mod_scan.c'), str(ROOT / 'runtime/mod_roster.c'), str(ROOT / 'runtime/mod_recovery.c'),
+                            *[str(ROOT / 'runtime' / f) for f in ('mod_room.c', 'mod_cache.c', 'mod_fetch.c', 'mod_sync.c', 'mod_zip.c', 'mod_manifest.c', 'mod_sha256.c')],
+                            '-lm', '-pthread', '-o', str(cls.exe)],
                            capture_output=True, text=True)
         if r.returncode:
             raise AssertionError(f'compiling the test failed:\n{r.stdout}{r.stderr}')

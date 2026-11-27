@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "gpu_texture.h"
+#include "gpu_blocklinear.h"
 
 #define DIV_UP(a, b) (((a) + (b) - 1) / (b))
 
@@ -111,20 +112,9 @@ int tic_decode(const u32 *tic, TextureDesc *d) {
     return 0;
 }
 
-/* Byte offset of (x bytes, y rows) inside a GOB. */
-static u32 gob_offset(u32 x, u32 y) {
-    return ((x % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + (x % 16);
-}
-
-/* Block-linear size of one level: width in bytes, height in block rows, block height log2. */
-static u64 level_size(u32 wbytes, u32 rows, u32 bh) {
-    return (u64)DIV_UP(wbytes, 64) * DIV_UP(rows, 8u << bh) * (512ull << bh);
-}
-
-static u32 level_block_height(u32 rows, u32 bh) {
-    while (bh > 0 && DIV_UP(rows, 8) <= (1u << (bh - 1))) bh--;
-    return bh;
-}
+#define gob_offset bl_gob_offset
+#define level_size bl_level_size
+#define level_block_height bl_level_block_height
 
 u64 texture_layer_size(const TextureDesc *d) {
     if (d->header_version == 2) return (u64)d->pitch * DIV_UP(d->height, d->bh);   /* pitch linear: one level */
@@ -152,18 +142,7 @@ void texture_read(const TextureDesc *d, u64 guest, u32 layer, u32 level, u8 *out
         u32 lw = DIV_UP(d->width >> l ? d->width >> l : 1, d->bw), lh = DIV_UP(d->height >> l ? d->height >> l : 1, d->bh);
         base += level_size(lw * d->bytes, lh, level_block_height(lh, d->block_height));
     }
-    u32 bh = level_block_height(h, d->block_height);
-    u32 gobs_x = DIV_UP(row, 64), block_rows = 8u << bh;
-    const u8 *src = P(u8, base);
-    for (u32 y = 0; y < h; y++) {
-        u32 by = y / block_rows, yin = y % block_rows;
-        u64 line = (u64)by * gobs_x * (512ull << bh) + (yin / 8) * 512ull;
-        for (u32 x = 0; x < row; x += 16) {   /* 16 contiguous bytes within a GOB */
-            u64 off = line + (u64)(x / 64) * (512ull << bh) + gob_offset(x, yin);
-            u32 n = row - x < 16 ? row - x : 16;
-            memcpy(out + (size_t)y * row + x, src + off, n);
-        }
-    }
+    bl_read(P(u8, base), row, h, level_block_height(h, d->block_height), out);
 }
 
 /* 3D textures: GOBs stack (1 << block_height) high and (1 << block_depth) deep in a block;

@@ -6,7 +6,8 @@
  *   palutena.c03 = "c06"
  *
  * A mod without an entry there, of one fighter and one color, whose folder's name ends in -c0Y goes
- * to c0Y. Entries of mods that are not in the folder any more are left out when it is written. */
+ * to c0Y. Entries of mods that are not in the folder any more are left out when it is written.
+ * share = false in a mod's entry keeps it out of the rooms hosted here (netplay-mod-sync). */
 #define _GNU_SOURCE
 #include "mod_scan.h"
 #include "mod_arc.h"
@@ -37,6 +38,276 @@ const char *mod_root(char *out, size_t n) {
     return out;
 }
 
+uint64_t (*mod_body_hook)(const char *fighter, int color);
+void *(*mod_game_file_hook)(const char *path, uint64_t *size);
+
+/* ---- param files of colors moved ------------------------------------------------------------ */
+/* paracobn: "paracobn", u32 hash table size, u32 ref table size, the hashes (u64), the ref table, the
+ * values: a type byte each (1-3: 1 byte, 4-5: 2, 6-10: 4 - 9 a hash's index, 10 a string's ref offset;
+ * 11 list: count, offsets from it; 12 struct: count, ref table offset of (hash index, offset from it)
+ * pairs). The mod's and the game's are matched by their names, not their bytes: a mod made on another
+ * version has other indices (Splatsune Inku's effect.prc: one name fewer). */
+typedef struct Prc { const unsigned char *b; size_t n, hashes, refs, root; } Prc;
+static uint32_t prc32(const Prc *p, size_t o) { return o + 4 <= p->n ? (uint32_t)p->b[o] | (uint32_t)p->b[o + 1] << 8 | (uint32_t)p->b[o + 2] << 16 | (uint32_t)p->b[o + 3] << 24 : 0; }
+static uint64_t prc_hash(const Prc *p, uint32_t index) {
+    size_t o = 16 + 8ull * index;
+    return o + 8 <= p->refs ? ((uint64_t)prc32(p, o) | (uint64_t)prc32(p, o + 4) << 32) & 0xFFFFFFFFFFull : 0;
+}
+static int prc_open(Prc *p, const unsigned char *b, size_t n) {
+    p->b = b, p->n = n;
+    if (n < 16 || memcmp(b, "paracobn", 8)) return 0;
+    p->hashes = 16, p->refs = 16 + (size_t)prc32(p, 8), p->root = p->refs + (size_t)prc32(p, 12);
+    return p->root < n && b[p->root] == 12;
+}
+static size_t prc_child(const Prc *p, size_t o, uint32_t i, uint64_t *hash) {   /* a list's or a struct's child i */
+    if (p->b[o] == 11) { if (hash) *hash = 0; return o + prc32(p, o + 5 + 4ull * i); }
+    size_t r = p->refs + prc32(p, o + 5) + 8ull * i;
+    if (hash) *hash = prc_hash(p, prc32(p, r));
+    return o + prc32(p, r + 4);
+}
+/* the end of the value at o (its last byte's next), 0 a bad one */
+static size_t prc_end(const Prc *p, size_t o, int depth) {
+    if (o >= p->n || depth > 32) return 0;
+    unsigned t = p->b[o];
+    if (t >= 1 && t <= 3) return o + 2;
+    if (t == 4 || t == 5) return o + 3;
+    if (t >= 6 && t <= 10) return o + 5;
+    if (t != 11 && t != 12) return 0;
+    uint32_t count = prc32(p, o + 1);
+    if (count > p->n) return 0;
+    size_t end = t == 11 ? o + 5 + 4ull * count : o + 9;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t e = prc_end(p, prc_child(p, o, i, NULL), depth + 1);
+        if (!e) return 0;
+        if (e > end) end = e;
+    }
+    return end <= p->n ? end : 0;
+}
+static size_t prc_find(const Prc *p, size_t o, uint64_t hash) {   /* a struct's child by its name, 0 none */
+    uint32_t count = prc32(p, o + 1);
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t h;
+        size_t at = prc_child(p, o, i, &h);
+        if (h == hash) return at;
+    }
+    return 0;
+}
+/* mine's value at a the same as game's at b (the numbers, the names; strings by their bytes) */
+static int prc_same(const Prc *m, size_t a, const Prc *g, size_t b, int depth) {
+    unsigned t = m->b[a];
+    if (t != g->b[b] || depth > 32) return 0;
+    if (t >= 1 && t <= 8) { size_t l = t <= 3 ? 1 : t <= 5 ? 2 : 4; return !memcmp(m->b + a + 1, g->b + b + 1, l); }
+    if (t == 9) return prc_hash(m, prc32(m, a + 1)) == prc_hash(g, prc32(g, b + 1));
+    if (t == 10) {
+        size_t x = m->refs + prc32(m, a + 1), y = g->refs + prc32(g, b + 1);
+        if (x >= m->n || y >= g->n) return 0;
+        return !strncmp((const char *)m->b + x, (const char *)g->b + y, m->n - x < g->n - y ? m->n - x : g->n - y);
+    }
+    uint32_t count = prc32(m, a + 1);
+    if (count != prc32(g, b + 1)) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t h;
+        size_t x = prc_child(m, a, i, &h), y = t == 11 ? prc_child(g, b, i, NULL) : prc_find(g, b, h);
+        if (!y || !prc_same(m, x, g, y, depth + 1)) return 0;
+    }
+    return 1;
+}
+/* game's numbers at b written into mine's at a, where both have them (the color left: the game's) */
+static void prc_assign(unsigned char *mine, const Prc *m, size_t a, const Prc *g, size_t b, int depth) {
+    unsigned t = m->b[a];
+    if (t != g->b[b] || depth > 32) return;
+    if (t >= 1 && t <= 8) { size_t l = t <= 3 ? 1 : t <= 5 ? 2 : 4; memcpy(mine + a + 1, g->b + b + 1, l); return; }
+    if (t != 11 && t != 12) return;
+    uint32_t count = prc32(m, a + 1), gcount = prc32(g, b + 1);
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t h;
+        size_t x = prc_child(m, a, i, &h), y = t == 11 ? (i < gcount ? prc_child(g, b, i, NULL) : 0) : prc_find(g, b, h);
+        if (y) prc_assign(mine, m, x, g, y, depth + 1);
+    }
+}
+/* pass 0: the colors the mod changed in any list of the colors (owned); pass 1: all those lists' entries of
+ * the owned colors moved (the ones it left as the game's color had too) */
+static int prc_walk(unsigned char *mine, const Prc *m, size_t a, const Prc *g, size_t b, const signed char to[8], int depth,
+                    int pass, int owned[8]) {
+    unsigned t = m->b[a];
+    if ((t != 11 && t != 12) || t != g->b[b] || depth > 32) return 0;
+    uint32_t count = prc32(m, a + 1);
+    int moved = 0;
+    if (t == 11 && count == 8 && prc32(g, b + 1) == 8) {   /* a color an entry? (all of the same size) */
+        size_t at[8], len[8];
+        int same = 1;
+        for (int i = 0; i < 8 && same; i++) {
+            at[i] = prc_child(m, a, (uint32_t)i, NULL);
+            size_t e = prc_end(m, at[i], depth + 1);
+            len[i] = e > at[i] ? e - at[i] : 0;
+            same = len[i] && len[i] == len[0] && len[i] <= 256;
+        }
+        if (same && !pass) {
+            for (int c = 0; c < 8; c++)
+                if (to[c] >= 0 && to[c] < 8 && to[c] != c && !prc_same(m, at[c], g, prc_child(g, b, (uint32_t)c, NULL), depth + 1)) owned[c] = 1;
+            return 0;
+        }
+        if (same) {
+            unsigned char was[8][256];
+            int dest[8] = {0};
+            for (int c = 0; c < 8; c++)
+                if (owned[c]) memcpy(was[c], mine + at[c], len[c]), dest[(int)to[c]] = 1;
+            for (int c = 0; c < 8; c++)
+                if (owned[c] && !dest[c]) prc_assign(mine, m, at[c], g, prc_child(g, b, (uint32_t)c, NULL), depth + 1);
+            for (int c = 0; c < 8; c++)
+                if (owned[c]) memcpy(mine + at[(int)to[c]], was[c], len[c]), moved++;
+            return moved;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t h;
+        size_t x = prc_child(m, a, i, &h), y = t == 11 ? (i < prc32(g, b + 1) ? prc_child(g, b, i, NULL) : 0) : prc_find(g, b, h);
+        if (y) moved += prc_walk(mine, m, x, g, y, to, depth + 1, pass, owned);
+    }
+    return moved;
+}
+/* ---- layouts of colors moved (SARC, BFLAN) ---------------------------------------------------- */
+static uint32_t le32(const unsigned char *b) { return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24; }
+static uint16_t le16(const unsigned char *b) { return (uint16_t)(b[0] | b[1] << 8); }
+/* SARC: file i's name and bytes; 0 none */
+static int sarc_file(const unsigned char *b, size_t n, int i, const char **name, size_t *at, size_t *len) {
+    if (n < 0x20 || memcmp(b, "SARC", 4) || le16(b + 6) != 0xFEFF || memcmp(b + 0x14, "SFAT", 4)) return 0;
+    size_t data = le32(b + 0xC), count = le16(b + 0x1A), nodes = 0x20, sfnt = nodes + 16 * count;
+    if ((size_t)i >= count || sfnt + 8 > n || memcmp(b + sfnt, "SFNT", 4)) return 0;
+    const unsigned char *node = b + nodes + 16ull * (size_t)i;
+    uint32_t attr = le32(node + 4), s = le32(node + 8), e = le32(node + 12);
+    size_t no = sfnt + 8 + 4ull * (attr & 0xFFFF);
+    if (!(attr >> 24) || no >= n || !memchr(b + no, 0, n - no) || e < s || data + e > n) return 0;
+    *name = (const char *)b + no, *at = data + s, *len = e - s;
+    return 1;
+}
+/* A BFLAN's curves (float keys: frame, value, slope): visited with their identity (pane name, tag, index,
+ * target) */
+typedef struct Curve { char pane[29], tag[5]; unsigned idx, target; size_t keys; unsigned nkeys; } Curve;
+static int flan_curves(const unsigned char *b, size_t n, Curve *out, int max) {
+    if (n < 0x14 || memcmp(b, "FLAN", 4) || le16(b + 4) != 0xFEFF) return 0;
+    size_t o = le16(b + 6);   /* (the header's size; its sections after it) */
+    unsigned sections = le16(b + 0x10);
+    int k = 0;
+    for (unsigned s = 0; s < sections && o + 8 <= n; s++) {
+        size_t size = le32(b + o + 4);
+        if (size < 8 || o + size > n) return k;
+        if (!memcmp(b + o, "pai1", 4) && size >= 0x14) {
+            unsigned entries = le16(b + o + 0xE);
+            size_t table = o + le32(b + o + 0x10);
+            for (unsigned e = 0; e < entries && table + 4ull * e + 4 <= n; e++) {
+                size_t eo = o + le32(b + table + 4ull * e);
+                if (eo + 32 > n) continue;
+                unsigned ntag = b[eo + 28];
+                for (unsigned t = 0; t < ntag && eo + 32 + 4ull * t + 4 <= n; t++) {
+                    size_t to = eo + le32(b + eo + 32 + 4ull * t);
+                    if (to + 8 > n) continue;
+                    unsigned nc = b[to + 4];
+                    for (unsigned c = 0; c < nc && to + 8 + 4ull * c + 4 <= n; c++) {
+                        size_t co = to + le32(b + to + 8 + 4ull * c);
+                        if (co + 12 > n || b[co + 2] != 2) continue;   /* (float keys only) */
+                        unsigned nk = le16(b + co + 4);
+                        size_t ko = co + le32(b + co + 8);
+                        if (ko + 12ull * nk > n || k >= max) continue;
+                        Curve *x = &out[k++];
+                        memcpy(x->pane, b + eo, 28), x->pane[28] = 0;
+                        memcpy(x->tag, b + to, 4), x->tag[4] = 0;
+                        x->idx = b[co], x->target = b[co + 1], x->keys = ko, x->nkeys = nk;
+                    }
+                }
+            }
+        }
+        o += size;
+    }
+    return k;
+}
+static float keyf(const unsigned char *b) { uint32_t u = le32(b); float f; memcpy(&f, &u, 4); return f; }
+/* key i's color: a step curve's keys - frame c at the start of color c, frame c + 1 its end (the next
+ * color's start at the same frame after it); -1 none */
+static int key_color(const unsigned char *b, const Curve *c, unsigned i) {
+    float f = keyf(b + c->keys + 12ull * i);
+    int fr = (int)f;
+    if ((float)fr != f || fr < 0 || fr > 8) return -1;
+    int next_same = i + 1 < c->nkeys && keyf(b + c->keys + 12ull * (i + 1)) == f;
+    int prev_less = i > 0 && keyf(b + c->keys + 12ull * (i - 1)) < f;
+    int col = next_same && prev_less ? fr - 1 : fr;   /* (the end of the color before, a start after it) */
+    return col >= 0 && col < 8 ? col : -1;
+}
+/* the value of color col in curve c, and whether one was found */
+static int color_value(const unsigned char *b, const Curve *c, int col, float *v) {
+    for (unsigned i = 0; i < c->nkeys; i++)
+        if (key_color(b, c, i) == col) { *v = keyf(b + c->keys + 12ull * i + 4); return 1; }
+    return 0;
+}
+static void set_color(unsigned char *b, const Curve *c, int col, float v) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    for (unsigned i = 0; i < c->nkeys; i++)
+        if (key_color(b, c, i) == col) {
+            unsigned char *p = b + c->keys + 12ull * i + 4;
+            p[0] = (unsigned char)u, p[1] = (unsigned char)(u >> 8), p[2] = (unsigned char)(u >> 16), p[3] = (unsigned char)(u >> 24);
+        }
+}
+/* A color is the mod's in an animation when it changed any of its values there; then all of them move,
+ * those it left as the game's color had too (Splatsune Inku's gauge: blue 255 as the game's c06, c00's
+ * 28 - green when ink is spent) */
+static int flan_move(unsigned char *mine, size_t n, const unsigned char *game, size_t gn, const signed char to[8]) {
+    static Curve mc[2048], gc[2048];   /* (one at a time: the game's start-up) */
+    static const Curve *pair[2048];
+    int nm = flan_curves(mine, n, mc, 2048), ng = flan_curves(game, gn, gc, 2048), moved = 0;
+    int owned[8] = {0}, dest[8] = {0};
+    for (int i = 0; i < nm; i++) {   /* (the curves of the colors, each with the game's; the colors the mod changed) */
+        const Curve *m = &mc[i];
+        pair[i] = NULL;
+        for (int j = 0; j < ng && !pair[i]; j++)
+            if (!strcmp(gc[j].pane, m->pane) && !strcmp(gc[j].tag, m->tag) && gc[j].idx == m->idx && gc[j].target == m->target) pair[i] = &gc[j];
+        int colors = 0;   /* (a key for each color - the last one's may hold to the end, c07 too) */
+        for (int c = 0; c < 8; c++) { float v; colors += color_value(mine, m, c, &v); }
+        if (!pair[i] || m->nkeys < 8 || colors < 7) { pair[i] = NULL; continue; }
+        for (int c = 0; c < 8; c++) {
+            float a, b;
+            if (to[c] >= 0 && to[c] < 8 && to[c] != c && color_value(mine, m, c, &a) && color_value(game, pair[i], c, &b) && a != b) owned[c] = 1;
+        }
+    }
+    for (int c = 0; c < 8; c++) if (owned[c]) dest[(int)to[c]] = 1;
+    for (int i = 0; i < nm; i++) {
+        const Curve *m = &mc[i];
+        if (!pair[i]) continue;
+        float was[8], theirs[8];
+        int go[8] = {0};
+        for (int c = 0; c < 8; c++) {
+            float there;
+            go[c] = owned[c] && color_value(mine, m, c, &was[c]) && color_value(game, pair[i], c, &theirs[c]) &&
+                    color_value(mine, m, to[c], &there);   /* (where it goes has its own key) */
+        }
+        for (int c = 0; c < 8; c++) if (go[c] && !dest[c]) set_color(mine, m, c, theirs[c]);
+        for (int c = 0; c < 8; c++) if (go[c]) set_color(mine, m, to[c], was[c]), moved++;
+    }
+    return moved;
+}
+int mod_layout_move(unsigned char *mine, size_t n, const unsigned char *game, size_t gn, const signed char to[8]) {
+    int moved = 0;
+    const char *name, *gname;
+    size_t at, len, gat, glen;
+    for (int i = 0; sarc_file(mine, n, i, &name, &at, &len); i++) {
+        size_t l = strlen(name);
+        if (l < 6 || strcmp(name + l - 6, ".bflan")) continue;
+        for (int j = 0; sarc_file(game, gn, j, &gname, &gat, &glen); j++)
+            if (!strcmp(gname, name)) { moved += flan_move(mine + at, len, game + gat, glen, to); break; }
+    }
+    return moved;
+}
+
+int mod_prc_move(unsigned char *mine, size_t n, const unsigned char *game, size_t gn, const signed char to[8]) {
+    Prc m, g;
+    if (!prc_open(&m, mine, n) || !prc_open(&g, game, gn)) return 0;
+    if (prc_end(&m, m.root, 0) != n || prc_end(&g, g.root, 0) != gn) return 0;   /* (all of each in range) */
+    int owned[8] = {0}, any = 0;
+    prc_walk(mine, &m, m.root, &g, g.root, to, 0, 0, owned);
+    for (int c = 0; c < 8; c++) any |= owned[c];
+    return any ? prc_walk(mine, &m, m.root, &g, g.root, to, 0, 1, owned) : 0;
+}
+
 /* ---- fighters ------------------------------------------------------------------------------- */
 static const char *const FIGHTERS[][2] = {
     {"mario", "Mario"}, {"donkey", "Donkey Kong"}, {"link", "Link"}, {"samus", "Samus"}, {"samusd", "Dark Samus"},
@@ -65,6 +336,12 @@ const char *mod_fighter_name(const char *internal) {
     for (size_t i = 0; i < sizeof FIGHTERS / sizeof FIGHTERS[0]; i++)
         if (!strcmp(FIGHTERS[i][0], internal)) return FIGHTERS[i][1];
     return internal;
+}
+
+static int fighter_known(const char *f) {
+    for (size_t i = 0; i < sizeof FIGHTERS / sizeof FIGHTERS[0]; i++)
+        if (!strcmp(FIGHTERS[i][0], f)) return 1;
+    return 0;
 }
 
 int mod_fighter_varied(const char *f) {
@@ -254,8 +531,23 @@ static void read_info(ModInfo *m, const char *file) {
         else if (!strcmp(key, "authors") || !strcmp(key, "author")) snprintf(m->authors, sizeof m->authors, "%s", val);
         else if (!strcmp(key, "version")) snprintf(m->version, sizeof m->version, "%s", val);
         else if (!strcmp(key, "description")) snprintf(m->description, sizeof m->description, "%s", val);
+        else if (!strcmp(key, "url") && !strncmp(val, "https://", 8)) snprintf(m->url, sizeof m->url, "%s", val);
+        else if (!strcmp(key, "url_sha256") && strlen(val) == 64) {
+            int hex = 1;
+            for (const char *c = val; *c; c++) hex &= isxdigit((unsigned char)*c) != 0;
+            if (hex) for (int i = 0; i < 65; i++) m->url_sha256[i] = (char)tolower((unsigned char)val[i]);
+        }
     }
+    if (!m->url_sha256[0]) m->url[0] = 0;   /* (an address without its hash is not used: nothing to check the download by) */
     fclose(fp);
+}
+
+unsigned mod_path_kind(const char *p) {
+    if (!strncmp(p, "fighter/", 8)) return strstr(p, "/model/") ? MK_MODEL : MK_OTHER;
+    if (!strncmp(p, "ui/replace/chara/", 17) || !strncmp(p, "ui/replace_patch/chara/", 23)) return MK_PORTRAIT;
+    if (!strncmp(p, "sound/bank/fighter_voice/", 25)) return MK_VOICE;
+    if (!strncmp(p, "effect/fighter/", 15)) return MK_EFFECT;
+    return MK_OTHER;
 }
 
 #ifndef _WIN32
@@ -282,7 +574,7 @@ static void walk(ModInfo *m, const char *dir, const char *rel, int depth) {
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (e->d_name[0] == '.') continue;   /* (., .., and hidden files: .DS_Store, macOS's ._ copies - never the game's) */
         char full[4096], sub[2048];
         snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
         snprintf(sub, sizeof sub, "%s%s%s", rel, *rel ? "/" : "", e->d_name);
@@ -292,12 +584,22 @@ static void walk(ModInfo *m, const char *dir, const char *rel, int depth) {
         else if (S_ISREG(st.st_mode)) {
             if (!*rel) {   /* at the top: the mod's own files (info.toml, preview.png, config.json...) */
                 if (!strcasecmp(e->d_name, "config.json")) m->has_config = 1;
+                if (!strcasecmp(e->d_name, "preview.png")) snprintf(m->preview, sizeof m->preview, "%s", e->d_name);
                 continue;
             }
             add_path(m, sub);
         }
     }
     closedir(d);
+}
+
+int mod_path_fighter(const char *path, char *fighter, size_t n) {
+    int c;
+    if (mod_path_color(path, fighter, n, &c)) return 1;
+    const char *slash;   /* (fighter/<f>/... without a color: that fighter still) */
+    if (strncmp(path, "fighter/", 8) || !(slash = strchr(path + 8, '/'))) return 0;
+    snprintf(fighter, n, "%.*s", (int)(slash - path - 8), path + 8);
+    return 1;
 }
 
 /* What the files are: the fighters, colors and kinds */
@@ -309,19 +611,13 @@ static void classify(ModInfo *m) {
         if (!strncmp(p, "stream;", 7) || !strncmp(p, "stream:", 7)) { m->has_stream = 1; continue; }
         m->files++;
         char f[64];
-        int c;
-        unsigned kind = MK_OTHER;
-        if (!strncmp(p, "fighter/", 8)) kind = strstr(p, "/model/") ? MK_MODEL : MK_OTHER;
-        else if (!strncmp(p, "ui/replace/chara/", 17) || !strncmp(p, "ui/replace_patch/chara/", 23)) kind = MK_PORTRAIT;
-        else if (!strncmp(p, "sound/bank/fighter_voice/", 25)) kind = MK_VOICE;
-        else if (!strncmp(p, "effect/fighter/", 15)) kind = MK_EFFECT;
+        unsigned kind = mod_path_kind(p);
         m->kinds |= kind;
         if (kind == MK_OTHER) m->gameplay = 1;
-        if (!mod_path_color(p, f, sizeof f, &c)) {   /* (fighter/<f>/... without a color: that fighter still) */
-            const char *slash;
-            if (strncmp(p, "fighter/", 8) || !(slash = strchr(p + 8, '/'))) continue;
-            snprintf(f, sizeof f, "%.*s", (int)(slash - p - 8), p + 8);
-        }
+        if (!mod_path_fighter(p, f, sizeof f)) continue;
+        /* (fighter/common/ - shared params, effects -, Giga Bowser's koopag...: no fighter's colors, so a
+         * skin with one of those is still its fighter's alone, and moves) */
+        if (!fighter_known(f)) continue;
         int known = -1;
         for (int k = 0; k < nf && known < 0; k++) if (!strcmp(seen[k], f)) known = k;
         if (known < 0 && nf < 16) snprintf(seen[known = nf++], sizeof seen[0], "%s", f);
@@ -361,14 +657,16 @@ static void read_slots(ModList *l) {
             }
             key[o] = 0;
             cur = mod_find(l, key);
-            if (cur >= 0 && l->mods[cur].from_name) {   /* (the file wins over the name) */
-                memset(l->mods[cur].to, -1, sizeof l->mods[cur].to);
-                l->mods[cur].from_name = 0;
-            }
             continue;
         }
         if (line[0] == '[') { cur = -1; continue; }
         if (cur < 0 || line[0] == '#') continue;
+        if (!strncmp(line, "share", 5)) {   /* share = false */
+            const char *v = line + 5;
+            while (*v == ' ' || *v == '=') v++;
+            l->mods[cur].no_share = !strncmp(v, "false", 5);
+            continue;
+        }
         /* palutena.c03 = "c06" */
         char f[64], from[16], to[16];
         if (sscanf(line, "%63[^.].%15[^ =] = \"%15[^\"]\"", f, from, to) != 3) continue;
@@ -377,8 +675,11 @@ static void read_slots(ModList *l) {
         if (!is_color(from, strlen(from), &a) || !is_color(to, strlen(to), &b) || a >= MOD_COLORS) continue;
         if (b >= MOD_COLORS) { fprintf(stderr, "[mods] %s: %s.%s = \"%s\": only c00-c07; left where it is\n", m->key, f, from, to); continue; }
         if (strcmp(f, m->fighter)) continue;
+        if (m->from_name) {   /* (the file wins over the name: its colors, not share = false alone) */
+            memset(m->to, -1, sizeof m->to);
+            m->from_name = 0;
+        }
         m->to[a] = (signed char)b;
-        m->from_name = 0;
     }
     fclose(fp);
 }
@@ -613,13 +914,203 @@ static int read_new_files(const ModList *l, const ModInfo *m, NewFile **out) {
 /* ---- what the game loads -------------------------------------------------------------------- */
 static int by_dest_name(const void *a, const void *b) { return strcmp(((const ModArcFile *)a)->dest, ((const ModArcFile *)b)->dest); }
 
+/* A fighter's file a color move took elsewhere ("fighter/inkling/model/body/c05/def_inkling_c06_001_col.nutexb"):
+ * its color's data.arc directory ("fighter/inkling/c05"), into dir; else "" left. Some fighters' files are
+ * named by their color (Inkling's textures), and the color it goes to has none of those names: there
+ * they are new files of that directory - what a reslotter's config.json says (mod_arc only adds a
+ * file of a directory when data.arc does not have it already) */
+static void moved_dir(const char *dest, char *dir, size_t n) {
+    if (strncmp(dest, "fighter/", 8)) return;
+    const char *name = dest + 8, *slash = strchr(name, '/');
+    if (!slash) return;
+    for (const char *c = slash; (c = strstr(c, "/c")) != NULL; c++)
+        if (isdigit((unsigned char)c[2]) && isdigit((unsigned char)c[3]) && c[4] == '/') {
+            snprintf(dir, n, "fighter/%.*s/c%c%c", (int)(slash - name), name, c[2], c[3]);
+            return;
+        }
+}
+
+/* A move of mod m that puts a color where the game's fighter has another body (a girl's Inkling on a
+ * boy's color: the fight's loading hangs): the first such color, else -1 */
+static int other_body(const ModInfo *m) {
+    if (!mod_body_hook || !m->fighter[0] || m->fighters != 1) return -1;
+    for (int c = 0; c < MOD_COLORS; c++) {
+        int to = mod_color_to(m, c);
+        if (!(m->colors & 1u << c) || to == c) continue;
+        uint64_t a = mod_body_hook(m->fighter, c), b = mod_body_hook(m->fighter, to);
+        if (a && b && a != b) return c;
+    }
+    return -1;
+}
+
+static int mkdirs(char *path) {   /* path's folders (its last part a file) */
+    for (char *s = strchr(path + 1, '/'); s; s = strchr(s + 1, '/')) {
+        *s = 0;
+        int ok = !mkdir(path, 0755) || errno == EEXIST;
+        *s = '/';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* A param file of a color-less path (fighter/common/param/effect.prc) of moved mod m: its entries of the
+ * colors moved taken along (mod_prc_move), written to cache/mods/moved/<mod>/<path> - src then that
+ * one. 0 nothing to do (src left). */
+/* bytes written to file (its folders made; the same bytes there already: left, its date too) - 1 done */
+static int write_same(const char *file, const unsigned char *b, size_t n) {
+    FILE *had = fopen(file, "rb");
+    if (had) {
+        unsigned char *old = malloc(n + 1);
+        int same = old && fread(old, 1, n + 1, had) == n && !memcmp(old, b, n);
+        free(old);
+        fclose(had);
+        if (same) return 1;
+    }
+    char path[4200], tmp[4300];
+    snprintf(path, sizeof path, "%s", file);
+    snprintf(tmp, sizeof tmp, "%s.new", file);
+    FILE *w = mkdirs(path) ? fopen(tmp, "wb") : NULL;
+    int ok = w && fwrite(b, 1, n, w) == n;
+    if (w) ok &= fclose(w) == 0;
+    if (ok && !rename(tmp, file)) return 1;
+    unlink(tmp);
+    return 0;
+}
+
+/* cache/mods/moved/<mod>/<path>: into out */
+static void moved_file(const ModList *l, const ModInfo *m, const char *path, char *out, size_t n) {
+    size_t rl = strlen(l->root);
+    snprintf(out, n, "%.*s/cache/mods/moved/%s/%s", (int)(rl >= 5 && !strcmp(l->root + rl - 5, "/mods") ? rl - 5 : rl), l->root, m->key, path);
+}
+
+static int moved_prc(const ModList *l, const ModInfo *m, const char *path, char *src, size_t n) {
+    size_t pl = strlen(path);
+    int layout = pl >= 11 && !strcmp(path + pl - 11, "/layout.arc");
+    if (!mod_game_file_hook || ((pl < 5 || strcmp(path + pl - 4, ".prc")) && !layout)) return 0;
+    char f[64];
+    int c;
+    if (mod_path_color(path, f, sizeof f, &c)) return 0;   /* (a color's own: its path moves instead) */
+    signed char to[8];
+    int any = 0;
+    for (int k = 0; k < 8; k++) to[k] = (signed char)(m->colors & 1u << k ? mod_color_to(m, k) : -1), any |= to[k] >= 0 && to[k] != k;
+    if (!any) return 0;
+    FILE *fp = fopen(src, "rb");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+    unsigned char *mine = size > 0 && size < (64 << 20) ? malloc((size_t)size) : NULL;
+    int ok = mine && fread(mine, 1, (size_t)size, fp) == (size_t)size;
+    fclose(fp);
+    uint64_t gsize = 0;
+    unsigned char *game = ok ? mod_game_file_hook(path, &gsize) : NULL;
+    int moved = !game ? 0 : layout ? mod_layout_move(mine, (size_t)size, game, (size_t)gsize, to) : mod_prc_move(mine, (size_t)size, game, (size_t)gsize, to);
+    free(game);
+    if (moved) {
+        char out[4096];
+        moved_file(l, m, path, out, sizeof out);   /* (the same as last time: left as it is, its date too - the table's cache keeps) */
+        if (write_same(out, mine, (size_t)size)) {
+            fprintf(stderr, "[mods] %s: %s: %d of its colors' entries moved with them\n", m->key, path, moved);
+            snprintf(src, n, "%s", out);
+        } else {
+            moved = 0;
+            fprintf(stderr, "[mods] %s: %s: cannot write %s; its colors' entries stay where they were\n", m->key, path, out);
+        }
+    }
+    free(mine);
+    return moved;
+}
+
+/* The game's textures a moved mod's material names and the mod does not bring: a reslotter copies them.
+ * Its material (a .numatb of a color it moves) names textures of its color, the mod's own or the game's
+ * there ("alp_inkling_c06_002_col": Splatsune Inku's hair, the game's c06 one); the color it goes to has
+ * none of those names, and without them the hair is black. Each: the game's file of the color it was
+ * made for, written to cache/mods/moved/<mod>/, a new file of the color it goes to. Appended to *v. */
+static void moved_textures(const ModList *l, const ModInfo *m, ModArcFile **v, int *n, int *cap) {
+    if (!mod_game_file_hook) return;
+    for (int k = 0; k < m->npaths; k++) {
+        const char *p = m->paths[k];
+        size_t pl = strlen(p);
+        char f[64], mdest[2048], dir[1100] = "";
+        int c;
+        if (pl < 7 || strcmp(p + pl - 7, ".numatb") || !mod_path_color(p, f, sizeof f, &c) || strcmp(f, m->fighter)) continue;
+        mod_dest_path(m, p, mdest, sizeof mdest);
+        if (!strcmp(mdest, p)) continue;   /* (not moved) */
+        moved_dir(mdest, dir, sizeof dir);
+        const char *slash = strrchr(p, '/');
+        if (!*dir || !slash) continue;
+        size_t dl = (size_t)(slash - p) + 1;
+        char src[4096];
+        snprintf(src, sizeof src, "%s/%s/%s", l->root, m->dir, m->real[k]);
+        FILE *fp = fopen(src, "rb");
+        if (!fp) continue;
+        fseek(fp, 0, SEEK_END);
+        long size = ftell(fp);
+        rewind(fp);
+        unsigned char *mat = size > 0 && size < (16 << 20) ? malloc((size_t)size + 1) : NULL;
+        int ok = mat && fread(mat, 1, (size_t)size, fp) == (size_t)size;
+        fclose(fp);
+        if (!ok) { free(mat); continue; }
+        mat[size] = 0;
+        int copied = 0;
+        for (long i = 0; i < size; i++) {   /* (its names: a string after a byte that is not a letter, ended by a 0) */
+            if (!(isalnum(mat[i]) || mat[i] == '_') || (i && (isalnum(mat[i - 1]) || mat[i - 1] == '_'))) continue;
+            long e = i;
+            while (e < size && (isalnum(mat[e]) || mat[e] == '_')) e++;
+            if (e >= size || mat[e] || e - i < 4 || e - i > 120) { i = e; continue; }
+            char name[128], path[2048], dest[2048];
+            for (long j = i; j < e; j++) name[j - i] = (char)tolower(mat[j]);
+            name[e - i] = 0;
+            i = e;
+            snprintf(path, sizeof path, "%.*s%s.nutexb", (int)dl, p, name);
+            int has = 0;
+            for (int q = 0; q < m->npaths && !has; q++) has = !strcmp(m->paths[q], path);
+            if (has) continue;   /* (the mod's own) */
+            mod_dest_path(m, path, dest, sizeof dest);
+            for (int q = 0; q < *n && !has; q++) has = !strcmp((*v)[q].dest, dest);
+            if (has) continue;   /* (another material named it first) */
+            uint64_t gsize = 0;
+            void *there = mod_game_file_hook(dest, &gsize);
+            if (there) { free(there); continue; }   /* (the color it goes to has it: that one) */
+            unsigned char *game = mod_game_file_hook(path, &gsize);
+            if (!game) continue;   /* (not a texture of the game's there either) */
+            char file[4096];
+            moved_file(l, m, dest, file, sizeof file);
+            int wrote = write_same(file, game, (size_t)gsize);
+            free(game);
+            struct stat st;
+            if (!wrote || stat(file, &st)) continue;
+            if (*n == *cap) {
+                ModArcFile *q = realloc(*v, sizeof **v * (size_t)(*cap = *cap ? *cap * 2 : 256));
+                if (!q) break;
+                *v = q;
+            }
+            ModArcFile *x = &(*v)[*n];
+            x->dest = strdup(dest), x->src = strdup(file), x->mod = strdup(m->key), x->dir = strdup(dir);
+            if (!x->dest || !x->src || !x->mod || !x->dir) { free(x->dest); free(x->src); free(x->mod); free(x->dir); break; }
+            x->size = (uint64_t)st.st_size;
+            x->mtime = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+            (*n)++, copied++;
+        }
+        free(mat);
+        if (copied) fprintf(stderr, "[mods] %s: %s: %d of the game's textures it names copied with it\n", m->key, mdest, copied);
+    }
+}
+
 int mod_load_list(const ModList *l, ModArcFile **out) {
     *out = NULL;
     int n = 0, cap = 0;
     ModArcFile *v = NULL;
     for (int i = 0; i < l->n; i++) {
-        const ModInfo *m = &l->mods[i];
-        if (!m->enabled) continue;
+        if (!l->mods[i].enabled) continue;
+        ModInfo own = l->mods[i];   /* (a copy: its move may be undone for this load) */
+        const ModInfo *m = &own;
+        int bad = other_body(m);
+        if (bad >= 0) {
+            fprintf(stderr, "[mods] %s: moved to color %d, where %s has another body (skeleton); loaded at its own colors\n",
+                    m->key, mod_color_to(m, bad) + 1, mod_fighter_name(m->fighter));
+            for (int c = 0; c < MOD_COLORS; c++) own.to[c] = -1;
+        }
         NewFile *nf;
         int nnf = read_new_files(l, m, &nf);
         for (int k = 0; k < m->npaths; k++) {
@@ -634,7 +1125,9 @@ int mod_load_list(const ModList *l, ModArcFile **out) {
                     mod_dest_path(m, probe, dir, sizeof dir);
                     dir[strlen(dir) > 2 ? strlen(dir) - 2 : 0] = 0;
                 }
+            if (!*dir && strcmp(dest, p)) moved_dir(dest, dir, sizeof dir);
             snprintf(src, sizeof src, "%s/%s/%s", l->root, m->dir, m->real[k]);
+            moved_prc(l, m, p, src, sizeof src);
             struct stat st;
             if (stat(src, &st) || !S_ISREG(st.st_mode)) continue;
             if (!st.st_size) {   /* (an unfinished download: an empty file would replace the game's) */
@@ -653,6 +1146,7 @@ int mod_load_list(const ModList *l, ModArcFile **out) {
             f->mtime = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
             n++;
         }
+        moved_textures(l, m, &v, &n, &cap);
         for (int x = 0; x < nnf; x++) free(nf[x].path), free(nf[x].dir);
         free(nf);
     }
@@ -755,6 +1249,10 @@ int mod_can_move(const ModList *l, int i, int delta) {
         if (m->colors & 1u << c) {
             int to = mod_color_to(m, c) + delta;
             if (to < 0 || to >= MOD_COLORS) return 0;
+            if (mod_body_hook && to != c) {   /* (another body there: not that color) */
+                uint64_t a = mod_body_hook(m->fighter, c), b = mod_body_hook(m->fighter, to);
+                if (a && b && a != b) return 0;
+            }
         }
     return 1;
 }
@@ -781,7 +1279,7 @@ int mod_occupant(const ModList *l, int i, int delta) {
 }
 
 int mod_move(ModList *l, int i, int delta, char *err, size_t n) {
-    if (!mod_can_move(l, i, delta)) { snprintf(err, n, "It cannot go there: only colors 1 to 8"); return 0; }
+    if (!mod_can_move(l, i, delta)) { snprintf(err, n, "It cannot go there: only colors 1 to 8 of the same body"); return 0; }
     if (!delta) return 1;
     ModInfo *m = &l->mods[i];
     int other = mod_occupant(l, i, delta);
@@ -812,28 +1310,41 @@ int mod_slots_save(const ModList *l) {
     snprintf(file, sizeof file, "%s/" SLOTS_FILE, l->root);
     snprintf(tmp, sizeof tmp, "%s.new", file);
     int any = 0;
-    for (int i = 0; i < l->n; i++)
+    for (int i = 0; i < l->n; i++) {
+        any |= l->mods[i].no_share;
         for (int c = 0; c < MOD_COLORS; c++) any |= l->mods[i].to[c] >= 0 && !l->mods[i].from_name;
+    }
     if (!any) { unlink(file); return 1; }
     FILE *fp = fopen(tmp, "wb");
     if (!fp) return 0;
     fprintf(fp, "# WindowSmash: the color each mod is loaded into (the start-up menu's Mods page writes this).\n"
-                "# [mod.\"<its folder, without the dot>\"]  <fighter>.c0X = \"c0Y\"\n");
+                "# [mod.\"<its folder, without the dot>\"]  <fighter>.c0X = \"c0Y\"\n"
+                "# share = false: not given to those who join a room you host.\n");
     for (int i = 0; i < l->n; i++) {
         const ModInfo *m = &l->mods[i];
-        if (m->from_name) continue;
         int has = 0;
-        for (int c = 0; c < MOD_COLORS; c++) has |= m->to[c] >= 0;
-        if (!has) continue;
+        for (int c = 0; c < MOD_COLORS; c++) has |= m->to[c] >= 0 && !m->from_name;
+        if (!has && !m->no_share) continue;
         fprintf(fp, "\n[mod.\"");
         for (const char *p = m->key; *p; p++) { if (*p == '"' || *p == '\\') fputc('\\', fp); fputc(*p, fp); }
         fprintf(fp, "\"]\n");
-        for (int c = 0; c < MOD_COLORS; c++)
+        if (m->no_share) fprintf(fp, "share = false\n");
+        for (int c = 0; c < MOD_COLORS && !m->from_name; c++)
             if (m->to[c] >= 0) fprintf(fp, "%s.c%02d = \"c%02d\"\n", m->fighter, c, m->to[c]);
     }
     int ok = !ferror(fp);
     ok &= fclose(fp) == 0;
     if (!ok || rename(tmp, file)) { unlink(tmp); return 0; }
+    return 1;
+}
+
+int mod_set_shared(ModList *l, int i, int on, char *err, size_t n) {
+    if (i < 0 || i >= l->n) { snprintf(err, n, "No such mod"); return 0; }
+    ModInfo *m = &l->mods[i];
+    int was = m->no_share;
+    m->no_share = !on;
+    if (!mod_slots_save(l)) { m->no_share = was; snprintf(err, n, "Cannot write %s", SLOTS_FILE); return 0; }
+    fprintf(stderr, "[mods] %s: %s in rooms hosted here\n", m->key, on ? "shared" : "not shared");
     return 1;
 }
 
@@ -864,7 +1375,19 @@ int mod_move(ModList *l, int i, int delta, char *err, size_t n) { (void)l; (void
 int mod_can_move(const ModList *l, int i, int delta) { (void)l; (void)i; (void)delta; return 0; }
 int mod_occupant(const ModList *l, int i, int delta) { (void)l; (void)i; (void)delta; return -1; }
 int mod_open_folder(const char *path) { (void)path; return 0; }
+int mod_set_shared(ModList *l, int i, int on, char *err, size_t n) { (void)l; (void)i; (void)on; snprintf(err, n, "Not on Windows"); return 0; }
 int mod_slots_save(const ModList *l) { (void)l; return 0; }
 int mod_load_list(const ModList *l, ModArcFile **out) { (void)l; *out = NULL; return 0; }
 void mod_load_free(ModArcFile *files, int n) { (void)n; free(files); }
 #endif
+
+int mod_gameplay_warning(const ModList *l, char *out, size_t n) {
+    int count = 0, first = -1;
+    if (n) out[0] = 0;
+    for (int i = 0; i < l->n; i++)
+        if (l->mods[i].enabled && l->mods[i].gameplay) { if (first < 0) first = i; count++; }
+    if (!count || !n) return 0;
+    if (count == 1) snprintf(out, n, "Online play can desync: %s changes more than looks", l->mods[first].name);
+    else snprintf(out, n, "Online play can desync: %d mods change more than looks, like %s", count, l->mods[first].name);
+    return 1;
+}

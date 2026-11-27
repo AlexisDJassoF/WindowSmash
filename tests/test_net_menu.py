@@ -175,8 +175,10 @@ class NetMenuTests(unittest.TestCase):
         self.assertEqual((out['plays'], out['host'], out['row']), ('0', '192.168.1.7:39420', 'Room'))
 
     def test_no_play_row(self):
-        out = self.run_menu('Ndrrgdddddap0')   # (Join on "dojo", no Play row: the room chosen, no game)
-        self.assertEqual((out['plays'], out['host'], out['room'], out['row']), ('0', '192.168.1.9:39420', 'dojo', 'Room'))
+        out = self.run_menu('Ndrrgdddddap0')   # (Join on "dojo", no Play row: the room chosen, and the game starts)
+        self.assertEqual((out['plays'], out['host'], out['room'], out['row']), ('1', '192.168.1.9:39420', 'dojo', 'Room'))
+        out = self.run_menu('Ndrrgddddap0')    # (Join on the full one: chosen, no game)
+        self.assertEqual((out['plays'], out['host']), ('0', '192.168.1.7:39420'))
         rows = [self.run_menu('Nudrr' + 'd' * i)['row'] for i in range(1, 6)]
         self.assertEqual(rows, ['Your name', 'Room name', 'Host address', 'Refresh', 'Connection'])   # (around, no Play)
 
@@ -219,6 +221,60 @@ class NetMenuTests(unittest.TestCase):
         self.assertEqual(out['tip'], 'No room exists at 10.0.0.9')
         out = self.run_menu('drrddd' + self.type('10.0.0.9') + 'gj2p0')
         self.assertEqual(out['kind'], '4')
+
+    def run_logged(self, script, **env):
+        base = {k: v for k, v in os.environ.items() if not k.startswith('SSBU_NET')}
+        base.update(USER='tester', SSBU_NETPLAY_INI=str(self.ini))
+        r = subprocess.run([str(self.exe), script], capture_output=True, text=True, cwd=self.dir.name, env={**base, **env}, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return dict(kv.split('=', 1) for kv in r.stdout.rstrip('\n').split('|')), r.stderr
+
+    def test_room_mods_defaults(self):
+        out = self.run_menu('')
+        self.assertEqual((out['share_mods'], out['room_mods'], out['room_mods_mode'], out['room_mods_rate'], out['host_id']),
+                         ('1', '0', '0', str(4 << 20), ''))
+
+    def test_room_mods_settings_read_and_kept(self):
+        self.ini.write_text('mode = host\nroom_mods = never\nroom_mods_mode = overlay\nshare_mods = off\n'
+                            'room_mods_rate = 512K\nhost_id = 9f3a00000000c1\n')
+        out = self.run_menu('W')
+        self.assertEqual((out['share_mods'], out['room_mods'], out['room_mods_mode'], out['room_mods_rate'], out['host_id']),
+                         ('0', '2', '1', str(512 << 10), '009f3a00000000c1'))
+        text = self.ini.read_text()   # (saved again: every key kept)
+        for line in ('room_mods = never', 'room_mods_mode = overlay', 'share_mods = off', 'room_mods_rate = 512K', 'host_id = 009f3a00000000c1'):
+            self.assertIn(line, text)
+        self.assertEqual(self.run_menu('')['room_mods'], '2')
+
+    def test_room_mods_bad_values(self):
+        self.ini.write_text('room_mods = maybe\nroom_mods_mode = sideways\nshare_mods = yes\nroom_mods_rate = fast\nhost_id = xyz\n')
+        out, log = self.run_logged('')
+        self.assertEqual((out['share_mods'], out['room_mods'], out['room_mods_mode'], out['room_mods_rate'], out['host_id']),
+                         ('1', '0', '0', str(4 << 20), ''))
+        for key in ('room_mods = maybe', 'room_mods_mode = sideways', 'share_mods = yes', 'room_mods_rate = fast', 'host_id = xyz'):
+            self.assertIn(key, log)
+        self.assertEqual(self.run_menu('', )['room_mods_rate'], str(4 << 20))
+        self.ini.write_text('room_mods_rate = 1K\n')   # (too slow to be meant)
+        self.assertEqual(self.run_menu('')['room_mods_rate'], str(4 << 20))
+        self.ini.write_text('room_mods_rate = 1.5M\n')
+        self.assertEqual(self.run_menu('')['room_mods_rate'], str(int(1.5 * (1 << 20))))
+
+    def test_host_id_made_once(self):
+        self.ini.write_text('mode = join\nname = Ana\nhost = 10.0.0.2\n')
+        first = self.run_menu('I')['id']
+        self.assertRegex(first, '^[0-9a-f]{16}$')
+        self.assertNotEqual(first, '0' * 16)
+        text = self.ini.read_text()
+        self.assertIn(f'host_id = {first}', text)
+        self.assertIn('mode = join', text)   # (the rest as it was)
+        self.assertIn('name = Ana', text)
+        self.assertEqual(self.run_menu('I')['id'], first)   # (the same one after)
+        self.ini.write_text('name = Ana\n')                 # (the line deleted: another one)
+        self.assertNotEqual(self.run_menu('I')['id'], first)
+
+    def test_mods_that_can_desync_are_said(self):
+        self.assertEqual(self.run_menu('')['mods'], '(hidden)')
+        out = self.run_menu('', TEST_MODS_WARN='Online play can desync: Params changes more than looks')
+        self.assertEqual(out['mods'], 'Online play can desync: Params changes more than looks')
 
 if __name__ == '__main__':
     unittest.main()

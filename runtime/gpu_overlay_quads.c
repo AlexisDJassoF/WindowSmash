@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include "gpu_overlay_quads.h"
+#include "mod_room.h"
 #include "gpu_menu.h"   /* (MENU_JOIN_BUTTON, MENU_ICON_BUTTON: where clicks on the Network page's list land) */
 
 #define CELL_W 12
@@ -18,7 +19,7 @@
 #define COLS 16
 #define ATLAS_W OVERLAY_ATLAS_W
 #define ATLAS_H OVERLAY_ATLAS_H     /* ' '..'~', then the solid cell (127) */
-#define MAX_QUADS 8192
+#define MAX_QUADS 16384   /* (the Mods page's grid of 87 tiles: some 56 000 vertices with every mark and badge) */
 #define HISTORY 240
 
 static OverlayVertex verts[MAX_QUADS * 6];
@@ -27,6 +28,85 @@ static unsigned nverts;
 const OverlayVertex *overlay_quads(unsigned *count) {
     *count = nverts;
     return verts;
+}
+
+/* ---- pictures: the batches, and the textures registered ---- */
+#define MAX_BATCHES 512
+static OverlayBatch batches[MAX_BATCHES];   /* (first, texture, mode: count filled in by overlay_batches) */
+static unsigned nbatches;
+static void reset(void) { nverts = 0; nbatches = 0; }
+
+/* What the next vertices sample: a batch begun when it changes */
+static void batch(int texture, int mode) {
+    if (nbatches && batches[nbatches - 1].texture == texture && batches[nbatches - 1].mode == mode) return;
+    if (!nbatches && !texture && nverts == 0) return;   /* (the glyphs from the start: the batch overlay_batches makes) */
+    if (!nbatches) batches[nbatches++] = (OverlayBatch){0, 0, 0, OVERLAY_GLYPHS};   /* (the glyphs before it) */
+    if (batches[nbatches - 1].first == nverts) { batches[nbatches - 1].texture = texture, batches[nbatches - 1].mode = mode; return; }
+    if (nbatches < MAX_BATCHES) batches[nbatches++] = (OverlayBatch){nverts, 0, texture, mode};
+}
+
+const OverlayBatch *overlay_batches(unsigned *count) {
+    if (!nbatches) { batches[0] = (OverlayBatch){0, nverts, 0, OVERLAY_GLYPHS}; *count = nverts ? 1 : 0; return batches; }
+    for (unsigned i = 0; i < nbatches; i++) batches[i].count = (i + 1 < nbatches ? batches[i + 1].first : nverts) - batches[i].first;
+    *count = nbatches;
+    return batches;
+}
+
+#define MAX_TEXTURES 256
+static struct Tex { int id, format; unsigned w, h; void *data; size_t size; } textures[MAX_TEXTURES];
+static int next_id = 1, dead[MAX_TEXTURES];
+static unsigned dead_head, dead_tail;
+static SRWLOCK tex_lock = SRWLOCK_INIT;
+
+int overlay_texture_add(int format, unsigned w, unsigned h, const void *data, size_t size) {
+    void *copy = malloc(size ? size : 1);
+    if (!copy) return 0;
+    memcpy(copy, data, size);
+    int id = 0;
+    AcquireSRWLockExclusive(&tex_lock);
+    for (int i = 0; i < MAX_TEXTURES && !id; i++)
+        if (!textures[i].id) {
+            id = next_id++;
+            if (next_id <= 0) next_id = 1;
+            textures[i] = (struct Tex){id, format, w, h, copy, size};
+        }
+    ReleaseSRWLockExclusive(&tex_lock);
+    if (!id) free(copy);
+    return id;
+}
+
+static struct Tex *tex_of(int id) {   /* (the lock held) */
+    for (int i = 0; i < MAX_TEXTURES; i++) if (textures[i].id == id && id) return &textures[i];
+    return NULL;
+}
+
+void overlay_texture_free(int id) {
+    AcquireSRWLockExclusive(&tex_lock);
+    struct Tex *t = tex_of(id);
+    if (t) {
+        free(t->data);
+        memset(t, 0, sizeof *t);
+        if (dead_head - dead_tail < MAX_TEXTURES) dead[dead_head++ % MAX_TEXTURES] = id;
+    }
+    ReleaseSRWLockExclusive(&tex_lock);
+}
+
+int overlay_texture_take(int id, int *format, unsigned *w, unsigned *h, void **data, size_t *size) {
+    AcquireSRWLockExclusive(&tex_lock);
+    struct Tex *t = tex_of(id);
+    if (t) {
+        *format = t->format, *w = t->w, *h = t->h, *data = t->data, *size = t->size;
+        t->data = NULL, t->size = 0;
+    }
+    ReleaseSRWLockExclusive(&tex_lock);
+    return t != NULL;
+}
+
+int overlay_texture_dead(void) {
+    AcquireSRWLockExclusive(&tex_lock);
+    int id = dead_tail != dead_head ? dead[dead_tail++ % MAX_TEXTURES] : 0;
+    ReleaseSRWLockExclusive(&tex_lock);
+    return id;
 }
 
 /* The glyphs: drawn white on black by GDI, kept as coverage in a one-channel texture. (Linux:
@@ -140,7 +220,7 @@ int overlay_build_present(int show, const char *detail) {
         if (ms < best) best = ms;
     }
     double fps = total > 0 ? frames * 1000.0 / total : 0, last_ms = filled ? history[(head + HISTORY - 1) % HISTORY] : 0;
-    nverts = 0;
+    reset();
     char line[256];
     float x = 16, y = 16, gw = 2.0f * HISTORY, gh = 100;   /* graph: 2 px a frame; 100 px = 50 ms */
     int detail_w = 0, detail_lines = detail ? lines_of(detail, &detail_w) : 0;
@@ -172,7 +252,7 @@ int overlay_build_present(int show, const char *detail) {
 /* The start-up's shader screen (gpu_precompile.c): a title, a bar of done out of total (none
  * while total is 0), a line under it and the way out, centred in the w x h back buffer. */
 void overlay_build_progress(unsigned w, unsigned h, const char *title, unsigned done, unsigned total, const char *status) {
-    nverts = 0;
+    reset();
     float bw = w * 0.6f < 360 ? 360 : w * 0.6f, bh = 18, x = (w - bw) / 2, y = h / 2.0f - 2 * CELL_H;
     if (bw > w - 32.0f) { bw = w - 32.0f; x = 16; }
     text((w - (float)strlen(title) * CELL_W) / 2, y, RGBA(240, 240, 240, 255), title);
@@ -204,6 +284,50 @@ static void tri(float x0, float y0, unsigned c0, float x1, float y1, unsigned c1
     if (nverts + 3 > MAX_QUADS * 6) return;
     vtx(x0, y0, c0); vtx(x1, y1, c1); vtx(x2, y2, c2);
 }
+/* Pictures: a triangle of a texture's (u, v), or a w x h rectangle of all of it, times color, as it is
+ * or in greys (mode); the glyphs again after it */
+static void image_tri(float x0, float y0, float u0, float v0, float x1, float y1, float u1, float v1, float x2, float y2, float u2, float v2,
+                      int tex, int mode, unsigned color) {
+    if (!tex || nverts + 3 > MAX_QUADS * 6) return;
+    batch(tex, mode);
+    verts[nverts++] = (OverlayVertex){x0, y0, u0, v0, color};
+    verts[nverts++] = (OverlayVertex){x1, y1, u1, v1, color};
+    verts[nverts++] = (OverlayVertex){x2, y2, u2, v2, color};
+    batch(0, OVERLAY_GLYPHS);
+}
+static void image(float x, float y, float w, float h, int tex, int mode, unsigned color) {
+    image_tri(x, y, 0, 0, x + w, y, 1, 0, x, y + h, 0, 1, tex, mode, color);
+    image_tri(x, y + h, 0, 1, x + w, y, 1, 0, x + w, y + h, 1, 1, tex, mode, color);
+}
+/* The part of a tw x th picture that covers a w x h box as uv's: centred across, and up and down
+ * cut around the height at (0 the top, 0.5 the middle: where a portrait's face is) */
+static void cover_uv(float w, float h, unsigned tw, unsigned th, float at, float uv[4]) {
+    float box = w / h, pic = th ? (float)tw / th : 1;
+    uv[0] = 0, uv[1] = 0, uv[2] = 1, uv[3] = 1;
+    if (pic > box) { float k = box / pic; uv[0] = (1 - k) / 2, uv[2] = uv[0] + k; }
+    else if (pic < box) {
+        float k = pic / box;
+        uv[1] = at - k / 2;
+        if (uv[1] < 0) uv[1] = 0;
+        if (uv[1] > 1 - k) uv[1] = 1 - k;
+        uv[3] = uv[1] + k;
+    }
+}
+
+static int (*pic_fn)(const char *key, unsigned *w, unsigned *h, int *failed);
+void overlay_menu_pictures(int (*pic)(const char *key, unsigned *w, unsigned *h, int *failed)) { pic_fn = pic; }
+/* A picture's texture by its key (0: none, or not yet) */
+static int picture_or(const char *key, unsigned *w, unsigned *h, int *failed) {   /* (*failed: it cannot be had) */
+    *w = *h = 0, *failed = 1;
+    return pic_fn && key && *key ? pic_fn(key, w, h, failed) : 0;
+}
+static int picture(const char *key, unsigned *w, unsigned *h) { int failed; return picture_or(key, w, h, &failed); }
+/* All of a tw x th picture inside a w x h box, centred */
+static void image_fit(float x, float y, float w, float h, int tex, unsigned tw, unsigned th, int mode, unsigned color) {
+    float k = th && tw ? fminf(w / tw, h / th) : 1, iw = tw * k, ih = th * k;
+    image(x + (w - iw) / 2, y + (h - ih) / 2, iw, ih, tex, mode, color);
+}
+
 /* A solid quad, a colour a corner: top left, top right, bottom left, bottom right */
 static void quad4(float x, float y, float w, float h, unsigned tl, unsigned tr, unsigned bl, unsigned br) {
     if (w <= 0 || h <= 0) return;
@@ -373,6 +497,8 @@ static void pad_button(float x, float mid, char kind, char where);
 /* The footer's hints: '\t' between them; "key=what" a key and what it does (a key "^" kind where: a
  * pad's face button drawn, see pad_button), '!' first a warning,
  * '#' first a countdown's fraction left (a bar); else plain text. Its width (draw 0: only measured). */
+static float *hint_rects;   /* (while set: each "key=what" hint drawn gives its place, x y w h, up to hint_max) */
+static int hint_count, hint_max;
 static float hints(float x, float y, const char *footer, int draw, float *countdown) {
     char buf[256];
     snprintf(buf, sizeof buf, "%s", footer);
@@ -393,6 +519,7 @@ static float hints(float x, float y, const char *footer, int draw, float *countd
             cx += text_w(tok + 1, 1, 0);
         } else if (eq && eq != tok) {
             *eq = 0;
+            float x0 = cx;
             if (tok[0] == '^' && tok[1] && tok[2]) {   /* (a pad's button) */
                 if (draw) pad_button(cx, y + CELL_H / 2.0f, tok[1], tok[2]);
                 cx += PAD_BUTTON;
@@ -403,6 +530,10 @@ static float hints(float x, float y, const char *footer, int draw, float *countd
             cx += CELL_W + 12;
             if (draw) text_ex(cx, y, 1, 0, RGBA(196, 200, 208, 255), RGBA(196, 200, 208, 255), 0, eq + 1);
             cx += text_w(eq + 1, 1, 0);
+            if (draw && hint_rects && hint_count < hint_max) {
+                float *r = hint_rects + 4 * hint_count++;
+                r[0] = x0 - 6, r[1] = y - 8, r[2] = cx - x0 + 12, r[3] = CELL_H + 16;
+            }
         } else {
             if (draw) text_ex(cx, y, 1, 0, RGBA(196, 200, 208, 255), RGBA(196, 200, 208, 255), 0, tok);
             cx += text_w(tok, 1, 0);
@@ -890,17 +1021,18 @@ static int wrap(const char *s, float max, float size, const char *start[], int l
 
 /* A mod's card ('\17'): its initial, name and the line under it, Enabled or Disabled */
 static void mod_card(float x, float y, float w, float h, int sel, const char *v) {
-    char buf[600], cut[200];
+    char buf[1400], cut[200];   /* (its icon's path in it) */
     snprintf(buf, sizeof buf, "%s", v);
     char on = buf[0], warn = buf[1], moving = buf[2];
     char *f[3] = {0};
     char *p = strchr(buf, '\t');
-    char *initial = buf + 3;
-    for (int i = 0; i < 3 && p; i++) {   /* the name, the line under it, the tag */
+    char *initial = buf + 3, *icon = NULL;
+    for (int i = 0; i < 3 && p; i++) {   /* the name, the line under it, the tag (then its icon's key) */
         *p++ = 0;
         f[i] = p;
         p = strchr(p, '\t');
     }
+    if (p) { *p++ = 0; icon = p; }
     if (!f[2]) return;
     const char *name = f[0], *sub = f[1], *tag = f[2];
     int enabled = on == 'E';
@@ -911,9 +1043,14 @@ static void mod_card(float x, float y, float w, float h, int sel, const char *v)
     float bs = h - 18, bx = x + 12, by = mid - bs / 2;
     unsigned bfill = enabled ? RGBA(36, 70, 34, 255) : RGBA(38, 40, 46, 255), bedge = enabled ? RGBA(84, 160, 70, 255) : RGBA(70, 74, 82, 255);
     rbox_edge(bx, by, bs, bs, 6, 1, bedge, bfill);
-    float is = bs / (CELL_H * 1.2f);
-    unsigned ic = enabled ? RGBA(200, 250, 190, 255) : RGBA(150, 154, 162, 255);
-    text_ex(bx + (bs - text_w(initial, is, 0)) / 2, mid - CELL_H * is / 2, is, 0, ic, ic, 0, initial);
+    unsigned pw, ph;
+    int tex = picture(icon, &pw, &ph);
+    if (tex) image_fit(bx + 2, by + 2, bs - 4, bs - 4, tex, pw, ph, OVERLAY_IMAGE, enabled ? RGBA(255, 255, 255, 255) : RGBA(150, 150, 156, 255));
+    else {
+        float is = bs / (CELL_H * 1.2f);
+        unsigned ic = enabled ? RGBA(200, 250, 190, 255) : RGBA(150, 154, 162, 255);
+        text_ex(bx + (bs - text_w(initial, is, 0)) / 2, mid - CELL_H * is / 2, is, 0, ic, ic, 0, initial);
+    }
     /* the tag, from the right */
     float tw = text_w("Disabled", 0.8f, 0) + 24, th = CELL_H * 0.8f + 10, tx = x + w - 14 - tw;
     if (enabled) rbox_edge(tx, mid - th / 2, tw, th, th / 2, 1, RGBA(84, 180, 70, 255), RGBA(30, 72, 28, 255));
@@ -972,15 +1109,57 @@ static float mod_slots(float x, float y, float w, const char *field) {
     return y + bh + 10;
 }
 
+/* The preview (mod_menu.c's preview_field: "<game's key>|<mod's key>|<note>|<caption>") in a w x h box
+ * at (x, y): split along the diagonal from the bottom left to the top right - above it the game's
+ * portrait, below it the mod's (the game's again with the note when the mod has none) - and the
+ * caption under it. The y below it. */
+static float mod_preview(float x, float y, float w, float h, const char *field) {
+    char buf[1400];
+    snprintf(buf, sizeof buf, "%s", field);
+    char *part[4] = {buf, NULL, NULL, NULL};
+    for (int i = 1; i < 4; i++) {
+        part[i] = part[i - 1] ? strchr(part[i - 1], '|') : NULL;
+        if (part[i]) *part[i]++ = 0;
+    }
+    if (!part[3]) return y;
+    rbox_edge(x, y, w, h, 6, 1, M_ROW_EDGE, RGBA(12, 12, 15, 255));
+    unsigned ow, oh, mw, mh;
+    int failed = 0, orig = picture(part[0], &ow, &oh), mine = *part[1] ? picture_or(part[1], &mw, &mh, &failed) : 0;
+    if (!*part[1] || failed) mine = orig, mw = ow, mh = oh;   /* (none of its own, or one that cannot be read: the game's) */
+    if (*part[1] && failed && !*part[2]) part[2] = "No portrait";
+    float x0 = x + 1, y0 = y + 1, x1 = x + w - 1, y1 = y + h - 1, uv[4];
+    if (orig) {   /* (above the diagonal: the game's) */
+        cover_uv(x1 - x0, y1 - y0, ow, oh, 0.3f, uv);
+        image_tri(x0, y0, uv[0], uv[1], x1, y0, uv[2], uv[1], x0, y1, uv[0], uv[3], orig, OVERLAY_IMAGE, RGBA(255, 255, 255, 255));
+    }
+    if (mine) {   /* (below it: the mod's) */
+        cover_uv(x1 - x0, y1 - y0, mw, mh, 0.3f, uv);
+        image_tri(x0, y1, uv[0], uv[3], x1, y0, uv[2], uv[1], x1, y1, uv[2], uv[3], mine, OVERLAY_IMAGE, RGBA(255, 255, 255, 255));
+    }
+    line(x0, y1, x1, y0, 2, RGBA(255, 255, 255, 230));
+    text_ex(x + 10, y + 8, 0.7f, 0, RGBA(230, 232, 238, 255), RGBA(230, 232, 238, 255), 160, "Game");
+    const char *right = *part[2] ? part[2] : "Mod";
+    text_ex(x1 - 10 - text_w(right, 0.7f, 0), y1 - CELL_H * 0.7f - 8, 0.7f, 0, RGBA(230, 232, 238, 255), RGBA(230, 232, 238, 255), 160, right);
+    float cy = y + h + 8;
+    text_c(x + w / 2, cy, 0.8f, 0, M_TEXT, part[3]);
+    return cy + CELL_H * 0.8f + 12;
+}
+
+/* The detail's actions and the colors' boxes as drawn last, for clicks */
+static float action_rects[32], color_rects[32];
+static int naction, ncolor;
+int overlay_menu_actions(float r[32]) { memcpy(r, action_rects, sizeof action_rects); return naction; }
+int overlay_menu_colors(float r[32]) { memcpy(r, color_rects, sizeof color_rects); return ncolor; }
+
 /* The selected mod's detail ('\22', see mod_menu.c's detail), in the column beside the cards */
 static void mod_detail(float x, float y, float w, float h, const char *fields) {
-    char buf[2400], cut[200];
+    char buf[4096], cut[200];
     snprintf(buf, sizeof buf, "%s", fields);
-    char *f[9] = {0};
+    char *f[10] = {0};
     char *p = buf;
-    for (int i = 0; i < 9 && p; i++) {   /* (the last field, the actions' hints, keeps its own '\t's) */
+    for (int i = 0; i < 10 && p; i++) {   /* (the last field, the actions' hints, keeps its own '\t's) */
         f[i] = p;
-        if (i == 8) break;
+        if (i == 9) break;
         p = strchr(p, '\t');
         if (p) *p++ = 0;
     }
@@ -1002,7 +1181,22 @@ static void mod_detail(float x, float y, float w, float h, const char *fields) {
     cy += CELL_H * 1.25f + 14;
     line(ix, cy, ix + iw, cy, 1, RGBA(255, 255, 255, 20));
     cy += 12;
-    float bottom = y + h - 16 - (CELL_H + 8);   /* (the actions' hints at the bottom) */
+    /* the actions' hints at the bottom: on two lines when they do not fit on one (split at the middle hint) */
+    char acts[2][400] = {"", ""};
+    int lines = 0;
+    if (f[9] && *f[9]) {
+        snprintf(acts[0], sizeof acts[0], "%s", f[9]);
+        lines = 1;
+        if (hints(0, 0, acts[0], 0, NULL) > w - 24) {
+            int tabs = 0;
+            for (const char *q = acts[0]; *q; q++) tabs += *q == '\t';
+            char *cut = acts[0];
+            for (int k = 0; k < (tabs + 1) / 2 && cut; k++) cut = strchr(cut + (k > 0), '\t');
+            if (cut && *cut == '\t') { *cut = 0; snprintf(acts[1], sizeof acts[1], "%s", cut + 1); lines = 2; }
+        }
+    }
+    float bottom = y + h - 16 - lines * (CELL_H + 8);
+    if (f[8] && *f[8] && bottom - cy > 300) cy = mod_preview(ix, cy, iw, fminf(230, (bottom - cy) * 0.42f), f[8]);
     /* the description, a few lines */
     if (f[2] && *f[2]) {
         const char *ls[5];
@@ -1050,36 +1244,245 @@ static void mod_detail(float x, float y, float w, float h, const char *fields) {
         cy += 6;
     }
     /* the actions */
-    if (f[8] && *f[8]) {
+    if (lines) {
         line(ix, bottom - 10, ix + iw, bottom - 10, 1, RGBA(255, 255, 255, 20));
-        float hw = hints(0, 0, f[8], 0, NULL);
-        hints(x + (w - hw) / 2, bottom + 6, f[8], 1, NULL);
+        hint_rects = action_rects, hint_count = 0, hint_max = 8;   /* (their places, for clicks) */
+        for (int k = 0; k < lines; k++) {
+            float hw = hints(0, 0, acts[k], 0, NULL);
+            hints(x + (w - hw) / 2, bottom + 6 + k * (CELL_H + 8), acts[k], 1, NULL);
+        }
+        naction = hint_count;
+        hint_rects = NULL;
     }
 }
 
 /* The question over the menu (overlay_menu_dialog): its title and text, Cancel and Delete */
-static char dialog_text[400];
+/* ---- the Mods page's grid of fighters ('\23', mod_menu.c's grid_row) ---- */
+#define GRID_MAX 128
+static float grid_rects[GRID_MAX * 4];
+static int grid_n, grid_cols;
+int overlay_menu_grid(float *rects, int n, int *cols) {
+    int k = grid_n < n ? grid_n : n;
+    memcpy(rects, grid_rects, sizeof(float) * 4 * (size_t)k);
+    *cols = grid_cols;
+    return k;
+}
+
+static void icon_stop(float cx, float cy, float s, unsigned c) {   /* a problem: a red disc, a white bar */
+    disc(cx, cy, s / 2, c);
+    rbox(cx - s * 0.28f, cy - s * 0.08f, s * 0.56f, s * 0.16f, 1, RGBA(255, 255, 255, 255), RGBA(255, 255, 255, 255));
+}
+
+/* Columns for n tiles of 3:2 in w x h, gap between them: the fewest that fit (the biggest tiles), the
+ * tiles at most 176 px wide */
+static int grid_fit(int n, float w, float h, float gap, float *tw, float *th) {
+    int cols = 4;
+    for (; cols < 24; cols++) {
+        float cw = (w - gap * (cols - 1)) / cols;
+        if (cw > 176) cw = 176;
+        int rows = (n + cols - 1) / cols;
+        if (rows * (cw / 1.5f) + (rows - 1) * gap <= h) break;
+    }
+    *tw = (w - gap * (cols - 1)) / cols;
+    if (*tw > 176) *tw = 176;
+    *th = *tw / 1.5f;
+    return cols;
+}
+
+static void mod_grid(float x, float y, float w, float h, const char *v) {
+    static char buf[4096];
+    snprintf(buf, sizeof buf, "%s", v);
+    char *f[8 + GRID_MAX];
+    int nf = 0;
+    for (char *p = buf; p && nf < 8 + GRID_MAX; nf++) {
+        f[nf] = p;
+        p = strchr(p, '\t');
+        if (p) *p++ = 0;
+    }
+    grid_n = 0;
+    if (nf < 9) return;
+    int sel = atoi(f[0]), on_button = atoi(f[1]), shown = atoi(f[4]), n = nf - 8;
+    float cur_x = (float)atof(f[2]), cur_y = (float)atof(f[3]);
+    char cut[200];
+    /* the label: the tile's name, its mods, the reason of its mark */
+    float ly = y + 4;
+    float end = text_ex(x + 6, ly, 1.25f, 0.5f, RGBA(244, 246, 250, 255), RGBA(244, 246, 250, 255), 120, f[5]);
+    end = text_ex(end + 16, ly + 5, 0.9f, 0, M_DIM, M_DIM, 0, f[6]);
+    if (f[7][0]) {
+        int bad = f[7][0] == 'x';
+        float ix = end + 26, mid = ly + CELL_H * 0.6f;
+        if (bad) icon_stop(ix, mid, 18, M_RED);
+        else icon_warning(ix, mid, 18, RGBA(255, 196, 70, 255));
+        unsigned c = bad ? RGBA(255, 190, 180, 255) : RGBA(255, 226, 170, 255);
+        text_ex(ix + 16, ly + 5, 0.9f, 0, c, c, 0, fit(f[7] + 1, (x + w - ix - 22) / 0.9f, cut, sizeof cut));
+    }
+    float gy = y + CELL_H * 1.25f + 20, gh = h - (gy - y), gap = 6, tw, th;
+    int cols = grid_fit(n, w, gh, gap, &tw, &th);
+    float x0 = floorf(x + (w - (cols * tw + (cols - 1) * gap)) / 2);
+    grid_cols = cols;
+    for (int t = 0; t < n && t < GRID_MAX; t++) {
+        const char *k = f[8 + t];
+        char state = k[0], mark = k[1], portrait[40] = "";
+        int on = atoi(k + 2);
+        const char *comma = strchr(k, ','), *name = "";
+        if (comma) {   /* ",<portrait>,<name>" */
+            const char *second = strchr(comma + 1, ',');
+            if (second) { snprintf(portrait, sizeof portrait, "%.*s", (int)(second - comma - 1), comma + 1); name = second + 1; }
+            else name = comma + 1;
+        }
+        float tx = x0 + (t % cols) * (tw + gap), ty = gy + (t / cols) * (th + gap);
+        float *r = grid_rects + 4 * t;
+        r[0] = tx, r[1] = ty, r[2] = tw, r[3] = th;
+        grid_n = t + 1;
+        int lit = t == sel && !on_button;
+        unsigned edge, fill, tc, ic;
+        if (state == 'A') edge = M_GREEN, fill = RGBA(34, 62, 32, 255), tc = RGBA(236, 250, 232, 255), ic = RGBA(120, 200, 104, 120);
+        else if (state == 'D') edge = RGBA(78, 82, 92, 255), fill = RGBA(36, 38, 44, 255), tc = RGBA(176, 180, 188, 255), ic = RGBA(150, 154, 162, 70);
+        else edge = RGBA(40, 42, 47, 255), fill = RGBA(22, 23, 26, 255), tc = RGBA(96, 100, 108, 255), ic = RGBA(110, 114, 122, 40);
+        if (lit) rbox_edge(tx - 3, ty - 3, tw + 6, th + 6, 7, 3, RGBA(255, 255, 255, 255), fill);
+        rbox_edge(tx, ty, tw, th, 5, state == 'A' ? 2 : 1, edge, fill);
+        /* its select screen picture (chara_7) - in colour with mods, dimmed with disabled ones alone, grey
+         * without; until it is there (or without one), the name's initial, big and faint */
+        char key[120];
+        unsigned pw, ph;
+        snprintf(key, sizeof key, "arc:ui/replace/chara/chara_7/chara_7_%s_00.bntx", portrait);
+        int tex = portrait[0] ? picture(key, &pw, &ph) : 0;
+        if (tex) {
+            float uv[4], in = state == 'A' ? 2 : 1;
+            cover_uv(tw - 2 * in, th - 2 * in, pw, ph, 0, uv);
+            float x0p = tx + in, y0p = ty + in, x1p = tx + tw - in, y1p = ty + th - in;
+            unsigned c = state == 'A' ? RGBA(255, 255, 255, 255) : state == 'D' ? RGBA(150, 150, 156, 255) : RGBA(96, 96, 100, 255);
+            int mode = state == 'N' ? OVERLAY_GREY : OVERLAY_IMAGE;
+            image_tri(x0p, y0p, uv[0], uv[1], x1p, y0p, uv[2], uv[1], x0p, y1p, uv[0], uv[3], tex, mode, c);
+            image_tri(x0p, y1p, uv[0], uv[3], x1p, y0p, uv[2], uv[1], x1p, y1p, uv[2], uv[3], tex, mode, c);
+            vgrad(x0p, ty + th * 0.55f, x1p - x0p, y1p - ty - th * 0.55f, RGBA(0, 0, 0, 0), RGBA(0, 0, 0, 210));   /* (the name readable over it) */
+        } else {
+            char initial[2] = {name[0], 0};
+            float is = th / CELL_H * 0.55f;
+            text_ex(tx + (tw - text_w(initial, is, 0)) / 2, ty + th * 0.36f - CELL_H * is / 2, is, 0, ic, ic, 0, initial);
+        }
+        float ns = tw < 110 ? 0.6f : 0.7f;
+        const char *nm = fit(name, (tw - 10) / ns, cut, sizeof cut);
+        text_ex(tx + (tw - text_w(nm, ns, 0)) / 2, ty + th - CELL_H * ns - 6, ns, 0, tc, tc, 0, nm);
+        if (state == 'A' && on > 0) {   /* how many enabled: a badge at the top right */
+            char cnt[8];
+            snprintf(cnt, sizeof cnt, "%d", on);
+            float bw = text_w(cnt, 0.7f, 0) + 12, bh = CELL_H * 0.7f + 4;
+            rbox(tx + tw - bw - 4, ty + 4, bw, bh, bh / 2, M_GREEN, RGBA(64, 176, 48, 255));
+            text_ex(tx + tw - bw + 2, ty + 6, 0.7f, 0, RGBA(10, 30, 10, 255), RGBA(10, 30, 10, 255), 0, cnt);
+        }
+        if (mark == 'x') icon_stop(tx + 13, ty + 13, 16, M_RED);
+        else if (mark == '!') icon_warning(tx + 13, ty + 13, 16, RGBA(255, 196, 70, 255));
+    }
+    if (shown && !on_button) {   /* the cursor: a token over the grid */
+        float cx = x0 + cur_x * (tw + gap) - gap / 2, cy = gy + cur_y * (th + gap) - gap / 2;
+        float tr = th * 0.2f < 15 ? th * 0.2f : 15, ts = tr / 15 * 0.7f;   /* (smaller on small tiles: the name still read) */
+        disc(cx + 2, cy + 3, tr, RGBA(0, 0, 0, 120));
+        disc(cx, cy, tr, RGBA(255, 255, 255, 255));
+        disc(cx, cy, tr * 0.8f, RGBA(232, 84, 72, 255));
+        text_ex(cx - CELL_W * ts / 2, cy - CELL_H * ts / 2, ts, 0, RGBA(255, 255, 255, 255), RGBA(255, 255, 255, 255), 0, "P");
+    }
+}
+
+/* The page's colors ('\24', mod_menu.c's colors_row): "Name|8 letters|moving|internal" - a box per
+ * color with its number: M the selected mod's (green; blue while moving), o another's (occupied), s
+ * two or more others' and W the selected one's with another's (shared, orange), . free */
+static void mod_colors(float x, float y, float w, float h, const char *v) {
+    char buf[2048];   /* (eight icons' paths in it) */
+    snprintf(buf, sizeof buf, "%s", v);
+    char *row = strchr(buf, '|');
+    if (!row) return;
+    *row++ = 0;
+    char *mv = strchr(row, '|'), *base = NULL, *icons[8] = {0};
+    int moving = 0;
+    if (mv) { *mv++ = 0; moving = atoi(mv); base = strchr(mv, '|'); }
+    if (base) {   /* "|<base>|<icon 0>|...|<icon 7>" */
+        *base++ = 0;
+        char *p = strchr(base, '|');
+        for (int c = 0; c < 8 && p; c++) {
+            *p++ = 0;
+            icons[c] = p;
+            p = strchr(p, '|');
+        }
+    }
+    rbox_edge(x, y, w, h, 5, 1, M_ROW_EDGE, M_ROW);
+    char head[128];
+    snprintf(head, sizeof head, "%s's colors", buf);
+    float mid = y + h / 2;
+    text_ex(x + 18, mid - CELL_H * 0.9f / 2, 0.9f, 0, M_TEXT, M_TEXT, 0, head);
+    float left = x + 18 + text_w(head, 0.9f, 0) + 40, room = x + w - 40 - left;
+    float gap = 10, bh = h - 18, bw = (room - gap * 7) / 8;
+    if (bw > bh * 1.3f) bw = bh * 1.3f;
+    float total = bw * 8 + gap * 7, x0 = left + (room - total) / 2, by = mid - bh / 2;
+    ncolor = 0;
+    for (int c = 0; c < 8 && row[c]; c++) {
+        float bx = x0 + c * (bw + gap);
+        float *cr = color_rects + 4 * c;
+        cr[0] = bx, cr[1] = by, cr[2] = bw, cr[3] = bh;
+        ncolor = c + 1;
+        char k = row[c], num[4];
+        unsigned edge = RGBA(70, 74, 82, 255), fill = RGBA(26, 27, 31, 255), tc = M_DIM;
+        if (k == 'M') { edge = moving ? RGBA(110, 190, 255, 255) : M_GREEN; fill = moving ? RGBA(24, 50, 80, 255) : RGBA(36, 80, 32, 255); tc = RGBA(255, 255, 255, 255); }
+        else if (k == 'o') { edge = RGBA(120, 124, 134, 255); fill = RGBA(52, 55, 62, 255); tc = M_TEXT; }
+        else if (k == 's' || k == 'W') { edge = RGBA(255, 180, 60, 255); fill = k == 'W' ? RGBA(80, 56, 20, 255) : RGBA(60, 44, 20, 255); tc = RGBA(255, 226, 170, 255); }
+        rbox_edge(bx, by, bw, bh, 6, k == '.' ? 1 : 2, edge, fill);
+        snprintf(num, sizeof num, "%d", c + 1);
+        /* the color's stock icon: a mod's there, else the game's (chara_2) */
+        char key[600];
+        unsigned pw, ph;
+        if (icons[c] && *icons[c]) snprintf(key, sizeof key, "%s", icons[c]);
+        else snprintf(key, sizeof key, "arc:ui/replace/chara/chara_2/chara_2_%s_%02d.bntx", base ? base : "", c);
+        int tex = base && *base ? picture(key, &pw, &ph) : 0;
+        if (tex) {
+            float is = fminf(bw, bh) - 8;
+            image_fit(bx + (bw - is) / 2, by + (bh - is) / 2, is, is, tex, pw, ph, OVERLAY_IMAGE, k == '.' ? RGBA(170, 170, 176, 255) : RGBA(255, 255, 255, 255));
+            text_ex(bx + 5, by + bh - CELL_H * 0.6f - 3, 0.6f, 0, tc, tc, 0, num);
+        } else text_ex(bx + (bw - text_w(num, 1, 0)) / 2, by + (bh - CELL_H) / 2, 1, 0, tc, tc, 0, num);
+        if (k == 'o' || k == 's') disc(bx + bw - 9, by + 9, 3.5f, k == 's' ? RGBA(255, 180, 60, 255) : RGBA(170, 174, 182, 255));
+        if (k == 's' || k == 'W') disc(bx + bw - 18, by + 9, 3.5f, RGBA(255, 180, 60, 255));
+    }
+    if (moving) {
+        unsigned b = RGBA(110, 190, 255, 255);
+        text_ex(x0 - 24, mid - CELL_H / 2.0f, 1, 0, b, b, 0, "<");
+        text_ex(x0 + total + 12, mid - CELL_H / 2.0f, 1, 0, b, b, 0, ">");
+    }
+}
+
+static char dialog_text[1400];
 static int dialog_on, dialog_sel;
-static float dialog_rects[8];
+static float dialog_rects[16];
 void overlay_menu_dialog(const char *text, int selected) {
     dialog_on = text != NULL;
     if (text) snprintf(dialog_text, sizeof dialog_text, "%s", text);
-    dialog_sel = selected;
-    if (!text) memset(dialog_rects, 0, sizeof dialog_rects);
+    dialog_sel = selected;   /* (its buttons' places stay until it is drawn again: the clicks of the frame after) */
 }
-void overlay_menu_dialog_rects(float r[8]) { memcpy(r, dialog_rects, sizeof dialog_rects); }
+void overlay_menu_dialog_rects(float r[16]) { memcpy(r, dialog_rects, sizeof dialog_rects); }
 
 static void dialog(float W, float H) {
-    char buf[400];
+    char buf[1400];
     snprintf(buf, sizeof buf, "%s", dialog_text);
-    char *q = strchr(buf, '\t');
+    char *q = strchr(buf, '\t'), *btns = NULL;
     if (q) *q++ = 0;
+    if (q && (btns = strchr(q, '\t'))) *btns++ = 0;
+    char *label[4] = {"Cancel", "Delete", NULL, NULL};   /* (none given: the delete question's) */
+    int nb = 2;
+    if (btns && *btns) {
+        nb = 0;
+        for (char *t = btns, *next; t && nb < 4; t = next) {
+            next = strchr(t, '|');
+            if (next) *next++ = 0;
+            label[nb++] = t;
+        }
+    }
+    int stack = nb > 2;   /* (the recovery's: one under the other, across) */
     quad4(0, 0, W, H, RGBA(0, 0, 0, 160), RGBA(0, 0, 0, 160), RGBA(0, 0, 0, 190), RGBA(0, 0, 0, 190));
-    float dw = 680 < W - 40 ? 680 : W - 40;
-    const char *ls[4];
-    int ll[4];
-    int nl = q ? wrap(q, dw - 64, 1, ls, ll, 4) : 0;
-    float dh = 64 + nl * (CELL_H + 6) + 30 + 52 + 24, dx = floorf((W - dw) / 2), dy = floorf((H - dh) / 2);
+    float dw = (stack ? 760 : 680) < W - 40 ? (stack ? 760 : 680) : W - 40;
+    const char *ls[6];
+    int ll[6];
+    int nl = q ? wrap(q, dw - 64, 1, ls, ll, 6) : 0;
+    float bh = stack ? 44 : 48, gap = stack ? 10 : 24;
+    float buttons_h = stack ? nb * bh + (nb - 1) * gap : bh;
+    float dh = 64 + nl * (CELL_H + 6) + 30 + buttons_h + 24, dx = floorf((W - dw) / 2), dy = floorf((H - dh) / 2);
     soft(dx + 8, dy + 10, dw - 16, dh - 8, 24, RGBA(0, 0, 0, 140));
     rbox_edge(dx, dy, dw, dh, 8, 2, M_PANEL_EDGE, M_PANEL);
     icon_warning(dx + 36, dy + 34, 22, RGBA(255, 196, 70, 255));
@@ -1091,19 +1494,133 @@ static void dialog(float W, float H) {
         text_ex(dx + 32, cy, 1, 0, M_TEXT, M_TEXT, 0, one);
         cy += CELL_H + 6;
     }
-    float bw = 180, bh = 48, by = dy + dh - 24 - bh, gap = 24, bx0 = dx + dw - 32 - 2 * bw - gap;
-    static const char *const LABEL[2] = {"Cancel", "Delete"};
-    for (int b = 0; b < 2; b++) {
-        float bx = bx0 + b * (bw + gap);
-        int sel = dialog_sel == b;
-        unsigned edge = b ? M_RED : RGBA(120, 124, 134, 255);
-        if (sel) {
-            rbox_edge(bx - 3, by - 3, bw + 6, bh + 6, 8, 3, M_GREEN, b ? RGBA(120, 34, 28, 255) : RGBA(44, 46, 52, 255));
-        } else rbox_edge(bx, by, bw, bh, 6, 2, edge, b ? RGBA(70, 24, 20, 255) : RGBA(32, 34, 39, 255));
-        unsigned c = b ? RGBA(255, 220, 214, 255) : M_TEXT;
-        text_ex(bx + (bw - text_w(LABEL[b], 1, 1)) / 2, by + (bh - CELL_H) / 2, 1, 1, c, c, sel ? 120 : 0, LABEL[b]);
+    memset(dialog_rects, 0, sizeof dialog_rects);
+    float bw = stack ? dw - 64 : 180, by0 = dy + dh - 24 - buttons_h, bx0 = stack ? dx + 32 : dx + dw - 32 - 2 * bw - gap;
+    for (int b = 0; b < nb; b++) {
+        float bx = stack ? bx0 : bx0 + b * (bw + gap), by = stack ? by0 + b * (bh + gap) : by0;
+        int sel = dialog_sel == b, red = !stack && b == 1;   /* (Delete) */
+        unsigned edge = red ? M_RED : RGBA(120, 124, 134, 255);
+        if (sel) rbox_edge(bx - 3, by - 3, bw + 6, bh + 6, 8, 3, M_GREEN, red ? RGBA(120, 34, 28, 255) : RGBA(44, 46, 52, 255));
+        else rbox_edge(bx, by, bw, bh, 6, 2, edge, red ? RGBA(70, 24, 20, 255) : RGBA(32, 34, 39, 255));
+        unsigned c = red ? RGBA(255, 220, 214, 255) : M_TEXT;
+        char cut[200];
+        const char *t = fit(label[b], (bw - 24), cut, sizeof cut);
+        text_ex(bx + (bw - text_w(t, 1, 1)) / 2, by + (bh - CELL_H) / 2, 1, 1, c, c, sel ? 120 : 0, t);
         dialog_rects[b * 4] = bx, dialog_rects[b * 4 + 1] = by, dialog_rects[b * 4 + 2] = bw, dialog_rects[b * 4 + 3] = bh;
     }
+}
+
+/* ---- a room's mods (overlay_menu_room): its mods, the mode, its buttons, the download's bar ---- */
+static RoomView room_view;
+static int room_on;
+static float room_rects[16];
+void overlay_menu_room(const RoomView *v) {
+    room_on = v && v->show == 1;
+    if (room_on) room_view = *v;
+    else memset(room_rects, 0, sizeof room_rects);
+}
+void overlay_menu_room_rects(float r[16]) { memcpy(r, room_rects, sizeof room_rects); }
+
+static void room_glyph(float x, float cy, char kind) {
+    static const struct { char kind; const char *text; unsigned color; } G[] = {
+        {'+', "+", RGBA(120, 230, 110, 255)}, {'~', "~", RGBA(255, 214, 120, 255)}, {'>', ">", RGBA(140, 180, 255, 255)},
+        {'=', "=", RGBA(150, 154, 162, 255)}, {'-', "-", RGBA(150, 154, 162, 255)}, {'x', "x", RGBA(255, 120, 100, 255)}};
+    if (kind == '!') { icon_warning(x + 9, cy, 16, RGBA(255, 196, 70, 255)); return; }
+    if (kind == 'i') { icon_info(x + 9, cy, 16, RGBA(120, 160, 255, 255)); return; }
+    for (size_t i = 0; i < sizeof G / sizeof G[0]; i++)
+        if (G[i].kind == kind) { text_ex(x + 9 - CELL_W / 2.0f, cy - CELL_H / 2.0f, 1, 0, G[i].color, G[i].color, 0, G[i].text); return; }
+}
+
+static void room(float W, float H) {
+    const RoomView *v = &room_view;
+    quad4(0, 0, W, H, RGBA(0, 0, 0, 170), RGBA(0, 0, 0, 170), RGBA(0, 0, 0, 200), RGBA(0, 0, 0, 200));
+    float dw = 1000 < W - 40 ? 1000 : W - 40, iw = dw - 64 - 26;
+    /* the lines' height first: each wraps to two lines at most */
+    const char *ls[2];
+    int ll[2], nl[ROOM_LINES];
+    float lines_h = 0;
+    for (int i = 0; i < v->nlines; i++) { nl[i] = wrap(v->lines[i] + 1, iw, 0.9f, ls, ll, 2); lines_h += nl[i] * (CELL_H * 0.9f + 3) + 6; }
+    float max_lines = H - 40 - (64 + 70 + 90 + 80);   /* (what the rest leaves) */
+    float dh = 64 + lines_h + (v->mode_row ? 70 : 0) + (v->progress >= 0 ? 76 : 0) + (v->nbuttons ? 52 + 24 : 16) + 16;
+    if (lines_h > max_lines) dh -= lines_h - max_lines;
+    float dx = floorf((W - dw) / 2), dy = floorf((H - dh) / 2);
+    if (dy < 20) dy = 20;
+    soft(dx + 8, dy + 10, dw - 16, dh - 8, 24, RGBA(0, 0, 0, 140));
+    rbox_edge(dx, dy, dw, dh, 8, 2, M_PANEL_EDGE, M_PANEL);
+    icon_people(dx + 26, dy + 24, 22, RGBA(120, 200, 255, 255));
+    char cut[256];
+    text_ex(dx + 60, dy + 22, 1.1f, 0.5f, RGBA(244, 246, 250, 255), RGBA(244, 246, 250, 255), 0, fit(v->title, (dw - 90) / 1.1f, cut, sizeof cut));
+    float cy = dy + 64, bottom = dy + dh - (v->nbuttons ? 52 + 24 : 16) - (v->progress >= 0 ? 76 : 0) - (v->mode_row ? 70 : 0);
+    for (int i = 0; i < v->nlines && cy + CELL_H * 0.9f <= bottom; i++) {
+        char kind = v->lines[i][0];
+        int n = wrap(v->lines[i] + 1, iw, 0.9f, ls, ll, 2);
+        unsigned c = kind == '!' ? RGBA(255, 226, 170, 255) : kind == 'x' ? RGBA(255, 190, 180, 255) : kind == 'i' ? RGBA(206, 216, 255, 255)
+                   : kind == '=' || kind == '-' ? M_DIM : M_TEXT;
+        room_glyph(dx + 32, cy + CELL_H * 0.45f, kind);
+        for (int k = 0; k < n; k++) {
+            char one[220];
+            snprintf(one, sizeof one, "%.*s%s", ll[k], ls[k], k == 1 && ls[k][ll[k]] ? "..." : "");
+            text_ex(dx + 32 + 26, cy, 0.9f, 0, c, c, 0, one);
+            cy += CELL_H * 0.9f + 3;
+        }
+        cy += 6;
+    }
+    cy = bottom;
+    if (v->mode_row) {   /* Mode: < Mirror >  what it means */
+        line(dx + 32, cy + 4, dx + dw - 32, cy + 4, 1, RGBA(255, 255, 255, 20));
+        float ry = cy + 16, rh = CELL_H + 18, rx = dx + 24, rw = dw - 48;
+        int sel = v->sel < 0;
+        if (sel) rbox_edge(rx, ry, rw, rh, 6, 2, M_GREEN, RGBA(30, 34, 30, 255));
+        text_ex(rx + 14, ry + 9, 1, 0, M_DIM, M_DIM, 0, "Mode");
+        char mode[48];
+        snprintf(mode, sizeof mode, "< %s >", v->mode);
+        float mx = rx + 14 + 7 * CELL_W;
+        text_ex(mx, ry + 9, 1, 0.5f, sel ? RGBA(244, 255, 240, 255) : M_TEXT, sel ? RGBA(244, 255, 240, 255) : M_TEXT, sel ? 120 : 0, mode);
+        float tx = mx + text_w(mode, 1, 0.5f) + 24;
+        text_ex(tx, ry + 9 + CELL_H * 0.05f, 0.9f, 0, RGBA(206, 210, 220, 255), RGBA(206, 210, 220, 255), 0,
+                fit(v->mode_text, (rx + rw - 14 - tx) / 0.9f, cut, sizeof cut));
+        room_rects[12] = rx, room_rects[13] = ry, room_rects[14] = rw, room_rects[15] = rh;
+        cy += 70;
+    } else memset(room_rects + 12, 0, 4 * sizeof room_rects[0]);
+    if (v->progress >= 0) {   /* the download's bar */
+        float bx = dx + 32, bw = dw - 64, f = v->progress / 1000.0f;
+        rbox(bx, cy + 14, bw, 12, 6, RGBA(255, 255, 255, 26), RGBA(255, 255, 255, 26));
+        if (f > 0) rbox(bx, cy + 14, bw * (f > 1 ? 1 : f), 12, 6, M_GREEN, M_GREEN);
+        text_ex(bx, cy + 36, 0.9f, 0, RGBA(206, 210, 220, 255), RGBA(206, 210, 220, 255), 0, fit(v->status, bw / 0.9f, cut, sizeof cut));
+        cy += 76;
+    }
+    /* the buttons, at the right */
+    float bh = 48, gap = 20, total = 0, bw[3];
+    for (int b = 0; b < v->nbuttons; b++) { bw[b] = text_w(v->buttons[b], 1, 1) + 48; if (bw[b] < 160) bw[b] = 160; total += bw[b] + (b ? gap : 0); }
+    float bx = dx + dw - 32 - total, by = dy + dh - 24 - bh;
+    for (int b = 0; b < 3; b++) {
+        float *r = room_rects + b * 4;
+        if (b >= v->nbuttons) { r[0] = r[1] = r[2] = r[3] = 0; continue; }
+        int sel = v->sel == b;
+        unsigned edge = b == 0 ? RGBA(54, 120, 46, 255) : RGBA(120, 124, 134, 255), fill = b == 0 ? RGBA(22, 48, 22, 255) : RGBA(32, 34, 39, 255);
+        if (sel) rbox_edge(bx - 3, by - 3, bw[b] + 6, bh + 6, 8, 3, M_GREEN, b == 0 ? RGBA(30, 70, 28, 255) : RGBA(44, 46, 52, 255));
+        else rbox_edge(bx, by, bw[b], bh, 6, 2, edge, fill);
+        unsigned c = b == 0 ? RGBA(200, 250, 190, 255) : M_TEXT;
+        text_ex(bx + (bw[b] - text_w(v->buttons[b], 1, 1)) / 2, by + (bh - CELL_H) / 2, 1, 1, c, c, sel ? 120 : 0, v->buttons[b]);
+        r[0] = bx, r[1] = by, r[2] = bw[b], r[3] = bh;
+        bx += bw[b] + gap;
+    }
+}
+
+void overlay_build_room(unsigned w, unsigned h, const RoomView *v) {
+    reset();
+    if (v->show == 2) {   /* a line at the top, its progress under it */
+        char s[320];
+        snprintf(s, sizeof s, "%s - %s", v->title, v->status);
+        float tw = text_w(s, 0.9f, 0), bw = tw + 40, bx = floorf((w - bw) / 2), by = h * 0.04f, bh = CELL_H * 0.9f + 26;
+        rbox_edge(bx, by, bw, bh, 6, 1, RGBA(58, 61, 68, 230), RGBA(20, 20, 24, 215));
+        text_ex(bx + 20, by + 9, 0.9f, 0, RGBA(236, 238, 242, 255), RGBA(236, 238, 242, 255), 0, s);
+        float f = v->progress > 0 ? v->progress / 1000.0f : 0;
+        if (f > 0) rect(bx + 6, by + bh - 5, (bw - 12) * (f > 1 ? 1 : f), 3, M_GREEN);
+        return;
+    }
+    room_view = *v;
+    room((float)w, (float)h);
 }
 
 static float tab_x0, tab_w;   /* the last menu's tabs (overlay_menu_tabs) */
@@ -1125,21 +1642,28 @@ static void shoulder_cap(float x, float mid, const char *label) {
  * one outlined, the button row (Play) as a button, and the footer's hints (see hints). Each row's
  * place goes to rects (x, y, w, h; 0 for a row not shown), and where the values start to *value_x,
  * for clicks; the tabs are just above the first row (Display left of the middle, Network right). */
+/* How much taller than a plain row a row of kind k is: the Network page's heading and rooms, a mod's
+ * card; a page's colors (twice as tall); the grid ('\23') none here - it takes the room left */
+static float row_extra(unsigned char k, float row_h, float more) {
+    return k == 6 || k == 7 || k == 15 ? more : k == 20 ? row_h + 14 : 0;
+}
+
 void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],
                         const int shown[], int selected, int button, const char *footer, float *rects, float *value_x) {
     static unsigned frame;
     frame++;
-    nverts = 0;
+    reset();
     float W = (float)w, H = (float)h;
     backdrop(W, H);
 
     /* rows: the plain ones, the taller ones of the Network page's list (its heading, rooms), and a
      * picture ('\16': the Controls page's pad) drawn in a column of its own beside the others */
-    int list = 0, pic = -1;
+    int list = 0, pic = -1, grid = -1;
     for (int i = 0; i < n; i++) {
         if (!shown[i] || i == button) continue;
         unsigned char k = (unsigned char)values[i][0];
-        list |= (k >= 6 && k <= 8) || k == 15;
+        list |= (k >= 6 && k <= 8) || k == 15 || k == 19 || k == 20;
+        if (k == 19 && grid < 0) grid = i;
         if ((k == 14 || k == 18) && pic < 0) pic = i;
     }
     /* widths: the label's column, values (the arrows' room too), callouts across the row */
@@ -1148,7 +1672,7 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     for (int i = 0; i < n; i++) {
         if (!shown[i] || i == button) continue;
         unsigned char k = (unsigned char)values[i][0];
-        if ((k >= 6 && k <= 8) || k == 15) continue;
+        if ((k >= 6 && k <= 8) || k == 15 || k == 19 || k == 20) continue;
         if (k == 14 || k == 18) continue;
         float l = text_w(values[i] + (k < 32), 1, 0);
         if (k >= 3 && k <= 5) { if (l + 72 > callout_w) callout_w = l + 72; }
@@ -1182,18 +1706,25 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         if (pass) { row_h = 36; play_h = 44; footer_h = 48; more = 14; pic_h = pic >= 0 ? 340 : 0; }
         rows_h = 0;
         for (int i = 0; i < n; i++)
-            if (shown[i] && i != button && i != pic)
-                rows_h += row_h + gap + ((unsigned char)values[i][0] == 6 || (unsigned char)values[i][0] == 7 || (unsigned char)values[i][0] == 15 ? more : 0);
+            if (shown[i] && i != button && i != pic && (unsigned char)values[i][0] != 19)
+                rows_h += row_h + gap + row_extra((unsigned char)values[i][0], row_h, more);
         fixed = 8 + tabs_h + 10 + (has_button ? 14 + play_h : 0) + 16 + footer_h;   /* (a page without the button: no room for it) */
         if (full || fixed + (rows_h > pic_h ? rows_h : pic_h) + 16 <= avail_h) break;
     }
     float room_h = avail_h - 16 - fixed;
+    float grid_h = 0;   /* (the Mods page's grid: the room the other rows leave) */
+    if (grid >= 0) {
+        grid_h = room_h - rows_h - gap;
+        if (grid_h < 160) grid_h = 160;
+        rows_h += grid_h + gap;
+    }
+    grid_n = 0, grid_cols = 0, naction = 0, ncolor = 0;
     if (rows_h > room_h && room_h > 0) {   /* scrolling: the window of rows around the selected one */
         float tall_of[256];
         int count = n < 256 ? n : 256;
         for (int i = 0; i < count; i++)
-            tall_of[i] = shown[i] && i != button && i != pic
-                         ? row_h + gap + ((unsigned char)values[i][0] == 6 || (unsigned char)values[i][0] == 7 || (unsigned char)values[i][0] == 15 ? more : 0) : 0;
+            tall_of[i] = !shown[i] || i == button || i == pic ? 0
+                         : i == grid ? grid_h + gap : row_h + gap + row_extra((unsigned char)values[i][0], row_h, more);
         int anchor = selected >= 0 && selected < count && tall_of[selected] > 0 ? selected : count - 1;
         static int keep_first;   /* (the window moves only as far as the selection makes it) */
         first = keep_first < count ? keep_first : 0;
@@ -1308,8 +1839,14 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
         size_t vl = strlen(val);
         int caret = sel && vl && val[vl - 1] == '_';   /* (the model's cursor: drawn as a caret) */
         if (caret) val[--vl] = 0;
-        float ry = y, rh = row_h + (kind == 6 || kind == 7 || kind == 15 ? more : 0), mid = ry + rh / 2, ty = mid - CELL_H / 2.0f;
+        float ry = y, rh = i == grid ? grid_h : row_h + row_extra(kind, row_h, more), mid = ry + rh / 2, ty = mid - CELL_H / 2.0f;
         r[0] = rx, r[1] = ry, r[2] = rw, r[3] = rh;
+        if (kind == 19 || kind == 20) {   /* the Mods page's grid, a page's colors (the whole value: longer than val holds) */
+            if (kind == 19) mod_grid(rx, ry, rw, rh, values[i] + 1);
+            else mod_colors(rx, ry, rw, rh, values[i] + 1);
+            y += rh + gap;
+            continue;
+        }
         if (kind == 15) {   /* a mod's card (the whole value: longer than val holds) */
             mod_card(rx, ry, rw, rh, sel, values[i] + 1);
             y += rh + gap;
@@ -1406,12 +1943,13 @@ void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const 
     }
     if (footer) hints(floorf((W - footer_w) / 2), fy + (footer_h - CELL_H) / 2 + 2, footer, 1, NULL);
     if (dialog_on) dialog(W, H);
+    if (room_on) room(W, H);
     *value_x = vx;
 }
 
 /* A short notice (F7's mode) at the top of a w x h picture, in a box. */
 void overlay_build_notice(unsigned w, unsigned h, const char *note) {
-    nverts = 0;
+    reset();
     float tw = (float)strlen(note) * CELL_W, bw = tw + 40, bh = CELL_H + 20, bx = (w - bw) / 2, by = h * 0.06f;
     rect(bx, by, bw, bh, RGBA(20, 20, 24, 210));
     rect(bx, by + bh - 3, bw, 3, RGBA(90, 200, 110, 255));
@@ -1422,7 +1960,7 @@ void overlay_build_notice(unsigned w, unsigned h, const char *note) {
  * button's place goes to button (x, y, w, h). */
 void overlay_build_bar(unsigned w, unsigned h, unsigned bar, const char *mode, int button[4]) {
     (void)h;
-    nverts = 0;
+    reset();
     float ty = (bar - CELL_H) / 2.0f;
     rect(0, 0, (float)w, (float)bar, RGBA(32, 32, 38, 255));
     rect(0, (float)bar - 1, (float)w, 1, RGBA(70, 70, 80, 255));

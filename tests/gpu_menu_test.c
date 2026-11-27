@@ -26,7 +26,21 @@ void display_show_notice(const char *text, unsigned ms) { (void)text; (void)ms; 
 void overlay_menu_over(int on) { (void)on; }
 void overlay_menu_tabs(float *x0, float *w, int *count) { *x0 = *w = 0; *count = 0; }
 void overlay_menu_dialog(const char *text, int selected) { (void)text; (void)selected; }
-void overlay_menu_dialog_rects(float r[8]) { memset(r, 0, 8 * sizeof *r); }
+void overlay_menu_dialog_rects(float r[16]) { memset(r, 0, 16 * sizeof *r); }
+int overlay_menu_grid(float *rects, int n, int *cols) { (void)rects; (void)n; *cols = 0; return 0; }
+int overlay_menu_actions(float r[32]) { (void)r; return 0; }
+int overlay_menu_colors(float r[32]) { (void)r; return 0; }
+void overlay_menu_pictures(int (*pic)(const char *, unsigned *, unsigned *, int *)) { (void)pic; }
+int menu_pic(const char *key, unsigned *w, unsigned *h, int *failed) { (void)key; *w = *h = 0; *failed = 1; return 0; }
+void menu_pics_stop(void) {}
+uint64_t mod_arc_game_body(const char *fighter, int color) { (void)fighter; (void)color; return 0; }
+void mod_arc_game_done(void) {}
+struct RoomView;
+void overlay_menu_room(const struct RoomView *v) { (void)v; }
+void overlay_menu_room_rects(float r[16]) { memset(r, 0, 16 * sizeof *r); }
+void overlay_build_room(unsigned w, unsigned h, const struct RoomView *v) { (void)w; (void)h; (void)v; }
+int net_configured(void) { return 0; }   /* (no room joined here: a Join plays at once) */
+unsigned net_local_ip(void) { return 0; }
 const char *rt_data_dir = ".";
 const char *pad_default_ini(void) { return "[device default]\n"; }
 void overlay_build_menu(unsigned w, unsigned h, const char *title, int n, const char *const labels[], const char *const values[],

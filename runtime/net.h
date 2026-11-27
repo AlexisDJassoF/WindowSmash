@@ -75,6 +75,9 @@ void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const voi
 /* (hle_net.c) Whether this player is in a local wireless network now, the player at ip one of its
  * nodes: only then do that player's direct packets reach the game. */
 int ldn_in_network(u32 ip);
+/* (hle_net.c) 1 this player hosts a local wireless network now, 2 it is in another's (*host: that
+ * network's host's address), 0 neither */
+int ldn_role(u32 *host);
 
 /* This player's network: the virtual LAN's, or in LAN mode the PC's own (host order). */
 u32 net_mask(void);

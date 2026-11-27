@@ -652,6 +652,8 @@ static int plan_adds(Build *B) {
             u32 pi;
             if (A->pi >= 0) {   /* a data.arc path that no directory loaded: it now names the new file */
                 pi = (u32)A->pi;
+                fprintf(stderr, "[mods] %s: %s: its path was in data.arc already (index %u, FileInfoIndex %llu), no directory loading it\n", F->mod, F->dest, pi,
+                        (unsigned long long)(rd64(E(T, paths, pi)) >> 40));
                 u8 *path = E(T, paths, pi);
                 wr64(path, (rd64(path) & LOW40) | (u64)ii << 40);
             } else {            /* path | ii, extension | 0xFFFFFF, parent "dir/", name: as data.arc's */
@@ -676,7 +678,8 @@ static int plan_adds(Build *B) {
         B->nmoved += count + r.added;
         if (moved) wr32(fo + 20, fcount + r.added);   /* (the moved folder: its new ones too) */
         if (!push(&B->relocs, &B->nrelocs, &r, sizeof r)) return 0;
-        fprintf(stderr, "[mods] %s: %u new files in %s (%u children before)\n", files[B->adds[a0].f].mod, r.added, files[B->adds[a0].f].dir, count);
+        fprintf(stderr, "[mods] %s: %u new files in %s (%u children before; folder %u, %u FileData at %u%s)\n", files[B->adds[a0].f].mod, r.added,
+                files[B->adds[a0].f].dir, count, folder, fcount, fstart, moved ? ", moved with them" : ": NOT moved - the new FileData are outside its range");
     }
     return 1;
 }
@@ -1453,6 +1456,8 @@ int mod_arc_setup(ModArc *a, uint64_t arc_size, const ModArcIO *io, const ModArc
     return ok;
 }
 
+void (*mod_arc_on_read)(const char *mod, const char *dest);
+
 int mod_arc_read(const ModArc *a, uint64_t at, void *buf, uint64_t size, const ModArcIO *io) {
     u8 *p = buf;
     while (size) {
@@ -1484,6 +1489,7 @@ int mod_arc_read(const ModArc *a, uint64_t at, void *buf, uint64_t size, const M
                 else {
                     ok = g->src < (u64)a->nfiles && read_file_frame(io, (int)g->src, fsize(a, (int)g->src), o, p, n,
                                                                     a->over ? a->over[g->src] : NULL);
+                    if (ok && mod_arc_on_read) mod_arc_on_read(a->files[g->src].mod, a->files[g->src].dest);   /* (mod_recovery.h's ring) */
                     if (ok && a->read_once && !a->read_once[g->src]) {   /* (which mod file the game is loading: a hang's last line) */
                         a->read_once[g->src] = 1;
                         fprintf(stderr, "[mods] loading %s: %s\n", a->files[g->src].mod, a->files[g->src].dest);
@@ -1503,4 +1509,52 @@ void mod_arc_free(ModArc *a) {
     patches_free(a);
     free((void *)a->read_once);
     memset(a, 0, sizeof *a);
+}
+
+/* ---- one file by its path (the menu's pictures) ---------------------------------------------- */
+static struct { Table T; u64 file_section; int state; } game;   /* state: 0 not read, 1 read, -1 unreadable */
+
+static int game_table(const ModArcIO *io) {
+    if (game.state) return game.state > 0;
+    game.state = -1;
+    u8 head[0x38], th[16];
+    if (!io->arc(io->ctx, 0, head, sizeof head) || rd64(head) != 0xABCDEF9876543210ull) return 0;
+    u64 toff = rd64(head + 0x20);
+    if (!io->arc(io->ctx, toff, th, sizeof th)) return 0;
+    u32 data_start = rd32(th), decomp = rd32(th + 4), comp = rd32(th + 8);
+    u8 *ct = malloc(comp ? comp : 1);
+    game.T.t = malloc(decomp ? decomp : 1);
+    game.T.len = decomp;
+    int ok = ct && game.T.t && io->arc(io->ctx, toff + data_start, ct, comp);
+    if (ok) {
+        size_t r = ZSTD_decompress(game.T.t, decomp, ct, comp);
+        ok = !ZSTD_isError(r) && r == decomp;
+    }
+    free(ct);
+    if (!ok || !parse(&game.T)) { free(game.T.t); memset(&game.T, 0, sizeof game.T); return 0; }
+    game.file_section = rd64(head + 0x10);
+    game.state = 1;
+    return 1;
+}
+
+void *mod_arc_read_path(const ModArcIO *io, const char *path, uint64_t *size) {
+    *size = 0;
+    if (!game_table(io)) return NULL;
+    Table *T = &game.T;
+    long long pi = path_index(T, path);
+    if (pi < 0 || (u64)pi >= T->paths.count) return NULL;
+    u32 ii = (u32)(rd64(E(T, paths, pi)) >> 40);
+    if (ii >= T->info_indices.count) return NULL;
+    u32 info = rd32(E(T, info_indices, ii) + 4);
+    if (info >= T->infos.count) return NULL;
+    Where w;
+    if (!data_where(T, game.file_section, rd32(E(T, infos, info) + 8), &w)) return NULL;
+    u8 *out = read_original(io, &w);
+    if (out) *size = w.size;
+    return out;
+}
+
+void mod_arc_read_done(void) {
+    free(game.T.t);
+    memset(&game, 0, sizeof game);
 }

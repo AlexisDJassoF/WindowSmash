@@ -522,6 +522,13 @@ int ldn_busy(void) {   /* (net_switch: not while the game is in a local wireless
     ReleaseSRWLockShared(&L.lock);
     return busy;
 }
+int ldn_role(u32 *host) {   /* (net_relay.c: a room's mods) 1 hosting a network, 2 in another's (*host its host's address), 0 neither */
+    AcquireSRWLockShared(&L.lock);
+    int role = L.state == LS_AP_CREATED ? 1 : L.state == LS_CONNECTED ? 2 : 0;
+    if (host) *host = role == 2 ? get_u32(L.net + NODE(0)) : 0;
+    ReleaseSRWLockShared(&L.lock);
+    return role;
+}
 int ldn_in_network(u32 ip) {
     AcquireSRWLockShared(&L.lock);
     int in = has_network() && node_of(ip) >= 0;
